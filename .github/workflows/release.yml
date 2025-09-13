@@ -10,11 +10,6 @@ permissions:
   contents: write
   packages: write
 
-on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
 
 jobs:
   draft:
