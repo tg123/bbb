@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    branches: [ master ]
+  release:
+    types: [ released ]
+
+permissions:
+  contents: write
+  packages: write
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'release'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: Repo SemVer
+        uses: lhstrh/action-repo-semver@v1.2.1
+        id: repo-semver
+        with:
+          bump: patch
+
+      - name: Create draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: | 
+          gh release list | grep Draft | grep v${{ steps.repo-semver.outputs.bump }} | cut -f 1 | xargs -r -L 1 gh release delete --yes
+          gh release create -d --generate-notes v${{ steps.repo-semver.outputs.bump }}
+
+  goreleaser:
+      runs-on: ubuntu-latest
+      if: github.event_name == 'release'
+      steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+
+      - name: Upload binaries to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: | 
+          awk '{print "dist/"$2}' dist/checksums.txt | xargs gh release upload ${{github.event.release.name}} dist/checksums.txt
+
+    # - name: Test
+    #   run: go test -v ./...
