@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -21,6 +22,30 @@ import (
 	"github.com/tg123/bbb/pkg/fsops"
 )
 
+var mainver string = "(devel)"
+
+func version() string {
+	v := mainver
+
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return v
+	}
+
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			v = fmt.Sprintf("%v, %v", v, s.Value[:9])
+		case "vcs.time":
+			v = fmt.Sprintf("%v, %v", v, s.Value)
+		}
+	}
+
+	v = fmt.Sprintf("%v, %v", v, bi.GoVersion)
+
+	return v
+}
+
 func isAz(s string) bool { return strings.HasPrefix(s, "az://") }
 
 func main() {
@@ -28,6 +53,7 @@ func main() {
 	app := &cli.Command{
 		Name:  "bbb",
 		Usage: "filesystem helper (local + az://)",
+		Version: version(),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "loglevel",
