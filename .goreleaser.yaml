@@ -32,3 +32,7 @@ archives:
         formats: ['zip']
     ids:
       - bbb
+release:
+  draft: true
+  replace_existing_draft: true
+  disable: true

@@ -53,7 +53,7 @@ jobs:
         with:
           distribution: goreleaser
           version: latest
-          args: release --clean --skip=publish
+          args: release --clean
 
       - name: Upload binaries to release
         env:
