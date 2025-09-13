@@ -32,6 +32,10 @@ archives:
         formats: ['zip']
     ids:
       - bbb
+checksum:
+  name_template: "checksums.txt"
+snapshot:
+  version_template: "{{ incpatch .Version }}"      
 release:
   draft: true
   replace_existing_draft: true
