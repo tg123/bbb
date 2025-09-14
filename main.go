@@ -18,8 +18,8 @@ import (
 
 	"github.com/urfave/cli/v3"
 
-	"github.com/tg123/bbb/pkg/azblob"
-	"github.com/tg123/bbb/pkg/fsops"
+	"github.com/tg123/bbb/internal/azblob"
+	"github.com/tg123/bbb/internal/fsops"
 )
 
 var mainver string = "(devel)"
@@ -51,8 +51,8 @@ func isAz(s string) bool { return strings.HasPrefix(s, "az://") }
 func main() {
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
-		Name:  "bbb",
-		Usage: "filesystem helper (local + az://)",
+		Name:    "bbb",
+		Usage:   "filesystem helper (local + az://)",
 		Version: version(),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -258,16 +258,22 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 			if !all && name[0] == '.' {
 				continue
 			}
-			fullpath := fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
-			fullpath = strings.TrimSuffix(fullpath, "/")
+			var fullpath string
+			if ap.Container == "" { // listing account root (containers)
+				fullpath = fmt.Sprintf("az://%s/%s", ap.Account, strings.TrimSuffix(name, "/"))
+			} else if ap.Blob == "" {
+				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, strings.TrimSuffix(name, "/"))
+			} else {
+				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
+				fullpath = strings.TrimSuffix(fullpath, "/")
+			}
 			displayPath := fullpath
 			if relFlag {
-				displayPath = name
-				displayPath = strings.TrimSuffix(displayPath, "/")
+				displayPath = strings.TrimSuffix(name, "/")
 			}
 			if long {
 				typ := "-"
-				if strings.HasSuffix(name, "/") || (bm.Size == 0 && strings.HasSuffix(ap.Blob, "/")) {
+				if strings.HasSuffix(name, "/") || (bm.Size == 0 && strings.HasSuffix(ap.Blob, "/")) || ap.Container == "" {
 					typ = "d"
 				}
 				if machine {
