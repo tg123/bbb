@@ -101,7 +101,7 @@ func runBBB(args ...string) ([]byte, error) {
 }
 
 func bbbLs(path string, recursive bool) ([]string, error) {
-	cmd := "ls" 
+	cmd := "ls"
 	if recursive {
 		cmd = "lsr"
 	}
@@ -134,6 +134,22 @@ func bbbLs(path string, recursive bool) ([]string, error) {
 	return filtered, nil
 }
 
+func cleanFolder(t *testing.T, path string) {
+	files, err := bbbLs(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("ls results:", files)
+	for _, file := range files {
+		t.Log("removing", file)
+		_, err := runBBB("rm", file)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestBasic(t *testing.T) {
 
 	// ls containers
@@ -164,19 +180,7 @@ func TestBasic(t *testing.T) {
 	}
 
 	{
-		files, err := bbbLs("az://devstoreaccount1/test", true)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		t.Log("ls results:", files)
-		for _, file := range files {
-			t.Log("removing", file)
-			_, err := runBBB("rm", file)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
+		cleanFolder(t, "az://devstoreaccount1/test")
 	}
 
 	{
@@ -235,6 +239,46 @@ func TestBasic(t *testing.T) {
 				t.Errorf("unexpected files: got %v, want %v", files, expected)
 			}
 
+		}
+
+		// lsr
+		{
+			files, err := bbbLs("az://devstoreaccount1/test", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			expected := []string{
+				fmt.Sprintf("az://devstoreaccount1/test/%s", tmpFile.Name()[len(os.TempDir())+1:]),
+				"az://devstoreaccount1/test/dir/testfile.txt",
+				"az://devstoreaccount1/test/testfile.txt",
+			}
+
+			if !slices.Equal(files, expected) {
+				t.Errorf("unexpected files: got %v, want %v", files, expected)
+			}
+		}
+
+		// cp az az
+		{
+			_, err := runBBB("cp", "az://devstoreaccount1/test/testfile.txt", "az://devstoreaccount1/test/testfile2.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			files, err := bbbLs("az://devstoreaccount1/test/testfile*", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			expected := []string{
+				"az://devstoreaccount1/test/testfile.txt",
+				"az://devstoreaccount1/test/testfile2.txt",
+			}
+
+			if !slices.Equal(files, expected) {
+				t.Errorf("unexpected files: got %v, want %v", files, expected)
+			}
 		}
 	}
 }

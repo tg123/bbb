@@ -226,24 +226,25 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s")
 	if isAz(target) {
-		ap, err := azblob.Parse(target)
+		// Wildcard support for Azure paths
+		var pattern string
+		var parentPath string
+		if strings.Contains(target, "*") {
+			// Split at last slash before the wildcard
+			lastSlash := strings.LastIndex(target, "/")
+			if lastSlash >= 0 {
+				parentPath = target[:lastSlash+1]
+				pattern = target[lastSlash+1:]
+			} else {
+				parentPath = target
+				pattern = "*"
+			}
+		} else {
+			parentPath = target
+		}
+		ap, err := azblob.Parse(parentPath)
 		if err != nil {
 			return err
-		}
-		if ap.Blob != "" && !strings.HasSuffix(ap.Blob, "/") {
-			size, err := azblob.HeadBlob(ctx, ap)
-			if err != nil {
-				return err
-			}
-			name := filepath.Base(ap.Blob)
-			if machine {
-				fmt.Printf("f\t%d\t-\t%s\n", size, name)
-			} else if long {
-				fmt.Printf("- %10d %s %s\n", size, "-", name)
-			} else {
-				fmt.Println(name)
-			}
-			return nil
 		}
 		list, err := azblob.List(ctx, ap)
 		if err != nil {
@@ -258,8 +259,15 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 			if !all && name[0] == '.' {
 				continue
 			}
+			// Wildcard filtering
+			if pattern != "" {
+				matched, _ := path.Match(pattern, strings.TrimSuffix(name, "/"))
+				if !matched {
+					continue
+				}
+			}
 			var fullpath string
-			if ap.Container == "" { // listing account root (containers)
+			if ap.Container == "" {
 				fullpath = fmt.Sprintf("az://%s/%s", ap.Account, strings.TrimSuffix(name, "/"))
 			} else if ap.Blob == "" {
 				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, strings.TrimSuffix(name, "/"))
@@ -344,6 +352,13 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	relFlag := c.Bool("s") || c.Bool("relative")
 
 	if isAz(root) {
+		// Wildcard support for Azure paths
+		var pattern string
+		if strings.Contains(root, "*") {
+			starIdx := strings.Index(root, "*")
+			pattern = root[starIdx:]
+			root = root[:starIdx]
+		}
 		ap, err := azblob.Parse(root)
 		if err != nil {
 			return err
@@ -359,8 +374,19 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 		var count int64
 		for _, bm := range list {
 			name := bm.Name
-			if name == "" || strings.HasSuffix(name, "/") { // skip directory markers
+			if name == "" || strings.HasSuffix(name, "/") {
 				continue
+			}
+			// Wildcard filtering: match only last segment
+			if pattern != "" {
+				last := name
+				if idx := strings.LastIndex(name, "/"); idx >= 0 {
+					last = name[idx+1:]
+				}
+				matched, _ := path.Match(pattern, last)
+				if !matched {
+					continue
+				}
 			}
 			count++
 			fullpath := ap.Child(name).String()
@@ -369,7 +395,6 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 				display = strings.TrimPrefix(name, prefix)
 			}
 			if longFlag {
-				// We have size; modtime not available quickly so use '-'
 				if machine {
 					fmt.Printf("f\t%d\t-\t%s\n", bm.Size, display)
 				} else {
