@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"sort"
 	"strings"
 
 	"net/http/httptrace"
@@ -128,13 +129,13 @@ func getAzBlobClient(account string) (*azblob.Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		return azblob.NewClientWithSharedKeyCredential(endpoint+"/", cred, nil)
+		return azblob.NewClientWithSharedKeyCredential(endpoint, cred, nil)
 	}
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		return nil, err
 	}
-	return azblob.NewClient(endpoint+"/", cred, nil)
+	return azblob.NewClient(endpoint, cred, nil)
 }
 
 func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
@@ -152,28 +153,43 @@ func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 		Prefix:  &prefix,
 		Include: azblob.ListBlobsInclude{Metadata: true},
 	})
-	var out []BlobMeta
+	firstLevel := make(map[string]*BlobMeta)
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
 			return nil, err
 		}
 		if resp.Segment == nil {
-			// Check if error is due to missing container
 			var respErr *azcore.ResponseError
 			if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerNotFound" {
 				return nil, fmt.Errorf("container '%s' not found", ap.Container)
 			}
-			// If Segment is nil but no error, treat as empty container
 			return []BlobMeta{}, nil
 		}
 		for _, blob := range resp.Segment.BlobItems {
 			if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
 				continue
 			}
-			out = append(out, BlobMeta{Name: strings.TrimPrefix(*blob.Name, prefix), Size: *blob.Properties.ContentLength})
+			rel := strings.TrimPrefix(*blob.Name, prefix)
+			parts := strings.SplitN(rel, "/", 2)
+			if len(parts) == 1 {
+				// file at first level
+				firstLevel[parts[0]] = &BlobMeta{Name: parts[0], Size: *blob.Properties.ContentLength}
+			} else if len(parts) == 2 {
+				// directory
+				dirName := parts[0] + "/"
+				if _, exists := firstLevel[dirName]; !exists {
+					firstLevel[dirName] = &BlobMeta{Name: dirName, Size: 0}
+				}
+			}
 		}
 	}
+	// Collect results in sorted order
+	var out []BlobMeta
+	for _, bm := range firstLevel {
+		out = append(out, *bm)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
 

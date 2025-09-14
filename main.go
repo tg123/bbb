@@ -363,9 +363,10 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 				continue
 			}
 			count++
-			display := name
-			if relFlag && prefix != "" && strings.HasPrefix(display, prefix) {
-				display = strings.TrimPrefix(display, prefix)
+			fullpath := ap.Child(name).String()
+			display := fullpath
+			if relFlag && prefix != "" && strings.HasPrefix(name, prefix) {
+				display = strings.TrimPrefix(name, prefix)
 			}
 			if longFlag {
 				// We have size; modtime not available quickly so use '-'

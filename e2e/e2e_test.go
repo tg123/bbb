@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +100,40 @@ func runBBB(args ...string) ([]byte, error) {
 	return runAndGetStdout(bin, args...)
 }
 
+func bbbLs(path string, recursive bool) ([]string, error) {
+	cmd := "ls" 
+	if recursive {
+		cmd = "lsr"
+	}
+	stdout, err := runBBB(cmd, path)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
+
+	if recursive {
+		if len(lines) > 0 {
+			last := strings.TrimSpace(lines[len(lines)-1])
+			fields := strings.Fields(last)
+			if len(fields) == 2 && fields[1] == "files" {
+				lines = lines[:len(lines)-1]
+			}
+		}
+	}
+
+	filtered := make([]string, 0, len(lines))
+	for _, l := range lines {
+		l := strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		filtered = append(filtered, l)
+	}
+
+	return filtered, nil
+}
+
 func TestBasic(t *testing.T) {
 
 	// ls containers
@@ -129,15 +164,15 @@ func TestBasic(t *testing.T) {
 	}
 
 	{
-		// clean up
-		stdout, err := runBBB("ls", "az://devstoreaccount1/test/")
+		files, err := bbbLs("az://devstoreaccount1/test", true)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
-		for _, line := range lines {
-			_, err := runBBB("rm", line)
+		t.Log("ls results:", files)
+		for _, file := range files {
+			t.Log("removing", file)
+			_, err := runBBB("rm", file)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -175,17 +210,31 @@ func TestBasic(t *testing.T) {
 			}
 		}
 
+		// upload
+		{
+			_, err := runBBB("cp", tmpFile.Name(), "az://devstoreaccount1/test/dir/testfile.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
 		// ls
 		{
-			stdout, err := runBBB("ls", "az://devstoreaccount1/test")
+			files, err := bbbLs("az://devstoreaccount1/test", false)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			output := strings.TrimSpace(string(stdout))
-			if output != fmt.Sprintf("az://devstoreaccount1/test/%s", tmpFile.Name()[len(os.TempDir())+1:])+"\naz://devstoreaccount1/test/testfile.txt" {
-				t.Errorf("unexpected ls output: %s", output)
+			expected := []string{
+				fmt.Sprintf("az://devstoreaccount1/test/%s", tmpFile.Name()[len(os.TempDir())+1:]),
+				"az://devstoreaccount1/test/dir",
+				"az://devstoreaccount1/test/testfile.txt",
 			}
+
+			if !slices.Equal(files, expected) {
+				t.Errorf("unexpected files: got %v, want %v", files, expected)
+			}
+
 		}
 	}
 }
