@@ -1,11 +1,11 @@
 package e2e_test
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +18,28 @@ import (
 )
 
 const waitTimeout = time.Second * 10
+
+func waitForEndpointReady(addr string) {
+	waitForEndpointReadyWithTimeout(addr, waitTimeout)
+}
+
+func waitForEndpointReadyWithTimeout(addr string, timeout time.Duration) {
+	now := time.Now()
+	timeout = max(timeout, waitTimeout)
+	for {
+		if time.Since(now) > timeout {
+			log.Panic("timeout waiting for endpoint " + addr)
+		}
+
+		conn, err := net.Dial("tcp", addr)
+		if err == nil {
+			log.Printf("endpoint %s is ready", addr)
+			conn.Close()
+			break
+		}
+		time.Sleep(time.Second)
+	}
+}
 
 func runCmd(cmd string, args ...string) (*exec.Cmd, io.Writer, io.Reader, error) {
 	newargs := append([]string{cmd}, args...)
@@ -38,44 +60,6 @@ func runCmd(cmd string, args ...string) (*exec.Cmd, io.Writer, io.Reader, error)
 	log.Printf("starting %v", c.Args)
 
 	return c, f, &buf, nil
-}
-
-func runCmdAndWait(cmd string, args ...string) error {
-	c, _, _, err := runCmd(cmd, args...)
-	if err != nil {
-		return err
-	}
-
-	return c.Wait()
-}
-
-func waitForStdoutContains(stdout io.Reader, text string, cb func(string)) {
-	st := time.Now()
-	for {
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.Contains(line, text) {
-				cb(line)
-				return
-			}
-		}
-
-		if time.Since(st) > waitTimeout {
-			log.Panicf("timeout waiting for [%s] from prompt", text)
-			return
-		}
-
-		time.Sleep(time.Second) // stdout has no data yet
-	}
-}
-
-func killCmd(c *exec.Cmd) {
-	if c.Process != nil {
-		if err := c.Process.Kill(); err != nil {
-			log.Printf("failed to kill ssh process, %v", err)
-		}
-	}
 }
 
 func runAndGetStdout(cmd string, args ...string) ([]byte, error) {
@@ -152,6 +136,10 @@ func cleanFolder(t *testing.T, path string) {
 }
 
 func TestBasic(t *testing.T) {
+
+	waitForEndpointReady("devstoreaccount1.blob.localhost:10000")
+
+
 	// create container
 	{
 		_, err := runBBB("mkcontainer", "az://devstoreaccount1/test")

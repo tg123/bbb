@@ -9,14 +9,14 @@ services:
   bbb:
     network_mode: service:azurite
     build:
-      context: ..
-      dockerfile: e2e/Dockerfile
+      context: ../..
+      dockerfile: internal/e2e/Dockerfile
     environment:
       - BBB_AZBLOB_ENDPOINT=http://%s.blob.localhost:10000/
       - BBB_AZBLOB_ACCOUNTKEY=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
     depends_on:
       - azurite
     volumes:
-      - ..:/src
+      - ../..:/src
     working_dir: /src/e2e
     command: ["go", "test", "-v"]
