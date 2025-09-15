@@ -2,6 +2,7 @@ package azblob
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -15,13 +16,14 @@ import (
 	"net/http/httptrace"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 )
 
 // MkContainer creates a new Azure Blob container
 func MkContainer(ctx context.Context, account, container string) error {
-	client, err := getAzBlobClient(account)
+	client, err := getAzBlobClient(ctx, account)
 	if err != nil {
 		return err
 	}
@@ -140,7 +142,7 @@ type BlobMeta struct {
 }
 
 // List lists immediate children (non-recursive). If dir-like path provided, lists under it.
-func getAzBlobClient(account string) (*azblob.Client, error) {
+func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
 	endpoint := getEndpoint(account)
 	if key := os.Getenv("BBB_AZBLOB_ACCOUNTKEY"); key != "" {
 		cred, err := azblob.NewSharedKeyCredential(account, key)
@@ -153,6 +155,25 @@ func getAzBlobClient(account string) (*azblob.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		tok, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
+		if err != nil {
+			return nil, err
+		}
+
+		parts := strings.Split(tok.Token, ".")
+		if len(parts) == 3 {
+			payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+			if err == nil {
+				slog.Debug("Decoded JWT payload", "payload", string(payload))
+			} else {
+				slog.Debug("Failed to decode JWT payload", "error", err)
+			}
+		} else {
+			slog.Debug("Token is not a JWT")
+		}
+	}
 	return azblob.NewClient(endpoint, cred, nil)
 }
 
@@ -162,7 +183,7 @@ func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 	}
 	ap = ap.WithDir()
 	prefix := ap.Blob
-	client, err := getAzBlobClient(ap.Account)
+	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +238,7 @@ func ListRecursive(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	client, err := getAzBlobClient(ap.Account)
+	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +277,7 @@ func HeadBlob(ctx context.Context, ap AzurePath) (int64, error) {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return 0, errors.New("path is directory-like")
 	}
-	client, err := getAzBlobClient(ap.Account)
+	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
 		return 0, err
 	}
@@ -277,7 +298,7 @@ func Download(ctx context.Context, ap AzurePath) ([]byte, error) {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return nil, errors.New("cannot download directory")
 	}
-	client, err := getAzBlobClient(ap.Account)
+	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +323,7 @@ func Upload(ctx context.Context, ap AzurePath, data []byte) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return errors.New("cannot upload to directory-like path")
 	}
-	client, err := getAzBlobClient(ap.Account)
+	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
 		return err
 	}
@@ -319,7 +340,7 @@ func Delete(ctx context.Context, ap AzurePath) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return errors.New("path is directory-like; use DeletePrefix")
 	}
-	client, err := getAzBlobClient(ap.Account)
+	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
 		return err
 	}
@@ -366,7 +387,7 @@ func truncate(s string, n int) string {
 
 // ListContainers lists all containers in the account
 func ListContainers(ctx context.Context, account string) ([]BlobMeta, error) {
-	client, err := getAzBlobClient(account)
+	client, err := getAzBlobClient(ctx, account)
 	if err != nil {
 		return nil, err
 	}
