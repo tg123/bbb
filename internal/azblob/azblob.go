@@ -164,9 +164,7 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 
 		parts := strings.Split(tok.Token, ".")
 		if len(parts) == 3 {
-			payload, err := io.ReadAll(
-				base64.NewDecoder(base64.RawURLEncoding, strings.NewReader(parts[1])),
-			)
+			payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 			if err == nil {
 				slog.Debug("Decoded JWT payload", "payload", string(payload))
 			} else {
