@@ -141,19 +141,24 @@ type BlobMeta struct {
 
 // List lists immediate children (non-recursive). If dir-like path provided, lists under it.
 func getAzBlobClient(account string) (*azblob.Client, error) {
+	// Optionally enable HTTP trace for debugging if BBB_AZBLOB_TRACE env is set
+	opts := &azblob.ClientOptions{}
+	opts.TracingProvider = 
+
+
 	endpoint := getEndpoint(account)
 	if key := os.Getenv("BBB_AZBLOB_ACCOUNTKEY"); key != "" {
 		cred, err := azblob.NewSharedKeyCredential(account, key)
 		if err != nil {
 			return nil, err
 		}
-		return azblob.NewClientWithSharedKeyCredential(endpoint, cred, nil)
+		return azblob.NewClientWithSharedKeyCredential(endpoint, cred, opts)
 	}
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		return nil, err
 	}
-	return azblob.NewClient(endpoint, cred, nil)
+	return azblob.NewClient(endpoint, cred, opts)
 }
 
 func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
