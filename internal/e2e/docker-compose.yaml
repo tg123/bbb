@@ -18,5 +18,5 @@ services:
       - azurite
     volumes:
       - ../..:/src
-    working_dir: /src/e2e
+    working_dir: /src/internal/e2e
     command: ["go", "test", "-v"]
