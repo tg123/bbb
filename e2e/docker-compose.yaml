@@ -16,7 +16,6 @@ services:
       - BBB_AZBLOB_ACCOUNTKEY=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
     depends_on:
       - azurite
-      - init
     volumes:
       - ..:/src
     working_dir: /src/e2e
