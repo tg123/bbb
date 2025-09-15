@@ -6,18 +6,6 @@ services:
     extra_hosts:
       - "devstoreaccount1.blob.localhost:127.0.0.1"
 
-  init:
-    image: mcr.microsoft.com/azure-cli
-    network_mode: service:azurite
-    command: >
-      sh -c "
-        az storage container create --name test --account-name devstoreaccount1 --account-key Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw== --blob-endpoint http://azurite:10000/devstoreaccount1
-        sleep inf
-        "
-    depends_on:
-      - azurite
-
-
   bbb:
     network_mode: service:azurite
     build:

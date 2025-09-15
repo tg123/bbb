@@ -1,4 +1,3 @@
-// ListContainers lists all containers in the account
 package azblob
 
 import (
@@ -19,6 +18,25 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 )
+
+// MkContainer creates a new Azure Blob container
+func MkContainer(ctx context.Context, account, container string) error {
+	client, err := getAzBlobClient(account)
+	if err != nil {
+		return err
+	}
+	containerClient := client.ServiceClient().NewContainerClient(container)
+	_, err = containerClient.Create(ctx, nil)
+	if err != nil {
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerAlreadyExists" {
+			// ignore if already exists (idempotent)
+			return nil
+		}
+		return err
+	}
+	return nil
+}
 
 // withHTTPTrace attaches httptrace to the request for debugging
 func withHTTPTrace(req *http.Request) *http.Request {

@@ -152,6 +152,13 @@ func cleanFolder(t *testing.T, path string) {
 }
 
 func TestBasic(t *testing.T) {
+	// create container
+	{
+		_, err := runBBB("mkcontainer", "az://devstoreaccount1/test")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	// ls containers
 	{
