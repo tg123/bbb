@@ -1,0 +1,22 @@
+
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    command: ["azurite-blob", "--blobHost", "0.0.0.0"] # for non e2e test
+    extra_hosts:
+      - "devstoreaccount1.blob.localhost:127.0.0.1"
+
+  bbb:
+    network_mode: service:azurite
+    build:
+      context: ../..
+      dockerfile: internal/e2e/Dockerfile
+    environment:
+      - BBB_AZBLOB_ENDPOINT=http://%s.blob.localhost:10000/
+      - BBB_AZBLOB_ACCOUNTKEY=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+    depends_on:
+      - azurite
+    volumes:
+      - ../..:/src
+    working_dir: /src/internal/e2e
+    command: ["go", "test", "-v"]

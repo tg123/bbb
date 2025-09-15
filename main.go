@@ -18,8 +18,8 @@ import (
 
 	"github.com/urfave/cli/v3"
 
-	"github.com/tg123/bbb/pkg/azblob"
-	"github.com/tg123/bbb/pkg/fsops"
+	"github.com/tg123/bbb/internal/azblob"
+	"github.com/tg123/bbb/internal/fsops"
 )
 
 var mainver string = "(devel)"
@@ -51,8 +51,8 @@ func isAz(s string) bool { return strings.HasPrefix(s, "az://") }
 func main() {
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
-		Name:  "bbb",
-		Usage: "filesystem helper (local + az://)",
+		Name:    "bbb",
+		Usage:   "filesystem helper (local + az://)",
 		Version: version(),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -83,6 +83,33 @@ func main() {
 			return ctx, nil
 		},
 		Commands: []*cli.Command{
+			{
+				Name:      "mkcontainer",
+				Usage:     "Create an Azure Blob container",
+				UsageText: "bbb mkcontainer az://account/container",
+				Action: func(ctx context.Context, c *cli.Command) error {
+					if c.Args().Len() != 1 {
+						return fmt.Errorf("mkcontainer: need az://account/container")
+					}
+					target := c.Args().Get(0)
+					if !isAz(target) {
+						return fmt.Errorf("mkcontainer: only az:// paths supported")
+					}
+					ap, err := azblob.Parse(target)
+					if err != nil {
+						return err
+					}
+					if ap.Container == "" {
+						return fmt.Errorf("mkcontainer: need az://account/container")
+					}
+					err = azblob.MkContainer(ctx, ap.Account, ap.Container)
+					if err != nil {
+						return err
+					}
+					fmt.Printf("Created container %s/%s\n", ap.Account, ap.Container)
+					return nil
+				},
+			},
 			{
 				Name:      "ls",
 				Usage:     "List directory contents",
@@ -226,24 +253,25 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s")
 	if isAz(target) {
-		ap, err := azblob.Parse(target)
+		// Wildcard support for Azure paths
+		var pattern string
+		var parentPath string
+		if strings.Contains(target, "*") {
+			// Split at last slash before the wildcard
+			lastSlash := strings.LastIndex(target, "/")
+			if lastSlash >= 0 {
+				parentPath = target[:lastSlash+1]
+				pattern = target[lastSlash+1:]
+			} else {
+				parentPath = target
+				pattern = "*"
+			}
+		} else {
+			parentPath = target
+		}
+		ap, err := azblob.Parse(parentPath)
 		if err != nil {
 			return err
-		}
-		if ap.Blob != "" && !strings.HasSuffix(ap.Blob, "/") {
-			size, err := azblob.HeadBlob(ctx, ap)
-			if err != nil {
-				return err
-			}
-			name := filepath.Base(ap.Blob)
-			if machine {
-				fmt.Printf("f\t%d\t-\t%s\n", size, name)
-			} else if long {
-				fmt.Printf("- %10d %s %s\n", size, "-", name)
-			} else {
-				fmt.Println(name)
-			}
-			return nil
 		}
 		list, err := azblob.List(ctx, ap)
 		if err != nil {
@@ -258,16 +286,29 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 			if !all && name[0] == '.' {
 				continue
 			}
-			fullpath := fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
-			fullpath = strings.TrimSuffix(fullpath, "/")
+			// Wildcard filtering
+			if pattern != "" {
+				matched, _ := path.Match(pattern, strings.TrimSuffix(name, "/"))
+				if !matched {
+					continue
+				}
+			}
+			var fullpath string
+			if ap.Container == "" {
+				fullpath = fmt.Sprintf("az://%s/%s", ap.Account, strings.TrimSuffix(name, "/"))
+			} else if ap.Blob == "" {
+				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, strings.TrimSuffix(name, "/"))
+			} else {
+				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
+				fullpath = strings.TrimSuffix(fullpath, "/")
+			}
 			displayPath := fullpath
 			if relFlag {
-				displayPath = name
-				displayPath = strings.TrimSuffix(displayPath, "/")
+				displayPath = strings.TrimSuffix(name, "/")
 			}
 			if long {
 				typ := "-"
-				if strings.HasSuffix(name, "/") || (bm.Size == 0 && strings.HasSuffix(ap.Blob, "/")) {
+				if strings.HasSuffix(name, "/") || (bm.Size == 0 && strings.HasSuffix(ap.Blob, "/")) || ap.Container == "" {
 					typ = "d"
 				}
 				if machine {
@@ -338,6 +379,13 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	relFlag := c.Bool("s") || c.Bool("relative")
 
 	if isAz(root) {
+		// Wildcard support for Azure paths
+		var pattern string
+		if strings.Contains(root, "*") {
+			starIdx := strings.Index(root, "*")
+			pattern = root[starIdx:]
+			root = root[:starIdx]
+		}
 		ap, err := azblob.Parse(root)
 		if err != nil {
 			return err
@@ -353,16 +401,27 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 		var count int64
 		for _, bm := range list {
 			name := bm.Name
-			if name == "" || strings.HasSuffix(name, "/") { // skip directory markers
+			if name == "" || strings.HasSuffix(name, "/") {
 				continue
 			}
+			// Wildcard filtering: match only last segment
+			if pattern != "" {
+				last := name
+				if idx := strings.LastIndex(name, "/"); idx >= 0 {
+					last = name[idx+1:]
+				}
+				matched, _ := path.Match(pattern, last)
+				if !matched {
+					continue
+				}
+			}
 			count++
-			display := name
-			if relFlag && prefix != "" && strings.HasPrefix(display, prefix) {
-				display = strings.TrimPrefix(display, prefix)
+			fullpath := ap.Child(name).String()
+			display := fullpath
+			if relFlag && prefix != "" && strings.HasPrefix(name, prefix) {
+				display = strings.TrimPrefix(name, prefix)
 			}
 			if longFlag {
-				// We have size; modtime not available quickly so use '-'
 				if machine {
 					fmt.Printf("f\t%d\t-\t%s\n", bm.Size, display)
 				} else {
