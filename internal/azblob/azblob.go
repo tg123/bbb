@@ -355,7 +355,7 @@ func ListContainers(ctx context.Context, account string) ([]BlobMeta, error) {
 	pager := client.ServiceClient().NewListContainersPager(nil)
 	var out []BlobMeta
 	for pager.More() {
-		resp, err := pager.NextPage(context.Background())
+		resp, err := pager.NextPage(ctx)
 		if err != nil {
 			return nil, err
 		}
