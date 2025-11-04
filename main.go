@@ -163,6 +163,11 @@ func main() {
 				Action: cmdCat,
 			},
 			{
+				Name:   "touch",
+				Usage:  "Create an empty file or update its timestamp",
+				Action: cmdTouch,
+			},
+			{
 				Name:      "cp",
 				Usage:     "Copy files",
 				UsageText: "bbb cp [-q|--quiet] [--concurrency N] srcs [srcs ...] dst",
@@ -520,6 +525,31 @@ func cmdCat(ctx context.Context, c *cli.Command) error {
 		f.Close()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
+		}
+	}
+	return nil
+}
+
+func cmdTouch(ctx context.Context, c *cli.Command) error {
+	slog.Debug("cmdTouch called", "args", c.Args().Slice())
+	if c.Args().Len() == 0 {
+		return fmt.Errorf("touch: need at least one path")
+	}
+	ts := time.Now()
+	for i := 0; i < c.Args().Len(); i++ {
+		p := c.Args().Get(i)
+		if isAz(p) {
+			ap, err := azblob.Parse(p)
+			if err != nil {
+				return err
+			}
+			if err := azblob.Touch(ctx, ap); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := fsops.Touch(p, ts); err != nil {
+			return err
 		}
 	}
 	return nil
