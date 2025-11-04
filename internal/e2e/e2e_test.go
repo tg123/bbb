@@ -139,7 +139,6 @@ func TestBasic(t *testing.T) {
 
 	waitForEndpointReady("devstoreaccount1.blob.localhost:10000")
 
-
 	// create container
 	{
 		_, err := runBBB("mkcontainer", "az://devstoreaccount1/test")
@@ -177,6 +176,24 @@ func TestBasic(t *testing.T) {
 
 	{
 		cleanFolder(t, "az://devstoreaccount1/test")
+	}
+
+	{
+		touchPath := "az://devstoreaccount1/test/touched.txt"
+		if _, err := runBBB("touch", touchPath); err != nil {
+			t.Fatal(err)
+		}
+		files, err := bbbLs("az://devstoreaccount1/test", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{touchPath}
+		if !slices.Equal(files, expected) {
+			t.Errorf("unexpected files after touch: got %v, want %v", files, expected)
+		}
+		if _, err := runBBB("rm", touchPath); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	tmpFile, err := os.CreateTemp("", "bbb-e2e-")
@@ -306,6 +323,28 @@ func TestBasic(t *testing.T) {
 
 		if string(data) != "hello world" {
 			t.Errorf("unexpected downloaded file content: %s", data)
+		}
+	}
+
+	{
+		localDir, err := os.MkdirTemp("", "bbb-touch-local-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(localDir)
+		localFile := filepath.Join(localDir, "new.txt")
+		if _, err := runBBB("touch", localFile); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(localFile)
+		if err != nil {
+			t.Fatalf("expected local file missing: %v", err)
+		}
+		if info.IsDir() {
+			t.Fatalf("expected file got directory: %s", localFile)
+		}
+		if info.Size() != 0 {
+			t.Fatalf("expected zero byte file, got %d", info.Size())
 		}
 	}
 

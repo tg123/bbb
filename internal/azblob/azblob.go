@@ -371,6 +371,22 @@ func DeletePrefix(ctx context.Context, ap AzurePath) error {
 	return nil
 }
 
+// Touch ensures the blob exists by creating an empty object when missing.
+func Touch(ctx context.Context, ap AzurePath) error {
+	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
+		return errors.New("cannot touch directory-like path")
+	}
+
+	if _, err := HeadBlob(ctx, ap); err != nil {
+		var nf notExistError
+		if errors.As(err, &nf) {
+			return Upload(ctx, ap, []byte{})
+		}
+		return err
+	}
+	return nil
+}
+
 // Error helpers
 type notExistError string
 

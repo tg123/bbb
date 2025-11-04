@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 )
 
 // List lists entries in a directory (non-recursive). If path is empty, '.' is used.
@@ -94,3 +95,15 @@ func RemoveFile(path string) error { return os.Remove(path) }
 
 // RemoveTree removes a directory tree.
 func RemoveTree(path string) error { return os.RemoveAll(path) }
+
+// Touch updates file timestamps or creates the file if missing.
+func Touch(path string, ts time.Time) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o666)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Chtimes(path, ts, ts)
+}
