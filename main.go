@@ -50,8 +50,7 @@ func isAz(s string) bool {
 	if strings.HasPrefix(s, "az://") {
 		return true
 	}
-	_, err := azblob.Parse(s)
-	return err == nil
+	return azblob.IsBlobURL(s)
 }
 
 func main() {

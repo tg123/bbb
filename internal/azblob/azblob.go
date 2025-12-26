@@ -76,12 +76,52 @@ type AzurePath struct {
 }
 
 var accountNameRe = regexp.MustCompile(`^[a-z0-9]{3,24}$`) // compiled once during package initialization
+var containerNameRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
 var validBlobSuffixes = []string{
 	".blob.core.windows.net",
 	".blob.core.chinacloudapi.cn",
 	".blob.core.usgovcloudapi.net",
 	".blob.core.cloudapi.de",
 	".blob.localhost",
+}
+
+// IsBlobURL performs a lightweight check whether the provided string is a blob endpoint URL.
+func IsBlobURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return false
+	}
+	var matchedSuffix string
+	for _, suffix := range validBlobSuffixes {
+		if strings.HasSuffix(host, suffix) {
+			matchedSuffix = suffix
+			break
+		}
+	}
+	if matchedSuffix == "" {
+		return false
+	}
+	hostParts := strings.Split(host, ".")
+	if len(hostParts) < 3 || hostParts[0] == "" {
+		return false
+	}
+	if !accountNameRe.MatchString(hostParts[0]) {
+		return false
+	}
+	trimmed := strings.TrimPrefix(u.Path, "/")
+	if trimmed == "" {
+		return false
+	}
+	container := strings.SplitN(trimmed, "/", 2)[0]
+	return validContainerName(container)
 }
 
 func (p AzurePath) IsDirLike() bool { return p.Blob == "" || strings.HasSuffix(p.Blob, "/") }
@@ -168,6 +208,9 @@ func Parse(raw string) (AzurePath, error) {
 		}
 		parts := strings.SplitN(trimmed, "/", 2)
 		ap := AzurePath{Account: account, Container: parts[0]}
+		if !validContainerName(ap.Container) {
+			return AzurePath{}, fmt.Errorf("invalid container name: %s", ap.Container)
+		}
 		if len(parts) == 2 {
 			ap.Blob = parts[1]
 		}
@@ -452,6 +495,13 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+func validContainerName(name string) bool {
+	if len(name) < 3 || len(name) > 63 {
+		return false
+	}
+	return containerNameRe.MatchString(name)
 }
 
 // ListContainers lists all containers in the account
