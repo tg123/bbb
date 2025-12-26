@@ -75,7 +75,7 @@ type AzurePath struct {
 	Blob      string // may be empty or end with '/' for virtual directory
 }
 
-var accountNameRe = regexp.MustCompile(`^[a-z0-9]{3,24}$`) // compiled once at init time
+var accountNameRe = regexp.MustCompile(`^[a-z0-9]{3,24}$`) // compiled once during package initialization
 var validBlobSuffixes = []string{
 	".blob.core.windows.net",
 	".blob.core.chinacloudapi.cn",
@@ -140,7 +140,10 @@ func Parse(raw string) (AzurePath, error) {
 
 	scheme := strings.ToLower(u.Scheme)
 	if scheme == "http" || scheme == "https" {
-		host := strings.ToLower(u.Hostname())
+		host := strings.ToLower(u.Hostname()) // Hostname strips port; suffix validation does not require it
+		if host == "" {
+			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
+		}
 		var matchedSuffix string
 		for _, suffix := range validBlobSuffixes {
 			if strings.HasSuffix(host, suffix) {
