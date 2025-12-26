@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -73,6 +74,8 @@ type AzurePath struct {
 	Container string
 	Blob      string // may be empty or end with '/' for virtual directory
 }
+
+var accountNameRe = regexp.MustCompile(`^[a-z0-9]{3,24}$`)
 
 func (p AzurePath) IsDirLike() bool { return p.Blob == "" || strings.HasSuffix(p.Blob, "/") }
 func (p AzurePath) WithDir() AzurePath {
@@ -151,11 +154,17 @@ func Parse(raw string) (AzurePath, error) {
 			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
 		}
 		account := hostParts[0]
+		if !accountNameRe.MatchString(account) {
+			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
+		}
 		trimmed := strings.TrimPrefix(u.Path, "/")
 		if trimmed == "" {
 			return AzurePath{Account: account}, nil
 		}
 		parts := strings.SplitN(trimmed, "/", 2)
+		if parts[0] == "" {
+			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
+		}
 		ap := AzurePath{Account: account, Container: parts[0]}
 		if len(parts) == 2 {
 			ap.Blob = parts[1]
