@@ -151,13 +151,11 @@ func Parse(raw string) (AzurePath, error) {
 		if matchedSuffix == "" {
 			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
 		}
-		hostPrefix := strings.TrimSuffix(host, matchedSuffix)
-		hostPrefix = strings.TrimSuffix(hostPrefix, ".")
-		if hostPrefix == "" {
+		hostParts := strings.Split(host, ".")
+		if len(hostParts) < 3 || hostParts[0] == "" {
 			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
 		}
-		accountParts := strings.Split(hostPrefix, ".")
-		account := accountParts[0]
+		account := hostParts[0]
 		if !accountNameRe.MatchString(account) {
 			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
 		}
