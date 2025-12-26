@@ -123,16 +123,34 @@ func Parse(raw string) (AzurePath, error) {
 		}
 	}
 
-	if strings.HasPrefix(strings.ToLower(raw), "http://") || strings.HasPrefix(strings.ToLower(raw), "https://") {
+	lowerRaw := strings.ToLower(raw)
+	if strings.HasPrefix(lowerRaw, "http://") || strings.HasPrefix(lowerRaw, "https://") {
 		u, err := url.Parse(raw)
 		if err != nil {
 			return AzurePath{}, err
 		}
 		host := strings.ToLower(u.Hostname())
-		if !strings.Contains(host, ".blob.") {
+		validSuffix := false
+		for _, suffix := range []string{
+			".blob.core.windows.net",
+			".blob.core.chinacloudapi.cn",
+			".blob.core.usgovcloudapi.net",
+			".blob.core.cloudapi.de",
+			".blob.localhost",
+		} {
+			if strings.HasSuffix(host, suffix) {
+				validSuffix = true
+				break
+			}
+		}
+		if !validSuffix {
 			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
 		}
-		account := strings.Split(host, ".")[0]
+		hostParts := strings.Split(host, ".")
+		if len(hostParts) < 2 || hostParts[0] == "" {
+			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
+		}
+		account := hostParts[0]
 		trimmed := strings.TrimPrefix(u.Path, "/")
 		if trimmed == "" {
 			return AzurePath{Account: account}, nil
