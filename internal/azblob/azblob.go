@@ -76,6 +76,13 @@ type AzurePath struct {
 }
 
 var accountNameRe = regexp.MustCompile(`^[a-z0-9]{3,24}$`) // compiled once at init time
+var validBlobSuffixes = []string{
+	".blob.core.windows.net",
+	".blob.core.chinacloudapi.cn",
+	".blob.core.usgovcloudapi.net",
+	".blob.core.cloudapi.de",
+	".blob.localhost",
+}
 
 func (p AzurePath) IsDirLike() bool { return p.Blob == "" || strings.HasSuffix(p.Blob, "/") }
 func (p AzurePath) WithDir() AzurePath {
@@ -134,27 +141,23 @@ func Parse(raw string) (AzurePath, error) {
 	scheme := strings.ToLower(u.Scheme)
 	if scheme == "http" || scheme == "https" {
 		host := strings.ToLower(u.Hostname())
-		validSuffix := false
-		for _, suffix := range []string{
-			".blob.core.windows.net",
-			".blob.core.chinacloudapi.cn",
-			".blob.core.usgovcloudapi.net",
-			".blob.core.cloudapi.de",
-			".blob.localhost",
-		} {
+		var matchedSuffix string
+		for _, suffix := range validBlobSuffixes {
 			if strings.HasSuffix(host, suffix) {
-				validSuffix = true
+				matchedSuffix = suffix
 				break
 			}
 		}
-		if !validSuffix {
+		if matchedSuffix == "" {
 			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
 		}
-		hostParts := strings.Split(host, ".")
-		if len(hostParts) < 2 || hostParts[0] == "" {
+		hostPrefix := strings.TrimSuffix(host, matchedSuffix)
+		hostPrefix = strings.TrimSuffix(hostPrefix, ".")
+		if hostPrefix == "" {
 			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
 		}
-		account := hostParts[0]
+		accountParts := strings.Split(hostPrefix, ".")
+		account := accountParts[0]
 		if !accountNameRe.MatchString(account) {
 			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
 		}
