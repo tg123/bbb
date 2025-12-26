@@ -123,12 +123,8 @@ func Parse(raw string) (AzurePath, error) {
 		}
 	}
 
-	lowerRaw := strings.ToLower(raw)
-	if strings.HasPrefix(lowerRaw, "http://") || strings.HasPrefix(lowerRaw, "https://") {
-		u, err := url.Parse(raw)
-		if err != nil {
-			return AzurePath{}, err
-		}
+	u, err := url.Parse(raw)
+	if err == nil && (strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "https")) {
 		host := strings.ToLower(u.Hostname())
 		validSuffix := false
 		for _, suffix := range []string{
@@ -147,7 +143,7 @@ func Parse(raw string) (AzurePath, error) {
 			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
 		}
 		hostParts := strings.Split(host, ".")
-		if len(hostParts) < 2 || hostParts[0] == "" {
+		if len(hostParts) < 3 || hostParts[0] == "" {
 			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
 		}
 		account := hostParts[0]
