@@ -75,7 +75,7 @@ type AzurePath struct {
 	Blob      string // may be empty or end with '/' for virtual directory
 }
 
-var accountNameRe = regexp.MustCompile(`^[a-z0-9]{3,24}$`)
+var accountNameRe = regexp.MustCompile(`^[a-z0-9]{3,24}$`) // compiled once at init time
 
 func (p AzurePath) IsDirLike() bool { return p.Blob == "" || strings.HasSuffix(p.Blob, "/") }
 func (p AzurePath) WithDir() AzurePath {
@@ -131,7 +131,8 @@ func Parse(raw string) (AzurePath, error) {
 		return AzurePath{}, fmt.Errorf("not az:// or https:// path: %w", err)
 	}
 
-	if strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "https") {
+	scheme := strings.ToLower(u.Scheme)
+	if scheme == "http" || scheme == "https" {
 		host := strings.ToLower(u.Hostname())
 		validSuffix := false
 		for _, suffix := range []string{
@@ -162,9 +163,6 @@ func Parse(raw string) (AzurePath, error) {
 			return AzurePath{Account: account}, nil
 		}
 		parts := strings.SplitN(trimmed, "/", 2)
-		if parts[0] == "" {
-			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
-		}
 		ap := AzurePath{Account: account, Container: parts[0]}
 		if len(parts) == 2 {
 			ap.Blob = parts[1]
