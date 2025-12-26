@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"sort"
@@ -101,27 +102,50 @@ func (p AzurePath) String() string {
 	return fmt.Sprintf("az://%s/%s/%s", p.Account, p.Container, p.Blob)
 }
 
-// Parse parses az://account/container[/blob]
+// Parse parses az://account/container[/blob] or https://account.blob.* URLs.
 func Parse(raw string) (AzurePath, error) {
-	if !strings.HasPrefix(raw, "az://") {
-		return AzurePath{}, fmt.Errorf("not az:// path: %s", raw)
+	if strings.HasPrefix(raw, "az://") {
+		rest := raw[5:]
+		if rest == "" {
+			return AzurePath{}, errors.New("expected az://account[/container[/blob]]")
+		}
+		parts := strings.SplitN(rest, "/", 3)
+		switch len(parts) {
+		case 1:
+			// account only
+			return AzurePath{Account: parts[0]}, nil
+		case 2:
+			return AzurePath{Account: parts[0], Container: parts[1]}, nil
+		case 3:
+			return AzurePath{Account: parts[0], Container: parts[1], Blob: parts[2]}, nil
+		default:
+			return AzurePath{}, errors.New("invalid az path")
+		}
 	}
-	rest := raw[5:]
-	if rest == "" {
-		return AzurePath{}, errors.New("expected az://account[/container[/blob]]")
+
+	if strings.HasPrefix(strings.ToLower(raw), "http://") || strings.HasPrefix(strings.ToLower(raw), "https://") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return AzurePath{}, err
+		}
+		host := strings.ToLower(u.Hostname())
+		if !strings.Contains(host, ".blob.") {
+			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
+		}
+		account := strings.Split(host, ".")[0]
+		trimmed := strings.TrimPrefix(u.Path, "/")
+		if trimmed == "" {
+			return AzurePath{Account: account}, nil
+		}
+		parts := strings.SplitN(trimmed, "/", 2)
+		ap := AzurePath{Account: account, Container: parts[0]}
+		if len(parts) == 2 {
+			ap.Blob = parts[1]
+		}
+		return ap, nil
 	}
-	parts := strings.SplitN(rest, "/", 3)
-	switch len(parts) {
-	case 1:
-		// account only
-		return AzurePath{Account: parts[0]}, nil
-	case 2:
-		return AzurePath{Account: parts[0], Container: parts[1]}, nil
-	case 3:
-		return AzurePath{Account: parts[0], Container: parts[1], Blob: parts[2]}, nil
-	default:
-		return AzurePath{}, errors.New("invalid az path")
-	}
+
+	return AzurePath{}, fmt.Errorf("not az:// or https:// path: %s", raw)
 }
 
 // getEndpoint returns the blob service endpoint, using BBB_AZBLOB_ENDPOINT env if set.
