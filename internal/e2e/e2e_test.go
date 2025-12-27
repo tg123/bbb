@@ -306,6 +306,18 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+	// cat via http blob URL
+	{
+		httpURL := "http://devstoreaccount1.blob.localhost:10000/test/testfile.txt"
+		stdout, err := runBBB("cat", httpURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(stdout) != "hello world" {
+			t.Errorf("unexpected cat output via http: %s", stdout)
+		}
+	}
+
 	// download
 	{
 		downloadPath := tmpFile.Name() + ".downloaded"
@@ -323,6 +335,25 @@ func TestBasic(t *testing.T) {
 
 		if string(data) != "hello world" {
 			t.Errorf("unexpected downloaded file content: %s", data)
+		}
+	}
+
+	// download via http blob URL
+	{
+		downloadPath := tmpFile.Name() + ".http.downloaded"
+		defer os.Remove(downloadPath)
+
+		httpURL := "http://devstoreaccount1.blob.localhost:10000/test/testfile.txt"
+		if _, err := runBBB("cp", httpURL, downloadPath); err != nil {
+			t.Fatal(err)
+		}
+
+		data, err := os.ReadFile(downloadPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "hello world" {
+			t.Errorf("unexpected downloaded file content via http: %s", data)
 		}
 	}
 

@@ -8,8 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -73,6 +75,55 @@ type AzurePath struct {
 	Blob      string // may be empty or end with '/' for virtual directory
 }
 
+var accountNameRe = regexp.MustCompile(`^[a-z0-9]{3,24}$`) // compiled once during package initialization
+var containerNameRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
+var validBlobSuffixes = []string{
+	".blob.core.windows.net",
+	".blob.core.chinacloudapi.cn",
+	".blob.core.usgovcloudapi.net",
+	".blob.core.cloudapi.de",
+	".blob.localhost",
+}
+
+// IsBlobURL performs a lightweight check whether the provided string is a blob endpoint URL.
+func IsBlobURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return false
+	}
+	var matchedSuffix string
+	for _, suffix := range validBlobSuffixes {
+		if strings.HasSuffix(host, suffix) {
+			matchedSuffix = suffix
+			break
+		}
+	}
+	if matchedSuffix == "" {
+		return false
+	}
+	hostParts := strings.Split(host, ".")
+	if len(hostParts) < 3 || hostParts[0] == "" {
+		return false
+	}
+	if !accountNameRe.MatchString(hostParts[0]) {
+		return false
+	}
+	trimmed := strings.TrimPrefix(u.Path, "/")
+	if trimmed == "" {
+		return false
+	}
+	container := strings.SplitN(trimmed, "/", 2)[0]
+	return validContainerName(container)
+}
+
 func (p AzurePath) IsDirLike() bool { return p.Blob == "" || strings.HasSuffix(p.Blob, "/") }
 func (p AzurePath) WithDir() AzurePath {
 	if p.Blob == "" || strings.HasSuffix(p.Blob, "/") {
@@ -101,27 +152,72 @@ func (p AzurePath) String() string {
 	return fmt.Sprintf("az://%s/%s/%s", p.Account, p.Container, p.Blob)
 }
 
-// Parse parses az://account/container[/blob]
+// Parse parses az://account/container[/blob] or https://account.blob.* URLs.
 func Parse(raw string) (AzurePath, error) {
-	if !strings.HasPrefix(raw, "az://") {
-		return AzurePath{}, fmt.Errorf("not az:// path: %s", raw)
+	if strings.HasPrefix(raw, "az://") {
+		rest := raw[5:]
+		if rest == "" {
+			return AzurePath{}, errors.New("expected az://account[/container[/blob]]")
+		}
+		parts := strings.SplitN(rest, "/", 3)
+		switch len(parts) {
+		case 1:
+			// account only
+			return AzurePath{Account: parts[0]}, nil
+		case 2:
+			return AzurePath{Account: parts[0], Container: parts[1]}, nil
+		case 3:
+			return AzurePath{Account: parts[0], Container: parts[1], Blob: parts[2]}, nil
+		default:
+			return AzurePath{}, errors.New("invalid az path")
+		}
 	}
-	rest := raw[5:]
-	if rest == "" {
-		return AzurePath{}, errors.New("expected az://account[/container[/blob]]")
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return AzurePath{}, fmt.Errorf("not az:// or https:// path: %w", err)
 	}
-	parts := strings.SplitN(rest, "/", 3)
-	switch len(parts) {
-	case 1:
-		// account only
-		return AzurePath{Account: parts[0]}, nil
-	case 2:
-		return AzurePath{Account: parts[0], Container: parts[1]}, nil
-	case 3:
-		return AzurePath{Account: parts[0], Container: parts[1], Blob: parts[2]}, nil
-	default:
-		return AzurePath{}, errors.New("invalid az path")
+
+	scheme := strings.ToLower(u.Scheme)
+	if scheme == "http" || scheme == "https" {
+		host := strings.ToLower(u.Hostname()) // Hostname strips port; suffix validation does not require it
+		if host == "" {
+			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
+		}
+		var matchedSuffix string
+		for _, suffix := range validBlobSuffixes {
+			if strings.HasSuffix(host, suffix) {
+				matchedSuffix = suffix
+				break
+			}
+		}
+		if matchedSuffix == "" {
+			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
+		}
+		hostParts := strings.Split(host, ".")
+		if len(hostParts) < 3 || hostParts[0] == "" {
+			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
+		}
+		account := hostParts[0]
+		if !accountNameRe.MatchString(account) {
+			return AzurePath{}, fmt.Errorf("not az blob path: %s", raw)
+		}
+		trimmed := strings.TrimPrefix(u.Path, "/")
+		if trimmed == "" {
+			return AzurePath{Account: account}, nil
+		}
+		parts := strings.SplitN(trimmed, "/", 2)
+		ap := AzurePath{Account: account, Container: parts[0]}
+		if !validContainerName(ap.Container) {
+			return AzurePath{}, fmt.Errorf("invalid container name: %s", ap.Container)
+		}
+		if len(parts) == 2 {
+			ap.Blob = parts[1]
+		}
+		return ap, nil
 	}
+
+	return AzurePath{}, fmt.Errorf("not az:// or https:// path: %s", raw)
 }
 
 // getEndpoint returns the blob service endpoint, using BBB_AZBLOB_ENDPOINT env if set.
@@ -399,6 +495,13 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+func validContainerName(name string) bool {
+	if len(name) < 3 || len(name) > 63 {
+		return false
+	}
+	return containerNameRe.MatchString(name)
 }
 
 // ListContainers lists all containers in the account

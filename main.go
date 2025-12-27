@@ -46,13 +46,18 @@ func version() string {
 	return v
 }
 
-func isAz(s string) bool { return strings.HasPrefix(s, "az://") }
+func isAz(s string) bool {
+	if strings.HasPrefix(s, "az://") {
+		return true
+	}
+	return azblob.IsBlobURL(s)
+}
 
 func main() {
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
 		Name:    "bbb",
-		Usage:   "filesystem helper (local + az://)",
+		Usage:   "filesystem helper (local + az:// / https://blob)",
 		Version: version(),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
