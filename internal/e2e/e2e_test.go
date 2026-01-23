@@ -2,17 +2,15 @@ package e2e_test
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -20,6 +18,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/tg123/bbb/internal/hf"
 )
 
 const waitTimeout = time.Second * 10
@@ -533,45 +532,16 @@ func TestHuggingFaceDownload(t *testing.T) {
 }
 
 func hfListFiles(repo string) ([]string, error) {
-	url := fmt.Sprintf("https://huggingface.co/api/models/%s?blobs=true", repo)
-	resp, err := http.Get(url)
+	files, err := hf.ListFiles(context.Background(), hf.Path{Repo: repo})
 	if err != nil {
 		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("hf list failed: %s", resp.Status)
-	}
-	var payload struct {
-		Siblings []struct {
-			Name string `json:"rfilename"`
-		} `json:"siblings"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, err
-	}
-	files := make([]string, 0, len(payload.Siblings))
-	for _, entry := range payload.Siblings {
-		if entry.Name == "" {
-			continue
-		}
-		files = append(files, entry.Name)
 	}
 	slices.Sort(files)
 	return files, nil
 }
 
 func hfDownload(repo, file string) ([]byte, error) {
-	url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", repo, url.PathEscape(path.Clean(file)))
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("hf download failed: %s", resp.Status)
-	}
-	return io.ReadAll(resp.Body)
+	return hf.Download(context.Background(), hf.Path{Repo: repo, File: file})
 }
 
 func isNetworkError(err error) bool {
