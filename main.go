@@ -921,6 +921,9 @@ func resolveDstPath(dst string, dstAz bool, base string, mustBeDir bool) (string
 		if err != nil {
 			return "", err
 		}
+		if mustBeDir && dap.Blob != "" && !strings.HasSuffix(dap.Blob, "/") {
+			dap.Blob += "/"
+		}
 		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
 			if dap.Blob == "" {
 				dap.Blob = base

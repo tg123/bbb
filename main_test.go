@@ -63,3 +63,13 @@ func TestHFPathDefaults(t *testing.T) {
 		t.Fatalf("unexpected file url: %s", url)
 	}
 }
+
+func TestResolveDstPathAzDir(t *testing.T) {
+	dst, err := resolveDstPath("az://acct/container/prefix", true, "model.bin", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dst != "az://acct/container/prefix/model.bin" {
+		t.Fatalf("unexpected destination: %s", dst)
+	}
+}
