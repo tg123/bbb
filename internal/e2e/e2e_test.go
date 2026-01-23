@@ -23,11 +23,15 @@ import (
 )
 
 const (
-	waitTimeout           = time.Second * 10
-	hfAzCopyPrefix        = "az://devstoreaccount1/test/hf-copy"
+	waitTimeout    = time.Second * 10
+	azuriteAccount = "devstoreaccount1"
+	azuriteHost    = azuriteAccount + ".blob.localhost:10000"
 )
 
-var preferredHFFileNames = []string{"config.json", "README.md", "tokenizer.json"}
+var (
+	preferredHFFileNames = []string{"config.json", "README.md", "tokenizer.json"}
+	hfAzCopyPrefix       = fmt.Sprintf("az://%s/test/hf-copy", azuriteAccount)
+)
 
 func waitForEndpointReady(addr string) {
 	waitForEndpointReadyWithTimeout(addr, waitTimeout)
@@ -147,11 +151,11 @@ func cleanFolder(t *testing.T, path string) {
 
 func TestBasic(t *testing.T) {
 
-	waitForEndpointReady("devstoreaccount1.blob.localhost:10000")
+	waitForEndpointReady(azuriteHost)
 
 	// create container
 	{
-		_, err := runBBB("mkcontainer", "az://devstoreaccount1/test")
+		_, err := runBBB("mkcontainer", "az://"+azuriteAccount+"/test")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -159,41 +163,41 @@ func TestBasic(t *testing.T) {
 
 	// ls containers
 	{
-		stdout, err := runBBB("ls", "az://devstoreaccount1/")
+		stdout, err := runBBB("ls", "az://"+azuriteAccount+"/")
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		output := strings.TrimSpace(string(stdout))
 
-		if output != "az://devstoreaccount1/test" {
+		if output != "az://"+azuriteAccount+"/test" {
 			t.Errorf("unexpected ls output: %s", output)
 		}
 	}
 
 	{
-		stdout, err := runBBB("ls", "az://devstoreaccount1")
+		stdout, err := runBBB("ls", "az://"+azuriteAccount)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		output := strings.TrimSpace(string(stdout))
 
-		if output != "az://devstoreaccount1/test" {
+		if output != "az://"+azuriteAccount+"/test" {
 			t.Errorf("unexpected ls output: %s", output)
 		}
 	}
 
 	{
-		cleanFolder(t, "az://devstoreaccount1/test")
+		cleanFolder(t, "az://"+azuriteAccount+"/test")
 	}
 
 	{
-		touchPath := "az://devstoreaccount1/test/touched.txt"
+		touchPath := "az://" + azuriteAccount + "/test/touched.txt"
 		if _, err := runBBB("touch", touchPath); err != nil {
 			t.Fatal(err)
 		}
-		files, err := bbbLs("az://devstoreaccount1/test", false)
+		files, err := bbbLs("az://"+azuriteAccount+"/test", false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -222,7 +226,7 @@ func TestBasic(t *testing.T) {
 
 	// upload
 	{
-		_, err := runBBB("cp", tmpFile.Name(), "az://devstoreaccount1/test")
+		_, err := runBBB("cp", tmpFile.Name(), "az://"+azuriteAccount+"/test")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -230,7 +234,7 @@ func TestBasic(t *testing.T) {
 
 	// upload
 	{
-		_, err := runBBB("cp", tmpFile.Name(), "az://devstoreaccount1/test/testfile.txt")
+		_, err := runBBB("cp", tmpFile.Name(), "az://"+azuriteAccount+"/test/testfile.txt")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -238,7 +242,7 @@ func TestBasic(t *testing.T) {
 
 	// upload
 	{
-		_, err := runBBB("cp", tmpFile.Name(), "az://devstoreaccount1/test/dir/testfile.txt")
+		_, err := runBBB("cp", tmpFile.Name(), "az://"+azuriteAccount+"/test/dir/testfile.txt")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -246,15 +250,15 @@ func TestBasic(t *testing.T) {
 
 	// ls
 	{
-		files, err := bbbLs("az://devstoreaccount1/test", false)
+		files, err := bbbLs("az://"+azuriteAccount+"/test", false)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		expected := []string{
-			fmt.Sprintf("az://devstoreaccount1/test/%s", tmpFile.Name()[len(os.TempDir())+1:]),
-			"az://devstoreaccount1/test/dir",
-			"az://devstoreaccount1/test/testfile.txt",
+			fmt.Sprintf("az://%s/test/%s", azuriteAccount, tmpFile.Name()[len(os.TempDir())+1:]),
+			"az://" + azuriteAccount + "/test/dir",
+			"az://" + azuriteAccount + "/test/testfile.txt",
 		}
 
 		if !slices.Equal(files, expected) {
@@ -265,15 +269,15 @@ func TestBasic(t *testing.T) {
 
 	// lsr
 	{
-		files, err := bbbLs("az://devstoreaccount1/test", true)
+		files, err := bbbLs("az://"+azuriteAccount+"/test", true)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		expected := []string{
-			fmt.Sprintf("az://devstoreaccount1/test/%s", tmpFile.Name()[len(os.TempDir())+1:]),
-			"az://devstoreaccount1/test/dir/testfile.txt",
-			"az://devstoreaccount1/test/testfile.txt",
+			fmt.Sprintf("az://%s/test/%s", azuriteAccount, tmpFile.Name()[len(os.TempDir())+1:]),
+			"az://" + azuriteAccount + "/test/dir/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile.txt",
 		}
 
 		if !slices.Equal(files, expected) {
@@ -283,19 +287,19 @@ func TestBasic(t *testing.T) {
 
 	// cp az az
 	{
-		_, err := runBBB("cp", "az://devstoreaccount1/test/testfile.txt", "az://devstoreaccount1/test/testfile2.txt")
+		_, err := runBBB("cp", "az://"+azuriteAccount+"/test/testfile.txt", "az://"+azuriteAccount+"/test/testfile2.txt")
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		files, err := bbbLs("az://devstoreaccount1/test/testfile*", false)
+		files, err := bbbLs("az://"+azuriteAccount+"/test/testfile*", false)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		expected := []string{
-			"az://devstoreaccount1/test/testfile.txt",
-			"az://devstoreaccount1/test/testfile2.txt",
+			"az://" + azuriteAccount + "/test/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile2.txt",
 		}
 
 		if !slices.Equal(files, expected) {
@@ -305,7 +309,7 @@ func TestBasic(t *testing.T) {
 
 	// cat
 	{
-		stdout, err := runBBB("cat", "az://devstoreaccount1/test/testfile.txt")
+		stdout, err := runBBB("cat", "az://"+azuriteAccount+"/test/testfile.txt")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -318,7 +322,7 @@ func TestBasic(t *testing.T) {
 
 	// cat via http blob URL
 	{
-		httpURL := "http://devstoreaccount1.blob.localhost:10000/test/testfile.txt"
+		httpURL := fmt.Sprintf("http://%s/test/testfile.txt", azuriteHost)
 		stdout, err := runBBB("cat", httpURL)
 		if err != nil {
 			t.Fatal(err)
@@ -333,7 +337,7 @@ func TestBasic(t *testing.T) {
 		downloadPath := tmpFile.Name() + ".downloaded"
 		defer os.Remove(downloadPath)
 
-		_, err := runBBB("cp", "az://devstoreaccount1/test/testfile.txt", downloadPath)
+		_, err := runBBB("cp", "az://"+azuriteAccount+"/test/testfile.txt", downloadPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -353,7 +357,7 @@ func TestBasic(t *testing.T) {
 		downloadPath := tmpFile.Name() + ".http.downloaded"
 		defer os.Remove(downloadPath)
 
-		httpURL := "http://devstoreaccount1.blob.localhost:10000/test/testfile.txt"
+		httpURL := fmt.Sprintf("http://%s/test/testfile.txt", azuriteHost)
 		if _, err := runBBB("cp", httpURL, downloadPath); err != nil {
 			t.Fatal(err)
 		}
@@ -390,7 +394,7 @@ func TestBasic(t *testing.T) {
 	}
 
 	{
-		cleanFolder(t, "az://devstoreaccount1/test/")
+		cleanFolder(t, "az://"+azuriteAccount+"/test/")
 	}
 
 	// cpr
@@ -414,19 +418,19 @@ func TestBasic(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := runBBB("cpr", localDir, "az://devstoreaccount1/test/"); err != nil {
+		if _, err := runBBB("cpr", localDir, "az://"+azuriteAccount+"/test/"); err != nil {
 			t.Fatal(err)
 		}
 
-		files, err := bbbLs("az://devstoreaccount1/test", true)
+		files, err := bbbLs("az://"+azuriteAccount+"/test", true)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		expected := []string{
-			"az://devstoreaccount1/test/1.txt",
-			"az://devstoreaccount1/test/2.txt",
-			"az://devstoreaccount1/test/test/3.txt",
+			"az://" + azuriteAccount + "/test/1.txt",
+			"az://" + azuriteAccount + "/test/2.txt",
+			"az://" + azuriteAccount + "/test/test/3.txt",
 		}
 
 		if !slices.Equal(files, expected) {
@@ -442,7 +446,7 @@ func TestBasic(t *testing.T) {
 		}
 		defer os.RemoveAll(localOut)
 
-		if _, err := runBBB("cpr", "az://devstoreaccount1/test/", localOut); err != nil {
+		if _, err := runBBB("cpr", "az://"+azuriteAccount+"/test/", localOut); err != nil {
 			t.Fatal(err)
 		}
 
@@ -453,7 +457,7 @@ func TestBasic(t *testing.T) {
 		}
 
 		for _, rel := range expectedLocal {
-			full := localOut + "/" + rel
+			full := filepath.Join(localOut, rel)
 			st, err := os.Stat(full)
 			if err != nil {
 				t.Fatalf("expected file missing: %s (%v)", full, err)
@@ -479,7 +483,7 @@ func TestBasic(t *testing.T) {
 			if d.IsDir() {
 				return nil
 			}
-			rel, _ := strings.CutPrefix(path, localOut+"/")
+			rel, _ := strings.CutPrefix(path, localOut+string(filepath.Separator))
 			collected[rel] = struct{}{}
 			return nil
 		})
@@ -531,7 +535,7 @@ func TestBasic(t *testing.T) {
 		if _, err := runBBB("cp", "hf://"+repo, dstPrefix); err != nil {
 			t.Fatal(err)
 		}
-		azFile := strings.TrimSuffix(dstPrefix, "/") + "/" + candidate
+		azFile := path.Join(strings.TrimSuffix(dstPrefix, "/"), candidate)
 		list, err := bbbLs(dstPrefix, true)
 		if err != nil {
 			t.Fatal(err)
