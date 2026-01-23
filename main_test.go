@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/tg123/bbb/internal/hf"
+)
 
 func TestIsAzHTTPS(t *testing.T) {
 	if !isAz("https://myacct.blob.core.windows.net/container") {
@@ -20,5 +24,42 @@ func TestIsAzHTTPEdgeCases(t *testing.T) {
 	}
 	if isAz("ftp://acct.blob.core.windows.net/container") {
 		t.Fatalf("non-http scheme should not be treated as az path")
+	}
+}
+
+func TestIsHF(t *testing.T) {
+	if !isHF("hf://openai/gpt-oss-120b") {
+		t.Fatalf("expected hf:// path to be detected")
+	}
+	if isHF("https://huggingface.co/openai/gpt-oss-120b") {
+		t.Fatalf("non-hf scheme should not be detected as hf")
+	}
+}
+
+func TestHFPathDefaults(t *testing.T) {
+	p, err := hf.Parse("hf://openai/gpt-oss-120b")
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if p.DefaultFilename() != "gpt-oss-120b" {
+		t.Fatalf("unexpected default filename: %s", p.DefaultFilename())
+	}
+	if _, err := p.URL(); err == nil {
+		t.Fatalf("expected url error for repo path")
+	}
+
+	p, err = hf.Parse("hf://openai/gpt-oss-120b/README.md")
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if p.DefaultFilename() != "README.md" {
+		t.Fatalf("unexpected file default filename: %s", p.DefaultFilename())
+	}
+	url, err := p.URL()
+	if err != nil {
+		t.Fatalf("unexpected url error: %v", err)
+	}
+	if url != "https://huggingface.co/openai/gpt-oss-120b/resolve/main/README.md" {
+		t.Fatalf("unexpected file url: %s", url)
 	}
 }
