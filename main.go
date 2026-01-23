@@ -915,7 +915,7 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 	return nil
 }
 
-func resolveDstPath(dst string, dstAz bool, base string, requireDir bool) (string, error) {
+func resolveDstPath(dst string, dstAz bool, base string, mustBeDir bool) (string, error) {
 	if dstAz {
 		dap, err := azblob.Parse(dst)
 		if err != nil {
@@ -929,7 +929,7 @@ func resolveDstPath(dst string, dstAz bool, base string, requireDir bool) (strin
 			}
 			return dap.String(), nil
 		}
-		if requireDir {
+		if mustBeDir {
 			return "", errors.New("cp: destination must be a directory")
 		}
 		return dst, nil
@@ -941,7 +941,7 @@ func resolveDstPath(dst string, dstAz bool, base string, requireDir bool) (strin
 	if strings.HasSuffix(dst, string(os.PathSeparator)) || strings.HasSuffix(dst, "/") {
 		return filepath.Join(dst, base), nil
 	}
-	if requireDir {
+	if mustBeDir {
 		return "", errors.New("cp: destination must be a directory")
 	}
 	return dst, nil
