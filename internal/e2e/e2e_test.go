@@ -2,12 +2,17 @@ package e2e_test
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -487,4 +492,99 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+}
+
+func TestHuggingFaceDownload(t *testing.T) {
+	repo := "hf-internal-testing/tiny-random-BertModel"
+	files, err := hfListFiles(repo)
+	if err != nil {
+		if isNetworkError(err) {
+			t.Skipf("huggingface unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	tempDir, err := os.MkdirTemp("", "bbb-hf-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	if _, err := runBBB("cp", "hf://"+repo, tempDir); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, file := range files {
+		localPath := filepath.Join(tempDir, filepath.FromSlash(file))
+		localData, err := os.ReadFile(localPath)
+		if err != nil {
+			t.Fatalf("missing local file %s: %v", file, err)
+		}
+		remoteData, err := hfDownload(repo, file)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatalf("download failed for %s: %v", file, err)
+		}
+		if !bytes.Equal(localData, remoteData) {
+			t.Fatalf("content mismatch for %s", file)
+		}
+	}
+}
+
+func hfListFiles(repo string) ([]string, error) {
+	url := fmt.Sprintf("https://huggingface.co/api/models/%s?blobs=true", repo)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("hf list failed: %s", resp.Status)
+	}
+	var payload struct {
+		Siblings []struct {
+			Name string `json:"rfilename"`
+		} `json:"siblings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	files := make([]string, 0, len(payload.Siblings))
+	for _, entry := range payload.Siblings {
+		if entry.Name == "" {
+			continue
+		}
+		files = append(files, entry.Name)
+	}
+	slices.Sort(files)
+	return files, nil
+}
+
+func hfDownload(repo, file string) ([]byte, error) {
+	url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", repo, path.Clean(file))
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("hf download failed: %s", resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+func isNetworkError(err error) bool {
+	var dnsErr *net.DNSError
+	var urlErr *url.Error
+	var opErr *net.OpError
+	switch {
+	case errors.As(err, &dnsErr):
+		return true
+	case errors.As(err, &urlErr):
+		return true
+	case errors.As(err, &opErr):
+		return true
+	}
+	return false
 }
