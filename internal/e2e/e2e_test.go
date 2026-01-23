@@ -535,7 +535,7 @@ func TestBasic(t *testing.T) {
 		if _, err := runBBB("cp", "hf://"+repo, dstPrefix); err != nil {
 			t.Fatal(err)
 		}
-		azFile := path.Join(strings.TrimSuffix(dstPrefix, "/"), candidate)
+		azFile := path.Join(strings.TrimSuffix(dstPrefix, "/"), candidate) // Azure blob paths always use forward slashes.
 		list, err := bbbLs(dstPrefix, true)
 		if err != nil {
 			t.Fatal(err)
