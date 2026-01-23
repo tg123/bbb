@@ -604,39 +604,35 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	for _, src := range srcs {
 		srcAz := isAz(src)
 		srcHF := isHF(src)
-		var hfPath hf.Path
 		base := filepath.Base(src)
 		if srcHF {
 			var err error
-			hfPath, err = hf.Parse(src)
+			hfPath, err := hf.Parse(src)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
 			base = hfPath.DefaultFilename()
-		}
-		var dstPath string
-		if isDstDir {
-			if dstAz {
-				dap, _ := azblob.Parse(dst)
-				if dap.Blob == "" {
-					dap.Blob = base
-				} else {
-					dap.Blob = strings.TrimSuffix(dap.Blob, "/") + "/" + base
-				}
-				dstPath = dap.String()
-			} else {
-				dstPath = filepath.Join(dst, base)
-			}
-		} else {
-			dstPath = dst
-		}
-		// src -> dstPath
-		if srcHF {
 			data, err := hf.Download(ctx, hfPath)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
+			}
+			var dstPath string
+			if isDstDir {
+				if dstAz {
+					dap, _ := azblob.Parse(dst)
+					if dap.Blob == "" {
+						dap.Blob = base
+					} else {
+						dap.Blob = strings.TrimSuffix(dap.Blob, "/") + "/" + base
+					}
+					dstPath = dap.String()
+				} else {
+					dstPath = filepath.Join(dst, base)
+				}
+			} else {
+				dstPath = dst
 			}
 			if dstAz {
 				dap, err := azblob.Parse(dstPath)
@@ -677,7 +673,26 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			if !quiet {
 				fmt.Printf("Copied %s -> %s\n", src, dstPath)
 			}
-		} else if srcAz && dstAz {
+			continue
+		}
+		var dstPath string
+		if isDstDir {
+			if dstAz {
+				dap, _ := azblob.Parse(dst)
+				if dap.Blob == "" {
+					dap.Blob = base
+				} else {
+					dap.Blob = strings.TrimSuffix(dap.Blob, "/") + "/" + base
+				}
+				dstPath = dap.String()
+			} else {
+				dstPath = filepath.Join(dst, base)
+			}
+		} else {
+			dstPath = dst
+		}
+		// src -> dstPath
+		if srcAz && dstAz {
 			sap, _ := azblob.Parse(src)
 			dap, _ := azblob.Parse(dstPath)
 			data, err := azblob.Download(ctx, sap)

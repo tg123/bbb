@@ -31,7 +31,7 @@ func Parse(raw string) (Path, error) {
 	}
 	p := Path{Repo: parts[0] + "/" + parts[1]}
 	if len(parts) == 3 {
-		p.File = strings.TrimPrefix(parts[2], "/")
+		p.File = parts[2]
 	}
 	return p, nil
 }
@@ -74,7 +74,7 @@ func Download(ctx context.Context, p Path) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("hf download failed: %s", resp.Status)
 	}
 	data, err := io.ReadAll(resp.Body)
