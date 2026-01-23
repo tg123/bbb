@@ -20,6 +20,7 @@ import (
 
 	"github.com/tg123/bbb/internal/azblob"
 	"github.com/tg123/bbb/internal/fsops"
+	"github.com/tg123/bbb/internal/hf"
 )
 
 var mainver string = "(devel)"
@@ -53,11 +54,15 @@ func isAz(s string) bool {
 	return azblob.IsBlobURL(s)
 }
 
+func isHF(s string) bool {
+	return strings.HasPrefix(s, "hf://")
+}
+
 func main() {
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
 		Name:    "bbb",
-		Usage:   "filesystem helper (local + az:// / https://blob)",
+		Usage:   "filesystem helper (local + az:// / https://blob / hf://)",
 		Version: version(),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -573,6 +578,9 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		srcs[i] = c.Args().Get(i)
 	}
 	dst := c.Args().Get(c.Args().Len() - 1)
+	if isHF(dst) {
+		return fmt.Errorf("cp: hf:// only supported as source")
+	}
 	dstAz := isAz(dst)
 	// Determine if dst is directory (local or Azure)
 	isDstDir := false
@@ -595,9 +603,20 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	}
 	for _, src := range srcs {
 		srcAz := isAz(src)
+		srcHF := isHF(src)
+		var hfPath hf.Path
+		base := filepath.Base(src)
+		if srcHF {
+			var err error
+			hfPath, err = hf.Parse(src)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			base = hfPath.DefaultFilename()
+		}
 		var dstPath string
 		if isDstDir {
-			base := filepath.Base(src)
 			if dstAz {
 				dap, _ := azblob.Parse(dst)
 				if dap.Blob == "" {
@@ -613,7 +632,52 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			dstPath = dst
 		}
 		// src -> dstPath
-		if srcAz && dstAz {
+		if srcHF {
+			data, err := hf.Download(ctx, hfPath)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			if dstAz {
+				dap, err := azblob.Parse(dstPath)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+				if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
+					fmt.Fprintln(os.Stderr, "cp: destination must be a blob path")
+					os.Exit(1)
+				}
+				if !overwrite {
+					if _, err := azblob.HeadBlob(ctx, dap); err == nil {
+						fmt.Fprintln(os.Stderr, "cp: destination exists")
+						os.Exit(1)
+					}
+				}
+				if err := azblob.Upload(ctx, dap, data); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+			} else {
+				if !overwrite {
+					if _, err := os.Stat(dstPath); err == nil {
+						fmt.Fprintln(os.Stderr, "cp: destination exists")
+						os.Exit(1)
+					}
+				}
+				if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+				if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+			}
+			if !quiet {
+				fmt.Printf("Copied %s -> %s\n", src, dstPath)
+			}
+		} else if srcAz && dstAz {
 			sap, _ := azblob.Parse(src)
 			dap, _ := azblob.Parse(dstPath)
 			data, err := azblob.Download(ctx, sap)
