@@ -41,15 +41,11 @@ func TestHFPathDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected parse error: %v", err)
 	}
-	if p.DefaultFilename() != "gpt-oss-120b.zip" {
+	if p.DefaultFilename() != "gpt-oss-120b" {
 		t.Fatalf("unexpected default filename: %s", p.DefaultFilename())
 	}
-	url, err := p.URL()
-	if err != nil {
-		t.Fatalf("unexpected url error: %v", err)
-	}
-	if url != "https://huggingface.co/openai/gpt-oss-120b/archive/main.zip" {
-		t.Fatalf("unexpected url: %s", url)
+	if _, err := p.URL(); err == nil {
+		t.Fatalf("expected url error for repo path")
 	}
 
 	p, err = hf.Parse("hf://openai/gpt-oss-120b/README.md")
@@ -59,7 +55,7 @@ func TestHFPathDefaults(t *testing.T) {
 	if p.DefaultFilename() != "README.md" {
 		t.Fatalf("unexpected file default filename: %s", p.DefaultFilename())
 	}
-	url, err = p.URL()
+	url, err := p.URL()
 	if err != nil {
 		t.Fatalf("unexpected url error: %v", err)
 	}

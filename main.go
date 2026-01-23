@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -612,66 +613,17 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
+			if hfPath.File == "" {
+				if err := copyHFDir(ctx, hfPath, dst, dstAz, overwrite, quiet); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+				continue
+			}
 			base = hfPath.DefaultFilename()
-			data, err := hf.Download(ctx, hfPath)
-			if err != nil {
+			if err := copyHFFile(ctx, hfPath, base, dst, dstAz, overwrite, quiet, isDstDir); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
-			}
-			var dstPath string
-			if isDstDir {
-				if dstAz {
-					dap, _ := azblob.Parse(dst)
-					if dap.Blob == "" {
-						dap.Blob = base
-					} else {
-						dap.Blob = strings.TrimSuffix(dap.Blob, "/") + "/" + base
-					}
-					dstPath = dap.String()
-				} else {
-					dstPath = filepath.Join(dst, base)
-				}
-			} else {
-				dstPath = dst
-			}
-			if dstAz {
-				dap, err := azblob.Parse(dstPath)
-				if err != nil {
-					fmt.Fprintln(os.Stderr, err)
-					os.Exit(1)
-				}
-				if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-					fmt.Fprintln(os.Stderr, "cp: destination must be a blob path")
-					os.Exit(1)
-				}
-				if !overwrite {
-					if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-						fmt.Fprintln(os.Stderr, "cp: destination exists")
-						os.Exit(1)
-					}
-				}
-				if err := azblob.Upload(ctx, dap, data); err != nil {
-					fmt.Fprintln(os.Stderr, err)
-					os.Exit(1)
-				}
-			} else {
-				if !overwrite {
-					if _, err := os.Stat(dstPath); err == nil {
-						fmt.Fprintln(os.Stderr, "cp: destination exists")
-						os.Exit(1)
-					}
-				}
-				if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-					fmt.Fprintln(os.Stderr, err)
-					os.Exit(1)
-				}
-				if err := os.WriteFile(dstPath, data, 0o644); err != nil {
-					fmt.Fprintln(os.Stderr, err)
-					os.Exit(1)
-				}
-			}
-			if !quiet {
-				fmt.Printf("Copied %s -> %s\n", src, dstPath)
 			}
 			continue
 		}
@@ -866,6 +818,133 @@ func cmdCPTree(ctx context.Context, c *cli.Command) error {
 		os.Exit(1)
 	}
 	return nil
+}
+
+func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, overwrite, quiet, dstDir bool) error {
+	data, err := hf.Download(ctx, hfPath)
+	if err != nil {
+		return err
+	}
+	dstPath, err := resolveDstPath(dst, dstAz, base, dstDir)
+	if err != nil {
+		return err
+	}
+	if dstAz {
+		dap, err := azblob.Parse(dstPath)
+		if err != nil {
+			return err
+		}
+		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
+			return errors.New("cp: destination must be a blob path")
+		}
+		if !overwrite {
+			if _, err := azblob.HeadBlob(ctx, dap); err == nil {
+				return errors.New("cp: destination exists")
+			}
+		}
+		if err := azblob.Upload(ctx, dap, data); err != nil {
+			return err
+		}
+	} else {
+		if !overwrite {
+			if _, err := os.Stat(dstPath); err == nil {
+				return errors.New("cp: destination exists")
+			}
+		}
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+			return err
+		}
+	}
+	if !quiet {
+		fmt.Printf("Copied %s -> %s\n", hfPath.String(), dstPath)
+	}
+	return nil
+}
+
+func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite, quiet bool) error {
+	files, err := hf.ListFiles(ctx, hfPath)
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		filePath := hf.Path{Repo: hfPath.Repo, File: file}
+		data, err := hf.Download(ctx, filePath)
+		if err != nil {
+			return err
+		}
+		dstPath, err := resolveDstPath(dst, dstAz, file, true)
+		if err != nil {
+			return err
+		}
+		if dstAz {
+			dap, err := azblob.Parse(dstPath)
+			if err != nil {
+				return err
+			}
+			if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
+				return errors.New("cp: destination must be a blob path")
+			}
+			if !overwrite {
+				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
+					continue
+				}
+			}
+			if err := azblob.Upload(ctx, dap, data); err != nil {
+				return err
+			}
+		} else {
+			if !overwrite {
+				if _, err := os.Stat(dstPath); err == nil {
+					continue
+				}
+			}
+			if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+				return err
+			}
+		}
+		if !quiet {
+			fmt.Printf("Copied %s -> %s\n", filePath.String(), dstPath)
+		}
+	}
+	return nil
+}
+
+func resolveDstPath(dst string, dstAz bool, base string, requireDir bool) (string, error) {
+	if dstAz {
+		dap, err := azblob.Parse(dst)
+		if err != nil {
+			return "", err
+		}
+		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
+			if dap.Blob == "" {
+				dap.Blob = base
+			} else {
+				dap.Blob = strings.TrimSuffix(dap.Blob, "/") + "/" + base
+			}
+			return dap.String(), nil
+		}
+		if requireDir {
+			return "", errors.New("cp: destination must be a directory")
+		}
+		return dst, nil
+	}
+	info, err := os.Stat(dst)
+	if err == nil && info.IsDir() {
+		return filepath.Join(dst, base), nil
+	}
+	if strings.HasSuffix(dst, string(os.PathSeparator)) || strings.HasSuffix(dst, "/") {
+		return filepath.Join(dst, base), nil
+	}
+	if requireDir {
+		return "", errors.New("cp: destination must be a directory")
+	}
+	return dst, nil
 }
 func cmdEdit(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdEdit called", "args", c.Args().Slice())
