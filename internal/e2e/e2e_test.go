@@ -535,7 +535,8 @@ func TestBasic(t *testing.T) {
 		if _, err := runBBB("cp", "hf://"+repo, dstPrefix); err != nil {
 			t.Fatal(err)
 		}
-		azFile := strings.TrimSuffix(dstPrefix, "/") + "/" + path.Clean(candidate)
+		normalized := strings.ReplaceAll(candidate, "\\", "/")
+		azFile := strings.TrimSuffix(dstPrefix, "/") + "/" + path.Clean(normalized)
 		list, err := bbbLs(dstPrefix, true)
 		if err != nil {
 			t.Fatal(err)
