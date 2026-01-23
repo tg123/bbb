@@ -536,7 +536,10 @@ func TestBasic(t *testing.T) {
 			t.Fatal(err)
 		}
 		normalized := strings.ReplaceAll(candidate, "\\", "/")
-		azFile := strings.TrimSuffix(dstPrefix, "/") + "/" + path.Clean(normalized)
+		azFile, err := url.JoinPath(strings.TrimSuffix(dstPrefix, "/"), path.Clean(normalized))
+		if err != nil {
+			t.Fatal(err)
+		}
 		list, err := bbbLs(dstPrefix, true)
 		if err != nil {
 			t.Fatal(err)
