@@ -492,6 +492,66 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+	t.Run("hf to az", func(t *testing.T) {
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		files, err := hfListFiles(repo)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		if len(files) == 0 {
+			t.Fatal("no huggingface files returned")
+		}
+		candidate := ""
+		for _, name := range []string{"config.json", "README.md", "tokenizer.json"} {
+			if slices.Contains(files, name) {
+				candidate = name
+				break
+			}
+		}
+		if candidate == "" {
+			candidate = files[0]
+		}
+		hfData, err := hfDownload(repo, candidate)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		dstPrefix := "az://devstoreaccount1/test/hf-copy"
+		cleanFolder(t, dstPrefix)
+		if _, err := runBBB("cp", "hf://"+repo, dstPrefix); err != nil {
+			t.Fatal(err)
+		}
+		azFile := strings.TrimSuffix(dstPrefix, "/") + "/" + candidate
+		list, err := bbbLs(dstPrefix, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(list, azFile) {
+			t.Fatalf("expected az file missing: %s", azFile)
+		}
+		out, err := os.CreateTemp("", "bbb-hf-az-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out.Close()
+		defer os.Remove(out.Name())
+		if _, err := runBBB("cp", azFile, out.Name()); err != nil {
+			t.Fatal(err)
+		}
+		azData, err := os.ReadFile(out.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(azData, hfData) {
+			t.Fatalf("hf to az content mismatch for %s", candidate)
+		}
+	})
+
 }
 
 func TestHuggingFaceDownload(t *testing.T) {
