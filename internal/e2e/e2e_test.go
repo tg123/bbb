@@ -533,7 +533,7 @@ func TestHuggingFaceDownload(t *testing.T) {
 }
 
 func hfListFiles(repo string) ([]string, error) {
-	url := fmt.Sprintf("https://huggingface.co/api/models/%s?blobs=true", repo)
+	url := fmt.Sprintf("https://huggingface.co/api/models/%s?blobs=true", url.PathEscape(repo))
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, err
@@ -562,7 +562,7 @@ func hfListFiles(repo string) ([]string, error) {
 }
 
 func hfDownload(repo, file string) ([]byte, error) {
-	url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", repo, path.Clean(file))
+	url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", url.PathEscape(repo), url.PathEscape(path.Clean(file)))
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, err
@@ -578,13 +578,5 @@ func isNetworkError(err error) bool {
 	var dnsErr *net.DNSError
 	var urlErr *url.Error
 	var opErr *net.OpError
-	switch {
-	case errors.As(err, &dnsErr):
-		return true
-	case errors.As(err, &urlErr):
-		return true
-	case errors.As(err, &opErr):
-		return true
-	}
-	return false
+	return errors.As(err, &dnsErr) || errors.As(err, &urlErr) || errors.As(err, &opErr)
 }
