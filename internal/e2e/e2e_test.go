@@ -551,12 +551,18 @@ func TestBasic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		out.Close()
-		defer os.Remove(out.Name())
-		if _, err := runBBB("cp", azFile, out.Name()); err != nil {
+		outPath := out.Name()
+		if err := out.Close(); err != nil {
 			t.Fatal(err)
 		}
-		azData, err := os.ReadFile(out.Name())
+		if err := os.Remove(outPath); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(outPath)
+		if _, err := runBBB("cp", azFile, outPath); err != nil {
+			t.Fatal(err)
+		}
+		azData, err := os.ReadFile(outPath)
 		if err != nil {
 			t.Fatal(err)
 		}
