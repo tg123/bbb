@@ -22,7 +22,12 @@ import (
 	"github.com/creack/pty"
 )
 
-const waitTimeout = time.Second * 10
+const (
+	waitTimeout           = time.Second * 10
+	hfAzCopyPrefix        = "az://devstoreaccount1/test/hf-copy"
+)
+
+var preferredHFFileNames = []string{"config.json", "README.md", "tokenizer.json"}
 
 func waitForEndpointReady(addr string) {
 	waitForEndpointReadyWithTimeout(addr, waitTimeout)
@@ -505,7 +510,7 @@ func TestBasic(t *testing.T) {
 			t.Fatal("no huggingface files returned")
 		}
 		candidate := ""
-		for _, name := range []string{"config.json", "README.md", "tokenizer.json"} {
+		for _, name := range preferredHFFileNames {
 			if slices.Contains(files, name) {
 				candidate = name
 				break
@@ -521,7 +526,7 @@ func TestBasic(t *testing.T) {
 			}
 			t.Fatal(err)
 		}
-		dstPrefix := "az://devstoreaccount1/test/hf-copy"
+		dstPrefix := hfAzCopyPrefix
 		cleanFolder(t, dstPrefix)
 		if _, err := runBBB("cp", "hf://"+repo, dstPrefix); err != nil {
 			t.Fatal(err)
