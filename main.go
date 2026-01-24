@@ -1103,11 +1103,10 @@ func syncHFFiles(ctx context.Context, hfPath hf.Path, excludeMatch func(string) 
 	}
 	out := make([]string, 0, len(files))
 	for _, file := range files {
-		rel := file
-		if excludeMatch(rel) {
+		if excludeMatch(file) {
 			continue
 		}
-		out = append(out, rel)
+		out = append(out, file)
 	}
 	return out, nil
 }
@@ -1226,7 +1225,11 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				continue
 			}
 			if srcHF && dstAz {
-				dap, _ := azblob.Parse(dst)
+				dap, err := azblob.Parse(dst)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "sync: %s: %v\n", dst, err)
+					return err
+				}
 				hfFile := hf.Path{Repo: hfPath.Repo, File: sPath}
 				if dry {
 					if !quiet {
