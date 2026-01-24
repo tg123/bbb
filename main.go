@@ -794,7 +794,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		if !srcAz && dstAz { // local -> Azure
 			dap, _ := azblob.Parse(dst)
 			// walk local
-			filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+			if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
@@ -813,7 +813,9 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					fmt.Printf("Copied %s -> %s\n", p, dap.Child(rel).String())
 				}
 				return nil
-			})
+			}); err != nil {
+				return err
+			}
 			return nil
 		}
 	}
