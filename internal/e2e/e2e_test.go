@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -580,11 +579,20 @@ func TestBasic(t *testing.T) {
 			}
 			t.Fatal(err)
 		}
-		entries := hfListEntriesForTest(files, "")
-		if len(entries) == 0 {
-			t.Fatal("no huggingface root entries returned")
+		expected := ""
+		for _, file := range files {
+			if !strings.Contains(file, "/") {
+				expected = file
+				break
+			}
 		}
-		expected := strings.TrimSuffix(entries[0], "/")
+		if expected == "" {
+			parts := strings.SplitN(files[0], "/", 2)
+			if len(parts) == 0 || parts[0] == "" {
+				t.Fatal("no huggingface root entries returned")
+			}
+			expected = parts[0]
+		}
 		list, err := bbbLs("hf://"+repo, false)
 		if err != nil {
 			if isNetworkError(err) {
@@ -598,49 +606,6 @@ func TestBasic(t *testing.T) {
 		}
 	})
 
-}
-
-func hfListEntriesForTest(files []string, prefix string) []string {
-	if prefix != "" {
-		prefix = strings.TrimPrefix(prefix, "/")
-		prefix = path.Clean(prefix)
-		if prefix == "." {
-			prefix = ""
-		}
-		if prefix != "" && !strings.HasSuffix(prefix, "/") {
-			prefix += "/"
-		}
-	}
-	seen := map[string]struct{}{}
-	for _, file := range files {
-		if file == "" {
-			continue
-		}
-		if prefix != "" {
-			if !strings.HasPrefix(file, prefix) {
-				continue
-			}
-			file = strings.TrimPrefix(file, prefix)
-			if file == "" {
-				continue
-			}
-		}
-		parts := strings.SplitN(file, "/", 2)
-		name := parts[0]
-		if name == "" {
-			continue
-		}
-		if len(parts) > 1 {
-			name += "/"
-		}
-		seen[name] = struct{}{}
-	}
-	entries := make([]string, 0, len(seen))
-	for name := range seen {
-		entries = append(entries, name)
-	}
-	slices.Sort(entries)
-	return entries
 }
 
 func TestHuggingFaceDownload(t *testing.T) {
