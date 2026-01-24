@@ -182,24 +182,13 @@ func main() {
 				Name:      "cp",
 				Usage:     "Copy files or directories",
 				UsageText: "bbb cp [-q|--quiet] [--concurrency N] srcs [srcs ...] dst",
-				Aliases:   []string{"cpr"},
+				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
 				},
 				Action: cmdCP,
-			},
-			{
-				Name:      "cptree",
-				Usage:     "Copy directories recursively",
-				UsageText: "bbb cptree [-q|--quiet] [--concurrency N] src dst",
-				Flags: []cli.Flag{
-					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
-					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
-					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
-				},
-				Action: cmdCPTree,
 			},
 			{
 				Name:   "edit",
