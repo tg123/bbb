@@ -628,7 +628,12 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			continue
 		}
 		if srcAz {
-			if sap, err := azblob.Parse(src); err == nil && sap.IsDirLike() {
+			sap, err := azblob.Parse(src)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			if sap.IsDirLike() {
 				if err := copyTree(ctx, src, dst, overwrite, quiet, "cp"); err != nil {
 					fmt.Fprintln(os.Stderr, "cp:", err)
 					os.Exit(1)
@@ -796,7 +801,8 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			// walk local
 			if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
-					return err
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, p, err)
+					return nil
 				}
 				if d.IsDir() {
 					return nil
@@ -804,7 +810,8 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				rel, _ := filepath.Rel(src, p)
 				data, err := os.ReadFile(p)
 				if err != nil {
-					return err
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, rel, err)
+					return nil
 				}
 				if err := azblob.Upload(ctx, dap.Child(rel), data); err != nil {
 					fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, rel, err)
