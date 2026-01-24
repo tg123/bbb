@@ -25,6 +25,7 @@ import (
 )
 
 var mainver string = "(devel)"
+const hfScheme = "hf://"
 
 func version() string {
 	v := mainver
@@ -56,7 +57,7 @@ func isAz(s string) bool {
 }
 
 func isHF(s string) bool {
-	return strings.HasPrefix(s, "hf://")
+	return strings.HasPrefix(s, hfScheme)
 }
 
 func main() {
@@ -310,7 +311,7 @@ func hfSplitWildcard(target string) (string, string) {
 	if strings.Contains(target, "*") {
 		starIdx := strings.Index(target, "*")
 		lastSlash := strings.LastIndex(target[:starIdx], "/")
-		if lastSlash >= len("hf://") {
+		if lastSlash >= len(hfScheme) {
 			parentPath = target[:lastSlash+1]
 			pattern = target[lastSlash+1:]
 		}
@@ -344,7 +345,7 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 			if trimmed == "" {
 				continue
 			}
-			if !all && trimmed[0] == '.' {
+			if !all && len(trimmed) > 0 && trimmed[0] == '.' {
 				continue
 			}
 			if pattern != "" {
