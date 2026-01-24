@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	"github.com/tg123/bbb/internal/hf"
@@ -86,5 +87,22 @@ func TestResolveDstPathAzDir(t *testing.T) {
 	}
 	if dst != "az://acct/container/prefix/model.bin" {
 		t.Fatalf("unexpected destination: %s", dst)
+	}
+}
+
+func TestSyncHFFiles(t *testing.T) {
+	files, err := syncHFFiles(context.Background(), hf.Path{Repo: "owner/repo", File: "dir/file.txt"}, func(string) bool { return false })
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(files) != 1 || files[0] != "dir/file.txt" {
+		t.Fatalf("unexpected files: %v", files)
+	}
+	files, err = syncHFFiles(context.Background(), hf.Path{Repo: "owner/repo", File: "dir/file.txt"}, func(rel string) bool { return rel == "dir/file.txt" })
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("expected filtered list, got: %v", files)
 	}
 }

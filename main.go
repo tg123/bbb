@@ -1093,6 +1093,29 @@ func cmdShare(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
+func syncHFFiles(ctx context.Context, hfPath hf.Path, excludeMatch func(string) bool) ([]string, error) {
+	if hfPath.File != "" {
+		rel := strings.ReplaceAll(hfPath.File, "\\", "/")
+		if excludeMatch(rel) {
+			return []string{}, nil
+		}
+		return []string{rel}, nil
+	}
+	files, err := hf.ListFiles(ctx, hfPath)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(files))
+	for _, file := range files {
+		rel := strings.ReplaceAll(file, "\\", "/")
+		if excludeMatch(rel) {
+			continue
+		}
+		out = append(out, rel)
+	}
+	return out, nil
+}
+
 func cmdSync(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdSync called", "args", c.Args().Slice())
 	if c.Args().Len() != 2 {
@@ -1104,6 +1127,22 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 	exclude := c.String("x")
 	// concurrency flag is ignored
 	src, dst := c.Args().Get(0), c.Args().Get(1)
+	if isHF(dst) {
+		return fmt.Errorf("sync: hf:// only supported as source")
+	}
+	srcHF := isHF(src)
+	if srcHF && !isAz(dst) {
+		return fmt.Errorf("sync: hf:// only supported with az:// destination")
+	}
+	var hfPath hf.Path
+	if srcHF {
+		var err error
+		hfPath, err = hf.Parse(src)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
 	//
 	var excludeMatch func(string) bool
 	if exclude != "" {
@@ -1141,6 +1180,18 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					continue
 				}
 				files = append(files, item{rel: bm.Name, size: bm.Size})
+			}
+		} else if srcHF {
+			list, err := syncHFFiles(ctx, hfPath, excludeMatch)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			for _, name := range list {
+				if name == "" {
+					continue
+				}
+				files = append(files, item{rel: name, size: 0})
 			}
 		} else {
 			filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
@@ -1180,6 +1231,27 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					fmt.Fprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
 				} else if !quiet {
 					fmt.Printf("Copied %s -> %s\n", sap.Child(sPath).String(), dap.Child(sPath).String())
+				}
+				continue
+			}
+			if srcHF && dstAz {
+				dap, _ := azblob.Parse(dst)
+				hfFile := hf.Path{Repo: hfPath.Repo, File: sPath}
+				if dry {
+					if !quiet {
+						fmt.Println("COPY", hfFile.String(), "->", dap.Child(sPath).String())
+					}
+					continue
+				}
+				data, err := hf.Download(ctx, hfFile)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
+					continue
+				}
+				if err := azblob.Upload(ctx, dap.Child(sPath), data); err != nil {
+					fmt.Fprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
+				} else if !quiet {
+					fmt.Printf("Copied %s -> %s\n", hfFile.String(), dap.Child(sPath).String())
 				}
 				continue
 			}
