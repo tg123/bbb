@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	"github.com/tg123/bbb/internal/hf"
+	"github.com/urfave/cli/v3"
 )
 
 func TestIsAzHTTPS(t *testing.T) {
@@ -86,5 +88,24 @@ func TestResolveDstPathAzDir(t *testing.T) {
 	}
 	if dst != "az://acct/container/prefix/model.bin" {
 		t.Fatalf("unexpected destination: %s", dst)
+	}
+}
+
+func TestRMUnsupportedProtocol(t *testing.T) {
+	app := &cli.Command{
+		Name: "bbb",
+		Commands: []*cli.Command{
+			{
+				Name:   "rm",
+				Flags:  []cli.Flag{&cli.BoolFlag{Name: "f"}},
+				Action: cmdRM,
+			},
+		},
+	}
+
+	if err := app.Run(context.Background(), []string{"bbb", "rm", "hf://boltuix/bert-emotion/README.md"}); err == nil {
+		t.Fatalf("expected unsupported protocol error")
+	} else if err.Error() != "rm: unsupported protocol: hf://boltuix/bert-emotion/README.md" {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

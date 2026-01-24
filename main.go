@@ -59,6 +59,14 @@ func isHF(s string) bool {
 	return strings.HasPrefix(s, "hf://")
 }
 
+func hasScheme(s string) bool {
+	return strings.Contains(s, "://")
+}
+
+func unsupportedSchemeError(cmd string, target string) error {
+	return fmt.Errorf("%s: unsupported protocol: %s", cmd, target)
+}
+
 func main() {
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
@@ -1011,6 +1019,11 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 			if !quiet {
 				fmt.Printf("Deleted %s\n", p)
 			}
+		} else if hasScheme(p) {
+			if force {
+				continue
+			}
+			return unsupportedSchemeError("rm", p)
 		} else {
 			if err := os.Remove(p); err != nil {
 				if force && os.IsNotExist(err) {
