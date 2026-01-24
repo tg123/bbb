@@ -310,12 +310,9 @@ func hfSplitWildcard(target string) (string, string) {
 	if strings.Contains(target, "*") {
 		starIdx := strings.Index(target, "*")
 		lastSlash := strings.LastIndex(target[:starIdx], "/")
-		if lastSlash >= 0 {
+		if lastSlash >= len("hf://") {
 			parentPath = target[:lastSlash+1]
 			pattern = target[lastSlash+1:]
-		} else {
-			parentPath = target[:starIdx]
-			pattern = target[starIdx:]
 		}
 	}
 	return parentPath, pattern
@@ -351,7 +348,10 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 				continue
 			}
 			if pattern != "" {
-				matched, _ := path.Match(pattern, trimmed)
+				matched, err := path.Match(pattern, trimmed)
+				if err != nil {
+					return err
+				}
 				if !matched {
 					continue
 				}
@@ -525,7 +525,10 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 				if idx := strings.LastIndex(name, "/"); idx >= 0 {
 					last = name[idx+1:]
 				}
-				matched, _ := path.Match(pattern, last)
+				matched, err := path.Match(pattern, last)
+				if err != nil {
+					return err
+				}
 				if !matched {
 					continue
 				}
