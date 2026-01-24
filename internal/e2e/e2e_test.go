@@ -587,6 +587,9 @@ func TestBasic(t *testing.T) {
 			}
 		}
 		if expected == "" {
+			if len(files) == 0 {
+				t.Fatal("no huggingface root entries returned")
+			}
 			parts := strings.SplitN(files[0], "/", 2)
 			if parts[0] == "" {
 				t.Fatal("no huggingface root entries returned")

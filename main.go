@@ -261,9 +261,11 @@ func main() {
 func hfFilterFiles(files []string, prefix string) []string {
 	if prefix != "" {
 		prefix = strings.TrimPrefix(prefix, "/")
-		prefix = path.Clean(prefix)
-		if prefix == "." {
-			prefix = ""
+		if prefix != "" {
+			prefix = path.Clean(prefix)
+			if prefix == "." {
+				prefix = ""
+			}
 		}
 		if prefix != "" && !strings.HasSuffix(prefix, "/") {
 			prefix += "/"
