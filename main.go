@@ -1103,7 +1103,7 @@ func syncHFFiles(ctx context.Context, hfPath hf.Path, excludeMatch func(string) 
 	}
 	out := make([]string, 0, len(files))
 	for _, file := range files {
-		rel := strings.ReplaceAll(file, "\\", "/")
+		rel := file
 		if excludeMatch(rel) {
 			continue
 		}
@@ -1156,8 +1156,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		srcAz, dstAz := isAz(src), isAz(dst)
 		// Build src file list
 		type item struct {
-			rel  string
-			size int64
+			rel string
 		}
 		var files []item
 		if srcAz {
@@ -1175,7 +1174,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				if bm.Name == "" || excludeMatch(bm.Name) {
 					continue
 				}
-				files = append(files, item{rel: bm.Name, size: bm.Size})
+				files = append(files, item{rel: bm.Name})
 			}
 		} else if srcHF {
 			list, err := syncHFFiles(ctx, hfPath, excludeMatch)
@@ -1184,7 +1183,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				os.Exit(1)
 			}
 			for _, name := range list {
-				files = append(files, item{rel: name, size: 0})
+				files = append(files, item{rel: name})
 			}
 		} else {
 			filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
@@ -1198,8 +1197,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				if excludeMatch(rel) {
 					return nil
 				}
-				info, _ := d.Info()
-				files = append(files, item{rel: rel, size: info.Size()})
+				files = append(files, item{rel: rel})
 				return nil
 			})
 		}
