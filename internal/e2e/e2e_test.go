@@ -570,6 +570,39 @@ func TestBasic(t *testing.T) {
 		}
 	})
 
+	t.Run("hf ls", func(t *testing.T) {
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		files, err := hfListFiles(t, repo)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		if len(files) == 0 {
+			t.Fatal("no huggingface files returned")
+		}
+		expected := files[0]
+		stdout, err := runBBB("ls", "hf://"+repo)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
+		found := false
+		for _, line := range lines {
+			if strings.TrimSpace(line) == "hf://"+repo+"/"+expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected hf file missing: %s", expected)
+		}
+	})
+
 }
 
 func TestHuggingFaceDownload(t *testing.T) {
