@@ -1155,7 +1155,8 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		srcAz, dstAz := isAz(src), isAz(dst)
 		// Build src file list
 		type item struct {
-			rel string
+			rel  string
+			size int64
 		}
 		var files []item
 		if srcAz {
@@ -1173,7 +1174,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				if bm.Name == "" || excludeMatch(bm.Name) {
 					continue
 				}
-				files = append(files, item{rel: bm.Name})
+				files = append(files, item{rel: bm.Name, size: bm.Size})
 			}
 		} else if srcHF {
 			list, err := syncHFFiles(ctx, hfPath, excludeMatch)
@@ -1195,7 +1196,8 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				if excludeMatch(rel) {
 					return nil
 				}
-				files = append(files, item{rel: rel})
+				info, _ := d.Info()
+				files = append(files, item{rel: rel, size: info.Size()})
 				return nil
 			})
 		}
