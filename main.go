@@ -799,7 +799,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 						continue
 					}
 				}
-				os.WriteFile(outPath, data, 0o644)
+				if err := os.WriteFile(outPath, data, 0o644); err != nil {
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
+					continue
+				}
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", sap.Child(bm.Name).String(), outPath)
 				}
