@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/tg123/bbb/internal/hf"
+	"github.com/urfave/cli/v3"
 )
 
 func TestIsAzHTTPS(t *testing.T) {
@@ -86,5 +90,52 @@ func TestResolveDstPathAzDir(t *testing.T) {
 	}
 	if dst != "az://acct/container/prefix/model.bin" {
 		t.Fatalf("unexpected destination: %s", dst)
+	}
+}
+
+func TestCPDirectoryCopiesTree(t *testing.T) {
+	srcDir := t.TempDir()
+	nested := filepath.Join(srcDir, "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "root.txt"), []byte("root"), 0o644); err != nil {
+		t.Fatalf("write root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "child.txt"), []byte("child"), 0o644); err != nil {
+		t.Fatalf("write child: %v", err)
+	}
+	dstDir := t.TempDir()
+
+	cmd := &cli.Command{
+		Name: "cp",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
+			&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
+			&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
+		},
+		Action: cmdCP,
+	}
+
+	if err := cmd.Run(context.Background(), []string{"cp", srcDir, dstDir}); err != nil {
+		t.Fatalf("cp run failed: %v", err)
+	}
+
+	cases := []struct {
+		rel  string
+		want string
+	}{
+		{rel: "root.txt", want: "root"},
+		{rel: filepath.Join("nested", "child.txt"), want: "child"},
+	}
+
+	for _, tc := range cases {
+		data, err := os.ReadFile(filepath.Join(dstDir, tc.rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", tc.rel, err)
+		}
+		if string(data) != tc.want {
+			t.Fatalf("unexpected content for %s: %q", tc.rel, string(data))
+		}
 	}
 }
