@@ -257,6 +257,53 @@ func main() {
 	// Remove any stray cli.Before assignment
 }
 
+func hfFilterFiles(files []string, prefix string) []string {
+	if prefix != "" {
+		prefix = strings.TrimPrefix(prefix, "/")
+		if prefix != "" && !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+	}
+	out := make([]string, 0, len(files))
+	for _, file := range files {
+		if file == "" {
+			continue
+		}
+		if prefix != "" {
+			if !strings.HasPrefix(file, prefix) {
+				continue
+			}
+			file = strings.TrimPrefix(file, prefix)
+			if file == "" {
+				continue
+			}
+		}
+		out = append(out, file)
+	}
+	return out
+}
+
+func hfListEntries(files []string, prefix string) []string {
+	seen := map[string]struct{}{}
+	for _, file := range hfFilterFiles(files, prefix) {
+		parts := strings.SplitN(file, "/", 2)
+		name := parts[0]
+		if name == "" {
+			continue
+		}
+		if len(parts) > 1 {
+			name += "/"
+		}
+		seen[name] = struct{}{}
+	}
+	entries := make([]string, 0, len(seen))
+	for name := range seen {
+		entries = append(entries, name)
+	}
+	sort.Strings(entries)
+	return entries
+}
+
 func cmdLS(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdLS called", "args", c.Args().Slice())
 	slog.Debug("cmdLSTree called", "args", c.Args().Slice())
@@ -268,6 +315,64 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 	}
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s")
+	if isHF(target) {
+		var pattern string
+		parentPath := target
+		if strings.Contains(target, "*") {
+			lastSlash := strings.LastIndex(target, "/")
+			if lastSlash >= 0 {
+				parentPath = target[:lastSlash+1]
+				pattern = target[lastSlash+1:]
+			} else {
+				parentPath = target
+				pattern = "*"
+			}
+		}
+		hp, err := hf.Parse(parentPath)
+		if err != nil {
+			return err
+		}
+		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
+		if err != nil {
+			return err
+		}
+		entries := hfListEntries(files, hp.File)
+		for _, name := range entries {
+			trimmed := strings.TrimSuffix(name, "/")
+			if trimmed == "" {
+				continue
+			}
+			if !all && trimmed[0] == '.' {
+				continue
+			}
+			if pattern != "" {
+				matched, _ := path.Match(pattern, trimmed)
+				if !matched {
+					continue
+				}
+			}
+			fullFile := path.Join(hp.File, trimmed)
+			fullpath := hf.Path{Repo: hp.Repo, File: fullFile}.String()
+			displayPath := fullpath
+			if relFlag {
+				displayPath = trimmed
+			}
+			if long {
+				typ := "-"
+				if strings.HasSuffix(name, "/") {
+					typ = "d"
+				}
+				if machine {
+					fmt.Printf("%s\t%d\t-\t%s\n", typ, 0, displayPath)
+				} else {
+					fmt.Printf("%1s %10d %s %s\n", typ, 0, "-", displayPath)
+				}
+			} else {
+				fmt.Println(displayPath)
+			}
+		}
+		return nil
+	}
 	if isAz(target) {
 		// Wildcard support for Azure paths
 		var pattern string
@@ -394,6 +499,63 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s") || c.Bool("relative")
 
+	if isHF(root) {
+		var pattern string
+		if strings.Contains(root, "*") {
+			starIdx := strings.Index(root, "*")
+			pattern = root[starIdx:]
+			root = root[:starIdx]
+		}
+		hp, err := hf.Parse(root)
+		if err != nil {
+			return err
+		}
+		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
+		if err != nil {
+			return err
+		}
+		list := hfFilterFiles(files, hp.File)
+		var count int64
+		for _, name := range list {
+			if name == "" {
+				continue
+			}
+			if pattern != "" {
+				last := name
+				if idx := strings.LastIndex(name, "/"); idx >= 0 {
+					last = name[idx+1:]
+				}
+				matched, _ := path.Match(pattern, last)
+				if !matched {
+					continue
+				}
+			}
+			count++
+			fullFile := path.Join(hp.File, name)
+			fullpath := hf.Path{Repo: hp.Repo, File: fullFile}.String()
+			display := fullpath
+			if relFlag {
+				display = name
+			}
+			if longFlag {
+				if machine {
+					fmt.Printf("f\t%d\t-\t%s\n", 0, display)
+				} else {
+					fmt.Printf("%10d  -  %s\n", 0, display)
+				}
+			} else {
+				if machine {
+					fmt.Printf("f\t%s\n", display)
+				} else {
+					fmt.Println(display)
+				}
+			}
+		}
+		if !machine {
+			fmt.Printf("%d files\n", count)
+		}
+		return nil
+	}
 	if isAz(root) {
 		// Wildcard support for Azure paths
 		var pattern string
