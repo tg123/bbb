@@ -74,11 +74,11 @@ func (p Path) URL() (string, error) {
 
 // Download retrieves the contents of a file in a Hugging Face repository.
 func Download(ctx context.Context, p Path) ([]byte, error) {
-	url, err := p.URL()
+	downloadURL, err := p.URL()
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -105,8 +105,8 @@ func ListFiles(ctx context.Context, p Path) ([]string, error) {
 	if p.File != "" {
 		return nil, errors.New("path is not directory-like")
 	}
-	url := fmt.Sprintf("https://huggingface.co/api/models/%s?blobs=true", p.Repo)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s?blobs=true", p.Repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
