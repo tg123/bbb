@@ -65,7 +65,7 @@ func hasScheme(s string) bool {
 	if err != nil || parsed.Scheme == "" {
 		return false
 	}
-	return strings.HasPrefix(s, parsed.Scheme+"://")
+	return strings.Contains(s, "://")
 }
 
 func unsupportedSchemeError(cmd string, target string) error {
