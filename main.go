@@ -606,6 +606,15 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		srcAz := isAz(src)
 		srcHF := isHF(src)
 		base := filepath.Base(src)
+		var srcAzPath azblob.AzurePath
+		if srcAz {
+			var err error
+			srcAzPath, err = azblob.Parse(src)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
 		if srcHF {
 			var err error
 			hfPath, err := hf.Parse(src)
@@ -628,12 +637,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			continue
 		}
 		if srcAz {
-			sap, err := azblob.Parse(src)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-			if sap.IsDirLike() {
+			if srcAzPath.IsDirLike() {
 				if err := copyTree(ctx, src, dst, overwrite, quiet, "cp"); err != nil {
 					fmt.Fprintln(os.Stderr, "cp:", err)
 					os.Exit(1)
@@ -665,9 +669,8 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 		// src -> dstPath
 		if srcAz && dstAz {
-			sap, _ := azblob.Parse(src)
 			dap, _ := azblob.Parse(dstPath)
-			data, err := azblob.Download(ctx, sap)
+			data, err := azblob.Download(ctx, srcAzPath)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
@@ -686,8 +689,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 				fmt.Printf("Copied %s -> %s\n", src, dstPath)
 			}
 		} else if srcAz && !dstAz {
-			sap, _ := azblob.Parse(src)
-			data, err := azblob.Download(ctx, sap)
+			data, err := azblob.Download(ctx, srcAzPath)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
@@ -753,18 +755,24 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			if err != nil {
 				return err
 			}
+			var hadErrors bool
 			for _, bm := range list {
 				data, err := azblob.Download(ctx, sap.Child(bm.Name))
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
 					continue
 				}
 				if err := azblob.Upload(ctx, dap.Child(bm.Name), data); err != nil {
 					fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
 				}
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", sap.Child(bm.Name).String(), dap.Child(bm.Name).String())
 				}
+			}
+			if hadErrors {
+				return fmt.Errorf("%s: one or more files failed to copy", errPrefix)
 			}
 			return nil
 		}
@@ -774,10 +782,12 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			if err != nil {
 				return err
 			}
+			var hadErrors bool
 			for _, bm := range list {
 				data, err := azblob.Download(ctx, sap.Child(bm.Name))
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
 					continue
 				}
 				outPath := filepath.Join(dst, bm.Name)
@@ -794,14 +804,19 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					fmt.Printf("Copied %s -> %s\n", sap.Child(bm.Name).String(), outPath)
 				}
 			}
+			if hadErrors {
+				return fmt.Errorf("%s: one or more files failed to copy", errPrefix)
+			}
 			return nil
 		}
 		if !srcAz && dstAz { // local -> Azure
 			dap, _ := azblob.Parse(dst)
 			// walk local
+			var hadErrors bool
 			if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, p, err)
+					hadErrors = true
 					return nil
 				}
 				if d.IsDir() {
@@ -811,10 +826,12 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				data, err := os.ReadFile(p)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, rel, err)
+					hadErrors = true
 					return nil
 				}
 				if err := azblob.Upload(ctx, dap.Child(rel), data); err != nil {
 					fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, rel, err)
+					hadErrors = true
 				}
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", p, dap.Child(rel).String())
@@ -822,6 +839,9 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				return nil
 			}); err != nil {
 				return err
+			}
+			if hadErrors {
+				return fmt.Errorf("%s: one or more files failed to copy", errPrefix)
 			}
 			return nil
 		}
