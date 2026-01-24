@@ -110,3 +110,21 @@ func TestHFListEntries(t *testing.T) {
 		}
 	}
 }
+
+func TestHFSplitWildcard(t *testing.T) {
+	tests := []struct {
+		input       string
+		parentPath  string
+		pattern     string
+	}{
+		{"hf://owner/repo", "hf://owner/repo", ""},
+		{"hf://owner/repo/*.bin", "hf://owner/repo/", "*.bin"},
+		{"hf://owner/repo/dir/*.bin", "hf://owner/repo/dir/", "*.bin"},
+	}
+	for _, tc := range tests {
+		parentPath, pattern := hfSplitWildcard(tc.input)
+		if parentPath != tc.parentPath || pattern != tc.pattern {
+			t.Fatalf("unexpected split for %s: %s %s", tc.input, parentPath, pattern)
+		}
+	}
+}
