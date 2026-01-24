@@ -2,17 +2,15 @@ package e2e_test
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -20,6 +18,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/tg123/bbb/internal/hf"
 )
 
 const (
@@ -503,7 +502,7 @@ func TestBasic(t *testing.T) {
 
 	t.Run("hf to az", func(t *testing.T) {
 		repo := "hf-internal-testing/tiny-random-BertModel"
-		files, err := hfListFiles(repo)
+		files, err := hfListFiles(t, repo)
 		if err != nil {
 			if isNetworkError(err) {
 				t.Skipf("huggingface unavailable: %v", err)
@@ -523,7 +522,7 @@ func TestBasic(t *testing.T) {
 		if candidate == "" {
 			candidate = files[0]
 		}
-		hfData, err := hfDownload(repo, candidate)
+		hfData, err := hfDownload(t, repo, candidate)
 		if err != nil {
 			if isNetworkError(err) {
 				t.Skipf("huggingface unavailable: %v", err)
@@ -575,7 +574,7 @@ func TestBasic(t *testing.T) {
 
 func TestHuggingFaceDownload(t *testing.T) {
 	repo := "hf-internal-testing/tiny-random-BertModel"
-	files, err := hfListFiles(repo)
+	files, err := hfListFiles(t, repo)
 	if err != nil {
 		if isNetworkError(err) {
 			t.Skipf("huggingface unavailable: %v", err)
@@ -598,7 +597,7 @@ func TestHuggingFaceDownload(t *testing.T) {
 		if err != nil {
 			t.Fatalf("missing local file %s: %v", file, err)
 		}
-		remoteData, err := hfDownload(repo, file)
+		remoteData, err := hfDownload(t, repo, file)
 		if err != nil {
 			if isNetworkError(err) {
 				t.Skipf("huggingface unavailable: %v", err)
@@ -611,46 +610,29 @@ func TestHuggingFaceDownload(t *testing.T) {
 	}
 }
 
-func hfListFiles(repo string) ([]string, error) {
-	url := fmt.Sprintf("https://huggingface.co/api/models/%s?blobs=true", repo)
-	resp, err := http.Get(url)
+func hfListFiles(t *testing.T, repo string) ([]string, error) {
+	ctx, cancel := hfTestContext(t)
+	defer cancel()
+	files, err := hf.ListFiles(ctx, hf.Path{Repo: repo})
 	if err != nil {
 		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("hf list failed: %s", resp.Status)
-	}
-	var payload struct {
-		Siblings []struct {
-			Name string `json:"rfilename"`
-		} `json:"siblings"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, err
-	}
-	files := make([]string, 0, len(payload.Siblings))
-	for _, entry := range payload.Siblings {
-		if entry.Name == "" {
-			continue
-		}
-		files = append(files, entry.Name)
 	}
 	slices.Sort(files)
 	return files, nil
 }
 
-func hfDownload(repo, file string) ([]byte, error) {
-	url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", repo, url.PathEscape(path.Clean(file)))
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
+func hfDownload(t *testing.T, repo, file string) ([]byte, error) {
+	ctx, cancel := hfTestContext(t)
+	defer cancel()
+	return hf.Download(ctx, hf.Path{Repo: repo, File: file})
+}
+
+func hfTestContext(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+	if deadline, ok := t.Deadline(); ok {
+		return context.WithDeadline(context.Background(), deadline)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("hf download failed: %s", resp.Status)
-	}
-	return io.ReadAll(resp.Body)
+	return context.WithTimeout(context.Background(), 30*time.Second)
 }
 
 func isNetworkError(err error) bool {

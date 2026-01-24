@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 )
@@ -64,20 +65,20 @@ func (p Path) URL() (string, error) {
 	if p.File == "" {
 		return "", errors.New("missing file path")
 	}
-	cleaned, err := cleanFile(p.File)
+	escaped, err := escapeFilePath(p.File)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", p.Repo, cleaned), nil
+	return fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", p.Repo, escaped), nil
 }
 
-// Download retrieves the Hugging Face repo archive or file.
+// Download retrieves the contents of a file in a Hugging Face repository.
 func Download(ctx context.Context, p Path) ([]byte, error) {
-	url, err := p.URL()
+	downloadURL, err := p.URL()
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -104,8 +105,8 @@ func ListFiles(ctx context.Context, p Path) ([]string, error) {
 	if p.File != "" {
 		return nil, errors.New("path is not directory-like")
 	}
-	url := fmt.Sprintf("https://huggingface.co/api/models/%s?blobs=true", p.Repo)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s?blobs=true", p.Repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +138,18 @@ func ListFiles(ctx context.Context, p Path) ([]string, error) {
 		files = append(files, cleaned)
 	}
 	return files, nil
+}
+
+func escapeFilePath(file string) (string, error) {
+	cleaned, err := cleanFile(file)
+	if err != nil {
+		return "", err
+	}
+	parts := strings.Split(cleaned, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return strings.Join(parts, "/"), nil
 }
 
 func cleanFile(file string) (string, error) {
