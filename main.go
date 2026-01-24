@@ -1151,7 +1151,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 	} else {
 		excludeMatch = func(string) bool { return false }
 	}
-	if isAz(src) || isAz(dst) {
+	if isAz(src) || isAz(dst) || srcHF {
 		srcAz, dstAz := isAz(src), isAz(dst)
 		// Build src file list
 		type item struct {
