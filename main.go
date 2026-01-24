@@ -845,22 +845,6 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 	return nil
 }
 
-func cmdCPTree(ctx context.Context, c *cli.Command) error {
-	slog.Debug("cmdCPTree called", "args", c.Args().Slice())
-	if c.Args().Len() != 2 {
-		return fmt.Errorf("cptree: need src dst")
-	}
-	overwrite := c.Bool("f")
-	quiet := c.Bool("q") || c.Bool("quiet")
-	// concurrency flag is ignored
-	src, dst := c.Args().Get(0), c.Args().Get(1)
-	if err := copyTree(ctx, src, dst, overwrite, quiet, "cptree"); err != nil {
-		fmt.Fprintln(os.Stderr, "cptree:", err)
-		os.Exit(1)
-	}
-	return nil
-}
-
 func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, overwrite, quiet, dstDir bool) error {
 	data, err := hf.Download(ctx, hfPath)
 	if err != nil {
