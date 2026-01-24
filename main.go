@@ -304,9 +304,25 @@ func hfListEntries(files []string, prefix string) []string {
 	return entries
 }
 
+func hfSplitWildcard(target string) (string, string) {
+	parentPath := target
+	var pattern string
+	if strings.Contains(target, "*") {
+		starIdx := strings.Index(target, "*")
+		lastSlash := strings.LastIndex(target[:starIdx], "/")
+		if lastSlash >= 0 {
+			parentPath = target[:lastSlash+1]
+			pattern = target[lastSlash+1:]
+		} else {
+			parentPath = target[:starIdx]
+			pattern = target[starIdx:]
+		}
+	}
+	return parentPath, pattern
+}
+
 func cmdLS(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdLS called", "args", c.Args().Slice())
-	slog.Debug("cmdLSTree called", "args", c.Args().Slice())
 	long := c.Bool("l")
 	all := c.Bool("a")
 	target := "."
@@ -316,18 +332,7 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s")
 	if isHF(target) {
-		var pattern string
-		parentPath := target
-		if strings.Contains(target, "*") {
-			lastSlash := strings.LastIndex(target, "/")
-			if lastSlash >= 0 {
-				parentPath = target[:lastSlash+1]
-				pattern = target[lastSlash+1:]
-			} else {
-				parentPath = target
-				pattern = "*"
-			}
-		}
+		parentPath, pattern := hfSplitWildcard(target)
 		hp, err := hf.Parse(parentPath)
 		if err != nil {
 			return err
@@ -500,13 +505,8 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	relFlag := c.Bool("s") || c.Bool("relative")
 
 	if isHF(root) {
-		var pattern string
-		if strings.Contains(root, "*") {
-			starIdx := strings.Index(root, "*")
-			pattern = root[starIdx:]
-			root = root[:starIdx]
-		}
-		hp, err := hf.Parse(root)
+		parentPath, pattern := hfSplitWildcard(root)
+		hp, err := hf.Parse(parentPath)
 		if err != nil {
 			return err
 		}
