@@ -1095,11 +1095,7 @@ func cmdShare(ctx context.Context, c *cli.Command) error {
 
 func syncHFFiles(ctx context.Context, hfPath hf.Path, excludeMatch func(string) bool) ([]string, error) {
 	if hfPath.File != "" {
-		rel := strings.ReplaceAll(hfPath.File, "\\", "/")
-		if excludeMatch(rel) {
-			return []string{}, nil
-		}
-		return []string{rel}, nil
+		return nil, errors.New("sync: hf:// path must be repository root")
 	}
 	files, err := hf.ListFiles(ctx, hfPath)
 	if err != nil {
@@ -1188,9 +1184,6 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				os.Exit(1)
 			}
 			for _, name := range list {
-				if name == "" {
-					continue
-				}
 				files = append(files, item{rel: name, size: 0})
 			}
 		} else {
