@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -60,7 +61,11 @@ func isHF(s string) bool {
 }
 
 func hasScheme(s string) bool {
-	return strings.Contains(s, "://")
+	parsed, err := url.Parse(s)
+	if err != nil || parsed.Scheme == "" {
+		return false
+	}
+	return strings.HasPrefix(s, parsed.Scheme+"://")
 }
 
 func unsupportedSchemeError(cmd string, target string) error {
@@ -1020,9 +1025,6 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 				fmt.Printf("Deleted %s\n", p)
 			}
 		} else if hasScheme(p) {
-			if force {
-				continue
-			}
 			return unsupportedSchemeError("rm", p)
 		} else {
 			if err := os.Remove(p); err != nil {
