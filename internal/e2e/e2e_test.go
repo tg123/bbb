@@ -330,6 +330,43 @@ func TestBasic(t *testing.T) {
 			t.Errorf("unexpected cat output via http: %s", stdout)
 		}
 	}
+	t.Run("cat hf", func(t *testing.T) {
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		files, err := hfListFiles(t, repo)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		if len(files) == 0 {
+			t.Fatal("no huggingface files returned")
+		}
+		candidate := ""
+		for _, name := range preferredHFFileNames {
+			if slices.Contains(files, name) {
+				candidate = name
+				break
+			}
+		}
+		if candidate == "" {
+			candidate = files[0]
+		}
+		expected, err := hfDownload(t, repo, candidate)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		stdout, err := runBBB("cat", "hf://"+repo+"/"+candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(stdout, expected) {
+			t.Fatalf("unexpected cat output for hf file %s", candidate)
+		}
+	})
 
 	// download
 	{
