@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -57,6 +58,18 @@ func isAz(s string) bool {
 
 func isHF(s string) bool {
 	return strings.HasPrefix(s, "hf://")
+}
+
+func hasScheme(s string) bool {
+	parsed, err := url.Parse(s)
+	if err != nil || parsed.Scheme == "" {
+		return false
+	}
+	return strings.Contains(s, "://")
+}
+
+func unsupportedSchemeError(cmd string, target string) error {
+	return fmt.Errorf("%s: unsupported protocol: %s", cmd, target)
 }
 
 func main() {
@@ -1011,6 +1024,8 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 			if !quiet {
 				fmt.Printf("Deleted %s\n", p)
 			}
+		} else if hasScheme(p) {
+			return unsupportedSchemeError("rm", p)
 		} else {
 			if err := os.Remove(p); err != nil {
 				if force && os.IsNotExist(err) {
