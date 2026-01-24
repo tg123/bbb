@@ -502,7 +502,7 @@ func TestBasic(t *testing.T) {
 
 	t.Run("hf to az", func(t *testing.T) {
 		repo := "hf-internal-testing/tiny-random-BertModel"
-		files, err := hfListFiles(repo)
+		files, err := hfListFiles(t, repo)
 		if err != nil {
 			if isNetworkError(err) {
 				t.Skipf("huggingface unavailable: %v", err)
@@ -522,7 +522,7 @@ func TestBasic(t *testing.T) {
 		if candidate == "" {
 			candidate = files[0]
 		}
-		hfData, err := hfDownload(repo, candidate)
+		hfData, err := hfDownload(t, repo, candidate)
 		if err != nil {
 			if isNetworkError(err) {
 				t.Skipf("huggingface unavailable: %v", err)
@@ -574,7 +574,7 @@ func TestBasic(t *testing.T) {
 
 func TestHuggingFaceDownload(t *testing.T) {
 	repo := "hf-internal-testing/tiny-random-BertModel"
-	files, err := hfListFiles(repo)
+	files, err := hfListFiles(t, repo)
 	if err != nil {
 		if isNetworkError(err) {
 			t.Skipf("huggingface unavailable: %v", err)
@@ -597,7 +597,7 @@ func TestHuggingFaceDownload(t *testing.T) {
 		if err != nil {
 			t.Fatalf("missing local file %s: %v", file, err)
 		}
-		remoteData, err := hfDownload(repo, file)
+		remoteData, err := hfDownload(t, repo, file)
 		if err != nil {
 			if isNetworkError(err) {
 				t.Skipf("huggingface unavailable: %v", err)
@@ -610,8 +610,10 @@ func TestHuggingFaceDownload(t *testing.T) {
 	}
 }
 
-func hfListFiles(repo string) ([]string, error) {
-	files, err := hf.ListFiles(context.Background(), hf.Path{Repo: repo})
+func hfListFiles(t *testing.T, repo string) ([]string, error) {
+	ctx, cancel := hfTestContext(t)
+	defer cancel()
+	files, err := hf.ListFiles(ctx, hf.Path{Repo: repo})
 	if err != nil {
 		return nil, err
 	}
@@ -619,8 +621,18 @@ func hfListFiles(repo string) ([]string, error) {
 	return files, nil
 }
 
-func hfDownload(repo, file string) ([]byte, error) {
-	return hf.Download(context.Background(), hf.Path{Repo: repo, File: file})
+func hfDownload(t *testing.T, repo, file string) ([]byte, error) {
+	ctx, cancel := hfTestContext(t)
+	defer cancel()
+	return hf.Download(ctx, hf.Path{Repo: repo, File: file})
+}
+
+func hfTestContext(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+	if deadline, ok := t.Deadline(); ok {
+		return context.WithDeadline(context.Background(), deadline)
+	}
+	return context.WithTimeout(context.Background(), 30*time.Second)
 }
 
 func isNetworkError(err error) bool {

@@ -64,6 +64,21 @@ func TestHFPathDefaults(t *testing.T) {
 	}
 }
 
+func TestHFPathURLEscaping(t *testing.T) {
+	p := hf.Path{
+		Repo: "openai/gpt-oss-120b",
+		File: "nested dir/file #1%?.bin",
+	}
+	url, err := p.URL()
+	if err != nil {
+		t.Fatalf("unexpected url error: %v", err)
+	}
+	expected := "https://huggingface.co/openai/gpt-oss-120b/resolve/main/nested%20dir/file%20%231%25%3F.bin"
+	if url != expected {
+		t.Fatalf("unexpected escaped url: %s", url)
+	}
+}
+
 func TestResolveDstPathAzDir(t *testing.T) {
 	dst, err := resolveDstPath("az://acct/container/prefix", true, "model.bin", true)
 	if err != nil {
