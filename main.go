@@ -21,6 +21,7 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"github.com/tg123/bbb/internal/azblob"
+	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/fsops"
 	"github.com/tg123/bbb/internal/hf"
 )
@@ -1700,39 +1701,12 @@ func cmdMD5Sum(ctx context.Context, c *cli.Command) error {
 	}
 	for i := 0; i < c.Args().Len(); i++ {
 		p := c.Args().Get(i)
-		switch {
-		case isAz(p):
-			ap, err := azblob.Parse(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
-				continue
-			}
-			reader, err := azblob.DownloadStream(ctx, ap)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
-				continue
-			}
-			printMD5Sum(reader, p)
-		case isHF(p):
-			hfPath, err := hf.Parse(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
-				continue
-			}
-			reader, err := hf.DownloadStream(ctx, hfPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
-				continue
-			}
-			printMD5Sum(reader, p)
-		default:
-			f, err := os.Open(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
-				continue
-			}
-			printMD5Sum(f, p)
+		reader, err := bbbfs.Resolve(p).Read(ctx, p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+			continue
 		}
+		printMD5Sum(reader, p)
 	}
 	return nil
 }

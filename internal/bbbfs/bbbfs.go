@@ -1,0 +1,115 @@
+package bbbfs
+
+import (
+	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/tg123/bbb/internal/azblob"
+	"github.com/tg123/bbb/internal/hf"
+)
+
+// FS provides abstract read/write access for supported backends.
+type FS interface {
+	Match(path string) bool
+	Read(ctx context.Context, path string) (io.ReadCloser, error)
+	Write(ctx context.Context, path string, r io.Reader) error
+}
+
+var providers []FS
+
+// ErrWriteUnsupported indicates that a backend does not support writes.
+var ErrWriteUnsupported = errors.New("bbbfs: write not supported")
+
+func init() {
+	Register(hfFS{})
+	Register(azFS{})
+}
+
+// Register adds a filesystem provider.
+func Register(provider FS) {
+	providers = append(providers, provider)
+}
+
+// Resolve returns the first filesystem provider that matches the path.
+func Resolve(path string) FS {
+	for _, provider := range providers {
+		if provider.Match(path) {
+			return provider
+		}
+	}
+	return localFS{}
+}
+
+type azFS struct{}
+
+func (azFS) Match(path string) bool {
+	return strings.HasPrefix(path, "az://") || azblob.IsBlobURL(path)
+}
+
+func (azFS) Read(ctx context.Context, path string) (io.ReadCloser, error) {
+	ap, err := azblob.Parse(path)
+	if err != nil {
+		return nil, err
+	}
+	return azblob.DownloadStream(ctx, ap)
+}
+
+func (azFS) Write(ctx context.Context, path string, r io.Reader) error {
+	ap, err := azblob.Parse(path)
+	if err != nil {
+		return err
+	}
+	return azblob.UploadStream(ctx, ap, r)
+}
+
+type hfFS struct{}
+
+func (hfFS) Match(path string) bool {
+	return strings.HasPrefix(path, "hf://")
+}
+
+func (hfFS) Read(ctx context.Context, path string) (io.ReadCloser, error) {
+	hp, err := hf.Parse(path)
+	if err != nil {
+		return nil, err
+	}
+	return hf.DownloadStream(ctx, hp)
+}
+
+func (hfFS) Write(ctx context.Context, path string, r io.Reader) error {
+	return ErrWriteUnsupported
+}
+
+type localFS struct{}
+
+func (localFS) Match(path string) bool {
+	return true
+}
+
+func (localFS) Read(ctx context.Context, path string) (io.ReadCloser, error) {
+	return os.Open(path)
+}
+
+func (localFS) Write(ctx context.Context, path string, r io.Reader) error {
+	return writeLocal(path, r)
+}
+
+func writeLocal(path string, r io.Reader) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	dstFile, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(dstFile, r)
+	closeErr := dstFile.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
