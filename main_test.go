@@ -100,6 +100,24 @@ func TestSyncHFFiles(t *testing.T) {
 	}
 }
 
+func TestCmdSyncRejectsHFFilePath(t *testing.T) {
+	cmd := &cli.Command{
+		Name: "sync",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "dry-run"},
+			&cli.BoolFlag{Name: "delete"},
+			&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}},
+			&cli.StringFlag{Name: "x"},
+		},
+		Action: cmdSync,
+	}
+
+	err := cmd.Run(context.Background(), []string{"sync", "hf://owner/repo/file.txt", "az://acct/container"})
+	if err == nil {
+		t.Fatalf("expected error for hf file path")
+	}
+}
+
 func TestCPDirectoryCopiesTree(t *testing.T) {
 	srcDir := t.TempDir()
 	nested := filepath.Join(srcDir, "nested")

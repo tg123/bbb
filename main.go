@@ -1374,6 +1374,9 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return fmt.Errorf("sync: %w", err)
 		}
+		if hfPath.File != "" {
+			return errors.New("sync: hf:// path must target repository root, not individual files")
+		}
 	}
 	//
 	var excludeMatch func(string) bool
