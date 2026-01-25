@@ -391,7 +391,8 @@ func TestBasic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(stdout, expected) {
+		normalized := bytes.ReplaceAll(stdout, []byte("\r"), nil)
+		if !bytes.Equal(normalized, expected) {
 			t.Fatalf("unexpected cat output for hf file %s", candidate)
 		}
 	})
