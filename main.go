@@ -26,6 +26,7 @@ import (
 )
 
 var mainver string = "(devel)"
+
 const hfScheme = "hf://"
 
 func version() string {
@@ -182,26 +183,15 @@ func main() {
 			},
 			{
 				Name:      "cp",
-				Usage:     "Copy files",
+				Usage:     "Copy files or directories",
 				UsageText: "bbb cp [-q|--quiet] [--concurrency N] srcs [srcs ...] dst",
+				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
 				},
 				Action: cmdCP,
-			},
-			{
-				Name:      "cptree",
-				Aliases:   []string{"cpr"},
-				Usage:     "Copy directories recursively",
-				UsageText: "bbb cptree [-q|--quiet] [--concurrency N] src dst",
-				Flags: []cli.Flag{
-					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
-					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
-					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
-				},
-				Action: cmdCPTree,
 			},
 			{
 				Name:   "edit",
@@ -808,6 +798,15 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		srcAz := isAz(src)
 		srcHF := isHF(src)
 		base := filepath.Base(src)
+		var srcAzPath azblob.AzurePath
+		if srcAz {
+			var err error
+			srcAzPath, err = azblob.Parse(src)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
 		if srcHF {
 			var err error
 			hfPath, err := hf.Parse(src)
@@ -825,6 +824,21 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			base = hfPath.DefaultFilename()
 			if err := copyHFFile(ctx, hfPath, base, dst, dstAz, overwrite, quiet, isDstDir); err != nil {
 				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			continue
+		}
+		if srcAz {
+			if srcAzPath.IsDirLike() {
+				if err := copyTree(ctx, src, dst, overwrite, quiet, "cp"); err != nil {
+					fmt.Fprintln(os.Stderr, "cp:", err)
+					os.Exit(1)
+				}
+				continue
+			}
+		} else if info, err := os.Stat(src); err == nil && info.IsDir() {
+			if err := copyTree(ctx, src, dst, overwrite, quiet, "cp"); err != nil {
+				fmt.Fprintln(os.Stderr, "cp:", err)
 				os.Exit(1)
 			}
 			continue
@@ -847,9 +861,8 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 		// src -> dstPath
 		if srcAz && dstAz {
-			sap, _ := azblob.Parse(src)
 			dap, _ := azblob.Parse(dstPath)
-			data, err := azblob.Download(ctx, sap)
+			data, err := azblob.Download(ctx, srcAzPath)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
@@ -868,8 +881,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 				fmt.Printf("Copied %s -> %s\n", src, dstPath)
 			}
 		} else if srcAz && !dstAz {
-			sap, _ := azblob.Parse(src)
-			data, err := azblob.Download(ctx, sap)
+			data, err := azblob.Download(ctx, srcAzPath)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
@@ -924,15 +936,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
-func cmdCPTree(ctx context.Context, c *cli.Command) error {
-	slog.Debug("cmdCPTree called", "args", c.Args().Slice())
-	if c.Args().Len() != 2 {
-		return fmt.Errorf("cptree: need src dst")
-	}
-	overwrite := c.Bool("f")
-	quiet := c.Bool("q") || c.Bool("quiet")
-	// concurrency flag is ignored
-	src, dst := c.Args().Get(0), c.Args().Get(1)
+func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPrefix string) error {
 	if isAz(src) || isAz(dst) {
 		// naive recursive copy via listing + per-blob cp
 		srcAz, dstAz := isAz(src), isAz(dst)
@@ -941,21 +945,31 @@ func cmdCPTree(ctx context.Context, c *cli.Command) error {
 			dap, _ := azblob.Parse(dst)
 			list, err := azblob.ListRecursive(ctx, sap)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
+				return err
 			}
+			var hadErrors bool
 			for _, bm := range list {
 				data, err := azblob.Download(ctx, sap.Child(bm.Name))
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "cptree: %s: %v\n", bm.Name, err)
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
 					continue
 				}
+				if !overwrite {
+					if _, err := azblob.HeadBlob(ctx, dap.Child(bm.Name)); err == nil {
+						continue
+					}
+				}
 				if err := azblob.Upload(ctx, dap.Child(bm.Name), data); err != nil {
-					fmt.Fprintf(os.Stderr, "cptree: upload %s: %v\n", bm.Name, err)
+					fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
 				}
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", sap.Child(bm.Name).String(), dap.Child(bm.Name).String())
 				}
+			}
+			if hadErrors {
+				return fmt.Errorf("%s: one or more files failed to copy", errPrefix)
 			}
 			return nil
 		}
@@ -963,38 +977,48 @@ func cmdCPTree(ctx context.Context, c *cli.Command) error {
 			sap, _ := azblob.Parse(src)
 			list, err := azblob.ListRecursive(ctx, sap)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
+				return err
 			}
+			var hadErrors bool
 			for _, bm := range list {
 				data, err := azblob.Download(ctx, sap.Child(bm.Name))
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "cptree: %s: %v\n", bm.Name, err)
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
 					continue
 				}
 				outPath := filepath.Join(dst, bm.Name)
 				if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-					fmt.Fprintln(os.Stderr, err)
-					os.Exit(1)
+					return err
 				}
 				if !overwrite {
 					if _, err := os.Stat(outPath); err == nil {
 						continue
 					}
 				}
-				os.WriteFile(outPath, data, 0o644)
+				if err := os.WriteFile(outPath, data, 0o644); err != nil {
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
+					continue
+				}
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", sap.Child(bm.Name).String(), outPath)
 				}
+			}
+			if hadErrors {
+				return fmt.Errorf("%s: one or more files failed to copy", errPrefix)
 			}
 			return nil
 		}
 		if !srcAz && dstAz { // local -> Azure
 			dap, _ := azblob.Parse(dst)
 			// walk local
-			filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+			var hadErrors bool
+			if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
-					return err
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, p, err)
+					hadErrors = true
+					return nil
 				}
 				if d.IsDir() {
 					return nil
@@ -1002,22 +1026,34 @@ func cmdCPTree(ctx context.Context, c *cli.Command) error {
 				rel, _ := filepath.Rel(src, p)
 				data, err := os.ReadFile(p)
 				if err != nil {
-					return err
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, rel, err)
+					hadErrors = true
+					return nil
+				}
+				if !overwrite {
+					if _, err := azblob.HeadBlob(ctx, dap.Child(rel)); err == nil {
+						return nil
+					}
 				}
 				if err := azblob.Upload(ctx, dap.Child(rel), data); err != nil {
-					fmt.Fprintf(os.Stderr, "cptree: upload %s: %v\n", rel, err)
+					fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, rel, err)
+					hadErrors = true
 				}
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", p, dap.Child(rel).String())
 				}
 				return nil
-			})
+			}); err != nil {
+				return err
+			}
+			if hadErrors {
+				return fmt.Errorf("%s: one or more files failed to copy", errPrefix)
+			}
 			return nil
 		}
 	}
 	if err := fsops.CopyTree(src, dst, overwrite); err != nil {
-		fmt.Fprintln(os.Stderr, "cptree:", err)
-		os.Exit(1)
+		return err
 	}
 	return nil
 }
