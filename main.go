@@ -258,18 +258,24 @@ func main() {
 	// Remove any stray cli.Before assignment
 }
 
+func normalizeHFPrefix(prefix string) string {
+	for strings.HasPrefix(prefix, "/") {
+		prefix = strings.TrimPrefix(prefix, "/")
+	}
+	if prefix == "" {
+		return ""
+	}
+	prefix = path.Clean(prefix)
+	if prefix == "." {
+		return ""
+	}
+	return prefix
+}
+
 func hfFilterFiles(files []string, prefix string) []string {
-	if prefix != "" {
-		prefix = strings.TrimLeft(prefix, "/")
-		if prefix != "" {
-			prefix = path.Clean(prefix)
-		}
-		if prefix == "." {
-			prefix = ""
-		}
-		if prefix != "" && !strings.HasSuffix(prefix, "/") {
-			prefix += "/"
-		}
+	prefix = normalizeHFPrefix(prefix)
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
 	}
 	out := make([]string, 0, len(files))
 	for _, file := range files {
@@ -341,7 +347,7 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		hp.File = strings.TrimLeft(hp.File, "/")
+		hp.File = normalizeHFPrefix(hp.File)
 		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 		if err != nil {
 			return err
@@ -518,7 +524,7 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 		if err != nil {
 			return err
 		}
-		hp.File = strings.TrimLeft(hp.File, "/")
+		hp.File = normalizeHFPrefix(hp.File)
 		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 		if err != nil {
 			return err

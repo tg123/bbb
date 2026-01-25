@@ -97,6 +97,15 @@ func TestHFFilterFiles(t *testing.T) {
 	}
 }
 
+func TestNormalizeHFPrefix(t *testing.T) {
+	if got := normalizeHFPrefix("///dir/sub"); got != "dir/sub" {
+		t.Fatalf("unexpected normalized prefix: %s", got)
+	}
+	if got := normalizeHFPrefix("/"); got != "" {
+		t.Fatalf("expected empty prefix, got: %s", got)
+	}
+}
+
 func TestHFListEntries(t *testing.T) {
 	files := []string{"dir/file.txt", "dir/sub/file2.txt", "root.txt"}
 	got := hfListEntries(files, "dir")
