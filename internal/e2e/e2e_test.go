@@ -26,11 +26,13 @@ const (
 	waitTimeout    = time.Second * 10
 	azuriteAccount = "devstoreaccount1"
 	azuriteHost    = azuriteAccount + ".blob.localhost:10000"
+	hfSyncEnv      = "BBB_E2E_HF_SYNC"
 )
 
 var (
 	preferredHFFileNames = []string{"config.json", "README.md", "tokenizer.json"}
 	hfAzCopyPrefix       = fmt.Sprintf("az://%s/test/hf-copy", azuriteAccount)
+	hfAzSyncPrefix       = fmt.Sprintf("az://%s/test/hf-sync", azuriteAccount)
 )
 
 func parseMD5Output(out []byte) string {
@@ -646,6 +648,81 @@ func TestBasic(t *testing.T) {
 		hfNormalized := bytes.ReplaceAll(hfData, []byte("\r"), nil)
 		if !bytes.Equal(azNormalized, hfNormalized) {
 			t.Fatalf("hf to az content mismatch for %s", candidate)
+		}
+	})
+
+	t.Run("hf sync to az", func(t *testing.T) {
+		if os.Getenv(hfSyncEnv) == "" {
+			t.Skipf("%s not set", hfSyncEnv)
+		}
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		files, err := hfListFiles(t, repo)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		if len(files) == 0 {
+			t.Fatal("no huggingface files returned")
+		}
+		candidate := ""
+		for _, name := range preferredHFFileNames {
+			if slices.Contains(files, name) {
+				candidate = name
+				break
+			}
+		}
+		if candidate == "" {
+			candidate = files[0]
+		}
+		hfData, err := hfDownload(t, repo, candidate)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		dstPrefix := hfAzSyncPrefix
+		cleanFolder(t, dstPrefix)
+		if _, err := runBBB("sync", "hf://"+repo, dstPrefix); err != nil {
+			t.Fatal(err)
+		}
+		normalized := strings.ReplaceAll(candidate, "\\", "/")
+		azFile, err := url.JoinPath(strings.TrimSuffix(dstPrefix, "/"), normalized)
+		if err != nil {
+			t.Fatal(err)
+		}
+		list, err := bbbLs(dstPrefix, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(list, azFile) {
+			t.Fatalf("expected az file missing: %s", azFile)
+		}
+		out, err := os.CreateTemp("", "bbb-hf-sync-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		outPath := out.Name()
+		if err := out.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(outPath); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(outPath)
+		if _, err := runBBB("cp", azFile, outPath); err != nil {
+			t.Fatal(err)
+		}
+		azData, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		azNormalized := bytes.ReplaceAll(azData, []byte("\r"), nil)
+		hfNormalized := bytes.ReplaceAll(hfData, []byte("\r"), nil)
+		if !bytes.Equal(azNormalized, hfNormalized) {
+			t.Fatalf("hf sync to az content mismatch for %s", candidate)
 		}
 	})
 
