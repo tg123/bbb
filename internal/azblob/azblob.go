@@ -436,6 +436,23 @@ func Upload(ctx context.Context, ap AzurePath, data []byte) error {
 	return nil
 }
 
+// UploadStream writes blob content from a reader (overwrite).
+func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
+	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
+		return errors.New("cannot upload to directory-like path")
+	}
+	client, err := getAzBlobClient(ctx, ap.Account)
+	if err != nil {
+		return err
+	}
+	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
+	_, err = blobClient.UploadStream(ctx, reader, nil)
+	if err != nil {
+		return fmt.Errorf("put failed: %v", err)
+	}
+	return nil
+}
+
 // Delete deletes a single blob
 func Delete(ctx context.Context, ap AzurePath) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
