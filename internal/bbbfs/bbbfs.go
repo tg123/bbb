@@ -21,10 +21,11 @@ type FS interface {
 }
 
 var (
-	providers   []FS
-	providersMu sync.RWMutex
-	azProvider  = azFS{}
-	hfProvider  = hfFS{}
+	providers       []FS
+	providersMu     sync.RWMutex
+	azProvider      = azFS{}
+	hfProvider      = hfFS{}
+	localFSProvider = localFS{}
 )
 
 // ErrWriteUnsupported indicates that a backend does not support writes.
@@ -34,7 +35,7 @@ func init() {
 	// Register order defines resolution priority; localFS is the fallback.
 	Register(hfProvider)
 	Register(azProvider)
-	Register(localFS{})
+	Register(localFSProvider)
 }
 
 // Register adds a filesystem provider.
@@ -53,7 +54,7 @@ func Resolve(path string) FS {
 			return provider
 		}
 	}
-	return localFS{}
+	return localFSProvider
 }
 
 type azFS struct{}
@@ -116,7 +117,7 @@ func (localFS) Write(ctx context.Context, path string, r io.Reader) error {
 	return writeLocal(path, r)
 }
 
-func writeLocal(path string, r io.Reader) error {
+func writeLocal(path string, r io.Reader) (err error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -124,10 +125,11 @@ func writeLocal(path string, r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(dstFile, r)
-	closeErr := dstFile.Close()
-	if copyErr != nil {
-		return copyErr
-	}
-	return closeErr
+	defer func() {
+		if closeErr := dstFile.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	_, err = io.Copy(dstFile, r)
+	return err
 }
