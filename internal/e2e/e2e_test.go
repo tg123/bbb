@@ -571,33 +571,7 @@ func TestBasic(t *testing.T) {
 
 	t.Run("hf to az", func(t *testing.T) {
 		repo := "hf-internal-testing/tiny-random-BertModel"
-		files, err := hfListFiles(t, repo)
-		if err != nil {
-			if isNetworkError(err) {
-				t.Skipf("huggingface unavailable: %v", err)
-			}
-			t.Fatal(err)
-		}
-		if len(files) == 0 {
-			t.Fatal("no huggingface files returned")
-		}
-		candidate := ""
-		for _, name := range preferredHFFileNames {
-			if slices.Contains(files, name) {
-				candidate = name
-				break
-			}
-		}
-		if candidate == "" {
-			candidate = files[0]
-		}
-		hfData, err := hfDownload(t, repo, candidate)
-		if err != nil {
-			if isNetworkError(err) {
-				t.Skipf("huggingface unavailable: %v", err)
-			}
-			t.Fatal(err)
-		}
+		candidate, hfData := hfCandidateData(t, repo)
 		{
 			expected := fmt.Sprintf("%x", md5.Sum(hfData))
 			stdout, err := runBBB("md5sum", "hf://"+repo+"/"+candidate)
@@ -625,18 +599,7 @@ func TestBasic(t *testing.T) {
 		if !slices.Contains(list, azFile) {
 			t.Fatalf("expected az file missing: %s", azFile)
 		}
-		out, err := os.CreateTemp("", "bbb-hf-az-")
-		if err != nil {
-			t.Fatal(err)
-		}
-		outPath := out.Name()
-		if err := out.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Remove(outPath); err != nil {
-			t.Fatal(err)
-		}
-		defer os.Remove(outPath)
+		outPath := tempOutPath(t, "bbb-hf-az-")
 		if _, err := runBBB("cp", azFile, outPath); err != nil {
 			t.Fatal(err)
 		}
@@ -656,33 +619,7 @@ func TestBasic(t *testing.T) {
 			t.Skipf("%s not set", hfSyncEnv)
 		}
 		repo := "hf-internal-testing/tiny-random-BertModel"
-		files, err := hfListFiles(t, repo)
-		if err != nil {
-			if isNetworkError(err) {
-				t.Skipf("huggingface unavailable: %v", err)
-			}
-			t.Fatal(err)
-		}
-		if len(files) == 0 {
-			t.Fatal("no huggingface files returned")
-		}
-		candidate := ""
-		for _, name := range preferredHFFileNames {
-			if slices.Contains(files, name) {
-				candidate = name
-				break
-			}
-		}
-		if candidate == "" {
-			candidate = files[0]
-		}
-		hfData, err := hfDownload(t, repo, candidate)
-		if err != nil {
-			if isNetworkError(err) {
-				t.Skipf("huggingface unavailable: %v", err)
-			}
-			t.Fatal(err)
-		}
+		candidate, hfData := hfCandidateData(t, repo)
 		dstPrefix := hfAzSyncPrefix
 		cleanFolder(t, dstPrefix)
 		if _, err := runBBB("sync", "hf://"+repo, dstPrefix); err != nil {
@@ -700,18 +637,7 @@ func TestBasic(t *testing.T) {
 		if !slices.Contains(list, azFile) {
 			t.Fatalf("expected az file missing: %s", azFile)
 		}
-		out, err := os.CreateTemp("", "bbb-hf-sync-")
-		if err != nil {
-			t.Fatal(err)
-		}
-		outPath := out.Name()
-		if err := out.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Remove(outPath); err != nil {
-			t.Fatal(err)
-		}
-		defer os.Remove(outPath)
+		outPath := tempOutPath(t, "bbb-hf-sync-")
 		if _, err := runBBB("cp", azFile, outPath); err != nil {
 			t.Fatal(err)
 		}
@@ -842,6 +768,57 @@ func hfTestContext(t *testing.T) (context.Context, context.CancelFunc) {
 		return context.WithDeadline(context.Background(), deadline)
 	}
 	return context.WithTimeout(context.Background(), 30*time.Second)
+}
+
+func hfCandidateData(t *testing.T, repo string) (string, []byte) {
+	t.Helper()
+	files, err := hfListFiles(t, repo)
+	if err != nil {
+		if isNetworkError(err) {
+			t.Skipf("huggingface unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no huggingface files returned")
+	}
+	candidate := ""
+	for _, name := range preferredHFFileNames {
+		if slices.Contains(files, name) {
+			candidate = name
+			break
+		}
+	}
+	if candidate == "" {
+		candidate = files[0]
+	}
+	hfData, err := hfDownload(t, repo, candidate)
+	if err != nil {
+		if isNetworkError(err) {
+			t.Skipf("huggingface unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	return candidate, hfData
+}
+
+func tempOutPath(t *testing.T, prefix string) string {
+	t.Helper()
+	out, err := os.CreateTemp("", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outPath := out.Name()
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(outPath); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(outPath)
+	})
+	return outPath
 }
 
 func isNetworkError(err error) bool {
