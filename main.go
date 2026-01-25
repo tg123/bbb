@@ -98,30 +98,37 @@ func main() {
 		},
 		Commands: []*cli.Command{
 			{
-				Name:      "mkcontainer",
-				Usage:     "Create an Azure Blob container",
-				UsageText: "bbb mkcontainer az://account/container",
-				Action: func(ctx context.Context, c *cli.Command) error {
-					if c.Args().Len() != 1 {
-						return fmt.Errorf("mkcontainer: need az://account/container")
-					}
-					target := c.Args().Get(0)
-					if !isAz(target) {
-						return fmt.Errorf("mkcontainer: only az:// paths supported")
-					}
-					ap, err := azblob.Parse(target)
-					if err != nil {
-						return err
-					}
-					if ap.Container == "" {
-						return fmt.Errorf("mkcontainer: need az://account/container")
-					}
-					err = azblob.MkContainer(ctx, ap.Account, ap.Container)
-					if err != nil {
-						return err
-					}
-					fmt.Printf("Created container %s/%s\n", ap.Account, ap.Container)
-					return nil
+				Name:      "az",
+				Usage:     "Azure Blob related commands",
+				UsageText: "bbb az <command>",
+				Commands: []*cli.Command{
+					{
+						Name:      "mkcontainer",
+						Usage:     "Create an Azure Blob container",
+						UsageText: "bbb az mkcontainer az://account/container",
+						Action: func(ctx context.Context, c *cli.Command) error {
+							if c.Args().Len() != 1 {
+								return fmt.Errorf("mkcontainer: need az://account/container")
+							}
+							target := c.Args().Get(0)
+							if !isAz(target) {
+								return fmt.Errorf("mkcontainer: only az:// paths supported")
+							}
+							ap, err := azblob.Parse(target)
+							if err != nil {
+								return err
+							}
+							if ap.Container == "" {
+								return fmt.Errorf("mkcontainer: need az://account/container")
+							}
+							err = azblob.MkContainer(ctx, ap.Account, ap.Container)
+							if err != nil {
+								return err
+							}
+							fmt.Printf("Created container %s/%s\n", ap.Account, ap.Container)
+							return nil
+						},
+					},
 				},
 			},
 			{
