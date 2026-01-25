@@ -393,7 +393,7 @@ func splitWildcard(target string) (string, string) {
 	if strings.Contains(target, "*") {
 		starIdx := strings.Index(target, "*")
 		lastSlash := strings.LastIndex(target[:starIdx], "/")
-		if lastSlash >= 0 {
+		if lastSlash >= len(hfScheme) {
 			return target[:lastSlash+1], target[lastSlash+1:]
 		}
 		return target, "*"

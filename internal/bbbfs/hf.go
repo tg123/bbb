@@ -139,6 +139,10 @@ func normalizeHFPrefix(prefix string) string {
 }
 
 func hfListPrefix(prefix string) string {
+	return hfFilterPrefix(prefix)
+}
+
+func hfFilterPrefix(prefix string) string {
 	prefix = normalizeHFPrefix(prefix)
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
@@ -147,10 +151,7 @@ func hfListPrefix(prefix string) string {
 }
 
 func hfFilterFiles(files []string, prefix string) []string {
-	prefix = normalizeHFPrefix(prefix)
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
+	prefix = hfFilterPrefix(prefix)
 	out := make([]string, 0, len(files))
 	for _, file := range files {
 		if file == "" {
