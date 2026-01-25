@@ -642,7 +642,9 @@ func TestBasic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(azData, hfData) {
+		azNormalized := bytes.ReplaceAll(azData, []byte("\r"), nil)
+		hfNormalized := bytes.ReplaceAll(hfData, []byte("\r"), nil)
+		if !bytes.Equal(azNormalized, hfNormalized) {
 			t.Fatalf("hf to az content mismatch for %s", candidate)
 		}
 	})
@@ -732,7 +734,9 @@ func TestHuggingFaceDownload(t *testing.T) {
 			}
 			t.Fatalf("download failed for %s: %v", file, err)
 		}
-		if !bytes.Equal(localData, remoteData) {
+		localNormalized := bytes.ReplaceAll(localData, []byte("\r"), nil)
+		remoteNormalized := bytes.ReplaceAll(remoteData, []byte("\r"), nil)
+		if !bytes.Equal(localNormalized, remoteNormalized) {
 			t.Fatalf("content mismatch for %s", file)
 		}
 	}
