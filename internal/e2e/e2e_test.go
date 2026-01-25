@@ -816,7 +816,9 @@ func tempOutPath(t *testing.T, prefix string) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = os.Remove(outPath)
+		if err := os.Remove(outPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Logf("cleanup temp file %s: %v", outPath, err)
+		}
 	})
 	return outPath
 }
