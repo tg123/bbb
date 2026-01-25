@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,8 @@ import (
 )
 
 var mainver string = "(devel)"
+
+const hfScheme = "hf://"
 
 func version() string {
 	v := mainver
@@ -56,7 +59,7 @@ func isAz(s string) bool {
 }
 
 func isHF(s string) bool {
-	return strings.HasPrefix(s, "hf://")
+	return strings.HasPrefix(s, hfScheme)
 }
 
 func main() {
@@ -180,26 +183,15 @@ func main() {
 			},
 			{
 				Name:      "cp",
-				Usage:     "Copy files",
+				Usage:     "Copy files or directories",
 				UsageText: "bbb cp [-q|--quiet] [--concurrency N] srcs [srcs ...] dst",
+				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
 				},
 				Action: cmdCP,
-			},
-			{
-				Name:      "cptree",
-				Aliases:   []string{"cpr"},
-				Usage:     "Copy directories recursively",
-				UsageText: "bbb cptree [-q|--quiet] [--concurrency N] src dst",
-				Flags: []cli.Flag{
-					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
-					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
-					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
-				},
-				Action: cmdCPTree,
 			},
 			{
 				Name:   "edit",
@@ -247,6 +239,12 @@ func main() {
 				},
 				Action: cmdSync,
 			},
+			{
+				Name:      "md5sum",
+				Usage:     "Compute MD5 checksums (for integrity verification only)",
+				UsageText: "bbb md5sum paths [paths ...]",
+				Action:    cmdMD5Sum,
+			},
 		},
 	}
 
@@ -257,9 +255,81 @@ func main() {
 	// Remove any stray cli.Before assignment
 }
 
+func normalizeHFPrefix(prefix string) string {
+	for strings.HasPrefix(prefix, "/") {
+		prefix = strings.TrimPrefix(prefix, "/")
+	}
+	if prefix == "" {
+		return ""
+	}
+	prefix = path.Clean(prefix)
+	if prefix == "." {
+		return ""
+	}
+	return prefix
+}
+
+func hfFilterFiles(files []string, prefix string) []string {
+	prefix = normalizeHFPrefix(prefix)
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	out := make([]string, 0, len(files))
+	for _, file := range files {
+		if file == "" {
+			continue
+		}
+		if prefix != "" {
+			if !strings.HasPrefix(file, prefix) {
+				continue
+			}
+			file = strings.TrimPrefix(file, prefix)
+			if file == "" {
+				continue
+			}
+		}
+		out = append(out, file)
+	}
+	return out
+}
+
+func hfListEntries(files []string, prefix string) []string {
+	seen := map[string]struct{}{}
+	for _, file := range hfFilterFiles(files, prefix) {
+		parts := strings.SplitN(file, "/", 2)
+		name := parts[0]
+		if name == "" {
+			continue
+		}
+		if len(parts) > 1 {
+			name += "/"
+		}
+		seen[name] = struct{}{}
+	}
+	entries := make([]string, 0, len(seen))
+	for name := range seen {
+		entries = append(entries, name)
+	}
+	sort.Strings(entries)
+	return entries
+}
+
+func hfSplitWildcard(target string) (string, string) {
+	parentPath := target
+	var pattern string
+	if strings.Contains(target, "*") {
+		starIdx := strings.Index(target, "*")
+		lastSlash := strings.LastIndex(target[:starIdx], "/")
+		if lastSlash >= len(hfScheme) {
+			parentPath = target[:lastSlash+1]
+			pattern = target[lastSlash+1:]
+		}
+	}
+	return parentPath, pattern
+}
+
 func cmdLS(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdLS called", "args", c.Args().Slice())
-	slog.Debug("cmdLSTree called", "args", c.Args().Slice())
 	long := c.Bool("l")
 	all := c.Bool("a")
 	target := "."
@@ -268,6 +338,57 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 	}
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s")
+	if isHF(target) {
+		parentPath, pattern := hfSplitWildcard(target)
+		hp, err := hf.Parse(parentPath)
+		if err != nil {
+			return err
+		}
+		hp.File = normalizeHFPrefix(hp.File)
+		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
+		if err != nil {
+			return err
+		}
+		entries := hfListEntries(files, hp.File)
+		for _, name := range entries {
+			trimmed := strings.TrimSuffix(name, "/")
+			if trimmed == "" {
+				continue
+			}
+			if !all && len(trimmed) > 0 && trimmed[0] == '.' {
+				continue
+			}
+			if pattern != "" {
+				matched, err := path.Match(pattern, trimmed)
+				if err != nil {
+					return err
+				}
+				if !matched {
+					continue
+				}
+			}
+			fullFile := path.Join(hp.File, trimmed)
+			fullpath := hf.Path{Repo: hp.Repo, File: fullFile}.String()
+			displayPath := fullpath
+			if relFlag {
+				displayPath = trimmed
+			}
+			if long {
+				typ := "-"
+				if strings.HasSuffix(name, "/") {
+					typ = "d"
+				}
+				if machine {
+					fmt.Printf("%s\t%d\t-\t%s\n", typ, 0, displayPath)
+				} else {
+					fmt.Printf("%1s %10d %s %s\n", typ, 0, "-", displayPath)
+				}
+			} else {
+				fmt.Println(displayPath)
+			}
+		}
+		return nil
+	}
 	if isAz(target) {
 		// Wildcard support for Azure paths
 		var pattern string
@@ -394,6 +515,63 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s") || c.Bool("relative")
 
+	if isHF(root) {
+		parentPath, pattern := hfSplitWildcard(root)
+		hp, err := hf.Parse(parentPath)
+		if err != nil {
+			return err
+		}
+		hp.File = normalizeHFPrefix(hp.File)
+		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
+		if err != nil {
+			return err
+		}
+		list := hfFilterFiles(files, hp.File)
+		sort.Strings(list)
+		var count int64
+		for _, name := range list {
+			if name == "" {
+				continue
+			}
+			if pattern != "" {
+				last := name
+				if idx := strings.LastIndex(name, "/"); idx >= 0 {
+					last = name[idx+1:]
+				}
+				matched, err := path.Match(pattern, last)
+				if err != nil {
+					return err
+				}
+				if !matched {
+					continue
+				}
+			}
+			count++
+			fullFile := path.Join(hp.File, name)
+			fullpath := hf.Path{Repo: hp.Repo, File: fullFile}.String()
+			display := fullpath
+			if relFlag {
+				display = name
+			}
+			if longFlag {
+				if machine {
+					fmt.Printf("f\t%d\t-\t%s\n", 0, display)
+				} else {
+					fmt.Printf("%10d  -  %s\n", 0, display)
+				}
+			} else {
+				if machine {
+					fmt.Printf("f\t%s\n", display)
+				} else {
+					fmt.Println(display)
+				}
+			}
+		}
+		if !machine {
+			fmt.Printf("%d files\n", count)
+		}
+		return nil
+	}
 	if isAz(root) {
 		// Wildcard support for Azure paths
 		var pattern string
@@ -527,6 +705,20 @@ func cmdCat(ctx context.Context, c *cli.Command) error {
 			os.Stdout.Write(data)
 			continue
 		}
+		if isHF(p) {
+			hfPath, err := hf.Parse(p)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
+				continue
+			}
+			data, err := hf.Download(ctx, hfPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
+				continue
+			}
+			os.Stdout.Write(data)
+			continue
+		}
 		f, err := os.Open(p)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
@@ -606,6 +798,15 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		srcAz := isAz(src)
 		srcHF := isHF(src)
 		base := filepath.Base(src)
+		var srcAzPath azblob.AzurePath
+		if srcAz {
+			var err error
+			srcAzPath, err = azblob.Parse(src)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
 		if srcHF {
 			var err error
 			hfPath, err := hf.Parse(src)
@@ -623,6 +824,21 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			base = hfPath.DefaultFilename()
 			if err := copyHFFile(ctx, hfPath, base, dst, dstAz, overwrite, quiet, isDstDir); err != nil {
 				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			continue
+		}
+		if srcAz {
+			if srcAzPath.IsDirLike() {
+				if err := copyTree(ctx, src, dst, overwrite, quiet, "cp"); err != nil {
+					fmt.Fprintln(os.Stderr, "cp:", err)
+					os.Exit(1)
+				}
+				continue
+			}
+		} else if info, err := os.Stat(src); err == nil && info.IsDir() {
+			if err := copyTree(ctx, src, dst, overwrite, quiet, "cp"); err != nil {
+				fmt.Fprintln(os.Stderr, "cp:", err)
 				os.Exit(1)
 			}
 			continue
@@ -645,9 +861,8 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 		// src -> dstPath
 		if srcAz && dstAz {
-			sap, _ := azblob.Parse(src)
 			dap, _ := azblob.Parse(dstPath)
-			data, err := azblob.Download(ctx, sap)
+			data, err := azblob.Download(ctx, srcAzPath)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
@@ -666,8 +881,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 				fmt.Printf("Copied %s -> %s\n", src, dstPath)
 			}
 		} else if srcAz && !dstAz {
-			sap, _ := azblob.Parse(src)
-			data, err := azblob.Download(ctx, sap)
+			data, err := azblob.Download(ctx, srcAzPath)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
@@ -722,15 +936,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
-func cmdCPTree(ctx context.Context, c *cli.Command) error {
-	slog.Debug("cmdCPTree called", "args", c.Args().Slice())
-	if c.Args().Len() != 2 {
-		return fmt.Errorf("cptree: need src dst")
-	}
-	overwrite := c.Bool("f")
-	quiet := c.Bool("q") || c.Bool("quiet")
-	// concurrency flag is ignored
-	src, dst := c.Args().Get(0), c.Args().Get(1)
+func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPrefix string) error {
 	if isAz(src) || isAz(dst) {
 		// naive recursive copy via listing + per-blob cp
 		srcAz, dstAz := isAz(src), isAz(dst)
@@ -739,21 +945,31 @@ func cmdCPTree(ctx context.Context, c *cli.Command) error {
 			dap, _ := azblob.Parse(dst)
 			list, err := azblob.ListRecursive(ctx, sap)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
+				return err
 			}
+			var hadErrors bool
 			for _, bm := range list {
 				data, err := azblob.Download(ctx, sap.Child(bm.Name))
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "cptree: %s: %v\n", bm.Name, err)
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
 					continue
 				}
+				if !overwrite {
+					if _, err := azblob.HeadBlob(ctx, dap.Child(bm.Name)); err == nil {
+						continue
+					}
+				}
 				if err := azblob.Upload(ctx, dap.Child(bm.Name), data); err != nil {
-					fmt.Fprintf(os.Stderr, "cptree: upload %s: %v\n", bm.Name, err)
+					fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
 				}
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", sap.Child(bm.Name).String(), dap.Child(bm.Name).String())
 				}
+			}
+			if hadErrors {
+				return fmt.Errorf("%s: one or more files failed to copy", errPrefix)
 			}
 			return nil
 		}
@@ -761,38 +977,48 @@ func cmdCPTree(ctx context.Context, c *cli.Command) error {
 			sap, _ := azblob.Parse(src)
 			list, err := azblob.ListRecursive(ctx, sap)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
+				return err
 			}
+			var hadErrors bool
 			for _, bm := range list {
 				data, err := azblob.Download(ctx, sap.Child(bm.Name))
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "cptree: %s: %v\n", bm.Name, err)
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
 					continue
 				}
 				outPath := filepath.Join(dst, bm.Name)
 				if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-					fmt.Fprintln(os.Stderr, err)
-					os.Exit(1)
+					return err
 				}
 				if !overwrite {
 					if _, err := os.Stat(outPath); err == nil {
 						continue
 					}
 				}
-				os.WriteFile(outPath, data, 0o644)
+				if err := os.WriteFile(outPath, data, 0o644); err != nil {
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+					hadErrors = true
+					continue
+				}
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", sap.Child(bm.Name).String(), outPath)
 				}
+			}
+			if hadErrors {
+				return fmt.Errorf("%s: one or more files failed to copy", errPrefix)
 			}
 			return nil
 		}
 		if !srcAz && dstAz { // local -> Azure
 			dap, _ := azblob.Parse(dst)
 			// walk local
-			filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+			var hadErrors bool
+			if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
-					return err
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, p, err)
+					hadErrors = true
+					return nil
 				}
 				if d.IsDir() {
 					return nil
@@ -800,22 +1026,34 @@ func cmdCPTree(ctx context.Context, c *cli.Command) error {
 				rel, _ := filepath.Rel(src, p)
 				data, err := os.ReadFile(p)
 				if err != nil {
-					return err
+					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, rel, err)
+					hadErrors = true
+					return nil
+				}
+				if !overwrite {
+					if _, err := azblob.HeadBlob(ctx, dap.Child(rel)); err == nil {
+						return nil
+					}
 				}
 				if err := azblob.Upload(ctx, dap.Child(rel), data); err != nil {
-					fmt.Fprintf(os.Stderr, "cptree: upload %s: %v\n", rel, err)
+					fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, rel, err)
+					hadErrors = true
 				}
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", p, dap.Child(rel).String())
 				}
 				return nil
-			})
+			}); err != nil {
+				return err
+			}
+			if hadErrors {
+				return fmt.Errorf("%s: one or more files failed to copy", errPrefix)
+			}
 			return nil
 		}
 	}
 	if err := fsops.CopyTree(src, dst, overwrite); err != nil {
-		fmt.Fprintln(os.Stderr, "cptree:", err)
-		os.Exit(1)
+		return err
 	}
 	return nil
 }
@@ -1376,6 +1614,70 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			return nil
 		})
 	}
+	return nil
+}
+
+func cmdMD5Sum(ctx context.Context, c *cli.Command) error {
+	slog.Debug("cmdMD5Sum called", "args", c.Args().Slice())
+	if c.Args().Len() == 0 {
+		return fmt.Errorf("md5sum: need at least one path")
+	}
+	for i := 0; i < c.Args().Len(); i++ {
+		p := c.Args().Get(i)
+		switch {
+		case isAz(p):
+			ap, err := azblob.Parse(p)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+				continue
+			}
+			reader, err := azblob.DownloadStream(ctx, ap)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+				continue
+			}
+			printMD5Sum(reader, p)
+		case isHF(p):
+			hfPath, err := hf.Parse(p)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+				continue
+			}
+			reader, err := hf.DownloadStream(ctx, hfPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+				continue
+			}
+			printMD5Sum(reader, p)
+		default:
+			f, err := os.Open(p)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+				continue
+			}
+			printMD5Sum(f, p)
+		}
+	}
+	return nil
+}
+
+func printMD5Sum(r io.ReadCloser, label string) {
+	if err := writeMD5SumReadCloser(r, label); err != nil {
+		fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", label, err)
+	}
+}
+
+func writeMD5SumReadCloser(r io.ReadCloser, label string) error {
+	defer r.Close()
+	return writeMD5Sum(r, label)
+}
+
+func writeMD5Sum(r io.Reader, label string) error {
+	hasher := md5.New()
+	if _, err := io.Copy(hasher, r); err != nil {
+		return err
+	}
+	fmt.Printf("%x  %s\n", hasher.Sum(nil), label)
 	return nil
 }
 

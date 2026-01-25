@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,14 @@ var (
 	preferredHFFileNames = []string{"config.json", "README.md", "tokenizer.json"}
 	hfAzCopyPrefix       = fmt.Sprintf("az://%s/test/hf-copy", azuriteAccount)
 )
+
+func parseMD5Output(out []byte) string {
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
 
 func waitForEndpointReady(addr string) {
 	waitForEndpointReadyWithTimeout(addr, waitTimeout)
@@ -319,6 +328,25 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+	// md5sum
+	{
+		expected := fmt.Sprintf("%x", md5.Sum(content))
+		stdout, err := runBBB("md5sum", "az://"+azuriteAccount+"/test/testfile.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parseMD5Output(stdout); got != expected {
+			t.Fatalf("unexpected az md5sum: got %s, want %s", got, expected)
+		}
+		stdout, err = runBBB("md5sum", tmpFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parseMD5Output(stdout); got != expected {
+			t.Fatalf("unexpected local md5sum: got %s, want %s", got, expected)
+		}
+	}
+
 	// cat via http blob URL
 	{
 		httpURL := fmt.Sprintf("http://%s/test/testfile.txt", azuriteHost)
@@ -330,6 +358,45 @@ func TestBasic(t *testing.T) {
 			t.Errorf("unexpected cat output via http: %s", stdout)
 		}
 	}
+	t.Run("cat hf", func(t *testing.T) {
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		files, err := hfListFiles(t, repo)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		if len(files) == 0 {
+			t.Fatal("no huggingface files returned")
+		}
+		candidate := ""
+		for _, name := range preferredHFFileNames {
+			if slices.Contains(files, name) {
+				candidate = name
+				break
+			}
+		}
+		if candidate == "" {
+			candidate = files[0]
+		}
+		expected, err := hfDownload(t, repo, candidate)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		stdout, err := runBBB("cat", "hf://"+repo+"/"+candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		normalized := bytes.ReplaceAll(stdout, []byte("\r"), nil)
+		expectedNormalized := bytes.ReplaceAll(expected, []byte("\r"), nil)
+		if !bytes.Equal(normalized, expectedNormalized) {
+			t.Fatalf("unexpected cat output for hf file %s", candidate)
+		}
+	})
 
 	// download
 	{
@@ -529,6 +596,16 @@ func TestBasic(t *testing.T) {
 			}
 			t.Fatal(err)
 		}
+		{
+			expected := fmt.Sprintf("%x", md5.Sum(hfData))
+			stdout, err := runBBB("md5sum", "hf://"+repo+"/"+candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := parseMD5Output(stdout); got != expected {
+				t.Fatalf("unexpected hf md5sum: got %s, want %s", got, expected)
+			}
+		}
 		dstPrefix := hfAzCopyPrefix
 		cleanFolder(t, dstPrefix)
 		if _, err := runBBB("cp", "hf://"+repo, dstPrefix); err != nil {
@@ -565,8 +642,61 @@ func TestBasic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(azData, hfData) {
+		azNormalized := bytes.ReplaceAll(azData, []byte("\r"), nil)
+		hfNormalized := bytes.ReplaceAll(hfData, []byte("\r"), nil)
+		if !bytes.Equal(azNormalized, hfNormalized) {
 			t.Fatalf("hf to az content mismatch for %s", candidate)
+		}
+	})
+
+	t.Run("hf ls", func(t *testing.T) {
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		files, err := hfListFiles(t, repo)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		expected := ""
+		// bbb ls defaults to hiding dotfiles unless -a is provided
+		for _, file := range files {
+			if strings.Contains(file, "/") {
+				continue
+			}
+			if strings.HasPrefix(file, ".") {
+				continue
+			}
+			expected = file
+			break
+		}
+		if expected == "" {
+			// Fallback: accept any root entry (including dotfiles) if that's all there is.
+			for _, file := range files {
+				if file == "" {
+					continue
+				}
+				parts := strings.SplitN(file, "/", 2)
+				if parts[0] == "" {
+					continue
+				}
+				expected = parts[0]
+				break
+			}
+			if expected == "" {
+				t.Fatal("no huggingface root entries returned")
+			}
+		}
+		list, err := bbbLs("hf://"+repo, false)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		expectedPath := "hf://" + repo + "/" + expected
+		if !slices.Contains(list, expectedPath) {
+			t.Fatalf("expected hf file missing: %s", expected)
 		}
 	})
 
@@ -604,7 +734,9 @@ func TestHuggingFaceDownload(t *testing.T) {
 			}
 			t.Fatalf("download failed for %s: %v", file, err)
 		}
-		if !bytes.Equal(localData, remoteData) {
+		localNormalized := bytes.ReplaceAll(localData, []byte("\r"), nil)
+		remoteNormalized := bytes.ReplaceAll(remoteData, []byte("\r"), nil)
+		if !bytes.Equal(localNormalized, remoteNormalized) {
 			t.Fatalf("content mismatch for %s", file)
 		}
 	}

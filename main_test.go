@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/tg123/bbb/internal/hf"
+	"github.com/urfave/cli/v3"
 )
 
 func TestIsAzHTTPS(t *testing.T) {
@@ -94,5 +97,101 @@ func TestSyncHFFiles(t *testing.T) {
 	_, err := syncHFFiles(context.Background(), hf.Path{Repo: "owner/repo", File: "dir/file.txt"}, func(string) bool { return false })
 	if err == nil {
 		t.Fatalf("expected error for file path")
+	}
+}
+
+func TestCPDirectoryCopiesTree(t *testing.T) {
+	srcDir := t.TempDir()
+	nested := filepath.Join(srcDir, "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "root.txt"), []byte("root"), 0o644); err != nil {
+		t.Fatalf("write root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "child.txt"), []byte("child"), 0o644); err != nil {
+		t.Fatalf("write child: %v", err)
+	}
+	dstDir := t.TempDir()
+
+	cmd := &cli.Command{
+		Name: "cp",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
+			&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
+			&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
+		},
+		Action: cmdCP,
+	}
+
+	if err := cmd.Run(context.Background(), []string{"cp", srcDir, dstDir}); err != nil {
+		t.Fatalf("cp run failed: %v", err)
+	}
+
+	cases := []struct {
+		rel  string
+		want string
+	}{
+		{rel: "root.txt", want: "root"},
+		{rel: filepath.Join("nested", "child.txt"), want: "child"},
+	}
+
+	for _, tc := range cases {
+		data, err := os.ReadFile(filepath.Join(dstDir, tc.rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", tc.rel, err)
+		}
+		if string(data) != tc.want {
+			t.Fatalf("unexpected content for %s: %q", tc.rel, string(data))
+		}
+	}
+}
+
+func TestHFFilterFiles(t *testing.T) {
+	files := []string{"dir/file.txt", "dir/sub/file2.txt", "root.txt"}
+	got := hfFilterFiles(files, "/dir")
+	if len(got) != 2 || got[0] != "file.txt" || got[1] != "sub/file2.txt" {
+		t.Fatalf("unexpected filtered files: %#v", got)
+	}
+}
+
+func TestNormalizeHFPrefix(t *testing.T) {
+	if got := normalizeHFPrefix("///dir/sub"); got != "dir/sub" {
+		t.Fatalf("unexpected normalized prefix: %s", got)
+	}
+	if got := normalizeHFPrefix("/"); got != "" {
+		t.Fatalf("expected empty prefix, got: %s", got)
+	}
+}
+
+func TestHFListEntries(t *testing.T) {
+	files := []string{"dir/file.txt", "dir/sub/file2.txt", "root.txt"}
+	got := hfListEntries(files, "dir")
+	expected := []string{"file.txt", "sub/"}
+	if len(got) != len(expected) {
+		t.Fatalf("unexpected entry count: %#v", got)
+	}
+	for i, entry := range expected {
+		if got[i] != entry {
+			t.Fatalf("unexpected entry at %d: %s", i, got[i])
+		}
+	}
+}
+
+func TestHFSplitWildcard(t *testing.T) {
+	tests := []struct {
+		input      string
+		parentPath string
+		pattern    string
+	}{
+		{"hf://owner/repo", "hf://owner/repo", ""},
+		{"hf://owner/repo/*.bin", "hf://owner/repo/", "*.bin"},
+		{"hf://owner/repo/dir/*.bin", "hf://owner/repo/dir/", "*.bin"},
+	}
+	for _, tc := range tests {
+		parentPath, pattern := hfSplitWildcard(tc.input)
+		if parentPath != tc.parentPath || pattern != tc.pattern {
+			t.Fatalf("unexpected split for %s: %s %s", tc.input, parentPath, pattern)
+		}
 	}
 }
