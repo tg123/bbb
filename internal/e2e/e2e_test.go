@@ -163,7 +163,7 @@ func TestBasic(t *testing.T) {
 
 	// create container
 	{
-		_, err := runBBB("mkcontainer", "az://"+azuriteAccount+"/test")
+		_, err := runBBB("az", "mkcontainer", "az://"+azuriteAccount+"/test")
 		if err != nil {
 			t.Fatal(err)
 		}
