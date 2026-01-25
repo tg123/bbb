@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tg123/bbb/internal/hf"
@@ -186,5 +187,21 @@ func TestHFSplitWildcard(t *testing.T) {
 		if parentPath != tc.parentPath || pattern != tc.pattern {
 			t.Fatalf("unexpected split for %s: %s %s", tc.input, parentPath, pattern)
 		}
+	}
+}
+
+func TestWriteStreamToFile(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "nested", "file.txt")
+	content := "stream data"
+	if err := writeStreamToFile(dst, strings.NewReader(content), 0o644); err != nil {
+		t.Fatalf("writeStreamToFile failed: %v", err)
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read back failed: %v", err)
+	}
+	if string(data) != content {
+		t.Fatalf("unexpected content: %s", string(data))
 	}
 }

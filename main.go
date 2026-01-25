@@ -697,12 +697,17 @@ func cmdCat(ctx context.Context, c *cli.Command) error {
 				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
 				continue
 			}
-			data, err := azblob.Download(ctx, ap)
+			reader, err := azblob.DownloadStream(ctx, ap)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
 				continue
 			}
-			os.Stdout.Write(data)
+			if err := withReadCloser(reader, func(r io.Reader) error {
+				_, err := io.Copy(os.Stdout, r)
+				return err
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
+			}
 			continue
 		}
 		if isHF(p) {
@@ -711,12 +716,17 @@ func cmdCat(ctx context.Context, c *cli.Command) error {
 				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
 				continue
 			}
-			data, err := hf.Download(ctx, hfPath)
+			reader, err := hf.DownloadStream(ctx, hfPath)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
 				continue
 			}
-			os.Stdout.Write(data)
+			if err := withReadCloser(reader, func(r io.Reader) error {
+				_, err := io.Copy(os.Stdout, r)
+				return err
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
+			}
 			continue
 		}
 		f, err := os.Open(p)
@@ -862,18 +872,21 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		// src -> dstPath
 		if srcAz && dstAz {
 			dap, _ := azblob.Parse(dstPath)
-			data, err := azblob.Download(ctx, srcAzPath)
+			reader, err := azblob.DownloadStream(ctx, srcAzPath)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
 			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
+					reader.Close()
 					fmt.Fprintln(os.Stderr, "cp: destination exists")
 					os.Exit(1)
 				}
 			}
-			if err := azblob.Upload(ctx, dap, data); err != nil {
+			if err := withReadCloser(reader, func(r io.Reader) error {
+				return azblob.UploadStream(ctx, dap, r)
+			}); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
@@ -881,22 +894,21 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 				fmt.Printf("Copied %s -> %s\n", src, dstPath)
 			}
 		} else if srcAz && !dstAz {
-			data, err := azblob.Download(ctx, srcAzPath)
+			reader, err := azblob.DownloadStream(ctx, srcAzPath)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
 			if !overwrite {
 				if _, err := os.Stat(dstPath); err == nil {
+					reader.Close()
 					fmt.Fprintln(os.Stderr, "cp: destination exists")
 					os.Exit(1)
 				}
 			}
-			if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-			if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+			if err := withReadCloser(reader, func(r io.Reader) error {
+				return writeStreamToFile(dstPath, r, 0o644)
+			}); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
@@ -905,18 +917,21 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			}
 		} else if !srcAz && dstAz {
 			dap, _ := azblob.Parse(dstPath)
-			data, err := os.ReadFile(src)
+			reader, err := os.Open(src)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
 			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
+					reader.Close()
 					fmt.Fprintln(os.Stderr, "cp: destination exists")
 					os.Exit(1)
 				}
 			}
-			if err := azblob.Upload(ctx, dap, data); err != nil {
+			if err := withReadCloser(reader, func(r io.Reader) error {
+				return azblob.UploadStream(ctx, dap, r)
+			}); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
@@ -949,7 +964,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			}
 			var hadErrors bool
 			for _, bm := range list {
-				data, err := azblob.Download(ctx, sap.Child(bm.Name))
+				reader, err := azblob.DownloadStream(ctx, sap.Child(bm.Name))
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
 					hadErrors = true
@@ -957,12 +972,16 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				if !overwrite {
 					if _, err := azblob.HeadBlob(ctx, dap.Child(bm.Name)); err == nil {
+						reader.Close()
 						continue
 					}
 				}
-				if err := azblob.Upload(ctx, dap.Child(bm.Name), data); err != nil {
+				if err := withReadCloser(reader, func(r io.Reader) error {
+					return azblob.UploadStream(ctx, dap.Child(bm.Name), r)
+				}); err != nil {
 					fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, bm.Name, err)
 					hadErrors = true
+					continue
 				}
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", sap.Child(bm.Name).String(), dap.Child(bm.Name).String())
@@ -981,22 +1000,22 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			}
 			var hadErrors bool
 			for _, bm := range list {
-				data, err := azblob.Download(ctx, sap.Child(bm.Name))
+				reader, err := azblob.DownloadStream(ctx, sap.Child(bm.Name))
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
 					hadErrors = true
 					continue
 				}
 				outPath := filepath.Join(dst, bm.Name)
-				if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-					return err
-				}
 				if !overwrite {
 					if _, err := os.Stat(outPath); err == nil {
+						reader.Close()
 						continue
 					}
 				}
-				if err := os.WriteFile(outPath, data, 0o644); err != nil {
+				if err := withReadCloser(reader, func(r io.Reader) error {
+					return writeStreamToFile(outPath, r, 0o644)
+				}); err != nil {
 					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
 					hadErrors = true
 					continue
@@ -1024,7 +1043,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					return nil
 				}
 				rel, _ := filepath.Rel(src, p)
-				data, err := os.ReadFile(p)
+				reader, err := os.Open(p)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, rel, err)
 					hadErrors = true
@@ -1032,12 +1051,16 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				if !overwrite {
 					if _, err := azblob.HeadBlob(ctx, dap.Child(rel)); err == nil {
+						reader.Close()
 						return nil
 					}
 				}
-				if err := azblob.Upload(ctx, dap.Child(rel), data); err != nil {
+				if err := withReadCloser(reader, func(r io.Reader) error {
+					return azblob.UploadStream(ctx, dap.Child(rel), r)
+				}); err != nil {
 					fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, rel, err)
 					hadErrors = true
+					return nil
 				}
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", p, dap.Child(rel).String())
@@ -1059,28 +1082,33 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 }
 
 func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, overwrite, quiet, dstDir bool) error {
-	data, err := hf.Download(ctx, hfPath)
-	if err != nil {
-		return err
-	}
 	dstPath, err := resolveDstPath(dst, dstAz, base, dstDir)
 	if err != nil {
 		return err
 	}
 	if dstAz {
-		dap, err := azblob.Parse(dstPath)
+		reader, err := hf.DownloadStream(ctx, hfPath)
 		if err != nil {
 			return err
 		}
+		dap, err := azblob.Parse(dstPath)
+		if err != nil {
+			reader.Close()
+			return err
+		}
 		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
+			reader.Close()
 			return errors.New("cp: destination must be a blob path")
 		}
 		if !overwrite {
 			if _, err := azblob.HeadBlob(ctx, dap); err == nil {
+				reader.Close()
 				return errors.New("cp: destination exists")
 			}
 		}
-		if err := azblob.Upload(ctx, dap, data); err != nil {
+		if err := withReadCloser(reader, func(r io.Reader) error {
+			return azblob.UploadStream(ctx, dap, r)
+		}); err != nil {
 			return err
 		}
 	} else {
@@ -1089,10 +1117,13 @@ func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, ov
 				return errors.New("cp: destination exists")
 			}
 		}
-		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		reader, err := hf.DownloadStream(ctx, hfPath)
+		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+		if err := withReadCloser(reader, func(r io.Reader) error {
+			return writeStreamToFile(dstPath, r, 0o644)
+		}); err != nil {
 			return err
 		}
 	}
@@ -1109,40 +1140,46 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 	}
 	for _, file := range files {
 		filePath := hf.Path{Repo: hfPath.Repo, File: file}
-		data, err := hf.Download(ctx, filePath)
+		reader, err := hf.DownloadStream(ctx, filePath)
 		if err != nil {
 			return err
 		}
 		dstPath, err := resolveDstPath(dst, dstAz, file, true)
 		if err != nil {
+			reader.Close()
 			return err
 		}
 		if dstAz {
 			dap, err := azblob.Parse(dstPath)
 			if err != nil {
+				reader.Close()
 				return err
 			}
 			if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
+				reader.Close()
 				return errors.New("cp: destination must be a blob path")
 			}
 			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
+					reader.Close()
 					continue
 				}
 			}
-			if err := azblob.Upload(ctx, dap, data); err != nil {
+			if err := withReadCloser(reader, func(r io.Reader) error {
+				return azblob.UploadStream(ctx, dap, r)
+			}); err != nil {
 				return err
 			}
 		} else {
 			if !overwrite {
 				if _, err := os.Stat(dstPath); err == nil {
+					reader.Close()
 					continue
 				}
 			}
-			if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-				return err
-			}
-			if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+			if err := withReadCloser(reader, func(r io.Reader) error {
+				return writeStreamToFile(dstPath, r, 0o644)
+			}); err != nil {
 				return err
 			}
 		}
@@ -1151,6 +1188,30 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 		}
 	}
 	return nil
+}
+
+func writeStreamToFile(dstPath string, reader io.Reader, perm os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return err
+	}
+	dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(dstFile, reader)
+	closeErr := dstFile.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func withReadCloser(reader io.ReadCloser, fn func(io.Reader) error) error {
+	if reader == nil {
+		return errors.New("nil reader")
+	}
+	defer reader.Close()
+	return fn(reader)
 }
 
 func resolveDstPath(dst string, dstAz bool, base string, mustBeDir bool) (string, error) {
@@ -1403,7 +1464,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			if srcAz && dstAz {
 				sap, _ := azblob.Parse(src)
 				dap, _ := azblob.Parse(dst)
-				data, err := azblob.Download(ctx, sap.Child(sPath))
+				reader, err := azblob.DownloadStream(ctx, sap.Child(sPath))
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 					continue
@@ -1412,9 +1473,12 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					if !quiet {
 						fmt.Println("COPY", sap.Child(sPath).String(), "->", dap.Child(sPath).String())
 					}
+					reader.Close()
 					continue
 				}
-				if err := azblob.Upload(ctx, dap.Child(sPath), data); err != nil {
+				if err := withReadCloser(reader, func(r io.Reader) error {
+					return azblob.UploadStream(ctx, dap.Child(sPath), r)
+				}); err != nil {
 					fmt.Fprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
 				} else if !quiet {
 					fmt.Printf("Copied %s -> %s\n", sap.Child(sPath).String(), dap.Child(sPath).String())
@@ -1423,7 +1487,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			}
 			if srcAz && !dstAz {
 				sap, _ := azblob.Parse(src)
-				data, err := azblob.Download(ctx, sap.Child(sPath))
+				reader, err := azblob.DownloadStream(ctx, sap.Child(sPath))
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 					continue
@@ -1433,13 +1497,15 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					if !quiet {
 						fmt.Println("COPY", sap.Child(sPath).String(), "->", out)
 					}
+					reader.Close()
 					continue
 				}
-				if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-					fmt.Fprintf(os.Stderr, "sync mkdir: %v\n", err)
+				if err := withReadCloser(reader, func(r io.Reader) error {
+					return writeStreamToFile(out, r, 0o644)
+				}); err != nil {
+					fmt.Fprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 					continue
 				}
-				os.WriteFile(out, data, 0o644)
 				if !quiet {
 					fmt.Printf("Copied %s -> %s\n", sap.Child(sPath).String(), out)
 				}
@@ -1447,7 +1513,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			}
 			if !srcAz && dstAz {
 				dap, _ := azblob.Parse(dst)
-				data, err := os.ReadFile(filepath.Join(src, sPath))
+				reader, err := os.Open(filepath.Join(src, sPath))
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 					continue
@@ -1456,9 +1522,12 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					if !quiet {
 						fmt.Println("COPY", filepath.Join(src, sPath), "->", dap.Child(sPath).String())
 					}
+					reader.Close()
 					continue
 				}
-				if err := azblob.Upload(ctx, dap.Child(sPath), data); err != nil {
+				if err := withReadCloser(reader, func(r io.Reader) error {
+					return azblob.UploadStream(ctx, dap.Child(sPath), r)
+				}); err != nil {
 					fmt.Fprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
 				} else if !quiet {
 					fmt.Printf("Copied %s -> %s\n", filepath.Join(src, sPath), dap.Child(sPath).String())
