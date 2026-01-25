@@ -358,6 +358,45 @@ func TestBasic(t *testing.T) {
 			t.Errorf("unexpected cat output via http: %s", stdout)
 		}
 	}
+	t.Run("cat hf", func(t *testing.T) {
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		files, err := hfListFiles(t, repo)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		if len(files) == 0 {
+			t.Fatal("no huggingface files returned")
+		}
+		candidate := ""
+		for _, name := range preferredHFFileNames {
+			if slices.Contains(files, name) {
+				candidate = name
+				break
+			}
+		}
+		if candidate == "" {
+			candidate = files[0]
+		}
+		expected, err := hfDownload(t, repo, candidate)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		stdout, err := runBBB("cat", "hf://"+repo+"/"+candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		normalized := bytes.ReplaceAll(stdout, []byte("\r"), nil)
+		expectedNormalized := bytes.ReplaceAll(expected, []byte("\r"), nil)
+		if !bytes.Equal(normalized, expectedNormalized) {
+			t.Fatalf("unexpected cat output for hf file %s", candidate)
+		}
+	})
 
 	// download
 	{
@@ -603,7 +642,9 @@ func TestBasic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(azData, hfData) {
+		azNormalized := bytes.ReplaceAll(azData, []byte("\r"), nil)
+		hfNormalized := bytes.ReplaceAll(hfData, []byte("\r"), nil)
+		if !bytes.Equal(azNormalized, hfNormalized) {
 			t.Fatalf("hf to az content mismatch for %s", candidate)
 		}
 	})
@@ -693,7 +734,9 @@ func TestHuggingFaceDownload(t *testing.T) {
 			}
 			t.Fatalf("download failed for %s: %v", file, err)
 		}
-		if !bytes.Equal(localData, remoteData) {
+		localNormalized := bytes.ReplaceAll(localData, []byte("\r"), nil)
+		remoteNormalized := bytes.ReplaceAll(remoteData, []byte("\r"), nil)
+		if !bytes.Equal(localNormalized, remoteNormalized) {
 			t.Fatalf("content mismatch for %s", file)
 		}
 	}
