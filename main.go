@@ -26,6 +26,7 @@ import (
 )
 
 var mainver string = "(devel)"
+
 const hfScheme = "hf://"
 
 func version() string {
@@ -940,6 +941,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					hadErrors = true
 					continue
 				}
+				if !overwrite {
+					if _, err := azblob.HeadBlob(ctx, dap.Child(bm.Name)); err == nil {
+						continue
+					}
+				}
 				if err := azblob.Upload(ctx, dap.Child(bm.Name), data); err != nil {
 					fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, bm.Name, err)
 					hadErrors = true
@@ -1009,6 +1015,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, rel, err)
 					hadErrors = true
 					return nil
+				}
+				if !overwrite {
+					if _, err := azblob.HeadBlob(ctx, dap.Child(rel)); err == nil {
+						return nil
+					}
 				}
 				if err := azblob.Upload(ctx, dap.Child(rel), data); err != nil {
 					fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, rel, err)

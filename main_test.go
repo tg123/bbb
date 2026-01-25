@@ -173,9 +173,9 @@ func TestHFListEntries(t *testing.T) {
 
 func TestHFSplitWildcard(t *testing.T) {
 	tests := []struct {
-		input       string
-		parentPath  string
-		pattern     string
+		input      string
+		parentPath string
+		pattern    string
 	}{
 		{"hf://owner/repo", "hf://owner/repo", ""},
 		{"hf://owner/repo/*.bin", "hf://owner/repo/", "*.bin"},
@@ -188,4 +188,3 @@ func TestHFSplitWildcard(t *testing.T) {
 		}
 	}
 }
-      
