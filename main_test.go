@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/hf"
 	"github.com/urfave/cli/v3"
 )
@@ -168,24 +169,24 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 
 func TestHFFilterFiles(t *testing.T) {
 	files := []string{"dir/file.txt", "dir/sub/file2.txt", "root.txt"}
-	got := hfFilterFiles(files, "/dir")
+	got := bbbfs.HFFilterFiles(files, "/dir")
 	if len(got) != 2 || got[0] != "file.txt" || got[1] != "sub/file2.txt" {
 		t.Fatalf("unexpected filtered files: %#v", got)
 	}
 }
 
 func TestNormalizeHFPrefix(t *testing.T) {
-	if got := normalizeHFPrefix("///dir/sub"); got != "dir/sub" {
+	if got := bbbfs.NormalizeHFPrefix("///dir/sub"); got != "dir/sub" {
 		t.Fatalf("unexpected normalized prefix: %s", got)
 	}
-	if got := normalizeHFPrefix("/"); got != "" {
+	if got := bbbfs.NormalizeHFPrefix("/"); got != "" {
 		t.Fatalf("expected empty prefix, got: %s", got)
 	}
 }
 
 func TestHFListEntries(t *testing.T) {
 	files := []string{"dir/file.txt", "dir/sub/file2.txt", "root.txt"}
-	got := hfListEntries(files, "dir")
+	got := bbbfs.HFListEntries(files, "dir")
 	expected := []string{"file.txt", "sub/"}
 	if len(got) != len(expected) {
 		t.Fatalf("unexpected entry count: %#v", got)
@@ -208,7 +209,7 @@ func TestHFSplitWildcard(t *testing.T) {
 		{"hf://owner/repo/dir/*.bin", "hf://owner/repo/dir/", "*.bin"},
 	}
 	for _, tc := range tests {
-		parentPath, pattern := hfSplitWildcard(tc.input)
+		parentPath, pattern := splitWildcard(tc.input)
 		if parentPath != tc.parentPath || pattern != tc.pattern {
 			t.Fatalf("unexpected split for %s: %s %s", tc.input, parentPath, pattern)
 		}

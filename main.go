@@ -260,79 +260,6 @@ func main() {
 	// Remove any stray cli.Before assignment
 }
 
-func normalizeHFPrefix(prefix string) string {
-	for strings.HasPrefix(prefix, "/") {
-		prefix = strings.TrimPrefix(prefix, "/")
-	}
-	if prefix == "" {
-		return ""
-	}
-	prefix = path.Clean(prefix)
-	if prefix == "." {
-		return ""
-	}
-	return prefix
-}
-
-func hfFilterFiles(files []string, prefix string) []string {
-	prefix = normalizeHFPrefix(prefix)
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-	out := make([]string, 0, len(files))
-	for _, file := range files {
-		if file == "" {
-			continue
-		}
-		if prefix != "" {
-			if !strings.HasPrefix(file, prefix) {
-				continue
-			}
-			file = strings.TrimPrefix(file, prefix)
-			if file == "" {
-				continue
-			}
-		}
-		out = append(out, file)
-	}
-	return out
-}
-
-func hfListEntries(files []string, prefix string) []string {
-	seen := map[string]struct{}{}
-	for _, file := range hfFilterFiles(files, prefix) {
-		parts := strings.SplitN(file, "/", 2)
-		name := parts[0]
-		if name == "" {
-			continue
-		}
-		if len(parts) > 1 {
-			name += "/"
-		}
-		seen[name] = struct{}{}
-	}
-	entries := make([]string, 0, len(seen))
-	for name := range seen {
-		entries = append(entries, name)
-	}
-	sort.Strings(entries)
-	return entries
-}
-
-func hfSplitWildcard(target string) (string, string) {
-	parentPath := target
-	var pattern string
-	if strings.Contains(target, "*") {
-		starIdx := strings.Index(target, "*")
-		lastSlash := strings.LastIndex(target[:starIdx], "/")
-		if lastSlash >= len(hfScheme) {
-			parentPath = target[:lastSlash+1]
-			pattern = target[lastSlash+1:]
-		}
-	}
-	return parentPath, pattern
-}
-
 func cmdLS(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdLS called", "args", c.Args().Slice())
 	long := c.Bool("l")
@@ -343,164 +270,51 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 	}
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s")
-	if isHF(target) {
-		parentPath, pattern := hfSplitWildcard(target)
-		hp, err := hf.Parse(parentPath)
-		if err != nil {
-			return err
-		}
-		hp.File = normalizeHFPrefix(hp.File)
-		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
-		if err != nil {
-			return err
-		}
-		entries := hfListEntries(files, hp.File)
-		for _, name := range entries {
-			trimmed := strings.TrimSuffix(name, "/")
-			if trimmed == "" {
-				continue
-			}
-			if !all && len(trimmed) > 0 && trimmed[0] == '.' {
-				continue
-			}
-			if pattern != "" {
-				matched, err := path.Match(pattern, trimmed)
-				if err != nil {
-					return err
-				}
-				if !matched {
-					continue
-				}
-			}
-			fullFile := path.Join(hp.File, trimmed)
-			fullpath := hf.Path{Repo: hp.Repo, File: fullFile}.String()
-			displayPath := fullpath
-			if relFlag {
-				displayPath = trimmed
-			}
-			if long {
-				typ := "-"
-				if strings.HasSuffix(name, "/") {
-					typ = "d"
-				}
-				if machine {
-					fmt.Printf("%s\t%d\t-\t%s\n", typ, 0, displayPath)
-				} else {
-					fmt.Printf("%1s %10d %s %s\n", typ, 0, "-", displayPath)
-				}
-			} else {
-				fmt.Println(displayPath)
-			}
-		}
-		return nil
-	}
-	if isAz(target) {
-		// Wildcard support for Azure paths
-		var pattern string
-		var parentPath string
-		if strings.Contains(target, "*") {
-			// Split at last slash before the wildcard
-			lastSlash := strings.LastIndex(target, "/")
-			if lastSlash >= 0 {
-				parentPath = target[:lastSlash+1]
-				pattern = target[lastSlash+1:]
-			} else {
-				parentPath = target
-				pattern = "*"
-			}
-		} else {
-			parentPath = target
-		}
-		ap, err := azblob.Parse(parentPath)
-		if err != nil {
-			return err
-		}
-		list, err := azblob.List(ctx, ap)
-		if err != nil {
-			return err
-		}
-		sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
-		for _, bm := range list {
-			name := bm.Name
-			if name == "" {
-				continue
-			}
-			if !all && name[0] == '.' {
-				continue
-			}
-			// Wildcard filtering
-			if pattern != "" {
-				matched, _ := path.Match(pattern, strings.TrimSuffix(name, "/"))
-				if !matched {
-					continue
-				}
-			}
-			var fullpath string
-			if ap.Container == "" {
-				fullpath = fmt.Sprintf("az://%s/%s", ap.Account, strings.TrimSuffix(name, "/"))
-			} else if ap.Blob == "" {
-				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, strings.TrimSuffix(name, "/"))
-			} else {
-				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
-				fullpath = strings.TrimSuffix(fullpath, "/")
-			}
-			displayPath := fullpath
-			if relFlag {
-				displayPath = strings.TrimSuffix(name, "/")
-			}
-			if long {
-				typ := "-"
-				if strings.HasSuffix(name, "/") || (bm.Size == 0 && strings.HasSuffix(ap.Blob, "/")) || ap.Container == "" {
-					typ = "d"
-				}
-				if machine {
-					fmt.Printf("%s\t%d\t-\t%s\n", typ, bm.Size, displayPath)
-				} else {
-					fmt.Printf("%1s %10d %s %s\n", typ, bm.Size, "-", displayPath)
-				}
-			} else {
-				fmt.Println(displayPath)
-			}
-		}
-		return nil
-	}
-	entries, err := fsops.List(target)
+	parentPath, pattern := splitWildcard(target)
+	fs := bbbfs.Resolve(parentPath)
+	entries, err := fs.List(ctx, parentPath)
 	if err != nil {
 		return err
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	for _, e := range entries {
-		name := e.Name()
-		if !all && name != "." && name != ".." && name[0] == '.' {
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	for _, entry := range entries {
+		name := entry.Name
+		trimmed := strings.TrimSuffix(name, "/")
+		if trimmed == "" {
 			continue
 		}
-		if long {
-			info, err := e.Info()
+		if !all && len(trimmed) > 0 && trimmed[0] == '.' {
+			continue
+		}
+		if pattern != "" {
+			matched, err := path.Match(pattern, trimmed)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
+				return err
+			}
+			if !matched {
 				continue
 			}
-			mod := info.ModTime().Format(time.RFC3339)
-			size := info.Size()
+		}
+		displayPath := entry.Path
+		if relFlag {
+			displayPath = trimmed
+		}
+		if long {
 			typ := "-"
-			if info.IsDir() {
+			if entry.IsDir {
 				typ = "d"
 			}
-			outName := name
-			if relFlag {
-				outName = filepath.Clean(name)
+			mod := "-"
+			if !entry.ModTime.IsZero() {
+				mod = entry.ModTime.Format(time.RFC3339)
 			}
 			if machine {
-				fmt.Printf("%s\t%d\t%s\t%s\n", typ, size, mod, outName)
+				fmt.Printf("%s\t%d\t%s\t%s\n", typ, entry.Size, mod, displayPath)
 			} else {
-				fmt.Printf("%1s %10d %s %s\n", typ, size, mod, outName)
+				fmt.Printf("%1s %10d %s %s\n", typ, entry.Size, mod, displayPath)
 			}
 		} else {
-			outName := name
-			if relFlag {
-				outName = filepath.Clean(name)
-			}
-			fmt.Println(outName)
+			fmt.Println(displayPath)
 		}
 	}
 	return nil
@@ -520,156 +334,46 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s") || c.Bool("relative")
 
-	if isHF(root) {
-		parentPath, pattern := hfSplitWildcard(root)
-		hp, err := hf.Parse(parentPath)
-		if err != nil {
-			return err
-		}
-		hp.File = normalizeHFPrefix(hp.File)
-		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
-		if err != nil {
-			return err
-		}
-		list := hfFilterFiles(files, hp.File)
-		sort.Strings(list)
-		var count int64
-		for _, name := range list {
-			if name == "" {
-				continue
-			}
-			if pattern != "" {
-				last := name
-				if idx := strings.LastIndex(name, "/"); idx >= 0 {
-					last = name[idx+1:]
-				}
-				matched, err := path.Match(pattern, last)
-				if err != nil {
-					return err
-				}
-				if !matched {
-					continue
-				}
-			}
-			count++
-			fullFile := path.Join(hp.File, name)
-			fullpath := hf.Path{Repo: hp.Repo, File: fullFile}.String()
-			display := fullpath
-			if relFlag {
-				display = name
-			}
-			if longFlag {
-				if machine {
-					fmt.Printf("f\t%d\t-\t%s\n", 0, display)
-				} else {
-					fmt.Printf("%10d  -  %s\n", 0, display)
-				}
-			} else {
-				if machine {
-					fmt.Printf("f\t%s\n", display)
-				} else {
-					fmt.Println(display)
-				}
-			}
-		}
-		if !machine {
-			fmt.Printf("%d files\n", count)
-		}
-		return nil
+	parentPath, pattern := splitWildcard(root)
+	fs := bbbfs.Resolve(parentPath)
+	list, err := fs.ListRecursive(ctx, parentPath)
+	if err != nil {
+		return err
 	}
-	if isAz(root) {
-		// Wildcard support for Azure paths
-		var pattern string
-		if strings.Contains(root, "*") {
-			starIdx := strings.Index(root, "*")
-			pattern = root[starIdx:]
-			root = root[:starIdx]
-		}
-		ap, err := azblob.Parse(root)
-		if err != nil {
-			return err
-		}
-		list, err := azblob.ListRecursive(ctx, ap)
-		if err != nil {
-			return err
-		}
-		prefix := ap.Blob
-		if relFlag && prefix != "" && !strings.HasSuffix(prefix, "/") {
-			prefix += "/"
-		}
-		var count int64
-		for _, bm := range list {
-			name := bm.Name
-			if name == "" || strings.HasSuffix(name, "/") {
-				continue
-			}
-			// Wildcard filtering: match only last segment
-			if pattern != "" {
-				last := name
-				if idx := strings.LastIndex(name, "/"); idx >= 0 {
-					last = name[idx+1:]
-				}
-				matched, _ := path.Match(pattern, last)
-				if !matched {
-					continue
-				}
-			}
-			count++
-			fullpath := ap.Child(name).String()
-			display := fullpath
-			if relFlag && prefix != "" && strings.HasPrefix(name, prefix) {
-				display = strings.TrimPrefix(name, prefix)
-			}
-			if longFlag {
-				if machine {
-					fmt.Printf("f\t%d\t-\t%s\n", bm.Size, display)
-				} else {
-					fmt.Printf("%10d  -  %s\n", bm.Size, display)
-				}
-			} else {
-				if machine {
-					fmt.Printf("f\t%s\n", display)
-				} else {
-					fmt.Println(display)
-				}
-			}
-		}
-		if !machine {
-			fmt.Printf("%d files\n", count)
-		}
-		return nil
-	}
-
-	// Local
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	var count int64
-	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
+	for _, entry := range list {
+		name := entry.Name
+		if name == "" || entry.IsDir {
+			continue
 		}
-		if d.IsDir() {
-			return nil
+		if pattern != "" {
+			last := name
+			if idx := strings.LastIndex(name, "/"); idx >= 0 {
+				last = name[idx+1:]
+			}
+			matched, err := path.Match(pattern, last)
+			if err != nil {
+				return err
+			}
+			if !matched {
+				continue
+			}
 		}
 		count++
-		display := p
+		display := entry.Path
 		if relFlag {
-			if root == "." {
-				display = p
-			} else if rel, rerr := filepath.Rel(root, p); rerr == nil {
-				display = rel
-			}
+			display = name
 		}
 		if longFlag {
-			info, serr := os.Stat(p)
-			var size int64
-			var modStr string = "-"
-			if serr == nil {
-				size = info.Size()
-				modStr = info.ModTime().Format(time.RFC3339)
+			mod := "-"
+			if !entry.ModTime.IsZero() {
+				mod = entry.ModTime.Format(time.RFC3339)
 			}
 			if machine {
-				fmt.Printf("f\t%d\t%s\t%s\n", size, modStr, display)
+				fmt.Printf("f\t%d\t%s\t%s\n", entry.Size, mod, display)
 			} else {
-				fmt.Printf("%10d  %s  %s\n", size, modStr, display)
+				fmt.Printf("%10d  %s  %s\n", entry.Size, mod, display)
 			}
 		} else {
 			if machine {
@@ -678,15 +382,23 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 				fmt.Println(display)
 			}
 		}
-		return nil
-	})
-	if err != nil {
-		return err
 	}
 	if !machine {
 		fmt.Printf("%d files\n", count)
 	}
 	return nil
+}
+
+func splitWildcard(target string) (string, string) {
+	if strings.Contains(target, "*") {
+		starIdx := strings.Index(target, "*")
+		lastSlash := strings.LastIndex(target[:starIdx], "/")
+		if lastSlash >= 0 {
+			return target[:lastSlash+1], target[lastSlash+1:]
+		}
+		return target, "*"
+	}
+	return target, ""
 }
 
 func cmdCat(ctx context.Context, c *cli.Command) error {
@@ -1737,74 +1449,45 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 	}
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s")
-	if isAz(target) {
-		ap, err := azblob.Parse(target)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		ctx := context.Background()
-		list, err := azblob.List(ctx, ap)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		var totalSize int64
-		var count int
-		for _, bm := range list {
-			name := bm.Name
-			if name == "" || strings.HasSuffix(name, "/") {
-				continue // skip directories
-			}
-			fullpath := fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
-			fullpath = strings.TrimSuffix(fullpath, "/")
-			sizeMiB := float64(bm.Size) / (1024 * 1024)
-			mod := "-" // Placeholder, modtime not available
-			display := fullpath
-			if relFlag {
-				display = strings.TrimSuffix(name, "/")
-			}
-			if machine {
-				fmt.Printf("f\t%d\t%s\t%s\n", bm.Size, mod, display)
-			} else {
-				fmt.Printf("%10.1f MiB  %s  %s\n", sizeMiB, mod, display)
-			}
-			totalSize += bm.Size
-			count++
-		}
-		if !machine {
-			fmt.Printf("Listed %d files summing to %d bytes (%.1f MiB)\n", count, totalSize, float64(totalSize)/(1024*1024))
-		}
-		return nil
-	}
-	// fallback: local
-	entries, err := fsops.List(target)
+	parentPath, pattern := splitWildcard(target)
+	fs := bbbfs.Resolve(parentPath)
+	list, err := fs.List(ctx, parentPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	var totalSize int64
 	var count int
-	for _, e := range entries {
-		info, err := e.Info()
-		if err != nil {
+	for _, entry := range list {
+		name := entry.Name
+		if name == "" || entry.IsDir {
 			continue
 		}
-		if info.IsDir() {
-			continue
+		if pattern != "" {
+			matched, err := path.Match(pattern, strings.TrimSuffix(name, "/"))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			if !matched {
+				continue
+			}
 		}
-		sizeMiB := float64(info.Size()) / (1024 * 1024)
-		mod := info.ModTime().Format(time.RFC3339)
-		display := e.Name()
+		sizeMiB := float64(entry.Size) / (1024 * 1024)
+		mod := "-"
+		if !entry.ModTime.IsZero() {
+			mod = entry.ModTime.Format(time.RFC3339)
+		}
+		display := entry.Path
 		if relFlag {
-			display = filepath.Clean(e.Name())
+			display = strings.TrimSuffix(name, "/")
 		}
 		if machine {
-			fmt.Printf("f\t%d\t%s\t%s\n", info.Size(), mod, display)
+			fmt.Printf("f\t%d\t%s\t%s\n", entry.Size, mod, display)
 		} else {
 			fmt.Printf("%10.1f MiB  %s  %s\n", sizeMiB, mod, display)
 		}
-		totalSize += info.Size()
+		totalSize += entry.Size
 		count++
 	}
 	if !machine {
