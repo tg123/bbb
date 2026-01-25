@@ -570,6 +570,57 @@ func TestBasic(t *testing.T) {
 		}
 	})
 
+	t.Run("hf ls", func(t *testing.T) {
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		files, err := hfListFiles(t, repo)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		expected := ""
+		// bbb ls defaults to hiding dotfiles unless -a is provided
+		for _, file := range files {
+			if strings.Contains(file, "/") {
+				continue
+			}
+			if strings.HasPrefix(file, ".") {
+				continue
+			}
+			expected = file
+			break
+		}
+		if expected == "" {
+			// Fallback: accept any root entry (including dotfiles) if that's all there is.
+			for _, file := range files {
+				if file == "" {
+					continue
+				}
+				parts := strings.SplitN(file, "/", 2)
+				if parts[0] == "" {
+					continue
+				}
+				expected = parts[0]
+				break
+			}
+			if expected == "" {
+				t.Fatal("no huggingface root entries returned")
+			}
+		}
+		list, err := bbbLs("hf://"+repo, false)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		expectedPath := "hf://" + repo + "/" + expected
+		if !slices.Contains(list, expectedPath) {
+			t.Fatalf("expected hf file missing: %s", expected)
+		}
+	})
+
 }
 
 func TestHuggingFaceDownload(t *testing.T) {
