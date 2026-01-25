@@ -209,7 +209,7 @@ func TestHFSplitWildcard(t *testing.T) {
 		{"hf://owner/repo/dir/*.bin", "hf://owner/repo/dir/", "*.bin"},
 	}
 	for _, tc := range tests {
-		parentPath, pattern := splitWildcard(tc.input)
+		parentPath, pattern := hfSplitWildcard(tc.input)
 		if parentPath != tc.parentPath || pattern != tc.pattern {
 			t.Fatalf("unexpected split for %s: %s %s", tc.input, parentPath, pattern)
 		}
