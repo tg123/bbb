@@ -29,6 +29,7 @@ var (
 var ErrWriteUnsupported = errors.New("bbbfs: write not supported")
 
 func init() {
+	// Register order defines resolution priority for overlapping matches.
 	Register(hfFS{})
 	Register(azFS{})
 }
@@ -95,7 +96,7 @@ func (hfFS) Write(ctx context.Context, path string, r io.Reader) error {
 type localFS struct{}
 
 func (localFS) Match(path string) bool {
-	return !strings.HasPrefix(path, "az://") && !strings.HasPrefix(path, "hf://") && !azblob.IsBlobURL(path)
+	return !azFS{}.Match(path) && !hfFS{}.Match(path)
 }
 
 func (localFS) Read(ctx context.Context, path string) (io.ReadCloser, error) {
