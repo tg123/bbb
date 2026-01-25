@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
@@ -247,6 +248,12 @@ func main() {
 					&cli.StringFlag{Name: "x", Aliases: []string{"exclude"}, Usage: "Exclude files matching this regex"},
 				},
 				Action: cmdSync,
+			},
+			{
+				Name:      "md5sum",
+				Usage:     "Compute MD5 checksums (for integrity verification only)",
+				UsageText: "bbb md5sum paths [paths ...]",
+				Action:    cmdMD5Sum,
 			},
 		},
 	}
@@ -1491,6 +1498,70 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			return nil
 		})
 	}
+	return nil
+}
+
+func cmdMD5Sum(ctx context.Context, c *cli.Command) error {
+	slog.Debug("cmdMD5Sum called", "args", c.Args().Slice())
+	if c.Args().Len() == 0 {
+		return fmt.Errorf("md5sum: need at least one path")
+	}
+	for i := 0; i < c.Args().Len(); i++ {
+		p := c.Args().Get(i)
+		switch {
+		case isAz(p):
+			ap, err := azblob.Parse(p)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+				continue
+			}
+			reader, err := azblob.DownloadStream(ctx, ap)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+				continue
+			}
+			printMD5Sum(reader, p)
+		case isHF(p):
+			hfPath, err := hf.Parse(p)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+				continue
+			}
+			reader, err := hf.DownloadStream(ctx, hfPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+				continue
+			}
+			printMD5Sum(reader, p)
+		default:
+			f, err := os.Open(p)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+				continue
+			}
+			printMD5Sum(f, p)
+		}
+	}
+	return nil
+}
+
+func printMD5Sum(r io.ReadCloser, label string) {
+	if err := writeMD5SumReadCloser(r, label); err != nil {
+		fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", label, err)
+	}
+}
+
+func writeMD5SumReadCloser(r io.ReadCloser, label string) error {
+	defer r.Close()
+	return writeMD5Sum(r, label)
+}
+
+func writeMD5Sum(r io.Reader, label string) error {
+	hasher := md5.New()
+	if _, err := io.Copy(hasher, r); err != nil {
+		return err
+	}
+	fmt.Printf("%x  %s\n", hasher.Sum(nil), label)
 	return nil
 }
 

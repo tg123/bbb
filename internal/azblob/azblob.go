@@ -391,6 +391,15 @@ func HeadBlob(ctx context.Context, ap AzurePath) (int64, error) {
 
 // Download returns blob content bytes (for small blobs)
 func Download(ctx context.Context, ap AzurePath) ([]byte, error) {
+	reader, err := DownloadStream(ctx, ap)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return io.ReadAll(reader)
+}
+
+func DownloadStream(ctx context.Context, ap AzurePath) (io.ReadCloser, error) {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return nil, errors.New("cannot download directory")
 	}
@@ -407,11 +416,7 @@ func Download(ctx context.Context, ap AzurePath) ([]byte, error) {
 		}
 		return nil, err
 	}
-	data, err := io.ReadAll(downloadResp.Body)
-	if err != nil {
-		return nil, err
-	}
-	return data, nil
+	return downloadResp.Body, nil
 }
 
 // Upload writes blob (overwrite)

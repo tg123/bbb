@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,14 @@ var (
 	preferredHFFileNames = []string{"config.json", "README.md", "tokenizer.json"}
 	hfAzCopyPrefix       = fmt.Sprintf("az://%s/test/hf-copy", azuriteAccount)
 )
+
+func parseMD5Output(out []byte) string {
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
 
 func waitForEndpointReady(addr string) {
 	waitForEndpointReadyWithTimeout(addr, waitTimeout)
@@ -319,6 +328,25 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+	// md5sum
+	{
+		expected := fmt.Sprintf("%x", md5.Sum(content))
+		stdout, err := runBBB("md5sum", "az://"+azuriteAccount+"/test/testfile.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parseMD5Output(stdout); got != expected {
+			t.Fatalf("unexpected az md5sum: got %s, want %s", got, expected)
+		}
+		stdout, err = runBBB("md5sum", tmpFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parseMD5Output(stdout); got != expected {
+			t.Fatalf("unexpected local md5sum: got %s, want %s", got, expected)
+		}
+	}
+
 	// cat via http blob URL
 	{
 		httpURL := fmt.Sprintf("http://%s/test/testfile.txt", azuriteHost)
@@ -528,6 +556,16 @@ func TestBasic(t *testing.T) {
 				t.Skipf("huggingface unavailable: %v", err)
 			}
 			t.Fatal(err)
+		}
+		{
+			expected := fmt.Sprintf("%x", md5.Sum(hfData))
+			stdout, err := runBBB("md5sum", "hf://"+repo+"/"+candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := parseMD5Output(stdout); got != expected {
+				t.Fatalf("unexpected hf md5sum: got %s, want %s", got, expected)
+			}
 		}
 		dstPrefix := hfAzCopyPrefix
 		cleanFolder(t, dstPrefix)
