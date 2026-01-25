@@ -402,6 +402,7 @@ func splitWildcard(target string) (string, string) {
 }
 
 func hfSplitWildcard(target string) (string, string) {
+	// Keep wrapper for compatibility with existing tests.
 	return splitWildcard(target)
 }
 

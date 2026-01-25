@@ -34,10 +34,7 @@ func (hfFS) List(ctx context.Context, target string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	hp.File = normalizeHFPrefix(hp.File)
-	if hp.File != "" && !strings.HasSuffix(hp.File, "/") {
-		hp.File += "/"
-	}
+	hp.File = hfListPrefix(hp.File)
 	files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 	if err != nil {
 		return nil, err
@@ -54,7 +51,7 @@ func (hfFS) List(ctx context.Context, target string) ([]Entry, error) {
 		out = append(out, Entry{
 			Name:    name,
 			Path:    fullpath,
-			Size:    0,
+			Size:    0, // HF API list doesn't expose size/modtime.
 			IsDir:   strings.HasSuffix(name, "/"),
 			ModTime: time.Time{},
 		})
@@ -67,10 +64,7 @@ func (hfFS) ListRecursive(ctx context.Context, target string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	hp.File = normalizeHFPrefix(hp.File)
-	if hp.File != "" && !strings.HasSuffix(hp.File, "/") {
-		hp.File += "/"
-	}
+	hp.File = hfListPrefix(hp.File)
 	files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 	if err != nil {
 		return nil, err
@@ -87,7 +81,7 @@ func (hfFS) ListRecursive(ctx context.Context, target string) ([]Entry, error) {
 		out = append(out, Entry{
 			Name:    name,
 			Path:    fullpath,
-			Size:    0,
+			Size:    0, // HF API list doesn't expose size/modtime.
 			IsDir:   strings.HasSuffix(name, "/"),
 			ModTime: time.Time{},
 		})
@@ -112,7 +106,7 @@ func (hfFS) Stat(ctx context.Context, target string) (Entry, error) {
 	return Entry{
 		Name:    path.Base(hp.File),
 		Path:    hp.String(),
-		Size:    0,
+		Size:    0, // HF API doesn't expose size/modtime for single file metadata.
 		IsDir:   false,
 		ModTime: time.Time{},
 	}, nil
@@ -138,6 +132,14 @@ func normalizeHFPrefix(prefix string) string {
 	prefix = path.Clean(prefix)
 	if prefix == "." {
 		return ""
+	}
+	return prefix
+}
+
+func hfListPrefix(prefix string) string {
+	prefix = normalizeHFPrefix(prefix)
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
 	}
 	return prefix
 }

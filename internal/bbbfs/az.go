@@ -116,7 +116,7 @@ func azChildPath(ap azblob.AzurePath, name string) string {
 	if ap.Container == "" || ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return ap.Child(trimmed).String()
 	}
-	return ap.Child(path.Join(ap.Blob, trimmed)).String()
+	return ap.Child(trimmed).String()
 }
 
 func pathBase(name string) string {
