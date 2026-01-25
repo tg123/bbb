@@ -1214,9 +1214,6 @@ func writeStreamToFile(dstPath string, reader io.Reader, perm os.FileMode) error
 }
 
 func withReadCloser(reader io.ReadCloser, fn func(io.Reader) error) error {
-	if reader == nil {
-		return errors.New("nil reader")
-	}
 	defer reader.Close()
 	return fn(reader)
 }
