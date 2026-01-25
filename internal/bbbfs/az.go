@@ -112,16 +112,11 @@ func (azFS) Stat(ctx context.Context, target string) (Entry, error) {
 }
 
 func azChildPath(ap azblob.AzurePath, name string) string {
-	if ap.Container == "" {
-		return ap.Child(strings.TrimSuffix(name, "/")).String()
+	trimmed := strings.TrimSuffix(name, "/")
+	if ap.Container == "" || ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
+		return ap.Child(trimmed).String()
 	}
-	if ap.Blob == "" {
-		return ap.Child(strings.TrimSuffix(name, "/")).String()
-	}
-	if strings.HasSuffix(ap.Blob, "/") {
-		return ap.Child(strings.TrimSuffix(name, "/")).String()
-	}
-	return ap.Child(path.Join(ap.Blob, strings.TrimSuffix(name, "/"))).String()
+	return ap.Child(path.Join(ap.Blob, trimmed)).String()
 }
 
 func pathBase(name string) string {
