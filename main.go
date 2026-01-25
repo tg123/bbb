@@ -401,11 +401,6 @@ func splitWildcard(target string) (string, string) {
 	return target, ""
 }
 
-func hfSplitWildcard(target string) (string, string) {
-	// Keep wrapper for compatibility with existing tests.
-	return splitWildcard(target)
-}
-
 func cmdCat(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdCat called", "args", c.Args().Slice())
 	if c.Args().Len() == 0 {

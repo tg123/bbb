@@ -13,6 +13,8 @@ import (
 
 type hfFS struct{}
 
+const hfUnknownSize = int64(0)
+
 func (hfFS) Match(path string) bool {
 	return IsHF(path)
 }
@@ -51,7 +53,7 @@ func (hfFS) List(ctx context.Context, target string) ([]Entry, error) {
 		out = append(out, Entry{
 			Name:    name,
 			Path:    fullpath,
-			Size:    0, // HF API list doesn't expose size/modtime.
+			Size:    hfUnknownSize, // HF API list doesn't expose size/modtime.
 			IsDir:   strings.HasSuffix(name, "/"),
 			ModTime: time.Time{},
 		})
@@ -81,7 +83,7 @@ func (hfFS) ListRecursive(ctx context.Context, target string) ([]Entry, error) {
 		out = append(out, Entry{
 			Name:    name,
 			Path:    fullpath,
-			Size:    0, // HF API list doesn't expose size/modtime.
+			Size:    hfUnknownSize, // HF API list doesn't expose size/modtime.
 			IsDir:   strings.HasSuffix(name, "/"),
 			ModTime: time.Time{},
 		})
@@ -106,7 +108,7 @@ func (hfFS) Stat(ctx context.Context, target string) (Entry, error) {
 	return Entry{
 		Name:    path.Base(hp.File),
 		Path:    hp.String(),
-		Size:    0, // HF API doesn't expose size/modtime for single file metadata.
+		Size:    hfUnknownSize, // HF API doesn't expose size/modtime for single file metadata.
 		IsDir:   false,
 		ModTime: time.Time{},
 	}, nil
