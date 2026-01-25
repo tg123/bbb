@@ -31,9 +31,10 @@ var (
 var ErrWriteUnsupported = errors.New("bbbfs: write not supported")
 
 func init() {
-	// Register order defines resolution priority if future schemes overlap.
+	// Register order defines resolution priority; localFS is the fallback.
 	Register(hfProvider)
 	Register(azProvider)
+	Register(localFS{})
 }
 
 // Register adds a filesystem provider.
@@ -98,7 +99,7 @@ func (hfFS) Write(ctx context.Context, path string, r io.Reader) error {
 type localFS struct{}
 
 func (localFS) Match(path string) bool {
-	return !azProvider.Match(path) && !hfProvider.Match(path)
+	return true
 }
 
 func (localFS) Read(ctx context.Context, path string) (io.ReadCloser, error) {
