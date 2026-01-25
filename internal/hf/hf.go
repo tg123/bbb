@@ -74,6 +74,15 @@ func (p Path) URL() (string, error) {
 
 // Download retrieves the contents of a file in a Hugging Face repository.
 func Download(ctx context.Context, p Path) ([]byte, error) {
+	rc, err := DownloadStream(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return io.ReadAll(rc)
+}
+
+func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	downloadURL, err := p.URL()
 	if err != nil {
 		return nil, err
@@ -86,15 +95,11 @@ func Download(ctx context.Context, p Path) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		resp.Body.Close()
 		return nil, fmt.Errorf("hf download failed: %s", resp.Status)
 	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	return data, nil
+	return resp.Body, nil
 }
 
 // ListFiles retrieves repo files for directory-like paths.
