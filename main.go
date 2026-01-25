@@ -705,6 +705,20 @@ func cmdCat(ctx context.Context, c *cli.Command) error {
 			os.Stdout.Write(data)
 			continue
 		}
+		if isHF(p) {
+			hfPath, err := hf.Parse(p)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
+				continue
+			}
+			data, err := hf.Download(ctx, hfPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
+				continue
+			}
+			os.Stdout.Write(data)
+			continue
+		}
 		f, err := os.Open(p)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
