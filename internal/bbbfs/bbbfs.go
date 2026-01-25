@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/tg123/bbb/internal/azblob"
 	"github.com/tg123/bbb/internal/hf"
@@ -19,7 +20,10 @@ type FS interface {
 	Write(ctx context.Context, path string, r io.Reader) error
 }
 
-var providers []FS
+var (
+	providers   []FS
+	providersMu sync.RWMutex
+)
 
 // ErrWriteUnsupported indicates that a backend does not support writes.
 var ErrWriteUnsupported = errors.New("bbbfs: write not supported")
@@ -31,11 +35,15 @@ func init() {
 
 // Register adds a filesystem provider.
 func Register(provider FS) {
+	providersMu.Lock()
+	defer providersMu.Unlock()
 	providers = append(providers, provider)
 }
 
 // Resolve returns the first filesystem provider that matches the path.
 func Resolve(path string) FS {
+	providersMu.RLock()
+	defer providersMu.RUnlock()
 	for _, provider := range providers {
 		if provider.Match(path) {
 			return provider
@@ -87,14 +95,20 @@ func (hfFS) Write(ctx context.Context, path string, r io.Reader) error {
 type localFS struct{}
 
 func (localFS) Match(path string) bool {
-	return true
+	return !strings.HasPrefix(path, "az://") && !strings.HasPrefix(path, "hf://") && !azblob.IsBlobURL(path)
 }
 
 func (localFS) Read(ctx context.Context, path string) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return os.Open(path)
 }
 
 func (localFS) Write(ctx context.Context, path string, r io.Reader) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return writeLocal(path, r)
 }
 
