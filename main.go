@@ -28,7 +28,7 @@ import (
 
 var mainver string = "(devel)"
 
-const hfScheme = "hf://"
+const hfScheme = bbbfs.HFScheme
 
 func version() string {
 	v := mainver
@@ -53,14 +53,11 @@ func version() string {
 }
 
 func isAz(s string) bool {
-	if strings.HasPrefix(s, "az://") {
-		return true
-	}
-	return azblob.IsBlobURL(s)
+	return bbbfs.IsAz(s)
 }
 
 func isHF(s string) bool {
-	return strings.HasPrefix(s, hfScheme)
+	return bbbfs.IsHF(s)
 }
 
 func main() {

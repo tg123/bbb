@@ -20,6 +20,9 @@ type FS interface {
 	Write(ctx context.Context, path string, r io.Reader) error
 }
 
+// HFScheme is the scheme prefix for Hugging Face paths.
+const HFScheme = "hf://"
+
 var (
 	providers       []FS
 	providersMu     sync.RWMutex
@@ -57,10 +60,20 @@ func Resolve(path string) FS {
 	return localFSProvider
 }
 
+// IsAz reports whether the path refers to an Azure blob resource.
+func IsAz(path string) bool {
+	return strings.HasPrefix(path, "az://") || azblob.IsBlobURL(path)
+}
+
+// IsHF reports whether the path refers to a Hugging Face resource.
+func IsHF(path string) bool {
+	return strings.HasPrefix(path, HFScheme)
+}
+
 type azFS struct{}
 
 func (azFS) Match(path string) bool {
-	return strings.HasPrefix(path, "az://") || azblob.IsBlobURL(path)
+	return IsAz(path)
 }
 
 func (azFS) Read(ctx context.Context, path string) (io.ReadCloser, error) {
@@ -82,7 +95,7 @@ func (azFS) Write(ctx context.Context, path string, r io.Reader) error {
 type hfFS struct{}
 
 func (hfFS) Match(path string) bool {
-	return strings.HasPrefix(path, "hf://")
+	return IsHF(path)
 }
 
 func (hfFS) Read(ctx context.Context, path string) (io.ReadCloser, error) {
