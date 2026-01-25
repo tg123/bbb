@@ -260,7 +260,7 @@ func main() {
 
 func hfFilterFiles(files []string, prefix string) []string {
 	if prefix != "" {
-		prefix = strings.TrimPrefix(prefix, "/")
+		prefix = strings.TrimLeft(prefix, "/")
 		if prefix != "" {
 			prefix = path.Clean(prefix)
 		}
@@ -341,7 +341,7 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		hp.File = strings.TrimPrefix(hp.File, "/")
+		hp.File = strings.TrimLeft(hp.File, "/")
 		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 		if err != nil {
 			return err
@@ -518,7 +518,7 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 		if err != nil {
 			return err
 		}
-		hp.File = strings.TrimPrefix(hp.File, "/")
+		hp.File = strings.TrimLeft(hp.File, "/")
 		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 		if err != nil {
 			return err
