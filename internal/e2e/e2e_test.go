@@ -580,24 +580,33 @@ func TestBasic(t *testing.T) {
 			t.Fatal(err)
 		}
 		expected := ""
+		// bbb ls defaults to hiding dotfiles unless -a is provided
 		for _, file := range files {
-			if !strings.Contains(file, "/") {
-				expected = file
-				break
+			if strings.Contains(file, "/") {
+				continue
 			}
+			if strings.HasPrefix(file, ".") {
+				continue
+			}
+			expected = file
+			break
 		}
 		if expected == "" {
-			if len(files) == 0 {
+			// Fallback: accept any root entry (including dotfiles) if that's all there is.
+			for _, file := range files {
+				if file == "" {
+					continue
+				}
+				parts := strings.SplitN(file, "/", 2)
+				if parts[0] == "" {
+					continue
+				}
+				expected = parts[0]
+				break
+			}
+			if expected == "" {
 				t.Fatal("no huggingface root entries returned")
 			}
-			if files[0] == "" {
-				t.Fatal("no huggingface root entries returned")
-			}
-			parts := strings.SplitN(files[0], "/", 2)
-			if parts[0] == "" {
-				t.Fatal("no huggingface root entries returned")
-			}
-			expected = parts[0]
 		}
 		list, err := bbbLs("hf://"+repo, false)
 		if err != nil {
