@@ -36,7 +36,7 @@ func (hfFS) List(ctx context.Context, target string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	hp.File = hfListPrefix(hp.File)
+	hp.File = hfFilterPrefix(hp.File)
 	files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 	if err != nil {
 		return nil, err
@@ -66,7 +66,7 @@ func (hfFS) ListRecursive(ctx context.Context, target string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	hp.File = hfListPrefix(hp.File)
+	hp.File = hfFilterPrefix(hp.File)
 	files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 	if err != nil {
 		return nil, err
@@ -136,10 +136,6 @@ func normalizeHFPrefix(prefix string) string {
 		return ""
 	}
 	return prefix
-}
-
-func hfListPrefix(prefix string) string {
-	return hfFilterPrefix(prefix)
 }
 
 func hfFilterPrefix(prefix string) string {
