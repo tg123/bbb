@@ -893,8 +893,9 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 		go func() {
 			defer wg.Done()
 			for op := range pending {
-				// Process received ops even if ctx is canceled to avoid dropping work; producers
-				// stop via sendOp on cancellation so workers only drain the bounded backlog.
+				// Process received ops even if ctx is canceled to avoid dropping queued work.
+				// Producers stop sending new work via sendOp on cancellation, so workers only
+				// need to drain the bounded channel.
 				if err := worker(op); err != nil {
 					mu.Lock()
 					collected = append(collected, err)
@@ -1317,7 +1318,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		})
 	}, func(work copyOp) error {
 		if work.isDir {
-			// Directory ops only carry dst; src is unused.
+			// Directory ops only carry dst; src is empty/ignored for these.
 			return os.MkdirAll(work.dst, 0o755)
 		}
 		return fsops.CopyFile(work.src, work.dst, overwrite)
