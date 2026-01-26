@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -203,6 +204,33 @@ func TestWorkerPoolRunsAll(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("worker pool did not complete")
+	}
+}
+
+func TestRunOpPoolProcessesAll(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	items := []int{1, 2, 3}
+	seen := make(map[int]struct{}, len(items))
+	var mu sync.Mutex
+	err := runOpPool(ctx, 2, func(pending chan<- int) error {
+		for _, item := range items {
+			if err := sendOp(ctx, pending, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, func(item int) error {
+		mu.Lock()
+		seen[item] = struct{}{}
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("runOpPool failed: %v", err)
+	}
+	if len(seen) != len(items) {
+		t.Fatalf("expected %d items, got %d", len(items), len(seen))
 	}
 }
 
