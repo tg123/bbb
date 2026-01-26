@@ -166,6 +166,30 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 	}
 }
 
+func TestWorkerPoolRunsAll(t *testing.T) {
+	count := 3
+	seen := make(chan int, count)
+	ops := make([]func() error, 0, count)
+	for i := 0; i < count; i++ {
+		i := i
+		ops = append(ops, func() error {
+			seen <- i
+			return nil
+		})
+	}
+	if err := runWorkerPool(2, ops); err != nil {
+		t.Fatalf("runWorkerPool failed: %v", err)
+	}
+	close(seen)
+	got := map[int]struct{}{}
+	for v := range seen {
+		got[v] = struct{}{}
+	}
+	if len(got) != count {
+		t.Fatalf("expected %d ops, got %d", count, len(got))
+	}
+}
+
 func TestHFFilterFiles(t *testing.T) {
 	files := []string{"dir/file.txt", "dir/sub/file2.txt", "root.txt"}
 	got := hfFilterFiles(files, "/dir")
