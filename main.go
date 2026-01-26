@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -197,7 +198,7 @@ func main() {
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
-					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
+					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 				},
 				Action: cmdCP,
 			},
@@ -213,7 +214,7 @@ func main() {
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "ignore nonexistent files"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
-					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
+					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 				},
 				Action: cmdRM,
 			},
@@ -224,7 +225,7 @@ func main() {
 				UsageText: "bbb rmtree [-q|--quiet] [--concurrency N] path",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
-					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
+					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 				},
 				Action: cmdRMTree,
 			},
@@ -242,7 +243,7 @@ func main() {
 					&cli.BoolFlag{Name: "dry-run", Usage: "show actions without applying"},
 					&cli.BoolFlag{Name: "delete", Usage: "Delete destination files that don't exist in source"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
-					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
+					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.StringFlag{Name: "x", Aliases: []string{"exclude"}, Usage: "Exclude files matching this regex"},
 				},
 				Action: cmdSync,
