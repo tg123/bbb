@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tg123/bbb/internal/hf"
 	"github.com/urfave/cli/v3"
@@ -163,6 +164,45 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 		if string(data) != tc.want {
 			t.Fatalf("unexpected content for %s: %q", tc.rel, string(data))
 		}
+	}
+}
+
+func TestWorkerPoolRunsAll(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	ops := []func() error{
+		func() error {
+			started <- struct{}{}
+			<-release
+			return nil
+		},
+		func() error {
+			started <- struct{}{}
+			<-release
+			return nil
+		},
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- runWorkerPool(ctx, 2, ops)
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatalf("expected worker %d to start", i+1)
+		}
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runWorkerPool failed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("worker pool did not complete")
 	}
 }
 
