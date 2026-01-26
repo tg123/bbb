@@ -193,12 +193,13 @@ func main() {
 			{
 				Name:      "cp",
 				Usage:     "Copy files or directories",
-				UsageText: "bbb cp [-q|--quiet] [--concurrency N] srcs [srcs ...] dst",
+				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
 				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
+					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
 				},
 				Action: cmdCP,
 			},
@@ -210,11 +211,12 @@ func main() {
 			{
 				Name:      "rm",
 				Usage:     "Remove file(s)",
-				UsageText: "bbb rm [-q|--quiet] [--concurrency N] paths [paths ...]",
+				UsageText: "bbb rm [-q|--quiet] [--concurrency N] [--retry-count N] paths [paths ...]",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "ignore nonexistent files"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
+					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
 				},
 				Action: cmdRM,
 			},
@@ -222,10 +224,11 @@ func main() {
 				Name:      "rmtree",
 				Aliases:   []string{"rmr"},
 				Usage:     "Remove directory tree",
-				UsageText: "bbb rmtree [-q|--quiet] [--concurrency N] path",
+				UsageText: "bbb rmtree [-q|--quiet] [--concurrency N] [--retry-count N] path",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
+					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
 				},
 				Action: cmdRMTree,
 			},
@@ -238,12 +241,13 @@ func main() {
 			{
 				Name:      "sync",
 				Usage:     "Synchronise two directory trees",
-				UsageText: "bbb sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] src dst",
+				UsageText: "bbb sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] src dst",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "dry-run", Usage: "show actions without applying"},
 					&cli.BoolFlag{Name: "delete", Usage: "Delete destination files that don't exist in source"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
+					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
 					&cli.StringFlag{Name: "x", Aliases: []string{"exclude"}, Usage: "Exclude files matching this regex"},
 				},
 				Action: cmdSync,
@@ -927,6 +931,31 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 	return errors.Join(collected...)
 }
 
+func retryOp(ctx context.Context, retryCount int, op func() error) error {
+	if retryCount < 0 {
+		retryCount = 0
+	}
+	var err error
+	for attempt := 0; attempt <= retryCount; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err = op()
+		if err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+func runOpPoolWithRetry[T any](ctx context.Context, concurrency int, retryCount int, producer func(chan<- T) error, worker func(T) error) error {
+	return runOpPool(ctx, concurrency, producer, func(op T) error {
+		return retryOp(ctx, retryCount, func() error {
+			return worker(op)
+		})
+	})
+}
+
 func cmdCP(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdCP called", "args", c.Args().Slice())
 	if c.Args().Len() < 2 {
@@ -935,6 +964,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	overwrite := c.Bool("f")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
+	retryCount := c.Int("retry-count")
 	srcs := make([]string, c.Args().Len()-1)
 	for i := 0; i < len(srcs); i++ {
 		srcs[i] = c.Args().Get(i)
@@ -1050,16 +1080,16 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	for _, op := range dirOps {
 		var err error
 		if op.srcHF {
-			err = copyHFDir(ctx, op.hf, op.dst, dstAz, overwrite, quiet, concurrency)
+			err = copyHFDir(ctx, op.hf, op.dst, dstAz, overwrite, quiet, concurrency, retryCount)
 		} else {
-			err = copyTree(ctx, op.src, op.dst, overwrite, quiet, "cp", concurrency)
+			err = copyTree(ctx, op.src, op.dst, overwrite, quiet, "cp", concurrency, retryCount)
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 	}
-	if err := runOpPool(ctx, concurrency, func(pending chan<- cpFileOp) error {
+	if err := runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
 			if err := sendOp(ctx, pending, op); err != nil {
 				return err
@@ -1149,7 +1179,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
-func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPrefix string, concurrency int) error {
+func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPrefix string, concurrency int, retryCount int) error {
 	if isAz(src) || isAz(dst) {
 		// naive recursive copy via listing + per-blob cp
 		srcAz, dstAz := isAz(src), isAz(dst)
@@ -1163,7 +1193,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			type azToAzOp struct {
 				name string
 			}
-			return runOpPool(ctx, concurrency, func(pending chan<- azToAzOp) error {
+			return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- azToAzOp) error {
 				for _, bm := range list {
 					if err := sendOp(ctx, pending, azToAzOp{name: bm.Name}); err != nil {
 						return err
@@ -1203,7 +1233,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			type azToLocalOp struct {
 				name string
 			}
-			return runOpPool(ctx, concurrency, func(pending chan<- azToLocalOp) error {
+			return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- azToLocalOp) error {
 				for _, bm := range list {
 					if err := sendOp(ctx, pending, azToLocalOp{name: bm.Name}); err != nil {
 						return err
@@ -1243,7 +1273,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			}
 			var walkErrors bool
 			var walkErr error
-			err := runOpPool(ctx, concurrency, func(pending chan<- localToAzOp) error {
+			err := runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- localToAzOp) error {
 				defer func() {
 					if walkErrors {
 						walkErr = fmt.Errorf("%s: one or more files failed to copy", errPrefix)
@@ -1302,7 +1332,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}
-	return runOpPool(ctx, concurrency, func(pending chan<- copyOp) error {
+	return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- copyOp) error {
 		return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -1380,7 +1410,7 @@ func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, ov
 	return nil
 }
 
-func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite, quiet bool, concurrency int) error {
+func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite, quiet bool, concurrency int, retryCount int) error {
 	files, err := hf.ListFiles(ctx, hfPath)
 	if err != nil {
 		return err
@@ -1388,7 +1418,7 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 	type hfOp struct {
 		file string
 	}
-	return runOpPool(ctx, concurrency, func(pending chan<- hfOp) error {
+	return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- hfOp) error {
 		for _, file := range files {
 			if err := sendOp(ctx, pending, hfOp{file: file}); err != nil {
 				return err
@@ -1541,6 +1571,7 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 	force := c.Bool("f")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
+	retryCount := c.Int("retry-count")
 	if c.Args().Len() == 0 {
 		return fmt.Errorf("rm: need at least one path")
 	}
@@ -1551,7 +1582,7 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 	type rmOp struct {
 		path string
 	}
-	return runOpPool(ctx, concurrency, func(pending chan<- rmOp) error {
+	return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- rmOp) error {
 		for _, p := range paths {
 			if err := sendOp(ctx, pending, rmOp{path: p}); err != nil {
 				return err
@@ -1595,6 +1626,7 @@ func cmdRMTree(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdRMTree called", "args", c.Args().Slice())
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
+	retryCount := c.Int("retry-count")
 	if c.Args().Len() != 1 {
 		return fmt.Errorf("rmtree: need directory root")
 	}
@@ -1611,7 +1643,7 @@ func cmdRMTree(ctx context.Context, c *cli.Command) error {
 		type rmTreeOp struct {
 			name string
 		}
-		return runOpPool(ctx, concurrency, func(pending chan<- rmTreeOp) error {
+		return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- rmTreeOp) error {
 			for _, bm := range list {
 				if bm.Name == "" || strings.HasSuffix(bm.Name, "/") {
 					continue
@@ -1698,6 +1730,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 	quiet := c.Bool("q") || c.Bool("quiet")
 	exclude := c.String("x")
 	concurrency := c.Int("concurrency")
+	retryCount := c.Int("retry-count")
 	src, dst := c.Args().Get(0), c.Args().Get(1)
 	if isHF(dst) {
 		return fmt.Errorf("sync: hf:// only supported as source")
@@ -1795,7 +1828,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				return err
 			}
 		}
-		workerErr := runOpPool(ctx, concurrency, func(pending chan<- item) error {
+		workerErr := runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- item) error {
 			for _, f := range files {
 				if err := sendOp(ctx, pending, f); err != nil {
 					return err
@@ -1914,7 +1947,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		srcSet = make(map[string]struct{})
 	}
 	// copy/update
-	workerErr := runOpPool(ctx, concurrency, func(pending chan<- syncOp) error {
+	workerErr := runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- syncOp) error {
 		return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -1966,7 +1999,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		type deleteOp struct {
 			path string
 		}
-		if err := runOpPool(ctx, concurrency, func(pending chan<- deleteOp) error {
+		if err := runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- deleteOp) error {
 			return filepath.WalkDir(dst, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
 					return err
