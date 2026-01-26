@@ -893,7 +893,8 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 		go func() {
 			defer wg.Done()
 			for op := range pending {
-				// Process received ops even if ctx is canceled to avoid dropping work.
+				// Process received ops even if ctx is canceled to avoid dropping work; producers
+				// are expected to stop via sendOp so workers only drain pending items.
 				if err := worker(op); err != nil {
 					mu.Lock()
 					collected = append(collected, err)
@@ -1299,7 +1300,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}
-	// Pre-create directories to preserve empty folders without blocking the op pipeline.
+	// Pre-create directories to preserve empty folders; extra walk avoids blocking the op pipeline.
 	if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
