@@ -776,7 +776,27 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
-func runWorkerPool(concurrency int, ops []func() error) error {
+var outputMu sync.Mutex
+
+func lockedPrintf(format string, args ...any) {
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	fmt.Printf(format, args...)
+}
+
+func lockedPrintln(args ...any) {
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	fmt.Println(args...)
+}
+
+func lockedFprintf(w io.Writer, format string, args ...any) {
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	fmt.Fprintf(w, format, args...)
+}
+
+func runWorkerPool(ctx context.Context, concurrency int, ops []func() error) error {
 	if len(ops) == 0 {
 		return nil
 	}
@@ -786,13 +806,24 @@ func runWorkerPool(concurrency int, ops []func() error) error {
 	if concurrency > len(ops) {
 		concurrency = len(ops)
 	}
+	var collected []error
 	if concurrency == 1 {
 		for _, op := range ops {
+			if err := ctx.Err(); err != nil {
+				collected = append(collected, err)
+				break
+			}
 			if err := op(); err != nil {
-				return err
+				collected = append(collected, err)
 			}
 		}
-		return nil
+		if len(collected) == 0 {
+			return nil
+		}
+		if len(collected) == 1 {
+			return collected[0]
+		}
+		return errors.Join(collected...)
 	}
 	work := make(chan func() error, len(ops))
 	for _, op := range ops {
@@ -805,9 +836,17 @@ func runWorkerPool(concurrency int, ops []func() error) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for op := range work {
-				if err := op(); err != nil {
-					errs <- err
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case op, ok := <-work:
+					if !ok {
+						return
+					}
+					if err := op(); err != nil {
+						errs <- err
+					}
 				}
 			}
 		}()
@@ -816,10 +855,19 @@ func runWorkerPool(concurrency int, ops []func() error) error {
 	close(errs)
 	for err := range errs {
 		if err != nil {
-			return err
+			collected = append(collected, err)
 		}
 	}
-	return nil
+	if err := ctx.Err(); err != nil {
+		collected = append(collected, err)
+	}
+	if len(collected) == 0 {
+		return nil
+	}
+	if len(collected) == 1 {
+		return collected[0]
+	}
+	return errors.Join(collected...)
 }
 
 func cmdCP(ctx context.Context, c *cli.Command) error {
@@ -930,7 +978,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 					return err
 				}
 				if !quiet {
-					fmt.Printf("Copied %s -> %s\n", src, dstPath)
+					lockedPrintf("Copied %s -> %s\n", src, dstPath)
 				}
 			} else if srcAz && !dstAz {
 				reader, err := azblob.DownloadStream(ctx, srcAzPath)
@@ -949,7 +997,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 					return err
 				}
 				if !quiet {
-					fmt.Printf("Copied %s -> %s\n", src, dstPath)
+					lockedPrintf("Copied %s -> %s\n", src, dstPath)
 				}
 			} else if !srcAz && dstAz {
 				dap, _ := azblob.Parse(dstPath)
@@ -969,14 +1017,14 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 					return err
 				}
 				if !quiet {
-					fmt.Printf("Copied %s -> %s\n", src, dstPath)
+					lockedPrintf("Copied %s -> %s\n", src, dstPath)
 				}
 			} else {
 				if err := fsops.CopyFile(src, dstPath, overwrite); err != nil {
 					return fmt.Errorf("cp: %w", err)
 				}
 				if !quiet {
-					fmt.Printf("Copied %s -> %s\n", src, dstPath)
+					lockedPrintf("Copied %s -> %s\n", src, dstPath)
 				}
 			}
 			return nil
@@ -988,7 +1036,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			os.Exit(1)
 		}
 	}
-	if err := runWorkerPool(concurrency, fileOps); err != nil {
+	if err := runWorkerPool(ctx, concurrency, fileOps); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -1012,7 +1060,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				ops = append(ops, func() error {
 					reader, err := azblob.DownloadStream(ctx, sap.Child(bm.Name))
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+						lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
 						return err
 					}
 					if !overwrite {
@@ -1024,16 +1072,16 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					if err := withReadCloser(reader, func(r io.Reader) error {
 						return azblob.UploadStream(ctx, dap.Child(bm.Name), r)
 					}); err != nil {
-						fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, bm.Name, err)
+						lockedFprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, bm.Name, err)
 						return err
 					}
 					if !quiet {
-						fmt.Printf("Copied %s -> %s\n", sap.Child(bm.Name).String(), dap.Child(bm.Name).String())
+						lockedPrintf("Copied %s -> %s\n", sap.Child(bm.Name).String(), dap.Child(bm.Name).String())
 					}
 					return nil
 				})
 			}
-			if err := runWorkerPool(concurrency, ops); err != nil {
+			if err := runWorkerPool(ctx, concurrency, ops); err != nil {
 				return err
 			}
 			return nil
@@ -1050,7 +1098,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				ops = append(ops, func() error {
 					reader, err := azblob.DownloadStream(ctx, sap.Child(bm.Name))
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+						lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
 						return err
 					}
 					outPath := filepath.Join(dst, bm.Name)
@@ -1063,16 +1111,16 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					if err := withReadCloser(reader, func(r io.Reader) error {
 						return writeStreamToFile(outPath, r, 0o644)
 					}); err != nil {
-						fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
+						lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, bm.Name, err)
 						return err
 					}
 					if !quiet {
-						fmt.Printf("Copied %s -> %s\n", sap.Child(bm.Name).String(), outPath)
+						lockedPrintf("Copied %s -> %s\n", sap.Child(bm.Name).String(), outPath)
 					}
 					return nil
 				})
 			}
-			if err := runWorkerPool(concurrency, ops); err != nil {
+			if err := runWorkerPool(ctx, concurrency, ops); err != nil {
 				return err
 			}
 			return nil
@@ -1083,8 +1131,8 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			var files []string
 			if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, p, err)
-					return nil
+					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, p, err)
+					return err
 				}
 				if d.IsDir() {
 					return nil
@@ -1101,7 +1149,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					rel, _ := filepath.Rel(src, p)
 					reader, err := os.Open(p)
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "%s: %s: %v\n", errPrefix, rel, err)
+						lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, rel, err)
 						return err
 					}
 					if !overwrite {
@@ -1113,16 +1161,16 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					if err := withReadCloser(reader, func(r io.Reader) error {
 						return azblob.UploadStream(ctx, dap.Child(rel), r)
 					}); err != nil {
-						fmt.Fprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, rel, err)
+						lockedFprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, rel, err)
 						return err
 					}
 					if !quiet {
-						fmt.Printf("Copied %s -> %s\n", p, dap.Child(rel).String())
+						lockedPrintf("Copied %s -> %s\n", p, dap.Child(rel).String())
 					}
 					return nil
 				})
 			}
-			if err := runWorkerPool(concurrency, ops); err != nil {
+			if err := runWorkerPool(ctx, concurrency, ops); err != nil {
 				return err
 			}
 			return nil
@@ -1163,7 +1211,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			return fsops.CopyFile(p, filepath.Join(dst, rel), overwrite)
 		})
 	}
-	if err := runWorkerPool(concurrency, ops); err != nil {
+	if err := runWorkerPool(ctx, concurrency, ops); err != nil {
 		return err
 	}
 	return nil
@@ -1216,7 +1264,7 @@ func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, ov
 		}
 	}
 	if !quiet {
-		fmt.Printf("Copied %s -> %s\n", hfPath.String(), dstPath)
+		lockedPrintf("Copied %s -> %s\n", hfPath.String(), dstPath)
 	}
 	return nil
 }
@@ -1275,12 +1323,12 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 				}
 			}
 			if !quiet {
-				fmt.Printf("Copied %s -> %s\n", filePath.String(), dstPath)
+				lockedPrintf("Copied %s -> %s\n", filePath.String(), dstPath)
 			}
 			return nil
 		})
 	}
-	return runWorkerPool(concurrency, ops)
+	return runWorkerPool(ctx, concurrency, ops)
 }
 
 func writeStreamToFile(dstPath string, reader io.Reader, perm os.FileMode) error {
@@ -1403,7 +1451,7 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 					return err
 				}
 				if !quiet {
-					fmt.Printf("Deleted %s\n", p)
+					lockedPrintf("Deleted %s\n", p)
 				}
 			} else {
 				if err := os.Remove(p); err != nil {
@@ -1413,13 +1461,13 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 					return err
 				}
 				if !quiet {
-					fmt.Printf("Deleted %s\n", p)
+					lockedPrintf("Deleted %s\n", p)
 				}
 			}
 			return nil
 		})
 	}
-	return runWorkerPool(concurrency, ops)
+	return runWorkerPool(ctx, concurrency, ops)
 }
 
 func cmdRMTree(ctx context.Context, c *cli.Command) error {
@@ -1447,23 +1495,23 @@ func cmdRMTree(ctx context.Context, c *cli.Command) error {
 			bm := bm
 			ops = append(ops, func() error {
 				if err := azblob.Delete(ctx, ap.Child(bm.Name)); err != nil {
-					fmt.Fprintf(os.Stderr, "rmtree: %s: %v\n", bm.Name, err)
+					lockedFprintf(os.Stderr, "rmtree: %s: %v\n", bm.Name, err)
 					return err
 				}
 				if !quiet {
-					fmt.Printf("Deleted %s\n", ap.Child(bm.Name).String())
+					lockedPrintf("Deleted %s\n", ap.Child(bm.Name).String())
 				}
 				return nil
 			})
 		}
-		if err := runWorkerPool(concurrency, ops); err != nil {
+		if err := runWorkerPool(ctx, concurrency, ops); err != nil {
 			return err
 		}
 		return nil
 	}
 	err := os.RemoveAll(root)
 	if err == nil && !quiet {
-		fmt.Printf("Deleted %s\n", root)
+		lockedPrintf("Deleted %s\n", root)
 	}
 	return err
 }
@@ -1630,12 +1678,12 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				if srcAz && dstAz {
 					reader, err := azblob.DownloadStream(ctx, sap.Child(sPath))
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-						return nil
+						lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
+						return err
 					}
 					if dry {
 						if !quiet {
-							fmt.Println("COPY", sap.Child(sPath).String(), "->", dap.Child(sPath).String())
+							lockedPrintln("COPY", sap.Child(sPath).String(), "->", dap.Child(sPath).String())
 						}
 						reader.Close()
 						return nil
@@ -1643,11 +1691,11 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					if err := withReadCloser(reader, func(r io.Reader) error {
 						return azblob.UploadStream(ctx, dap.Child(sPath), r)
 					}); err != nil {
-						fmt.Fprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
-						return nil
+						lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
+						return err
 					}
 					if !quiet {
-						fmt.Printf("Copied %s -> %s\n", sap.Child(sPath).String(), dap.Child(sPath).String())
+						lockedPrintf("Copied %s -> %s\n", sap.Child(sPath).String(), dap.Child(sPath).String())
 					}
 					return nil
 				}
@@ -1655,34 +1703,34 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					hfFile := hf.Path{Repo: hfPath.Repo, File: sPath}
 					if dry {
 						if !quiet {
-							fmt.Println("COPY", hfFile.String(), "->", dap.Child(sPath).String())
+						lockedPrintln("COPY", hfFile.String(), "->", dap.Child(sPath).String())
 						}
 						return nil
 					}
 					data, err := hf.Download(ctx, hfFile)
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-						return nil
+						lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
+						return err
 					}
 					if err := azblob.Upload(ctx, dap.Child(sPath), data); err != nil {
-						fmt.Fprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
-						return nil
+						lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
+						return err
 					}
 					if !quiet {
-						fmt.Printf("Copied %s -> %s\n", hfFile.String(), dap.Child(sPath).String())
+						lockedPrintf("Copied %s -> %s\n", hfFile.String(), dap.Child(sPath).String())
 					}
 					return nil
 				}
 				if srcAz && !dstAz {
 					reader, err := azblob.DownloadStream(ctx, sap.Child(sPath))
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-						return nil
+						lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
+						return err
 					}
 					out := filepath.Join(dst, sPath)
 					if dry {
 						if !quiet {
-							fmt.Println("COPY", sap.Child(sPath).String(), "->", out)
+							lockedPrintln("COPY", sap.Child(sPath).String(), "->", out)
 						}
 						reader.Close()
 						return nil
@@ -1690,23 +1738,23 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					if err := withReadCloser(reader, func(r io.Reader) error {
 						return writeStreamToFile(out, r, 0o644)
 					}); err != nil {
-						fmt.Fprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-						return nil
+						lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
+						return err
 					}
 					if !quiet {
-						fmt.Printf("Copied %s -> %s\n", sap.Child(sPath).String(), out)
+						lockedPrintf("Copied %s -> %s\n", sap.Child(sPath).String(), out)
 					}
 					return nil
 				}
 				if !srcAz && dstAz {
 					reader, err := os.Open(filepath.Join(src, sPath))
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-						return nil
+						lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
+						return err
 					}
 					if dry {
 						if !quiet {
-							fmt.Println("COPY", filepath.Join(src, sPath), "->", dap.Child(sPath).String())
+							lockedPrintln("COPY", filepath.Join(src, sPath), "->", dap.Child(sPath).String())
 						}
 						reader.Close()
 						return nil
@@ -1714,18 +1762,18 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					if err := withReadCloser(reader, func(r io.Reader) error {
 						return azblob.UploadStream(ctx, dap.Child(sPath), r)
 					}); err != nil {
-						fmt.Fprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
-						return nil
+						lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
+						return err
 					}
 					if !quiet {
-						fmt.Printf("Copied %s -> %s\n", filepath.Join(src, sPath), dap.Child(sPath).String())
+						lockedPrintf("Copied %s -> %s\n", filepath.Join(src, sPath), dap.Child(sPath).String())
 					}
 					return nil
 				}
 				return nil
 			})
 		}
-		if err := runWorkerPool(concurrency, ops); err != nil {
+		if err := runWorkerPool(ctx, concurrency, ops); err != nil {
 			return err
 		}
 		// delete phase not implemented for cloud combos yet
@@ -1769,11 +1817,11 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			if needCopy {
 				if dry {
 					if !quiet {
-						fmt.Println("COPY", sPath, "->", dPath)
+						lockedPrintln("COPY", sPath, "->", dPath)
 					}
 				} else {
 					if err := fsops.CopyFile(sPath, dPath, true); err != nil {
-						fmt.Fprintf(os.Stderr, "sync copy: %s: %v\n", r, err)
+						lockedFprintf(os.Stderr, "sync copy: %s: %v\n", r, err)
 						return err
 					}
 					// preserve modtime
@@ -1781,14 +1829,14 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 						os.Chtimes(dPath, info.ModTime(), info.ModTime())
 					}
 					if !quiet {
-						fmt.Printf("Copied %s -> %s\n", sPath, dPath)
+						lockedPrintf("Copied %s -> %s\n", sPath, dPath)
 					}
 				}
 			}
 			return nil
 		})
 	}
-	if err := runWorkerPool(concurrency, ops); err != nil {
+	if err := runWorkerPool(ctx, concurrency, ops); err != nil {
 		return err
 	}
 	if del {
@@ -1815,18 +1863,18 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			ops = append(ops, func() error {
 				if dry {
 					if !quiet {
-						fmt.Println("DELETE", p)
+						lockedPrintln("DELETE", p)
 					}
 					return nil
 				}
 				os.Remove(p)
 				if !quiet {
-					fmt.Printf("Deleted %s\n", p)
+					lockedPrintf("Deleted %s\n", p)
 				}
 				return nil
 			})
 		}
-		if err := runWorkerPool(concurrency, ops); err != nil {
+		if err := runWorkerPool(ctx, concurrency, ops); err != nil {
 			return err
 		}
 	}

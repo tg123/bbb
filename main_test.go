@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tg123/bbb/internal/hf"
 	"github.com/urfave/cli/v3"
@@ -167,26 +168,41 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 }
 
 func TestWorkerPoolRunsAll(t *testing.T) {
-	count := 3
-	seen := make(chan int, count)
-	ops := make([]func() error, 0, count)
-	for i := 0; i < count; i++ {
-		i := i
-		ops = append(ops, func() error {
-			seen <- i
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	ops := []func() error{
+		func() error {
+			started <- struct{}{}
+			<-release
 			return nil
-		})
+		},
+		func() error {
+			started <- struct{}{}
+			<-release
+			return nil
+		},
 	}
-	if err := runWorkerPool(2, ops); err != nil {
-		t.Fatalf("runWorkerPool failed: %v", err)
+	done := make(chan error, 1)
+	go func() {
+		done <- runWorkerPool(ctx, 2, ops)
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatalf("expected worker %d to start", i+1)
+		}
 	}
-	close(seen)
-	got := map[int]struct{}{}
-	for v := range seen {
-		got[v] = struct{}{}
-	}
-	if len(got) != count {
-		t.Fatalf("expected %d ops, got %d", count, len(got))
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runWorkerPool failed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("worker pool did not complete")
 	}
 }
 
