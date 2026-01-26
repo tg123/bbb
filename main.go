@@ -1172,7 +1172,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					return nil
 				})
 			}
-			walkErr := error(nil)
+			var walkErr error
 			if walkErrors {
 				walkErr = fmt.Errorf("%s: one or more files failed to copy", errPrefix)
 			}
@@ -1709,7 +1709,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					hfFile := hf.Path{Repo: hfPath.Repo, File: sPath}
 					if dry {
 						if !quiet {
-						lockedPrintln("COPY", hfFile.String(), "->", dap.Child(sPath).String())
+							lockedPrintln("COPY", hfFile.String(), "->", dap.Child(sPath).String())
 						}
 						return nil
 					}
