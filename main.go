@@ -1317,6 +1317,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		})
 	}, func(work copyOp) error {
 		if work.isDir {
+			// Directory ops only carry dst; src is unused.
 			return os.MkdirAll(work.dst, 0o755)
 		}
 		return fsops.CopyFile(work.src, work.dst, overwrite)
