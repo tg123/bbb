@@ -1129,10 +1129,12 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			dap, _ := azblob.Parse(dst)
 			// walk local
 			var files []string
+			var walkErrors bool
 			if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
 					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, p, err)
-					return err
+					walkErrors = true
+					return nil
 				}
 				if d.IsDir() {
 					return nil
@@ -1170,10 +1172,14 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					return nil
 				})
 			}
-			if err := runWorkerPool(ctx, concurrency, ops); err != nil {
-				return err
+			walkErr := error(nil)
+			if walkErrors {
+				walkErr = fmt.Errorf("%s: one or more files failed to copy", errPrefix)
 			}
-			return nil
+			if err := runWorkerPool(ctx, concurrency, ops); err != nil {
+				return errors.Join(err, walkErr)
+			}
+			return walkErr
 		}
 	}
 	var files []string
@@ -1679,7 +1685,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					reader, err := azblob.DownloadStream(ctx, sap.Child(sPath))
 					if err != nil {
 						lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-						return err
+						return fmt.Errorf("sync: %s: %w", sPath, err)
 					}
 					if dry {
 						if !quiet {
@@ -1692,7 +1698,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 						return azblob.UploadStream(ctx, dap.Child(sPath), r)
 					}); err != nil {
 						lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
-						return err
+						return fmt.Errorf("sync upload: %s: %w", sPath, err)
 					}
 					if !quiet {
 						lockedPrintf("Copied %s -> %s\n", sap.Child(sPath).String(), dap.Child(sPath).String())
@@ -1710,11 +1716,11 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					data, err := hf.Download(ctx, hfFile)
 					if err != nil {
 						lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-						return err
+						return fmt.Errorf("sync: %s: %w", sPath, err)
 					}
 					if err := azblob.Upload(ctx, dap.Child(sPath), data); err != nil {
 						lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
-						return err
+						return fmt.Errorf("sync upload: %s: %w", sPath, err)
 					}
 					if !quiet {
 						lockedPrintf("Copied %s -> %s\n", hfFile.String(), dap.Child(sPath).String())
@@ -1725,7 +1731,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					reader, err := azblob.DownloadStream(ctx, sap.Child(sPath))
 					if err != nil {
 						lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-						return err
+						return fmt.Errorf("sync: %s: %w", sPath, err)
 					}
 					out := filepath.Join(dst, sPath)
 					if dry {
@@ -1739,7 +1745,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 						return writeStreamToFile(out, r, 0o644)
 					}); err != nil {
 						lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-						return err
+						return fmt.Errorf("sync: %s: %w", sPath, err)
 					}
 					if !quiet {
 						lockedPrintf("Copied %s -> %s\n", sap.Child(sPath).String(), out)
@@ -1750,7 +1756,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					reader, err := os.Open(filepath.Join(src, sPath))
 					if err != nil {
 						lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-						return err
+						return fmt.Errorf("sync: %s: %w", sPath, err)
 					}
 					if dry {
 						if !quiet {
@@ -1763,7 +1769,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 						return azblob.UploadStream(ctx, dap.Child(sPath), r)
 					}); err != nil {
 						lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
-						return err
+						return fmt.Errorf("sync upload: %s: %w", sPath, err)
 					}
 					if !quiet {
 						lockedPrintf("Copied %s -> %s\n", filepath.Join(src, sPath), dap.Child(sPath).String())
@@ -1773,11 +1779,12 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				return nil
 			})
 		}
-		if err := runWorkerPool(ctx, concurrency, ops); err != nil {
-			return err
+		workerErr := runWorkerPool(ctx, concurrency, ops)
+		if workerErr != nil {
+			lockedFprintf(os.Stderr, "sync: one or more files failed\n")
 		}
 		// delete phase not implemented for cloud combos yet
-		return nil
+		return workerErr
 	}
 	// collect source files
 	var srcFiles []string
@@ -1836,8 +1843,9 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			return nil
 		})
 	}
-	if err := runWorkerPool(ctx, concurrency, ops); err != nil {
-		return err
+	workerErr := runWorkerPool(ctx, concurrency, ops)
+	if workerErr != nil {
+		lockedFprintf(os.Stderr, "sync: one or more files failed\n")
 	}
 	if del {
 		var deleteFiles []string
@@ -1875,10 +1883,10 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			})
 		}
 		if err := runWorkerPool(ctx, concurrency, ops); err != nil {
-			return err
+			return errors.Join(workerErr, err)
 		}
 	}
-	return nil
+	return workerErr
 }
 
 func cmdMD5Sum(ctx context.Context, c *cli.Command) error {
