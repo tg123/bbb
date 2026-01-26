@@ -894,7 +894,7 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 			defer wg.Done()
 			for op := range pending {
 				// Process received ops even if ctx is canceled to avoid dropping work; producers
-				// are expected to stop via sendOp so workers only drain pending items.
+				// stop via sendOp on cancellation so workers only drain the bounded backlog.
 				if err := worker(op); err != nil {
 					mu.Lock()
 					collected = append(collected, err)
@@ -1294,26 +1294,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		}
 	}
 	type copyOp struct {
-		src string
-		dst string
+		src   string
+		dst   string
+		isDir bool
 	}
 	if err := os.MkdirAll(dst, 0o755); err != nil {
-		return err
-	}
-	// Pre-create directories to preserve empty folders; extra walk avoids blocking the op pipeline.
-	if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(src, p)
-		if rel == "." {
-			return nil
-		}
-		if d.IsDir() {
-			return os.MkdirAll(filepath.Join(dst, rel), 0o755)
-		}
-		return nil
-	}); err != nil {
 		return err
 	}
 	return runOpPool(ctx, concurrency, func(pending chan<- copyOp) error {
@@ -1326,11 +1311,14 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				return nil
 			}
 			if d.IsDir() {
-				return nil
+				return sendOp(ctx, pending, copyOp{dst: filepath.Join(dst, rel), isDir: true})
 			}
 			return sendOp(ctx, pending, copyOp{src: p, dst: filepath.Join(dst, rel)})
 		})
 	}, func(work copyOp) error {
+		if work.isDir {
+			return os.MkdirAll(work.dst, 0o755)
+		}
 		return fsops.CopyFile(work.src, work.dst, overwrite)
 	})
 }
