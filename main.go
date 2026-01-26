@@ -893,13 +893,13 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 		go func() {
 			defer wg.Done()
 			for op := range pending {
-				if ctx.Err() != nil {
-					return
-				}
 				if err := worker(op); err != nil {
 					mu.Lock()
 					collected = append(collected, err)
 					mu.Unlock()
+				}
+				if ctx.Err() != nil {
+					return
 				}
 			}
 		}()
@@ -1157,17 +1157,17 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			if err != nil {
 				return err
 			}
-			type op struct {
+			type azToAzOp struct {
 				name string
 			}
-			return runOpPool(ctx, concurrency, func(pending chan<- op) error {
+			return runOpPool(ctx, concurrency, func(pending chan<- azToAzOp) error {
 				for _, bm := range list {
-					if err := sendOp(ctx, pending, op{name: bm.Name}); err != nil {
+					if err := sendOp(ctx, pending, azToAzOp{name: bm.Name}); err != nil {
 						return err
 					}
 				}
 				return nil
-			}, func(work op) error {
+			}, func(work azToAzOp) error {
 				reader, err := azblob.DownloadStream(ctx, sap.Child(work.name))
 				if err != nil {
 					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
@@ -1197,17 +1197,17 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			if err != nil {
 				return err
 			}
-			type op struct {
+			type azToLocalOp struct {
 				name string
 			}
-			return runOpPool(ctx, concurrency, func(pending chan<- op) error {
+			return runOpPool(ctx, concurrency, func(pending chan<- azToLocalOp) error {
 				for _, bm := range list {
-					if err := sendOp(ctx, pending, op{name: bm.Name}); err != nil {
+					if err := sendOp(ctx, pending, azToLocalOp{name: bm.Name}); err != nil {
 						return err
 					}
 				}
 				return nil
-			}, func(work op) error {
+			}, func(work azToLocalOp) error {
 				reader, err := azblob.DownloadStream(ctx, sap.Child(work.name))
 				if err != nil {
 					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
@@ -1235,12 +1235,12 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		if !srcAz && dstAz { // local -> Azure
 			dap, _ := azblob.Parse(dst)
 			// walk local
-			type op struct {
+			type localToAzOp struct {
 				rel string
 			}
 			var walkErrors bool
 			var walkErr error
-			err := runOpPool(ctx, concurrency, func(pending chan<- op) error {
+			err := runOpPool(ctx, concurrency, func(pending chan<- localToAzOp) error {
 				defer func() {
 					if walkErrors {
 						walkErr = fmt.Errorf("%s: one or more files failed to copy", errPrefix)
@@ -1256,12 +1256,12 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 						return nil
 					}
 					rel, _ := filepath.Rel(src, p)
-					if sendErr := sendOp(ctx, pending, op{rel: rel}); sendErr != nil {
+					if sendErr := sendOp(ctx, pending, localToAzOp{rel: rel}); sendErr != nil {
 						return sendErr
 					}
 					return nil
 				})
-			}, func(work op) error {
+			}, func(work localToAzOp) error {
 				p := filepath.Join(src, work.rel)
 				reader, err := os.Open(p)
 				if err != nil {
@@ -1298,6 +1298,21 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}
+	if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, p)
+		if rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			return os.MkdirAll(filepath.Join(dst, rel), 0o755)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
 	return runOpPool(ctx, concurrency, func(pending chan<- copyOp) error {
 		return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 			if err != nil {
@@ -1308,7 +1323,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				return nil
 			}
 			if d.IsDir() {
-				return os.MkdirAll(filepath.Join(dst, rel), 0o755)
+				return nil
 			}
 			return sendOp(ctx, pending, copyOp{src: p, dst: filepath.Join(dst, rel)})
 		})
