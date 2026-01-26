@@ -1869,12 +1869,14 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					}
 					return nil
 				}
-				data, err := hf.Download(ctx, hfFile)
+				reader, err := hf.DownloadStream(ctx, hfFile)
 				if err != nil {
 					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 					return fmt.Errorf("sync: %s: %w", sPath, err)
 				}
-				if err := azblob.Upload(ctx, dap.Child(sPath), data); err != nil {
+				if err := withReadCloser(reader, func(r io.Reader) error {
+					return azblob.UploadStream(ctx, dap.Child(sPath), r)
+				}); err != nil {
 					lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
 					return fmt.Errorf("sync upload: %s: %w", sPath, err)
 				}
