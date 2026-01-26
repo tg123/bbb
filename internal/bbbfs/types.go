@@ -14,7 +14,6 @@ type FS interface {
 	Read(ctx context.Context, path string) (io.ReadCloser, error)
 	Write(ctx context.Context, path string, r io.Reader) error
 	List(ctx context.Context, path string) ([]Entry, error)
-	ListRecursive(ctx context.Context, path string) ([]Entry, error)
 	Stat(ctx context.Context, path string) (Entry, error)
 }
 
