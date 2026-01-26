@@ -404,16 +404,8 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 				return serr
 			}
 			rel := p
-			if relFlag {
-				if parentPath == "." {
-					rel = p
-				} else if relPath, rerr := filepath.Rel(parentPath, p); rerr == nil {
-					rel = relPath
-				}
-			} else if parentPath != "." {
-				if relPath, rerr := filepath.Rel(parentPath, p); rerr == nil {
-					rel = relPath
-				}
+			if relPath, rerr := filepath.Rel(parentPath, p); rerr == nil {
+				rel = relPath
 			}
 			list = append(list, bbbfs.Entry{
 				Name:    rel,
