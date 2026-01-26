@@ -47,45 +47,13 @@ func (localFS) List(ctx context.Context, path string) ([]Entry, error) {
 		}
 		out = append(out, Entry{
 			Name:    name,
-			Path:    name,
+			Path:    filepath.Join(path, name),
 			Size:    info.Size(),
 			IsDir:   info.IsDir(),
 			ModTime: info.ModTime(),
 		})
 	}
 	return out, nil
-}
-
-func (localFS) ListRecursive(ctx context.Context, path string) ([]Entry, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if path == "" {
-		path = "."
-	}
-	out := []Entry{}
-	err := filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(path, p)
-		if err != nil {
-			return err
-		}
-		out = append(out, Entry{
-			Name:    rel,
-			Path:    p,
-			Size:    info.Size(),
-			IsDir:   info.IsDir(),
-			ModTime: info.ModTime(),
-		})
-		return nil
-	})
-	return out, err
 }
 
 func (localFS) Stat(ctx context.Context, path string) (Entry, error) {

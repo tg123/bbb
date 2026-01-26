@@ -335,90 +335,9 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	relFlag := c.Bool("s") || c.Bool("relative")
 
 	parentPath, pattern := splitWildcard(root)
-	var list []bbbfs.Entry
-	if isAz(parentPath) {
-		ap, err := azblob.Parse(parentPath)
-		if err != nil {
-			return err
-		}
-		azList, err := azblob.ListRecursive(ctx, ap)
-		if err != nil {
-			return err
-		}
-		list = make([]bbbfs.Entry, 0, len(azList))
-		for _, bm := range azList {
-			name := bm.Name
-			if name == "" || strings.HasSuffix(name, "/") {
-				continue
-			}
-			full := ap.Child(name).String()
-			list = append(list, bbbfs.Entry{
-				Name:  name,
-				Path:  full,
-				Size:  bm.Size,
-				IsDir: false,
-			})
-		}
-	} else if isHF(parentPath) {
-		hp, err := hf.Parse(parentPath)
-		if err != nil {
-			return err
-		}
-		hp.File = bbbfs.NormalizeHFPrefix(hp.File)
-		if hp.File != "" && !strings.HasSuffix(hp.File, "/") {
-			hp.File += "/"
-		}
-		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
-		if err != nil {
-			return err
-		}
-		filtered := bbbfs.HFFilterFiles(files, hp.File)
-		sort.Strings(filtered)
-		list = make([]bbbfs.Entry, 0, len(filtered))
-		for _, name := range filtered {
-			if name == "" {
-				continue
-			}
-			fullFile := path.Join(hp.File, name)
-			fullpath := hf.Path{Repo: hp.Repo, File: fullFile}.String()
-			list = append(list, bbbfs.Entry{
-				Name:  name,
-				Path:  fullpath,
-				Size:  0,
-				IsDir: false,
-			})
-		}
-	} else {
-		if parentPath == "" {
-			parentPath = "."
-		}
-		err := filepath.WalkDir(parentPath, func(p string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.IsDir() {
-				return nil
-			}
-			info, serr := d.Info()
-			if serr != nil {
-				return serr
-			}
-			rel := p
-			if relPath, rerr := filepath.Rel(parentPath, p); rerr == nil {
-				rel = relPath
-			}
-			list = append(list, bbbfs.Entry{
-				Name:    rel,
-				Path:    p,
-				Size:    info.Size(),
-				IsDir:   false,
-				ModTime: info.ModTime(),
-			})
-			return nil
-		})
-		if err != nil {
-			return err
-		}
+	list, err := bbbfs.ListRecursive(ctx, parentPath)
+	if err != nil {
+		return err
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	var count int64
