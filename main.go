@@ -1321,6 +1321,9 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			// Directory ops only carry dst; src is not used for these operations.
 			return os.MkdirAll(work.dst, 0o755)
 		}
+		if work.src == "" {
+			return errors.New("copytree: missing source path")
+		}
 		return fsops.CopyFile(work.src, work.dst, overwrite)
 	})
 }
