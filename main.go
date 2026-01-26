@@ -1780,9 +1780,6 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			})
 		}
 		workerErr := runWorkerPool(ctx, concurrency, ops)
-		if workerErr != nil {
-			lockedFprintf(os.Stderr, "sync: one or more files failed\n")
-		}
 		// delete phase not implemented for cloud combos yet
 		return workerErr
 	}
@@ -1844,9 +1841,6 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		})
 	}
 	workerErr := runWorkerPool(ctx, concurrency, ops)
-	if workerErr != nil {
-		lockedFprintf(os.Stderr, "sync: one or more files failed\n")
-	}
 	if del {
 		var deleteFiles []string
 		filepath.WalkDir(dst, func(p string, d os.DirEntry, err error) error {
