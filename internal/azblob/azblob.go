@@ -512,6 +512,14 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 		copyStatus = *props.CopyStatus
 	}
 	if copyStatus != blob.CopyStatusTypeSuccess {
+		statusDescription := ""
+		props, err := blobClient.GetProperties(ctx, nil)
+		if err == nil && props.CopyStatusDescription != nil {
+			statusDescription = *props.CopyStatusDescription
+		}
+		if statusDescription != "" {
+			return fmt.Errorf("copy failed with status %s: %s", copyStatus, statusDescription)
+		}
 		return fmt.Errorf("copy failed with status %s", copyStatus)
 	}
 	return nil

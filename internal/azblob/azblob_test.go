@@ -61,10 +61,18 @@ func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
 		t.Fatal("expected error for dir-like source")
 	}
+	src = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
+	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+		t.Fatal("expected error for trailing slash source")
+	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst = AzurePath{Account: "acct", Container: "container"}
 	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
 		t.Fatal("expected error for dir-like destination")
+	}
+	dst = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
+	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+		t.Fatal("expected error for trailing slash destination")
 	}
 }
 
