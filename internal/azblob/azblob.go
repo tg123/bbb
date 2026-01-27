@@ -474,12 +474,12 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 	if src.Account != dst.Account {
 		return errors.New("server-side copy requires same storage account")
 	}
+	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
+		return bloberror.MissingSharedKeyCredential
+	}
 	client, err := getAzBlobClient(ctx, dst.Account)
 	if err != nil {
 		return err
-	}
-	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
-		return bloberror.MissingSharedKeyCredential
 	}
 	blobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlobClient(dst.Blob)
 	copySource, err := blobSASURL(ctx, src)
@@ -523,7 +523,11 @@ func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
 		return "", err
 	}
 	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob)
-	return blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(copySASDuration()), nil)
+	sasURL, err := blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(copySASDuration()), nil)
+	if err != nil {
+		return "", fmt.Errorf("generate SAS URL: %w", err)
+	}
+	return sasURL, nil
 }
 
 func nextPollDelay(current time.Duration) time.Duration {
