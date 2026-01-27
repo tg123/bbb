@@ -382,7 +382,7 @@ func HeadBlob(ctx context.Context, ap AzurePath) (int64, error) {
 		return 0, err
 	}
 	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
-		props, err := blobClient.GetProperties(ctx, nil)
+	props, err := blobClient.GetProperties(ctx, nil)
 	if err != nil {
 		var respErr *azcore.ResponseError
 		if errors.As(err, &respErr) && respErr.ErrorCode == "BlobNotFound" {
