@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,6 +112,8 @@ func TestCmdSyncRejectsHFFilePath(t *testing.T) {
 			&cli.BoolFlag{Name: "dry-run"},
 			&cli.BoolFlag{Name: "delete"},
 			&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}},
+			&cli.IntFlag{Name: "concurrency", Value: 1},
+			&cli.IntFlag{Name: "retry-count", Value: 0},
 			&cli.StringFlag{Name: "x"},
 		},
 		Action: cmdSync,
@@ -142,6 +145,7 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 			&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 			&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 			&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
+			&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
 		},
 		Action: cmdCP,
 	}
@@ -232,6 +236,58 @@ func TestRunOpPoolProcessesAll(t *testing.T) {
 	}
 	if len(seen) != len(items) {
 		t.Fatalf("expected %d items, got %d", len(items), len(seen))
+	}
+}
+
+func TestRetryOpRetries(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	attempts := 0
+	err := retryOp(ctx, 2, func() error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("retry")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryOp failed: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+func TestRunOpPoolWithRetry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	items := []int{1, 2, 3}
+	attempts := make(map[int]int, len(items))
+	var mu sync.Mutex
+	err := runOpPoolWithRetry(ctx, 2, 1, func(pending chan<- int) error {
+		for _, item := range items {
+			if err := sendOp(ctx, pending, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, func(item int) error {
+		mu.Lock()
+		attempts[item]++
+		count := attempts[item]
+		mu.Unlock()
+		if count == 1 {
+			return errors.New("retry")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("runOpPoolWithRetry failed: %v", err)
+	}
+	for _, item := range items {
+		if attempts[item] != 2 {
+			t.Fatalf("expected item %d to retry once, got %d attempts", item, attempts[item])
+		}
 	}
 }
 
