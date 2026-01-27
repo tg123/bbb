@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"net/http/httptrace"
 
@@ -21,6 +22,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 )
 
 // MkContainer creates a new Azure Blob container
@@ -378,7 +382,7 @@ func HeadBlob(ctx context.Context, ap AzurePath) (int64, error) {
 		return 0, err
 	}
 	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
-	props, err := blobClient.GetProperties(ctx, nil)
+		props, err := blobClient.GetProperties(ctx, nil)
 	if err != nil {
 		var respErr *azcore.ResponseError
 		if errors.As(err, &respErr) && respErr.ErrorCode == "BlobNotFound" {
@@ -451,6 +455,66 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 		return fmt.Errorf("put failed: %v", err)
 	}
 	return nil
+}
+
+func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error {
+	if src.Blob == "" || strings.HasSuffix(src.Blob, "/") {
+		return errors.New("source path is directory-like")
+	}
+	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
+		return errors.New("destination path is directory-like")
+	}
+	if src.Account != dst.Account {
+		return errors.New("server-side copy requires same storage account")
+	}
+	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
+		return bloberror.MissingSharedKeyCredential
+	}
+	client, err := getAzBlobClient(ctx, dst.Account)
+	if err != nil {
+		return err
+	}
+	blobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlobClient(dst.Blob)
+	copySource, err := blobSASURL(ctx, src)
+	if err != nil {
+		return err
+	}
+	startCopy, err := blobClient.StartCopyFromURL(ctx, copySource, nil)
+	if err != nil {
+		return err
+	}
+	if startCopy.CopyStatus == nil {
+		return errors.New("copy status missing")
+	}
+	copyStatus := *startCopy.CopyStatus
+	for copyStatus == blob.CopyStatusTypePending {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+		props, err := blobClient.GetProperties(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if props.CopyStatus == nil {
+			return errors.New("copy status missing")
+		}
+		copyStatus = *props.CopyStatus
+	}
+	if copyStatus != blob.CopyStatusTypeSuccess {
+		return fmt.Errorf("copy failed with status %s", copyStatus)
+	}
+	return nil
+}
+
+func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
+	client, err := getAzBlobClient(ctx, ap.Account)
+	if err != nil {
+		return "", err
+	}
+	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob)
+	return blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(15*time.Minute), nil)
 }
 
 // Delete deletes a single blob
