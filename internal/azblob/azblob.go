@@ -493,9 +493,17 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 	if startCopy.CopyStatus == nil {
 		return errors.New("copy status missing")
 	}
-	copyStatus := *startCopy.CopyStatus
 	var lastProps blob.GetPropertiesResponse
 	hasProps := false
+	copyStatus := *startCopy.CopyStatus
+	if copyStatus != blob.CopyStatusTypePending {
+		props, err := blobClient.GetProperties(ctx, nil)
+		if err == nil && props.CopyStatus != nil {
+			lastProps = props
+			hasProps = true
+			copyStatus = *props.CopyStatus
+		}
+	}
 	pollDelay := copyPollInitialDelay
 	for copyStatus == blob.CopyStatusTypePending {
 		select {
