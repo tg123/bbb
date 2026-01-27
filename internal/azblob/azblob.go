@@ -89,6 +89,13 @@ var validBlobSuffixes = []string{
 	".blob.localhost",
 }
 
+const (
+	defaultCopySASExpiry  = time.Hour
+	copyPollInitialDelay  = time.Second
+	copyPollMaxDelay      = 30 * time.Second
+	copyPollBackoffFactor = 2
+)
+
 // IsBlobURL performs a lightweight check whether the provided string is a blob endpoint URL.
 func IsBlobURL(raw string) bool {
 	u, err := url.Parse(raw)
@@ -487,12 +494,14 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 		return errors.New("copy status missing")
 	}
 	copyStatus := *startCopy.CopyStatus
+	pollDelay := copyPollInitialDelay
 	for copyStatus == blob.CopyStatusTypePending {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Second):
+		case <-time.After(pollDelay):
 		}
+		pollDelay = nextPollDelay(pollDelay)
 		props, err := blobClient.GetProperties(ctx, nil)
 		if err != nil {
 			return err
@@ -514,7 +523,27 @@ func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
 		return "", err
 	}
 	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob)
-	return blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(15*time.Minute), nil)
+	return blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(copySASExpiry()), nil)
+}
+
+func nextPollDelay(current time.Duration) time.Duration {
+	if current >= copyPollMaxDelay {
+		return copyPollMaxDelay
+	}
+	next := current * copyPollBackoffFactor
+	if next > copyPollMaxDelay {
+		return copyPollMaxDelay
+	}
+	return next
+}
+
+func copySASExpiry() time.Duration {
+	if raw := os.Getenv("BBB_AZBLOB_COPY_SAS_EXPIRY"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return defaultCopySASExpiry
 }
 
 // Delete deletes a single blob

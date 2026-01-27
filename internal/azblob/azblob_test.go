@@ -56,17 +56,23 @@ func TestParseRejectsNonBlobHTTPS(t *testing.T) {
 
 func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 	ctx := context.Background()
-	if err := CopyBlobServerSide(ctx, AzurePath{Account: "acct", Container: "container"}, AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}); err == nil {
+	src := AzurePath{Account: "acct", Container: "container"}
+	dst := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
+	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
 		t.Fatal("expected error for dir-like source")
 	}
-	if err := CopyBlobServerSide(ctx, AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}, AzurePath{Account: "acct", Container: "container"}); err == nil {
+	src = AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
+	dst = AzurePath{Account: "acct", Container: "container"}
+	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
 		t.Fatal("expected error for dir-like destination")
 	}
 }
 
 func TestCopyBlobServerSideRequiresSameAccount(t *testing.T) {
 	ctx := context.Background()
-	err := CopyBlobServerSide(ctx, AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}, AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"})
+	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
+	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
+	err := CopyBlobServerSide(ctx, src, dst)
 	if err == nil {
 		t.Fatal("expected error for cross-account copy")
 	}
@@ -75,7 +81,9 @@ func TestCopyBlobServerSideRequiresSameAccount(t *testing.T) {
 func TestCopyBlobServerSideRequiresSharedKey(t *testing.T) {
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
 	ctx := context.Background()
-	err := CopyBlobServerSide(ctx, AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}, AzurePath{Account: "acct", Container: "container", Blob: "other.txt"})
+	src := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
+	dst := AzurePath{Account: "acct", Container: "container", Blob: "other.txt"}
+	err := CopyBlobServerSide(ctx, src, dst)
 	if !errors.Is(err, bloberror.MissingSharedKeyCredential) {
 		t.Fatalf("expected missing shared key error, got %v", err)
 	}
