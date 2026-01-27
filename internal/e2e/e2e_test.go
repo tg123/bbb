@@ -317,6 +317,27 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+	// cp az az (directory-style destination)
+	{
+		_, err := runBBB("cp", "az://"+azuriteAccount+"/test/testfile.txt", "az://"+azuriteAccount+"/test/dir/")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		files, err := bbbLs("az://"+azuriteAccount+"/test/dir/testfile*", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/dir/testfile.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("unexpected files: got %v, want %v", files, expected)
+		}
+	}
+
 	// cat
 	{
 		stdout, err := runBBB("cat", "az://"+azuriteAccount+"/test/testfile.txt")
