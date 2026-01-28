@@ -238,6 +238,14 @@ func TestRunOpPoolProcessesAll(t *testing.T) {
 	}
 }
 
+func TestFormatProgressBar(t *testing.T) {
+	got := formatProgressBar("op", 5, 10, 10)
+	want := "op [=====     ]  50% (5/10)"
+	if got != want {
+		t.Fatalf("unexpected progress bar: %q", got)
+	}
+}
+
 func TestRetryOpRetries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
