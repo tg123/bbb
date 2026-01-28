@@ -454,15 +454,15 @@ func Upload(ctx context.Context, ap AzurePath, data []byte) error {
 // uploadStreamBlockSize returns a block size clamped to Azure's limits.
 // size is the total stream size, or -1 if unknown.
 func uploadStreamBlockSize(size int64) int64 {
-	blockSize := uploadStreamBlockBase
+	blockSize := int64(uploadStreamBlockBase)
 	if size >= 0 {
-		blockSize = (size + uploadStreamMaxBlocks - 1) / uploadStreamMaxBlocks
+		blockSize = (size + int64(uploadStreamMaxBlocks) - 1) / int64(uploadStreamMaxBlocks)
 	}
-	if blockSize < uploadStreamBlockMin {
-		blockSize = uploadStreamBlockMin
+	if blockSize < int64(uploadStreamBlockMin) {
+		blockSize = int64(uploadStreamBlockMin)
 	}
-	if blockSize > uploadStreamBlockMax {
-		blockSize = uploadStreamBlockMax
+	if blockSize > int64(uploadStreamBlockMax) {
+		blockSize = int64(uploadStreamBlockMax)
 	}
 	return blockSize
 }
