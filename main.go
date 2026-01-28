@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"log/slog"
@@ -805,6 +806,108 @@ func lockedFprintf(w io.Writer, format string, args ...any) {
 	}
 }
 
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+type progressBar struct {
+	label       string
+	total       int64
+	width       int
+	done        atomic.Int64
+	lastPercent atomic.Int64
+	finished    atomic.Bool
+}
+
+func newProgressBar(total int, label string, quiet bool) *progressBar {
+	if quiet || total <= 1 || !isTerminal(os.Stderr) {
+		return nil
+	}
+	bar := &progressBar{
+		label: label,
+		total: int64(total),
+		width: 28,
+	}
+	bar.render(0)
+	return bar
+}
+
+func (p *progressBar) Increment() {
+	if p == nil {
+		return
+	}
+	done := p.done.Add(1)
+	p.render(done)
+}
+
+func (p *progressBar) Finish() {
+	if p == nil {
+		return
+	}
+	p.done.Store(p.total)
+	p.render(p.total)
+}
+
+func (p *progressBar) render(done int64) {
+	if p == nil {
+		return
+	}
+	if p.total <= 0 {
+		return
+	}
+	if done < 0 {
+		done = 0
+	}
+	if done > p.total {
+		done = p.total
+	}
+	percent := done * 100 / p.total
+	if done != p.total {
+		for {
+			prev := p.lastPercent.Load()
+			if percent == prev {
+				return
+			}
+			if p.lastPercent.CompareAndSwap(prev, percent) {
+				break
+			}
+		}
+	} else if !p.finished.CompareAndSwap(false, true) {
+		return
+	}
+	line := formatProgressBar(p.label, done, p.total, p.width)
+	lockedFprintf(os.Stderr, "\r%s", line)
+	if done == p.total {
+		lockedFprintf(os.Stderr, "\n")
+	}
+}
+
+func formatProgressBar(label string, done, total int64, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	if total < 1 {
+		total = 1
+	}
+	if done < 0 {
+		done = 0
+	}
+	if done > total {
+		done = total
+	}
+	percent := done * 100 / total
+	filled := int(done * int64(width) / total)
+	if filled > width {
+		filled = width
+	}
+	bar := strings.Repeat("=", filled) + strings.Repeat(" ", width-filled)
+	return fmt.Sprintf("%s [%s] %3d%% (%d/%d)", label, bar, percent, done, total)
+}
+
 func runWorkerPool(ctx context.Context, concurrency int, ops []func() error) error {
 	if len(ops) == 0 {
 		return nil
@@ -960,6 +1063,21 @@ func runOpPoolWithRetry[T any](ctx context.Context, concurrency int, retryCount 
 	})
 }
 
+func runOpPoolWithRetryProgress[T any](ctx context.Context, concurrency int, retryCount int, total int, quiet bool, label string, producer func(chan<- T) error, worker func(T) error) error {
+	progress := newProgressBar(total, label, quiet)
+	err := runOpPoolWithRetry(ctx, concurrency, retryCount, producer, func(op T) error {
+		err := worker(op)
+		if progress != nil {
+			progress.Increment()
+		}
+		return err
+	})
+	if progress != nil {
+		progress.Finish()
+	}
+	return err
+}
+
 func cmdCP(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdCP called", "args", c.Args().Slice())
 	if c.Args().Len() < 2 {
@@ -1093,7 +1211,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			os.Exit(1)
 		}
 	}
-	if err := runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- cpFileOp) error {
+	if err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
 			if err := sendOp(ctx, pending, op); err != nil {
 				return err
@@ -1194,7 +1312,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			type azToAzOp struct {
 				name string
 			}
-			return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- azToAzOp) error {
+			return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(list), quiet, errPrefix, func(pending chan<- azToAzOp) error {
 				for _, bm := range list {
 					if err := sendOp(ctx, pending, azToAzOp{name: bm.Name}); err != nil {
 						return err
@@ -1236,7 +1354,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			type azToLocalOp struct {
 				name string
 			}
-			return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- azToLocalOp) error {
+			return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(list), quiet, errPrefix, func(pending chan<- azToLocalOp) error {
 				for _, bm := range list {
 					if err := sendOp(ctx, pending, azToLocalOp{name: bm.Name}); err != nil {
 						return err
@@ -1276,29 +1394,38 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			type localToAzOp struct {
 				rel string
 			}
-			var walkErrors bool
-			var walkErr error
-			err := runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- localToAzOp) error {
-				defer func() {
-					if walkErrors {
-						walkErr = fmt.Errorf("%s: one or more files failed to copy", errPrefix)
-					}
-				}()
-				return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
-					if err != nil {
-						lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, p, err)
-						walkErrors = true
-						return nil
-					}
-					if d.IsDir() {
-						return nil
-					}
-					rel, _ := filepath.Rel(src, p)
-					if sendErr := sendOp(ctx, pending, localToAzOp{rel: rel}); sendErr != nil {
-						return sendErr
-					}
+			var walkIssues bool
+			ops := make([]localToAzOp, 0)
+			walkErr := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+				if err != nil {
+					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, p, err)
+					walkIssues = true
 					return nil
-				})
+				}
+				if d.IsDir() {
+					return nil
+				}
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				rel, _ := filepath.Rel(src, p)
+				ops = append(ops, localToAzOp{rel: rel})
+				return nil
+			})
+			if walkErr != nil {
+				return walkErr
+			}
+			var walkIssueErr error
+			if walkIssues {
+				walkIssueErr = fmt.Errorf("%s: one or more files failed to copy", errPrefix)
+			}
+			err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(ops), quiet, errPrefix, func(pending chan<- localToAzOp) error {
+				for _, op := range ops {
+					if err := sendOp(ctx, pending, op); err != nil {
+						return err
+					}
+				}
+				return nil
 			}, func(work localToAzOp) error {
 				p := filepath.Join(src, work.rel)
 				reader, err := os.Open(p)
@@ -1325,8 +1452,8 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				return nil
 			})
-			if walkErr != nil {
-				return errors.Join(err, walkErr)
+			if walkIssueErr != nil {
+				return errors.Join(err, walkIssueErr)
 			}
 			return err
 		}
@@ -1339,20 +1466,31 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}
-	return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- copyOp) error {
-		return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
-			if err != nil {
+	ops := make([]copyOp, 0)
+	if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, p)
+		if rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			ops = append(ops, copyOp{dst: filepath.Join(dst, rel), isDir: true})
+			return nil
+		}
+		ops = append(ops, copyOp{src: p, dst: filepath.Join(dst, rel)})
+		return nil
+	}); err != nil {
+		return err
+	}
+	return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(ops), quiet, errPrefix, func(pending chan<- copyOp) error {
+		for _, op := range ops {
+			if err := sendOp(ctx, pending, op); err != nil {
 				return err
 			}
-			rel, _ := filepath.Rel(src, p)
-			if rel == "." {
-				return nil
-			}
-			if d.IsDir() {
-				return sendOp(ctx, pending, copyOp{dst: filepath.Join(dst, rel), isDir: true})
-			}
-			return sendOp(ctx, pending, copyOp{src: p, dst: filepath.Join(dst, rel)})
-		})
+		}
+		return nil
 	}, func(work copyOp) error {
 		if work.isDir {
 			// Directory ops only carry dst; src is not used for these operations.
@@ -1431,7 +1569,7 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 	type hfOp struct {
 		file string
 	}
-	return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- hfOp) error {
+	return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(files), quiet, "cp", func(pending chan<- hfOp) error {
 		for _, file := range files {
 			if err := sendOp(ctx, pending, hfOp{file: file}); err != nil {
 				return err
@@ -1610,7 +1748,7 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 	type rmOp struct {
 		path string
 	}
-	return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- rmOp) error {
+	return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(paths), quiet, "rm", func(pending chan<- rmOp) error {
 		for _, p := range paths {
 			if err := sendOp(ctx, pending, rmOp{path: p}); err != nil {
 				return err
@@ -1671,12 +1809,16 @@ func cmdRMTree(ctx context.Context, c *cli.Command) error {
 		type rmTreeOp struct {
 			name string
 		}
-		return runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- rmTreeOp) error {
-			for _, bm := range list {
-				if bm.Name == "" || strings.HasSuffix(bm.Name, "/") {
-					continue
-				}
-				if err := sendOp(ctx, pending, rmTreeOp{name: bm.Name}); err != nil {
+		ops := make([]rmTreeOp, 0, len(list))
+		for _, bm := range list {
+			if bm.Name == "" || strings.HasSuffix(bm.Name, "/") {
+				continue
+			}
+			ops = append(ops, rmTreeOp{name: bm.Name})
+		}
+		return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(ops), quiet, "rmtree", func(pending chan<- rmTreeOp) error {
+			for _, op := range ops {
+				if err := sendOp(ctx, pending, op); err != nil {
 					return err
 				}
 			}
@@ -1856,7 +1998,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				return err
 			}
 		}
-		workerErr := runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- item) error {
+		workerErr := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(files), quiet, "sync", func(pending chan<- item) error {
 			for _, f := range files {
 				if err := sendOp(ctx, pending, f); err != nil {
 					return err
@@ -1983,23 +2125,33 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		srcSet = make(map[string]struct{})
 	}
 	// copy/update
-	workerErr := runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- syncOp) error {
-		return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
-			if err != nil {
+	syncOps := make([]syncOp, 0)
+	if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(src, p)
+		if excludeMatch(rel) {
+			return nil
+		}
+		if srcSet != nil {
+			srcSet[rel] = struct{}{}
+		}
+		syncOps = append(syncOps, syncOp{rel: rel})
+		return nil
+	}); err != nil {
+		return err
+	}
+	workerErr := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(syncOps), quiet, "sync", func(pending chan<- syncOp) error {
+		for _, op := range syncOps {
+			if err := sendOp(ctx, pending, op); err != nil {
 				return err
 			}
-			if d.IsDir() {
-				return nil
-			}
-			rel, _ := filepath.Rel(src, p)
-			if excludeMatch(rel) {
-				return nil
-			}
-			if srcSet != nil {
-				srcSet[rel] = struct{}{}
-			}
-			return sendOp(ctx, pending, syncOp{rel: rel})
-		})
+		}
+		return nil
 	}, func(op syncOp) error {
 		sPath := filepath.Join(src, op.rel)
 		dPath := filepath.Join(dst, op.rel)
@@ -2037,23 +2189,32 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		type deleteOp struct {
 			path string
 		}
-		if err := runOpPoolWithRetry(ctx, concurrency, retryCount, func(pending chan<- deleteOp) error {
-			return filepath.WalkDir(dst, func(p string, d os.DirEntry, err error) error {
-				if err != nil {
+		deleteOps := make([]deleteOp, 0)
+		if err := filepath.WalkDir(dst, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			rel, _ := filepath.Rel(dst, p)
+			if excludeMatch(rel) {
+				return nil
+			}
+			if _, ok := srcSet[rel]; !ok {
+				deleteOps = append(deleteOps, deleteOp{path: p})
+			}
+			return nil
+		}); err != nil {
+			return errors.Join(workerErr, err)
+		}
+		if err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(deleteOps), quiet, "sync delete", func(pending chan<- deleteOp) error {
+			for _, op := range deleteOps {
+				if err := sendOp(ctx, pending, op); err != nil {
 					return err
 				}
-				if d.IsDir() {
-					return nil
-				}
-				rel, _ := filepath.Rel(dst, p)
-				if excludeMatch(rel) {
-					return nil
-				}
-				if _, ok := srcSet[rel]; !ok {
-					return sendOp(ctx, pending, deleteOp{path: p})
-				}
-				return nil
-			})
+			}
+			return nil
 		}, func(op deleteOp) error {
 			if dry {
 				if !quiet {
