@@ -153,11 +153,54 @@ func TestReaderSizeUsesFileInfo(t *testing.T) {
 	if got := readerSize(file); got != int64(len(data)) {
 		t.Fatalf("expected size %d, got %d", len(data), got)
 	}
+	contents, err := io.ReadAll(file)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(contents) != string(data) {
+		t.Fatalf("expected file contents %q, got %q", data, contents)
+	}
 }
 
 func TestReaderSizeUsesSeeker(t *testing.T) {
 	reader := io.NewSectionReader(strings.NewReader("size"), 0, 4)
 	if got := readerSize(reader); got != 4 {
 		t.Fatalf("expected size 4, got %d", got)
+	}
+}
+
+type failingSeeker struct {
+	read *strings.Reader
+}
+
+func (f failingSeeker) Read(p []byte) (int, error) {
+	return f.read.Read(p)
+}
+
+func (f failingSeeker) Seek(int64, int) (int64, error) {
+	return 0, errors.New("seek failed")
+}
+
+func TestReaderSizeSeekerFailureRestores(t *testing.T) {
+	reader := io.NewSectionReader(strings.NewReader("size"), 0, 4)
+	if _, err := reader.Seek(2, io.SeekStart); err != nil {
+		t.Fatalf("seek start: %v", err)
+	}
+	if got := readerSize(reader); got != 4 {
+		t.Fatalf("expected size 4, got %d", got)
+	}
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(reader, buf); err != nil {
+		t.Fatalf("read remaining: %v", err)
+	}
+	if string(buf) != "ze" {
+		t.Fatalf("expected remaining %q, got %q", "ze", buf)
+	}
+}
+
+func TestReaderSizeSeekError(t *testing.T) {
+	reader := failingSeeker{read: strings.NewReader("size")}
+	if got := readerSize(reader); got != -1 {
+		t.Fatalf("expected size -1, got %d", got)
 	}
 }

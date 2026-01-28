@@ -467,7 +467,7 @@ func uploadStreamBlockSize(size int64) int64 {
 	return blockSize
 }
 
-// readerSize returns size from Size or Stat if available, otherwise -1.
+// readerSize returns size from Size, Stat, or Seek (restoring position). Returns -1 if unknown.
 func readerSize(reader io.Reader) int64 {
 	if sizer, ok := reader.(interface{ Size() int64 }); ok {
 		size := sizer.Size()
@@ -485,13 +485,13 @@ func readerSize(reader io.Reader) int64 {
 		current, err := seeker.Seek(0, io.SeekCurrent)
 		if err == nil {
 			end, err := seeker.Seek(0, io.SeekEnd)
-			if err == nil {
-				if _, err := seeker.Seek(current, io.SeekStart); err == nil && end >= 0 {
-					return end
-				}
-				return -1
+			restoreErr := func() error {
+				_, err := seeker.Seek(current, io.SeekStart)
+				return err
+			}()
+			if err == nil && restoreErr == nil && end >= 0 {
+				return end
 			}
-			_, _ = seeker.Seek(current, io.SeekStart)
 		}
 	}
 	return -1
