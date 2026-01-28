@@ -24,6 +24,9 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
 
+      - name: Go fmt
+        run: test -z "$(gofmt -l .)"
+
   test:
     runs-on: ubuntu-latest
     steps:

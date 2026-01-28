@@ -43,7 +43,6 @@ func MkContainer(ctx context.Context, account, container string) error {
 	return nil
 }
 
-
 // AzurePath represents an az:// path (account/container/blob)
 type AzurePath struct {
 	Account   string
