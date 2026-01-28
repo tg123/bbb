@@ -496,8 +496,8 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
 	size := readerSize(reader)
 	blockSize := uploadStreamBlockSize(size)
-	if size >= 0 && blockSize == uploadStreamBlockMax {
-		maxSize := int64(uploadStreamMaxBlocks) * uploadStreamBlockMax
+	if size >= 0 && blockSize == int64(uploadStreamBlockMax) {
+		maxSize := int64(uploadStreamMaxBlocks) * int64(uploadStreamBlockMax)
 		if size > maxSize {
 			return fmt.Errorf("put failed: stream size %d exceeds %d", size, maxSize)
 		}
