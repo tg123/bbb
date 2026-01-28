@@ -99,7 +99,20 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 		resp.Body.Close()
 		return nil, fmt.Errorf("hf download failed: %s", resp.Status)
 	}
-	return resp.Body, nil
+	return downloadReadCloser{
+		ReadCloser: resp.Body,
+		size:       resp.ContentLength,
+	}, nil
+}
+
+type downloadReadCloser struct {
+	io.ReadCloser
+	size int64
+}
+
+// Size reports the HTTP Content-Length or -1 if unknown.
+func (d downloadReadCloser) Size() int64 {
+	return d.size
 }
 
 // ListFiles retrieves repo files for directory-like paths.
