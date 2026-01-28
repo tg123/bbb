@@ -481,6 +481,19 @@ func readerSize(reader io.Reader) int64 {
 			return info.Size()
 		}
 	}
+	if seeker, ok := reader.(io.Seeker); ok {
+		current, err := seeker.Seek(0, io.SeekCurrent)
+		if err == nil {
+			end, err := seeker.Seek(0, io.SeekEnd)
+			if err == nil {
+				if _, err := seeker.Seek(current, io.SeekStart); err == nil && end >= 0 {
+					return end
+				}
+				return -1
+			}
+			_, _ = seeker.Seek(current, io.SeekStart)
+		}
+	}
 	return -1
 }
 

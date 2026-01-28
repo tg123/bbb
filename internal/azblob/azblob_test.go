@@ -3,6 +3,9 @@ package azblob
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
@@ -132,5 +135,29 @@ func TestUploadStreamBlockSizeMaxClamp(t *testing.T) {
 	blockSize := uploadStreamBlockSize((int64(uploadStreamMaxBlocks) * uploadStreamBlockMax) + 1)
 	if blockSize != uploadStreamBlockMax {
 		t.Fatalf("expected block size %d, got %d", uploadStreamBlockMax, blockSize)
+	}
+}
+
+func TestReaderSizeUsesFileInfo(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/data.bin"
+	data := []byte("hello")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open file: %v", err)
+	}
+	defer file.Close()
+	if got := readerSize(file); got != int64(len(data)) {
+		t.Fatalf("expected size %d, got %d", len(data), got)
+	}
+}
+
+func TestReaderSizeUsesSeeker(t *testing.T) {
+	reader := io.NewSectionReader(strings.NewReader("size"), 0, 4)
+	if got := readerSize(reader); got != 4 {
+		t.Fatalf("expected size 4, got %d", got)
 	}
 }
