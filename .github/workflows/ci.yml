@@ -24,6 +24,15 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
 
+      - name: Go fmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            echo "The following files need formatting:"
+            printf '%s\n' "${unformatted}"
+            exit 1
+          fi
+
   test:
     runs-on: ubuntu-latest
     steps:
