@@ -94,10 +94,10 @@ const (
 	copyPollInitialDelay  = time.Second
 	copyPollMaxDelay      = 30 * time.Second
 	copyPollBackoffFactor = 2
-	uploadStreamBlockMin  = 1 << 20   // Azure UploadStream minimum block size.
+	uploadStreamBlockMin  = 1 << 20    // Azure UploadStream minimum block size.
 	uploadStreamBlockMax  = 4000 << 20 // Azure UploadStream maximum block size.
-	uploadStreamBlockBase = 8 << 20   // Default block size when stream size is unknown.
-	uploadStreamMaxBlocks = 100000    // Azure block upload limit (newer API).
+	uploadStreamBlockBase = 8 << 20    // Default block size when stream size is unknown.
+	uploadStreamMaxBlocks = 100000     // Azure block upload limit (newer API).
 )
 
 // IsBlobURL performs a lightweight check whether the provided string is a blob endpoint URL.
