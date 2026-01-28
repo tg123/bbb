@@ -345,7 +345,7 @@ func TestBasic(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		files, err := bbbLs("az://"+azuriteAccount+"/test/dir/testfile3.txt", false)
+		files, err := bbbLs("az://"+azuriteAccount+"/test/dir/testfile3.txt*", false)
 		if err != nil {
 			t.Fatal(err)
 		}
