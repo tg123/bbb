@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -15,8 +14,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"net/http/httptrace"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
@@ -46,31 +43,6 @@ func MkContainer(ctx context.Context, account, container string) error {
 	return nil
 }
 
-// withHTTPTrace attaches httptrace to the request for debugging
-func withHTTPTrace(req *http.Request) *http.Request {
-	trace := &httptrace.ClientTrace{
-		GotConn: func(info httptrace.GotConnInfo) {
-			slog.Debug("httptrace: GotConn", "reused", info.Reused, "wasIdle", info.WasIdle)
-		},
-		DNSStart: func(info httptrace.DNSStartInfo) {
-			slog.Debug("httptrace: DNSStart", "host", info.Host)
-		},
-		DNSDone: func(info httptrace.DNSDoneInfo) {
-			slog.Debug("httptrace: DNSDone", "addrs", info.Addrs, "err", info.Err)
-		},
-		ConnectStart: func(network, addr string) {
-			slog.Debug("httptrace: ConnectStart", "network", network, "addr", addr)
-		},
-		ConnectDone: func(network, addr string, err error) {
-			slog.Debug("httptrace: ConnectDone", "network", network, "addr", addr, "err", err)
-		},
-		GotFirstResponseByte: func() {
-			slog.Debug("httptrace: GotFirstResponseByte")
-		},
-	}
-
-	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
-}
 
 // AzurePath represents an az:// path (account/container/blob)
 type AzurePath struct {
@@ -410,7 +382,9 @@ func Download(ctx context.Context, ap AzurePath) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer reader.Close()
+	defer func() {
+		_ = reader.Close()
+	}()
 	return io.ReadAll(reader)
 }
 
@@ -687,13 +661,6 @@ type notExistError string
 func (e notExistError) Error() string  { return string(e) + ": not found" }
 func (e notExistError) NotFound() bool { return true }
 func osNotExist(s string) error        { return notExistError(s) }
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}
 
 func validContainerName(name string) bool {
 	if len(name) < 3 || len(name) > 63 {

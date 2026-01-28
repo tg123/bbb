@@ -149,7 +149,11 @@ func TestReaderSizeUsesFileInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open file: %v", err)
 	}
-	defer file.Close()
+	defer func() {
+		if cerr := file.Close(); cerr != nil {
+			t.Errorf("close file: %v", cerr)
+		}
+	}()
 	if got := readerSize(file); got != int64(len(data)) {
 		t.Fatalf("expected size %d, got %d", len(data), got)
 	}

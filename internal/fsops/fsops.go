@@ -63,12 +63,16 @@ func CopyFile(src, dst string, overwrite bool) error {
 	if err != nil {
 		return err
 	}
-	defer srcF.Close()
+	defer func() {
+		_ = srcF.Close()
+	}()
 	dstF, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
 	if err != nil {
 		return err
 	}
-	defer dstF.Close()
+	defer func() {
+		_ = dstF.Close()
+	}()
 	if _, err := io.Copy(dstF, srcF); err != nil {
 		return err
 	}

@@ -669,7 +669,7 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 		if longFlag {
 			info, serr := os.Stat(p)
 			var size int64
-			var modStr string = "-"
+			modStr := "-"
 			if serr == nil {
 				size = info.Size()
 				modStr = info.ModTime().Format(time.RFC3339)
@@ -748,7 +748,9 @@ func cmdCat(ctx context.Context, c *cli.Command) error {
 			continue
 		}
 		_, err = io.Copy(os.Stdout, f)
-		f.Close()
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
 		}
@@ -798,7 +800,9 @@ func lockedPrintln(args ...any) {
 func lockedFprintf(w io.Writer, format string, args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	fmt.Fprintf(w, format, args...)
+	if _, err := fmt.Fprintf(w, format, args...); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
 }
 
 func runWorkerPool(ctx context.Context, concurrency int, ops []func() error) error {
@@ -1122,7 +1126,9 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			}
 			if !overwrite {
 				if _, err := os.Stat(op.dst); err == nil {
-					reader.Close()
+					if cerr := reader.Close(); cerr != nil {
+						return cerr
+					}
 					return errors.New("cp: destination exists")
 				}
 			}
@@ -1144,7 +1150,9 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			}
 			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-					reader.Close()
+					if cerr := reader.Close(); cerr != nil {
+						return cerr
+					}
 					return errors.New("cp: destination exists")
 				}
 			}
@@ -1201,7 +1209,9 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				if !overwrite {
 					if _, err := azblob.HeadBlob(ctx, dap.Child(work.name)); err == nil {
-						reader.Close()
+						if cerr := reader.Close(); cerr != nil {
+							return cerr
+						}
 						return nil
 					}
 				}
@@ -1242,7 +1252,9 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				outPath := filepath.Join(dst, work.name)
 				if !overwrite {
 					if _, err := os.Stat(outPath); err == nil {
-						reader.Close()
+						if cerr := reader.Close(); cerr != nil {
+							return cerr
+						}
 						return nil
 					}
 				}
@@ -1296,7 +1308,9 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				if !overwrite {
 					if _, err := azblob.HeadBlob(ctx, dap.Child(work.rel)); err == nil {
-						reader.Close()
+						if cerr := reader.Close(); cerr != nil {
+							return cerr
+						}
 						return nil
 					}
 				}
@@ -1363,16 +1377,22 @@ func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, ov
 		}
 		dap, err := azblob.Parse(dstPath)
 		if err != nil {
-			reader.Close()
+			if cerr := reader.Close(); cerr != nil {
+				return cerr
+			}
 			return err
 		}
 		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-			reader.Close()
+			if cerr := reader.Close(); cerr != nil {
+				return cerr
+			}
 			return errors.New("cp: destination must be a blob path")
 		}
 		if !overwrite {
 			if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-				reader.Close()
+				if cerr := reader.Close(); cerr != nil {
+					return cerr
+				}
 				return errors.New("cp: destination exists")
 			}
 		}
@@ -1426,22 +1446,30 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 		}
 		dstPath, err := resolveDstPath(dst, dstAz, op.file, true)
 		if err != nil {
-			reader.Close()
+			if cerr := reader.Close(); cerr != nil {
+				return cerr
+			}
 			return err
 		}
 		if dstAz {
 			dap, err := azblob.Parse(dstPath)
 			if err != nil {
-				reader.Close()
+				if cerr := reader.Close(); cerr != nil {
+					return cerr
+				}
 				return err
 			}
 			if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-				reader.Close()
+				if cerr := reader.Close(); cerr != nil {
+					return cerr
+				}
 				return errors.New("cp: destination must be a blob path")
 			}
 			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-					reader.Close()
+					if cerr := reader.Close(); cerr != nil {
+						return cerr
+					}
 					return nil
 				}
 			}
@@ -1453,7 +1481,9 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 		} else {
 			if !overwrite {
 				if _, err := os.Stat(dstPath); err == nil {
-					reader.Close()
+					if cerr := reader.Close(); cerr != nil {
+						return cerr
+					}
 					return nil
 				}
 			}
@@ -1487,7 +1517,9 @@ func writeStreamToFile(dstPath string, reader io.Reader, perm os.FileMode) error
 }
 
 func withReadCloser(reader io.ReadCloser, fn func(io.Reader) error) error {
-	defer reader.Close()
+	defer func() {
+		_ = reader.Close()
+	}()
 	return fn(reader)
 }
 
@@ -1538,7 +1570,10 @@ func cmdEdit(ctx context.Context, c *cli.Command) error {
 			os.Exit(1)
 		}
 		if f, err := os.OpenFile(path, os.O_CREATE, 0o644); err == nil {
-			f.Close()
+			if cerr := f.Close(); cerr != nil {
+				fmt.Fprintln(os.Stderr, cerr)
+				os.Exit(1)
+			}
 		} else {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -1840,7 +1875,9 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					if !quiet {
 						lockedPrintln("COPY", sap.Child(sPath).String(), "->", dap.Child(sPath).String())
 					}
-					reader.Close()
+					if cerr := reader.Close(); cerr != nil {
+						return cerr
+					}
 					return nil
 				}
 				if err := withReadCloser(reader, func(r io.Reader) error {
@@ -1889,7 +1926,9 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					if !quiet {
 						lockedPrintln("COPY", sap.Child(sPath).String(), "->", out)
 					}
-					reader.Close()
+					if cerr := reader.Close(); cerr != nil {
+						return cerr
+					}
 					return nil
 				}
 				if err := withReadCloser(reader, func(r io.Reader) error {
@@ -1913,7 +1952,9 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 					if !quiet {
 						lockedPrintln("COPY", filepath.Join(src, sPath), "->", dap.Child(sPath).String())
 					}
-					reader.Close()
+					if cerr := reader.Close(); cerr != nil {
+						return cerr
+					}
 					return nil
 				}
 				if err := withReadCloser(reader, func(r io.Reader) error {
@@ -1981,7 +2022,9 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				}
 				// preserve modtime
 				if info, err := os.Stat(sPath); err == nil {
-					os.Chtimes(dPath, info.ModTime(), info.ModTime())
+					if err := os.Chtimes(dPath, info.ModTime(), info.ModTime()); err != nil {
+						return err
+					}
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", sPath, dPath)
@@ -2018,7 +2061,9 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				}
 				return nil
 			}
-			os.Remove(op.path)
+			if err := os.Remove(op.path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 			if !quiet {
 				lockedPrintf("Deleted %s\n", op.path)
 			}
@@ -2081,7 +2126,9 @@ func printMD5Sum(r io.ReadCloser, label string) {
 }
 
 func writeMD5SumReadCloser(r io.ReadCloser, label string) error {
-	defer r.Close()
+	defer func() {
+		_ = r.Close()
+	}()
 	return writeMD5Sum(r, label)
 }
 
