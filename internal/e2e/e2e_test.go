@@ -43,23 +43,24 @@ func parseMD5Output(out []byte) string {
 	return fields[0]
 }
 
-func waitForEndpointReady(addr string) {
-	waitForEndpointReadyWithTimeout(addr, waitTimeout)
+func waitForEndpointReady(addr string) bool {
+	return waitForEndpointReadyWithTimeout(addr, waitTimeout)
 }
 
-func waitForEndpointReadyWithTimeout(addr string, timeout time.Duration) {
+func waitForEndpointReadyWithTimeout(addr string, timeout time.Duration) bool {
 	now := time.Now()
 	timeout = max(timeout, waitTimeout)
 	for {
 		if time.Since(now) > timeout {
-			log.Panic("timeout waiting for endpoint " + addr)
+			log.Printf("timeout waiting for endpoint %s", addr)
+			return false
 		}
 
 		conn, err := net.Dial("tcp", addr)
 		if err == nil {
 			log.Printf("endpoint %s is ready", addr)
 			conn.Close()
-			break
+			return true
 		}
 		time.Sleep(time.Second)
 	}
@@ -164,7 +165,9 @@ func TestBasic(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
-	waitForEndpointReady(azuriteHost)
+	if !waitForEndpointReady(azuriteHost) {
+		t.Skipf("azurite endpoint %s not reachable", azuriteHost)
+	}
 
 	// create container
 	{
