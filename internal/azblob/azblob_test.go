@@ -96,3 +96,41 @@ func TestCopyBlobServerSideRequiresSharedKey(t *testing.T) {
 		t.Fatalf("expected missing shared key error, got %v", err)
 	}
 }
+
+func TestUploadStreamBlockSizeWithinLimit(t *testing.T) {
+	blockSize := uploadStreamBlockSize(100000 * uploadStreamBlockMin)
+	if blockSize != uploadStreamBlockMin {
+		t.Fatalf("expected block size %d, got %d", uploadStreamBlockMin, blockSize)
+	}
+}
+
+func TestUploadStreamBlockSizeOverLimit(t *testing.T) {
+	blockSize := uploadStreamBlockSize((100000 * uploadStreamBlockMin) + 1)
+	if blockSize <= uploadStreamBlockMin {
+		t.Fatalf("expected block size > %d, got %d", uploadStreamBlockMin, blockSize)
+	}
+	if blockSize > uploadStreamBlockMax {
+		t.Fatalf("expected block size <= %d, got %d", uploadStreamBlockMax, blockSize)
+	}
+}
+
+func TestUploadStreamBlockSizeUnknown(t *testing.T) {
+	blockSize := uploadStreamBlockSize(-1)
+	if blockSize != uploadStreamBlockBase {
+		t.Fatalf("expected block size %d, got %d", uploadStreamBlockBase, blockSize)
+	}
+}
+
+func TestUploadStreamBlockSizeZero(t *testing.T) {
+	blockSize := uploadStreamBlockSize(0)
+	if blockSize != uploadStreamBlockMin {
+		t.Fatalf("expected block size %d, got %d", uploadStreamBlockMin, blockSize)
+	}
+}
+
+func TestUploadStreamBlockSizeMaxClamp(t *testing.T) {
+	blockSize := uploadStreamBlockSize((int64(uploadStreamMaxBlocks) * uploadStreamBlockMax) + 1)
+	if blockSize != uploadStreamBlockMax {
+		t.Fatalf("expected block size %d, got %d", uploadStreamBlockMax, blockSize)
+	}
+}
