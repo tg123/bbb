@@ -1,6 +1,12 @@
 package azblob
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+)
 
 func TestParseHTTPSBlobURL(t *testing.T) {
 	ap, err := Parse("https://myacct.blob.core.windows.net/container/path/to/blob.txt")
@@ -45,5 +51,48 @@ func TestParseHTTPSInvalidContainer(t *testing.T) {
 func TestParseRejectsNonBlobHTTPS(t *testing.T) {
 	if _, err := Parse("https://example.com/container/blob"); err == nil {
 		t.Fatal("expected error for non blob https url")
+	}
+}
+
+func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
+	ctx := context.Background()
+	src := AzurePath{Account: "acct", Container: "container"}
+	dst := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
+	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+		t.Fatal("expected error for dir-like source")
+	}
+	src = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
+	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+		t.Fatal("expected error for trailing slash source")
+	}
+	src = AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
+	dst = AzurePath{Account: "acct", Container: "container"}
+	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+		t.Fatal("expected error for dir-like destination")
+	}
+	dst = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
+	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+		t.Fatal("expected error for trailing slash destination")
+	}
+}
+
+func TestCopyBlobServerSideRequiresSameAccount(t *testing.T) {
+	ctx := context.Background()
+	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
+	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
+	err := CopyBlobServerSide(ctx, src, dst)
+	if err == nil {
+		t.Fatal("expected error for cross-account copy")
+	}
+}
+
+func TestCopyBlobServerSideRequiresSharedKey(t *testing.T) {
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
+	ctx := context.Background()
+	src := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
+	dst := AzurePath{Account: "acct", Container: "container", Blob: "other.txt"}
+	err := CopyBlobServerSide(ctx, src, dst)
+	if !errors.Is(err, bloberror.MissingSharedKeyCredential) {
+		t.Fatalf("expected missing shared key error, got %v", err)
 	}
 }

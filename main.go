@@ -1102,19 +1102,12 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 		if op.srcAz && op.dstAz {
 			dap, _ := azblob.Parse(op.dst)
-			reader, err := azblob.DownloadStream(ctx, op.srcAzPath)
-			if err != nil {
-				return err
-			}
 			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-					reader.Close()
 					return errors.New("cp: destination exists")
 				}
 			}
-			if err := withReadCloser(reader, func(r io.Reader) error {
-				return azblob.UploadStream(ctx, dap, r)
-			}); err != nil {
+			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap); err != nil {
 				return err
 			}
 			if !quiet {
