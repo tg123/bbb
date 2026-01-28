@@ -3,6 +3,9 @@ package azblob
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
@@ -94,5 +97,110 @@ func TestCopyBlobServerSideRequiresSharedKey(t *testing.T) {
 	err := CopyBlobServerSide(ctx, src, dst)
 	if !errors.Is(err, bloberror.MissingSharedKeyCredential) {
 		t.Fatalf("expected missing shared key error, got %v", err)
+	}
+}
+
+func TestUploadStreamBlockSizeWithinLimit(t *testing.T) {
+	blockSize := uploadStreamBlockSize(100000 * uploadStreamBlockMin)
+	if blockSize != uploadStreamBlockMin {
+		t.Fatalf("expected block size %d, got %d", uploadStreamBlockMin, blockSize)
+	}
+}
+
+func TestUploadStreamBlockSizeOverLimit(t *testing.T) {
+	blockSize := uploadStreamBlockSize((100000 * uploadStreamBlockMin) + 1)
+	if blockSize <= uploadStreamBlockMin {
+		t.Fatalf("expected block size > %d, got %d", uploadStreamBlockMin, blockSize)
+	}
+	if blockSize > uploadStreamBlockMax {
+		t.Fatalf("expected block size <= %d, got %d", uploadStreamBlockMax, blockSize)
+	}
+}
+
+func TestUploadStreamBlockSizeUnknown(t *testing.T) {
+	blockSize := uploadStreamBlockSize(-1)
+	if blockSize != uploadStreamBlockBase {
+		t.Fatalf("expected block size %d, got %d", uploadStreamBlockBase, blockSize)
+	}
+}
+
+func TestUploadStreamBlockSizeZero(t *testing.T) {
+	blockSize := uploadStreamBlockSize(0)
+	if blockSize != uploadStreamBlockMin {
+		t.Fatalf("expected block size %d, got %d", uploadStreamBlockMin, blockSize)
+	}
+}
+
+func TestUploadStreamBlockSizeMaxClamp(t *testing.T) {
+	blockSize := uploadStreamBlockSize((int64(uploadStreamMaxBlocks) * uploadStreamBlockMax) + 1)
+	if blockSize != uploadStreamBlockMax {
+		t.Fatalf("expected block size %d, got %d", uploadStreamBlockMax, blockSize)
+	}
+}
+
+func TestReaderSizeUsesFileInfo(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/data.bin"
+	data := []byte("hello")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open file: %v", err)
+	}
+	defer file.Close()
+	if got := readerSize(file); got != int64(len(data)) {
+		t.Fatalf("expected size %d, got %d", len(data), got)
+	}
+	contents, err := io.ReadAll(file)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(contents) != string(data) {
+		t.Fatalf("expected file contents %q, got %q", data, contents)
+	}
+}
+
+func TestReaderSizeUsesSeeker(t *testing.T) {
+	reader := io.NewSectionReader(strings.NewReader("size"), 0, 4)
+	if got := readerSize(reader); got != 4 {
+		t.Fatalf("expected size 4, got %d", got)
+	}
+}
+
+type failingSeeker struct {
+	read *strings.Reader
+}
+
+func (f failingSeeker) Read(p []byte) (int, error) {
+	return f.read.Read(p)
+}
+
+func (f failingSeeker) Seek(int64, int) (int64, error) {
+	return 0, errors.New("seek failed")
+}
+
+func TestReaderSizeSeekerFailureRestores(t *testing.T) {
+	reader := io.NewSectionReader(strings.NewReader("size"), 0, 4)
+	if _, err := reader.Seek(2, io.SeekStart); err != nil {
+		t.Fatalf("seek start: %v", err)
+	}
+	if got := readerSize(reader); got != 4 {
+		t.Fatalf("expected size 4, got %d", got)
+	}
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(reader, buf); err != nil {
+		t.Fatalf("read remaining: %v", err)
+	}
+	if string(buf) != "ze" {
+		t.Fatalf("expected remaining %q, got %q", "ze", buf)
+	}
+}
+
+func TestReaderSizeSeekError(t *testing.T) {
+	reader := failingSeeker{read: strings.NewReader("size")}
+	if got := readerSize(reader); got != -1 {
+		t.Fatalf("expected size -1, got %d", got)
 	}
 }

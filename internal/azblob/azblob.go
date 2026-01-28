@@ -94,6 +94,10 @@ const (
 	copyPollInitialDelay  = time.Second
 	copyPollMaxDelay      = 30 * time.Second
 	copyPollBackoffFactor = 2
+	uploadStreamBlockMin  = 1 << 20   // Azure UploadStream minimum block size.
+	uploadStreamBlockMax  = 4000 << 20 // Azure UploadStream maximum block size.
+	uploadStreamBlockBase = 8 << 20   // Default block size when stream size is unknown.
+	uploadStreamMaxBlocks = 100000    // Azure block upload limit (newer API).
 )
 
 // IsBlobURL performs a lightweight check whether the provided string is a blob endpoint URL.
@@ -447,6 +451,52 @@ func Upload(ctx context.Context, ap AzurePath, data []byte) error {
 	return nil
 }
 
+// uploadStreamBlockSize returns a block size clamped to Azure's limits.
+// size is the total stream size, or -1 if unknown.
+func uploadStreamBlockSize(size int64) int64 {
+	blockSize := int64(uploadStreamBlockBase)
+	if size >= 0 {
+		blockSize = (size + int64(uploadStreamMaxBlocks) - 1) / int64(uploadStreamMaxBlocks)
+	}
+	if blockSize < int64(uploadStreamBlockMin) {
+		blockSize = int64(uploadStreamBlockMin)
+	}
+	if blockSize > int64(uploadStreamBlockMax) {
+		blockSize = int64(uploadStreamBlockMax)
+	}
+	return blockSize
+}
+
+// readerSize returns size from Size, Stat, or Seek (restoring position). Returns -1 if unknown.
+func readerSize(reader io.Reader) int64 {
+	if sizer, ok := reader.(interface{ Size() int64 }); ok {
+		size := sizer.Size()
+		if size >= 0 {
+			return size
+		}
+	}
+	if statter, ok := reader.(interface{ Stat() (os.FileInfo, error) }); ok {
+		info, err := statter.Stat()
+		if err == nil && info != nil {
+			return info.Size()
+		}
+	}
+	if seeker, ok := reader.(io.Seeker); ok {
+		current, err := seeker.Seek(0, io.SeekCurrent)
+		if err == nil {
+			end, err := seeker.Seek(0, io.SeekEnd)
+			restoreErr := func() error {
+				_, err := seeker.Seek(current, io.SeekStart)
+				return err
+			}()
+			if err == nil && restoreErr == nil && end >= 0 {
+				return end
+			}
+		}
+	}
+	return -1
+}
+
 // UploadStream writes blob content from a reader (overwrite).
 func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
@@ -457,7 +507,17 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 		return err
 	}
 	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
-	_, err = blobClient.UploadStream(ctx, reader, nil)
+	size := readerSize(reader)
+	blockSize := uploadStreamBlockSize(size)
+	if size >= 0 && blockSize == int64(uploadStreamBlockMax) {
+		maxSize := int64(uploadStreamMaxBlocks) * int64(uploadStreamBlockMax)
+		if size > maxSize {
+			return fmt.Errorf("put failed: stream size %d exceeds %d", size, maxSize)
+		}
+	}
+	_, err = blobClient.UploadStream(ctx, reader, &azblob.UploadStreamOptions{
+		BlockSize: blockSize,
+	})
 	if err != nil {
 		return fmt.Errorf("put failed: %v", err)
 	}
