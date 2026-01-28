@@ -160,6 +160,9 @@ func cleanFolder(t *testing.T, path string) {
 }
 
 func TestBasic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
 
 	waitForEndpointReady(azuriteHost)
 
