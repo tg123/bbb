@@ -78,7 +78,9 @@ func Download(ctx context.Context, p Path) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rc.Close()
+	defer func() {
+		_ = rc.Close()
+	}()
 	return io.ReadAll(rc)
 }
 
@@ -96,7 +98,9 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		resp.Body.Close()
+		if cerr := resp.Body.Close(); cerr != nil {
+			return nil, fmt.Errorf("hf download failed: %s (close error: %v)", resp.Status, cerr)
+		}
 		return nil, fmt.Errorf("hf download failed: %s", resp.Status)
 	}
 	return downloadReadCloser{
@@ -132,7 +136,9 @@ func ListFiles(ctx context.Context, p Path) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("hf list failed: %s", resp.Status)
 	}
