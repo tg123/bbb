@@ -751,6 +751,10 @@ func TestBasic(t *testing.T) {
 }
 
 func TestHuggingFaceDownload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
 	repo := "hf-internal-testing/tiny-random-BertModel"
 	files, err := hfListFiles(t, repo)
 	if err != nil {
