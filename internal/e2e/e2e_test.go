@@ -161,6 +161,9 @@ func cleanFolder(t *testing.T, path string) {
 }
 
 func TestBasic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e tests in short mode")
+	}
 	if !waitForEndpointReady(azuriteHost) {
 		t.Skipf("azurite endpoint %s not reachable", azuriteHost)
 	}
@@ -750,6 +753,9 @@ func TestBasic(t *testing.T) {
 }
 
 func TestHuggingFaceDownload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e tests in short mode")
+	}
 	repo := "hf-internal-testing/tiny-random-BertModel"
 	files, err := hfListFiles(t, repo)
 	if err != nil {
