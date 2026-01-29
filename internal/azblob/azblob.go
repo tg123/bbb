@@ -68,7 +68,7 @@ const (
 	copyPollMaxDelay      = 30 * time.Second
 	copyPollBackoffFactor = 2
 	uploadStreamMiB       = 1 << 20
-	uploadStreamBlockMin  = 1 * uploadStreamMiB    // Azure UploadStream minimum block size.
+	uploadStreamBlockMin  = 256 * uploadStreamMiB  // Default UploadStream minimum block size.
 	uploadStreamBlockMax  = 4000 * uploadStreamMiB // Azure UploadStream maximum block size.
 	uploadStreamBlockBase = 256 * uploadStreamMiB  // Default block size when stream size is unknown.
 	uploadStreamMaxBlocks = 100000                 // Azure block upload limit (newer API).
