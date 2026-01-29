@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,15 +63,18 @@ var validBlobSuffixes = []string{
 }
 
 const (
-	defaultCopySASExpiry  = time.Hour
-	copyPollInitialDelay  = time.Second
-	copyPollMaxDelay      = 30 * time.Second
-	copyPollBackoffFactor = 2
-	uploadStreamMiB       = 1 << 20
-	uploadStreamBlockMin  = 1 * uploadStreamMiB    // Azure UploadStream minimum block size.
-	uploadStreamBlockMax  = 4000 * uploadStreamMiB // Azure UploadStream maximum block size.
-	uploadStreamBlockBase = 256 * uploadStreamMiB  // Default block size when stream size is unknown.
-	uploadStreamMaxBlocks = 100000                 // Azure block upload limit (newer API).
+	defaultCopySASExpiry     = time.Hour
+	copyPollInitialDelay     = time.Second
+	copyPollMaxDelay         = 30 * time.Second
+	copyPollBackoffFactor    = 2
+	uploadStreamMiB          = 1 << 20
+	uploadStreamBlockMin     = 256 * uploadStreamMiB  // Default UploadStream minimum block size.
+	uploadStreamBlockMax     = 4000 * uploadStreamMiB // Azure UploadStream maximum block size.
+	uploadStreamBlockBase    = 256 * uploadStreamMiB  // Default block size when stream size is unknown.
+	uploadStreamMaxBlocks    = 100000                 // Azure block upload limit (newer API).
+	uploadStreamBlockMinEnv  = "AZ_BLOB_UPLOAD_STREAM_BLOCK_MIN_MIB"
+	uploadStreamBlockMaxEnv  = "AZ_BLOB_UPLOAD_STREAM_BLOCK_MAX_MIB"
+	uploadStreamBlockBaseEnv = "AZ_BLOB_UPLOAD_STREAM_BLOCK_BASE_MIB"
 )
 
 // IsBlobURL performs a lightweight check whether the provided string is a blob endpoint URL.
@@ -428,15 +433,73 @@ func Upload(ctx context.Context, ap AzurePath, data []byte) error {
 // uploadStreamBlockSize returns a block size clamped to Azure's limits.
 // size is the total stream size, or -1 if unknown.
 func uploadStreamBlockSize(size int64) int64 {
-	blockSize := int64(uploadStreamBlockBase)
+	minBlockSize, maxBlockSize, baseBlockSize := uploadStreamBlockLimits()
+	return uploadStreamBlockSizeWithLimits(size, minBlockSize, maxBlockSize, baseBlockSize)
+}
+
+func uploadStreamBlockLimits() (int64, int64, int64) {
+	minBlockSize := int64(uploadStreamBlockMin)
+	maxBlockSize := int64(uploadStreamBlockMax)
+	baseBlockSize := int64(uploadStreamBlockBase)
+
+	if value, ok := uploadStreamBlockEnvMiB(uploadStreamBlockMinEnv); ok {
+		minBlockSize = value
+	}
+	if value, ok := uploadStreamBlockEnvMiB(uploadStreamBlockMaxEnv); ok {
+		maxBlockSize = value
+	}
+	if minBlockSize < int64(uploadStreamBlockMin) {
+		minBlockSize = int64(uploadStreamBlockMin)
+	}
+	if minBlockSize > int64(uploadStreamBlockMax) {
+		minBlockSize = int64(uploadStreamBlockMax)
+	}
+	if maxBlockSize < int64(uploadStreamBlockMin) {
+		maxBlockSize = int64(uploadStreamBlockMin)
+	}
+	if maxBlockSize > int64(uploadStreamBlockMax) {
+		maxBlockSize = int64(uploadStreamBlockMax)
+	}
+	if maxBlockSize < minBlockSize {
+		maxBlockSize = minBlockSize
+	}
+	if value, ok := uploadStreamBlockEnvMiB(uploadStreamBlockBaseEnv); ok {
+		baseBlockSize = value
+	}
+	if baseBlockSize < minBlockSize {
+		baseBlockSize = minBlockSize
+	}
+	if baseBlockSize > maxBlockSize {
+		baseBlockSize = maxBlockSize
+	}
+	return minBlockSize, maxBlockSize, baseBlockSize
+}
+
+func uploadStreamBlockEnvMiB(name string) (int64, bool) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0, false
+	}
+	if parsed > int64(math.MaxInt64/uploadStreamMiB) {
+		return 0, false
+	}
+	return parsed * uploadStreamMiB, true
+}
+
+func uploadStreamBlockSizeWithLimits(size, minBlockSize, maxBlockSize, baseBlockSize int64) int64 {
+	blockSize := baseBlockSize
 	if size >= 0 {
 		blockSize = (size + int64(uploadStreamMaxBlocks) - 1) / int64(uploadStreamMaxBlocks)
 	}
-	if blockSize < int64(uploadStreamBlockMin) {
-		blockSize = int64(uploadStreamBlockMin)
+	if blockSize < minBlockSize {
+		blockSize = minBlockSize
 	}
-	if blockSize > int64(uploadStreamBlockMax) {
-		blockSize = int64(uploadStreamBlockMax)
+	if blockSize > maxBlockSize {
+		blockSize = maxBlockSize
 	}
 	return blockSize
 }
@@ -482,9 +545,10 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 	}
 	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
 	size := readerSize(reader)
-	blockSize := uploadStreamBlockSize(size)
-	if size >= 0 && blockSize == int64(uploadStreamBlockMax) {
-		maxSize := int64(uploadStreamMaxBlocks) * int64(uploadStreamBlockMax)
+	minBlockSize, maxBlockSize, baseBlockSize := uploadStreamBlockLimits()
+	blockSize := uploadStreamBlockSizeWithLimits(size, minBlockSize, maxBlockSize, baseBlockSize)
+	if size >= 0 && blockSize == maxBlockSize {
+		maxSize := int64(uploadStreamMaxBlocks) * maxBlockSize
 		if size > maxSize {
 			return fmt.Errorf("put failed: stream size %d exceeds %d", size, maxSize)
 		}
