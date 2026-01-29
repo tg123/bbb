@@ -63,15 +63,15 @@ var validBlobSuffixes = []string{
 }
 
 const (
-	defaultCopySASExpiry  = time.Hour
-	copyPollInitialDelay  = time.Second
-	copyPollMaxDelay      = 30 * time.Second
-	copyPollBackoffFactor = 2
-	uploadStreamMiB       = 1 << 20
-	uploadStreamBlockMin  = 256 * uploadStreamMiB  // Default UploadStream minimum block size.
-	uploadStreamBlockMax  = 4000 * uploadStreamMiB // Azure UploadStream maximum block size.
-	uploadStreamBlockBase = 256 * uploadStreamMiB  // Default block size when stream size is unknown.
-	uploadStreamMaxBlocks = 100000                 // Azure block upload limit (newer API).
+	defaultCopySASExpiry     = time.Hour
+	copyPollInitialDelay     = time.Second
+	copyPollMaxDelay         = 30 * time.Second
+	copyPollBackoffFactor    = 2
+	uploadStreamMiB          = 1 << 20
+	uploadStreamBlockMin     = 256 * uploadStreamMiB  // Default UploadStream minimum block size.
+	uploadStreamBlockMax     = 4000 * uploadStreamMiB // Azure UploadStream maximum block size.
+	uploadStreamBlockBase    = 256 * uploadStreamMiB  // Default block size when stream size is unknown.
+	uploadStreamMaxBlocks    = 100000                 // Azure block upload limit (newer API).
 	uploadStreamBlockMinEnv  = "AZ_BLOB_UPLOAD_STREAM_BLOCK_MIN_MIB"
 	uploadStreamBlockMaxEnv  = "AZ_BLOB_UPLOAD_STREAM_BLOCK_MAX_MIB"
 	uploadStreamBlockBaseEnv = "AZ_BLOB_UPLOAD_STREAM_BLOCK_BASE_MIB"
