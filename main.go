@@ -1099,8 +1099,13 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			return err
 		}
 	}
-	srcCtx := azblob.WithSourceTenant(ctx)
-	dstCtx := azblob.WithDestinationTenant(ctx)
+	crossTenantOK := azblob.CrossTenantConfigured()
+	srcCtx := ctx
+	dstCtx := ctx
+	if crossTenantOK {
+		srcCtx = azblob.WithSourceTenant(ctx)
+		dstCtx = azblob.WithDestinationTenant(ctx)
+	}
 	srcs := make([]string, c.Args().Len()-1)
 	for i := 0; i < len(srcs); i++ {
 		srcs[i] = c.Args().Get(i)
@@ -1238,6 +1243,9 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 		if op.srcAz && op.dstAz {
 			dap, _ := azblob.Parse(op.dst)
+			if op.srcAzPath.Account != dap.Account && !crossTenantOK {
+				return azblob.ErrCrossTenantMissing
+			}
 			if op.srcAzPath.Account != dap.Account {
 				if !overwrite {
 					if _, err := azblob.HeadBlob(dstCtx, dap); err == nil {
@@ -1323,8 +1331,13 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		// naive recursive copy via listing + per-blob cp
 		srcAz, dstAz := isAz(src), isAz(dst)
 		if srcAz && dstAz {
-			srcCtx := azblob.WithSourceTenant(ctx)
-			dstCtx := azblob.WithDestinationTenant(ctx)
+			crossTenantOK := azblob.CrossTenantConfigured()
+			srcCtx := ctx
+			dstCtx := ctx
+			if crossTenantOK {
+				srcCtx = azblob.WithSourceTenant(ctx)
+				dstCtx = azblob.WithDestinationTenant(ctx)
+			}
 			sap, _ := azblob.Parse(src)
 			dap, _ := azblob.Parse(dst)
 			list, err := azblob.ListRecursive(srcCtx, sap)
@@ -1342,6 +1355,9 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				return nil
 			}, func(work azToAzOp) error {
+				if !crossTenantOK && sap.Account != dap.Account {
+					return azblob.ErrCrossTenantMissing
+				}
 				reader, err := azblob.DownloadStream(srcCtx, sap.Child(work.name))
 				if err != nil {
 					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
@@ -1368,7 +1384,10 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			})
 		}
 		if srcAz && !dstAz { // Azure -> local
-			srcCtx := azblob.WithSourceTenant(ctx)
+			srcCtx := ctx
+			if azblob.CrossTenantConfigured() {
+				srcCtx = azblob.WithSourceTenant(ctx)
+			}
 			sap, _ := azblob.Parse(src)
 			list, err := azblob.ListRecursive(srcCtx, sap)
 			if err != nil {
@@ -1412,7 +1431,10 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			})
 		}
 		if !srcAz && dstAz { // local -> Azure
-			dstCtx := azblob.WithDestinationTenant(ctx)
+			dstCtx := ctx
+			if azblob.CrossTenantConfigured() {
+				dstCtx = azblob.WithDestinationTenant(ctx)
+			}
 			dap, _ := azblob.Parse(dst)
 			// walk local
 			type localToAzOp struct {
@@ -1528,7 +1550,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 }
 
 func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, overwrite, quiet, dstDir bool) error {
-	if dstAz {
+	if dstAz && azblob.CrossTenantConfigured() {
 		ctx = azblob.WithDestinationTenant(ctx)
 	}
 	dstPath, err := resolveDstPath(dst, dstAz, base, dstDir)
@@ -1589,7 +1611,7 @@ func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, ov
 }
 
 func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite, quiet bool, concurrency int, retryCount int) error {
-	if dstAz {
+	if dstAz && azblob.CrossTenantConfigured() {
 		ctx = azblob.WithDestinationTenant(ctx)
 	}
 	files, err := hf.ListFiles(ctx, hfPath)

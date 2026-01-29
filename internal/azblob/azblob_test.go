@@ -84,7 +84,7 @@ func TestCopyBlobServerSideRequiresSameAccount(t *testing.T) {
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
 	err := CopyBlobServerSide(ctx, src, dst)
-	if !errors.Is(err, errCrossTenantMissing) {
+	if !errors.Is(err, ErrCrossTenantMissing) {
 		t.Fatalf("expected missing tenant error, got %v", err)
 	}
 }
@@ -110,6 +110,9 @@ func TestTenantContextHelpers(t *testing.T) {
 	dstCtx := WithDestinationTenant(context.Background())
 	if got := tenantFromContext(dstCtx); got != "tenant-dst" {
 		t.Fatalf("expected dst tenant, got %q", got)
+	}
+	if !CrossTenantConfigured() {
+		t.Fatal("expected cross tenant configuration to be true")
 	}
 	if got := tenantFromContext(context.Background()); got != "" {
 		t.Fatalf("expected empty tenant, got %q", got)

@@ -238,7 +238,8 @@ type tenantContextKey struct{}
 var tenantCredMu sync.Mutex
 var tenantCreds = make(map[string]azcore.TokenCredential)
 
-var errCrossTenantMissing = errors.New("cross-account copy requires AZ_BLOB_SRC_TENANT and AZ_BLOB_DST_TENANT (or --src-tenant/--dst-tenant)")
+// ErrCrossTenantMissing is returned when cross-account copy lacks tenant configuration.
+var ErrCrossTenantMissing = errors.New("cross-account copy requires AZ_BLOB_SRC_TENANT and AZ_BLOB_DST_TENANT (or --src-tenant/--dst-tenant)")
 
 // WithSourceTenant adds the source tenant from AZ_BLOB_SRC_TENANT to the context.
 func WithSourceTenant(ctx context.Context) context.Context {
@@ -264,6 +265,11 @@ func sourceTenant() string {
 
 func destinationTenant() string {
 	return strings.TrimSpace(os.Getenv(azBlobDstTenantEnv))
+}
+
+// CrossTenantConfigured reports whether both tenant env vars are set.
+func CrossTenantConfigured() bool {
+	return sourceTenant() != "" && destinationTenant() != ""
 }
 
 func tenantFromContext(ctx context.Context) string {
@@ -640,7 +646,7 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 		srcTenant := sourceTenant()
 		dstTenant := destinationTenant()
 		if srcTenant == "" || dstTenant == "" {
-			return errCrossTenantMissing
+			return ErrCrossTenantMissing
 		}
 		return copyBlobClientSide(ctx, src, dst, srcTenant, dstTenant)
 	}
