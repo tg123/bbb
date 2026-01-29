@@ -29,7 +29,7 @@ func listRecursive(ctx context.Context, fs FS, current, relPrefix string, isRemo
 			continue
 		}
 		childPath := entry.Path
-		if entry.IsDir && !strings.HasSuffix(childPath, "/") && strings.Contains(childPath, "://") {
+		if entry.IsDir && !strings.HasSuffix(childPath, "/") && isRemote {
 			childPath += "/"
 		}
 		if !isRemote && !filepath.IsAbs(childPath) {
