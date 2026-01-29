@@ -138,6 +138,40 @@ func TestUploadStreamBlockSizeMaxClamp(t *testing.T) {
 	}
 }
 
+func TestUploadStreamBlockSizeUsesEnvOverrides(t *testing.T) {
+	t.Setenv(uploadStreamBlockMinEnv, "2")
+	t.Setenv(uploadStreamBlockMaxEnv, "4")
+	t.Setenv(uploadStreamBlockBaseEnv, "3")
+	blockSize := uploadStreamBlockSize(-1)
+	if blockSize != 3*uploadStreamMiB {
+		t.Fatalf("expected block size %d, got %d", 3*uploadStreamMiB, blockSize)
+	}
+	blockSize = uploadStreamBlockSize(0)
+	if blockSize != 2*uploadStreamMiB {
+		t.Fatalf("expected block size %d, got %d", 2*uploadStreamMiB, blockSize)
+	}
+}
+
+func TestUploadStreamBlockSizeIgnoresInvalidEnv(t *testing.T) {
+	t.Setenv(uploadStreamBlockMinEnv, "nope")
+	t.Setenv(uploadStreamBlockMaxEnv, "-2")
+	t.Setenv(uploadStreamBlockBaseEnv, "0")
+	blockSize := uploadStreamBlockSize(-1)
+	if blockSize != uploadStreamBlockBase {
+		t.Fatalf("expected block size %d, got %d", uploadStreamBlockBase, blockSize)
+	}
+}
+
+func TestUploadStreamBlockLimitsClampEnv(t *testing.T) {
+	t.Setenv(uploadStreamBlockMinEnv, "5000")
+	t.Setenv(uploadStreamBlockMaxEnv, "1")
+	t.Setenv(uploadStreamBlockBaseEnv, "0")
+	blockSize := uploadStreamBlockSize(-1)
+	if blockSize != uploadStreamBlockMax {
+		t.Fatalf("expected block size %d, got %d", uploadStreamBlockMax, blockSize)
+	}
+}
+
 func TestReaderSizeUsesFileInfo(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/data.bin"
