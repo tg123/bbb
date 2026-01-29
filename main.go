@@ -421,54 +421,15 @@ func cmdCat(ctx context.Context, c *cli.Command) error {
 	}
 	for i := 0; i < c.Args().Len(); i++ {
 		p := c.Args().Get(i)
-		if isAz(p) {
-			ap, err := azblob.Parse(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-				continue
-			}
-			reader, err := azblob.DownloadStream(ctx, ap)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-				continue
-			}
-			if err := withReadCloser(reader, func(r io.Reader) error {
-				_, err := io.Copy(os.Stdout, r)
-				return err
-			}); err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-			}
-			continue
-		}
-		if isHF(p) {
-			hfPath, err := hf.Parse(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-				continue
-			}
-			reader, err := hf.DownloadStream(ctx, hfPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-				continue
-			}
-			if err := withReadCloser(reader, func(r io.Reader) error {
-				_, err := io.Copy(os.Stdout, r)
-				return err
-			}); err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-			}
-			continue
-		}
-		f, err := os.Open(p)
+		reader, err := bbbfs.Resolve(p).Read(ctx, p)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
 			continue
 		}
-		_, err = io.Copy(os.Stdout, f)
-		if cerr := f.Close(); cerr != nil && err == nil {
-			err = cerr
-		}
-		if err != nil {
+		if err := withReadCloser(reader, func(r io.Reader) error {
+			_, err := io.Copy(os.Stdout, r)
+			return err
+		}); err != nil {
 			fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
 		}
 	}
@@ -1224,52 +1185,42 @@ func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, ov
 	if err != nil {
 		return err
 	}
-	if dstAz {
-		reader, err := hf.DownloadStream(ctx, hfPath)
-		if err != nil {
-			return err
-		}
-		dap, err := azblob.Parse(dstPath)
-		if err != nil {
-			if cerr := reader.Close(); cerr != nil {
-				return cerr
+	reader, err := bbbfs.Resolve(hfPath.String()).Read(ctx, hfPath.String())
+	if err != nil {
+		return err
+	}
+	if !overwrite {
+		if dstAz {
+			dap, err := azblob.Parse(dstPath)
+			if err != nil {
+				if cerr := reader.Close(); cerr != nil {
+					return cerr
+				}
+				return err
 			}
-			return err
-		}
-		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-			if cerr := reader.Close(); cerr != nil {
-				return cerr
+			if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
+				if cerr := reader.Close(); cerr != nil {
+					return cerr
+				}
+				return errors.New("cp: destination must be a blob path")
 			}
-			return errors.New("cp: destination must be a blob path")
-		}
-		if !overwrite {
 			if _, err := azblob.HeadBlob(ctx, dap); err == nil {
 				if cerr := reader.Close(); cerr != nil {
 					return cerr
 				}
 				return errors.New("cp: destination exists")
 			}
-		}
-		if err := withReadCloser(reader, func(r io.Reader) error {
-			return azblob.UploadStream(ctx, dap, r)
-		}); err != nil {
-			return err
-		}
-	} else {
-		if !overwrite {
-			if _, err := os.Stat(dstPath); err == nil {
-				return errors.New("cp: destination exists")
+		} else if _, err := os.Stat(dstPath); err == nil {
+			if cerr := reader.Close(); cerr != nil {
+				return cerr
 			}
+			return errors.New("cp: destination exists")
 		}
-		reader, err := hf.DownloadStream(ctx, hfPath)
-		if err != nil {
-			return err
-		}
-		if err := withReadCloser(reader, func(r io.Reader) error {
-			return writeStreamToFile(dstPath, r, 0o644)
-		}); err != nil {
-			return err
-		}
+	}
+	if err := withReadCloser(reader, func(r io.Reader) error {
+		return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
+	}); err != nil {
+		return err
 	}
 	if !quiet {
 		lockedPrintf("Copied %s -> %s\n", hfPath.String(), dstPath)
@@ -1294,58 +1245,46 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 		return nil
 	}, func(op hfOp) error {
 		filePath := hf.Path{Repo: hfPath.Repo, File: op.file}
-		reader, err := hf.DownloadStream(ctx, filePath)
-		if err != nil {
-			return err
-		}
 		dstPath, err := resolveDstPath(dst, dstAz, op.file, true)
 		if err != nil {
-			if cerr := reader.Close(); cerr != nil {
-				return cerr
-			}
 			return err
 		}
-		if dstAz {
-			dap, err := azblob.Parse(dstPath)
-			if err != nil {
-				if cerr := reader.Close(); cerr != nil {
-					return cerr
+		reader, err := bbbfs.Resolve(filePath.String()).Read(ctx, filePath.String())
+		if err != nil {
+			return err
+		}
+		if !overwrite {
+			if dstAz {
+				dap, err := azblob.Parse(dstPath)
+				if err != nil {
+					if cerr := reader.Close(); cerr != nil {
+						return cerr
+					}
+					return err
 				}
-				return err
-			}
-			if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-				if cerr := reader.Close(); cerr != nil {
-					return cerr
+				if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
+					if cerr := reader.Close(); cerr != nil {
+						return cerr
+					}
+					return errors.New("cp: destination must be a blob path")
 				}
-				return errors.New("cp: destination must be a blob path")
-			}
-			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
 					if cerr := reader.Close(); cerr != nil {
 						return cerr
 					}
 					return nil
 				}
-			}
-			if err := withReadCloser(reader, func(r io.Reader) error {
-				return azblob.UploadStream(ctx, dap, r)
-			}); err != nil {
-				return err
-			}
-		} else {
-			if !overwrite {
-				if _, err := os.Stat(dstPath); err == nil {
-					if cerr := reader.Close(); cerr != nil {
-						return cerr
-					}
-					return nil
+			} else if _, err := os.Stat(dstPath); err == nil {
+				if cerr := reader.Close(); cerr != nil {
+					return cerr
 				}
+				return nil
 			}
-			if err := withReadCloser(reader, func(r io.Reader) error {
-				return writeStreamToFile(dstPath, r, 0o644)
-			}); err != nil {
-				return err
-			}
+		}
+		if err := withReadCloser(reader, func(r io.Reader) error {
+			return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
+		}); err != nil {
+			return err
 		}
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", filePath.String(), dstPath)
