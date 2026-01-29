@@ -7,9 +7,19 @@ import (
 	"strings"
 )
 
-// ListRecursive lists all files under the path using List and Stat metadata.
+// recursiveLister is implemented by backends that support efficient recursive listing.
+type recursiveLister interface {
+	ListRecursive(ctx context.Context, root string) ([]Entry, error)
+}
+
+// ListRecursive lists all files under the path, using provider-specific recursive
+// listing when available, and falling back to List and Stat-based traversal.
 func ListRecursive(ctx context.Context, root string) ([]Entry, error) {
 	fs := Resolve(root)
+
+	if rl, ok := fs.(recursiveLister); ok {
+		return rl.ListRecursive(ctx, root)
+	}
 	isRemote := IsAz(root) || IsHF(root)
 	return listRecursive(ctx, fs, root, root, "", isRemote)
 }
