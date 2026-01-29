@@ -194,7 +194,7 @@ func main() {
 			{
 				Name:      "cp",
 				Usage:     "Copy files or directories",
-				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
+				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] [--src-tenant TENANT] [--dst-tenant TENANT] srcs [srcs ...] dst",
 				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
@@ -1225,7 +1225,6 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			os.Exit(1)
 		}
 	}
-	ctx = dstCtx
 	if err := runOpPoolWithRetryProgress(dstCtx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
 			if err := sendOp(ctx, pending, op); err != nil {
@@ -1328,7 +1327,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			dstCtx := azblob.WithDestinationTenant(ctx)
 			sap, _ := azblob.Parse(src)
 			dap, _ := azblob.Parse(dst)
-			list, err := azblob.ListRecursive(ctx, sap)
+			list, err := azblob.ListRecursive(srcCtx, sap)
 			if err != nil {
 				return err
 			}
@@ -1371,7 +1370,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		if srcAz && !dstAz { // Azure -> local
 			srcCtx := azblob.WithSourceTenant(ctx)
 			sap, _ := azblob.Parse(src)
-			list, err := azblob.ListRecursive(ctx, sap)
+			list, err := azblob.ListRecursive(srcCtx, sap)
 			if err != nil {
 				return err
 			}
@@ -1687,7 +1686,9 @@ func writeStreamToFile(dstPath string, reader io.Reader, perm os.FileMode) error
 
 func withReadCloser(reader io.ReadCloser, fn func(io.Reader) error) error {
 	defer func() {
-		_ = reader.Close()
+		if err := reader.Close(); err != nil {
+			slog.Debug("failed to close reader", "error", err)
+		}
 	}()
 	return fn(reader)
 }

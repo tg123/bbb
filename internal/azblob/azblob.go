@@ -238,12 +238,14 @@ type tenantContextKey struct{}
 var tenantCredMu sync.Mutex
 var tenantCreds = make(map[string]azcore.TokenCredential)
 
-var errCrossTenantMissing = errors.New("cross-account copy requires AZ_BLOB_SRC_TENANT and AZ_BLOB_DST_TENANT")
+var errCrossTenantMissing = errors.New("cross-account copy requires AZ_BLOB_SRC_TENANT and AZ_BLOB_DST_TENANT (or --src-tenant/--dst-tenant)")
 
+// WithSourceTenant adds the source tenant from AZ_BLOB_SRC_TENANT to the context.
 func WithSourceTenant(ctx context.Context) context.Context {
 	return withTenant(ctx, sourceTenant())
 }
 
+// WithDestinationTenant adds the destination tenant from AZ_BLOB_DST_TENANT to the context.
 func WithDestinationTenant(ctx context.Context) context.Context {
 	return withTenant(ctx, destinationTenant())
 }
