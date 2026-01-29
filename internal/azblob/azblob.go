@@ -7,20 +7,21 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"regexp"
 	"sort"
 	"strings"
-
-	"net/http/httptrace"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 )
 
 // MkContainer creates a new Azure Blob container
@@ -42,32 +43,6 @@ func MkContainer(ctx context.Context, account, container string) error {
 	return nil
 }
 
-// withHTTPTrace attaches httptrace to the request for debugging
-func withHTTPTrace(req *http.Request) *http.Request {
-	trace := &httptrace.ClientTrace{
-		GotConn: func(info httptrace.GotConnInfo) {
-			slog.Debug("httptrace: GotConn", "reused", info.Reused, "wasIdle", info.WasIdle)
-		},
-		DNSStart: func(info httptrace.DNSStartInfo) {
-			slog.Debug("httptrace: DNSStart", "host", info.Host)
-		},
-		DNSDone: func(info httptrace.DNSDoneInfo) {
-			slog.Debug("httptrace: DNSDone", "addrs", info.Addrs, "err", info.Err)
-		},
-		ConnectStart: func(network, addr string) {
-			slog.Debug("httptrace: ConnectStart", "network", network, "addr", addr)
-		},
-		ConnectDone: func(network, addr string, err error) {
-			slog.Debug("httptrace: ConnectDone", "network", network, "addr", addr, "err", err)
-		},
-		GotFirstResponseByte: func() {
-			slog.Debug("httptrace: GotFirstResponseByte")
-		},
-	}
-
-	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
-}
-
 // AzurePath represents an az:// path (account/container/blob)
 type AzurePath struct {
 	Account   string
@@ -84,6 +59,18 @@ var validBlobSuffixes = []string{
 	".blob.core.cloudapi.de",
 	".blob.localhost",
 }
+
+const (
+	defaultCopySASExpiry  = time.Hour
+	copyPollInitialDelay  = time.Second
+	copyPollMaxDelay      = 30 * time.Second
+	copyPollBackoffFactor = 2
+	uploadStreamMiB       = 1 << 20
+	uploadStreamBlockMin  = 1 * uploadStreamMiB    // Azure UploadStream minimum block size.
+	uploadStreamBlockMax  = 4000 * uploadStreamMiB // Azure UploadStream maximum block size.
+	uploadStreamBlockBase = 256 * uploadStreamMiB  // Default block size when stream size is unknown.
+	uploadStreamMaxBlocks = 100000                 // Azure block upload limit (newer API).
+)
 
 // IsBlobURL performs a lightweight check whether the provided string is a blob endpoint URL.
 func IsBlobURL(raw string) bool {
@@ -395,7 +382,9 @@ func Download(ctx context.Context, ap AzurePath) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer reader.Close()
+	defer func() {
+		_ = reader.Close()
+	}()
 	return io.ReadAll(reader)
 }
 
@@ -436,6 +425,52 @@ func Upload(ctx context.Context, ap AzurePath, data []byte) error {
 	return nil
 }
 
+// uploadStreamBlockSize returns a block size clamped to Azure's limits.
+// size is the total stream size, or -1 if unknown.
+func uploadStreamBlockSize(size int64) int64 {
+	blockSize := int64(uploadStreamBlockBase)
+	if size >= 0 {
+		blockSize = (size + int64(uploadStreamMaxBlocks) - 1) / int64(uploadStreamMaxBlocks)
+	}
+	if blockSize < int64(uploadStreamBlockMin) {
+		blockSize = int64(uploadStreamBlockMin)
+	}
+	if blockSize > int64(uploadStreamBlockMax) {
+		blockSize = int64(uploadStreamBlockMax)
+	}
+	return blockSize
+}
+
+// readerSize returns size from Size, Stat, or Seek (restoring position). Returns -1 if unknown.
+func readerSize(reader io.Reader) int64 {
+	if sizer, ok := reader.(interface{ Size() int64 }); ok {
+		size := sizer.Size()
+		if size >= 0 {
+			return size
+		}
+	}
+	if statter, ok := reader.(interface{ Stat() (os.FileInfo, error) }); ok {
+		info, err := statter.Stat()
+		if err == nil && info != nil {
+			return info.Size()
+		}
+	}
+	if seeker, ok := reader.(io.Seeker); ok {
+		current, err := seeker.Seek(0, io.SeekCurrent)
+		if err == nil {
+			end, err := seeker.Seek(0, io.SeekEnd)
+			restoreErr := func() error {
+				_, err := seeker.Seek(current, io.SeekStart)
+				return err
+			}()
+			if err == nil && restoreErr == nil && end >= 0 {
+				return end
+			}
+		}
+	}
+	return -1
+}
+
 // UploadStream writes blob content from a reader (overwrite).
 func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
@@ -446,11 +481,126 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 		return err
 	}
 	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
-	_, err = blobClient.UploadStream(ctx, reader, nil)
+	size := readerSize(reader)
+	blockSize := uploadStreamBlockSize(size)
+	if size >= 0 && blockSize == int64(uploadStreamBlockMax) {
+		maxSize := int64(uploadStreamMaxBlocks) * int64(uploadStreamBlockMax)
+		if size > maxSize {
+			return fmt.Errorf("put failed: stream size %d exceeds %d", size, maxSize)
+		}
+	}
+	_, err = blobClient.UploadStream(ctx, reader, &azblob.UploadStreamOptions{
+		BlockSize: blockSize,
+	})
 	if err != nil {
 		return fmt.Errorf("put failed: %v", err)
 	}
 	return nil
+}
+
+func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error {
+	if src.Blob == "" || strings.HasSuffix(src.Blob, "/") {
+		return errors.New("source path is directory-like")
+	}
+	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
+		return errors.New("destination path is directory-like")
+	}
+	if src.Account != dst.Account {
+		return errors.New("server-side copy requires same storage account")
+	}
+	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
+		return bloberror.MissingSharedKeyCredential
+	}
+	client, err := getAzBlobClient(ctx, dst.Account)
+	if err != nil {
+		return err
+	}
+	blobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlobClient(dst.Blob)
+	copySource, err := blobSASURL(ctx, src)
+	if err != nil {
+		return err
+	}
+	startCopy, err := blobClient.StartCopyFromURL(ctx, copySource, nil)
+	if err != nil {
+		return err
+	}
+	if startCopy.CopyStatus == nil {
+		return errors.New("copy status missing")
+	}
+	var lastProps blob.GetPropertiesResponse
+	hasProps := false
+	copyStatus := *startCopy.CopyStatus
+	if copyStatus != blob.CopyStatusTypePending {
+		props, err := blobClient.GetProperties(ctx, nil)
+		if err == nil && props.CopyStatus != nil {
+			lastProps = props
+			hasProps = true
+			copyStatus = *props.CopyStatus
+		}
+	}
+	pollDelay := copyPollInitialDelay
+	for copyStatus == blob.CopyStatusTypePending {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollDelay):
+		}
+		pollDelay = nextPollDelay(pollDelay)
+		props, err := blobClient.GetProperties(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if props.CopyStatus == nil {
+			return errors.New("copy status missing")
+		}
+		lastProps = props
+		hasProps = true
+		copyStatus = *props.CopyStatus
+	}
+	if copyStatus != blob.CopyStatusTypeSuccess {
+		statusDescription := ""
+		if hasProps && lastProps.CopyStatusDescription != nil {
+			statusDescription = *lastProps.CopyStatusDescription
+		}
+		if statusDescription != "" {
+			return fmt.Errorf("copy failed with status %s: %s", copyStatus, statusDescription)
+		}
+		return fmt.Errorf("copy failed with status %s", copyStatus)
+	}
+	return nil
+}
+
+func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
+	client, err := getAzBlobClient(ctx, ap.Account)
+	if err != nil {
+		return "", err
+	}
+	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob)
+	sasURL, err := blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(copySASDuration()), nil)
+	if err != nil {
+		return "", fmt.Errorf("generate SAS URL: %w", err)
+	}
+	return sasURL, nil
+}
+
+func nextPollDelay(current time.Duration) time.Duration {
+	if current >= copyPollMaxDelay {
+		return copyPollMaxDelay
+	}
+	next := current * copyPollBackoffFactor
+	if next > copyPollMaxDelay {
+		return copyPollMaxDelay
+	}
+	return next
+}
+
+func copySASDuration() time.Duration {
+	if raw := os.Getenv("BBB_AZBLOB_COPY_SAS_EXPIRY"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return defaultCopySASExpiry
 }
 
 // Delete deletes a single blob
@@ -511,13 +661,6 @@ type notExistError string
 func (e notExistError) Error() string  { return string(e) + ": not found" }
 func (e notExistError) NotFound() bool { return true }
 func osNotExist(s string) error        { return notExistError(s) }
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}
 
 func validContainerName(name string) bool {
 	if len(name) < 3 || len(name) > 63 {

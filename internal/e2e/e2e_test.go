@@ -43,23 +43,26 @@ func parseMD5Output(out []byte) string {
 	return fields[0]
 }
 
-func waitForEndpointReady(addr string) {
-	waitForEndpointReadyWithTimeout(addr, waitTimeout)
+func waitForEndpointReady(addr string) bool {
+	return waitForEndpointReadyWithTimeout(addr, waitTimeout)
 }
 
-func waitForEndpointReadyWithTimeout(addr string, timeout time.Duration) {
+func waitForEndpointReadyWithTimeout(addr string, timeout time.Duration) bool {
 	now := time.Now()
 	timeout = max(timeout, waitTimeout)
 	for {
 		if time.Since(now) > timeout {
-			log.Panic("timeout waiting for endpoint " + addr)
+			log.Printf("timeout waiting for endpoint %s", addr)
+			return false
 		}
 
 		conn, err := net.Dial("tcp", addr)
 		if err == nil {
 			log.Printf("endpoint %s is ready", addr)
-			conn.Close()
-			break
+			if cerr := conn.Close(); cerr != nil {
+				log.Printf("failed to close connection: %v", cerr)
+			}
+			return true
 		}
 		time.Sleep(time.Second)
 	}
@@ -160,8 +163,12 @@ func cleanFolder(t *testing.T, path string) {
 }
 
 func TestBasic(t *testing.T) {
-
-	waitForEndpointReady(azuriteHost)
+	if testing.Short() {
+		t.Skip("skipping e2e tests in short mode")
+	}
+	if !waitForEndpointReady(azuriteHost) {
+		t.Skipf("azurite endpoint %s not reachable", azuriteHost)
+	}
 
 	// create container
 	{
@@ -224,7 +231,11 @@ func TestBasic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(tmpFile.Name())
+	defer func() {
+		if rerr := os.Remove(tmpFile.Name()); rerr != nil {
+			t.Logf("cleanup temp file: %v", rerr)
+		}
+	}()
 
 	content := []byte("hello world")
 	if _, err := tmpFile.Write(content); err != nil {
@@ -310,6 +321,48 @@ func TestBasic(t *testing.T) {
 		expected := []string{
 			"az://" + azuriteAccount + "/test/testfile.txt",
 			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("unexpected files: got %v, want %v", files, expected)
+		}
+	}
+
+	// cp az az (directory-style destination)
+	{
+		_, err := runBBB("cp", "az://"+azuriteAccount+"/test/testfile.txt", "az://"+azuriteAccount+"/test/dir2/")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		files, err := bbbLs("az://"+azuriteAccount+"/test/dir2/testfile*", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/dir2/testfile.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("unexpected files: got %v, want %v", files, expected)
+		}
+	}
+
+	// cp az az (explicit file destination)
+	{
+		_, err := runBBB("cp", "az://"+azuriteAccount+"/test/testfile.txt", "az://"+azuriteAccount+"/test/dir/testfile3.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		files, err := bbbLs("az://"+azuriteAccount+"/test/dir/testfile3.txt*", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/dir/testfile3.txt",
 		}
 
 		if !slices.Equal(files, expected) {
@@ -403,7 +456,11 @@ func TestBasic(t *testing.T) {
 	// download
 	{
 		downloadPath := tmpFile.Name() + ".downloaded"
-		defer os.Remove(downloadPath)
+		defer func() {
+			if rerr := os.Remove(downloadPath); rerr != nil {
+				t.Logf("cleanup download file: %v", rerr)
+			}
+		}()
 
 		_, err := runBBB("cp", "az://"+azuriteAccount+"/test/testfile.txt", downloadPath)
 		if err != nil {
@@ -423,7 +480,11 @@ func TestBasic(t *testing.T) {
 	// download via http blob URL
 	{
 		downloadPath := tmpFile.Name() + ".http.downloaded"
-		defer os.Remove(downloadPath)
+		defer func() {
+			if rerr := os.Remove(downloadPath); rerr != nil {
+				t.Logf("cleanup download file: %v", rerr)
+			}
+		}()
 
 		httpURL := fmt.Sprintf("http://%s/test/testfile.txt", azuriteHost)
 		if _, err := runBBB("cp", httpURL, downloadPath); err != nil {
@@ -444,7 +505,11 @@ func TestBasic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer os.RemoveAll(localDir)
+		defer func() {
+			if rerr := os.RemoveAll(localDir); rerr != nil {
+				t.Logf("cleanup local dir: %v", rerr)
+			}
+		}()
 		localFile := filepath.Join(localDir, "new.txt")
 		if _, err := runBBB("touch", localFile); err != nil {
 			t.Fatal(err)
@@ -471,7 +536,11 @@ func TestBasic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer os.RemoveAll(localDir)
+		defer func() {
+			if rerr := os.RemoveAll(localDir); rerr != nil {
+				t.Logf("cleanup local dir: %v", rerr)
+			}
+		}()
 
 		if err := os.WriteFile(localDir+"/1.txt", content, 0o644); err != nil {
 			t.Fatal(err)
@@ -512,7 +581,11 @@ func TestBasic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer os.RemoveAll(localOut)
+		defer func() {
+			if rerr := os.RemoveAll(localOut); rerr != nil {
+				t.Logf("cleanup local out: %v", rerr)
+			}
+		}()
 
 		if _, err := runBBB("cpr", "az://"+azuriteAccount+"/test/", localOut); err != nil {
 			t.Fatal(err)
@@ -706,6 +779,9 @@ func TestBasic(t *testing.T) {
 }
 
 func TestHuggingFaceDownload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e tests in short mode")
+	}
 	repo := "hf-internal-testing/tiny-random-BertModel"
 	files, err := hfListFiles(t, repo)
 	if err != nil {
@@ -718,7 +794,11 @@ func TestHuggingFaceDownload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		if rerr := os.RemoveAll(tempDir); rerr != nil {
+			t.Logf("cleanup temp dir: %v", rerr)
+		}
+	}()
 
 	if _, err := runBBB("cp", "hf://"+repo, tempDir); err != nil {
 		t.Fatal(err)
