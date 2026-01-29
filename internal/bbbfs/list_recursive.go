@@ -11,10 +11,10 @@ import (
 func ListRecursive(ctx context.Context, root string) ([]Entry, error) {
 	fs := Resolve(root)
 	isRemote := IsAz(root) || IsHF(root)
-	return listRecursive(ctx, fs, root, "", isRemote)
+	return listRecursive(ctx, fs, root, root, "", isRemote)
 }
 
-func listRecursive(ctx context.Context, fs FS, current, relPrefix string, isRemote bool) ([]Entry, error) {
+func listRecursive(ctx context.Context, fs FS, root, current, relPrefix string, isRemote bool) ([]Entry, error) {
 	entries, err := fs.List(ctx, current)
 	if err != nil {
 		return nil, err
@@ -48,14 +48,22 @@ func listRecursive(ctx context.Context, fs FS, current, relPrefix string, isRemo
 			return nil, err
 		}
 		if stat.IsDir {
-			childEntries, err := listRecursive(ctx, fs, childPath, childRel, isRemote)
+			childEntries, err := listRecursive(ctx, fs, root, childPath, childRel, isRemote)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, childEntries...)
 			continue
 		}
-		stat.Name = childRel
+		if !isRemote {
+			if relPath, relErr := filepath.Rel(root, stat.Path); relErr == nil {
+				stat.Name = relPath
+			} else {
+				stat.Name = childRel
+			}
+		} else {
+			stat.Name = childRel
+		}
 		stat.Path = childPath
 		out = append(out, stat)
 	}
