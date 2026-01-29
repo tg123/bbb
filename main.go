@@ -396,14 +396,15 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 }
 
 func splitWildcard(target string) (string, string) {
+	const azScheme = "az://"
 	if strings.Contains(target, "*") {
 		starIdx := strings.Index(target, "*")
 		lastSlash := strings.LastIndex(target[:starIdx], "/")
 		minPrefix := 0
 		if strings.HasPrefix(target, hfScheme) {
 			minPrefix = len(hfScheme)
-		} else if strings.HasPrefix(target, "az://") {
-			minPrefix = len("az://")
+		} else if strings.HasPrefix(target, azScheme) {
+			minPrefix = len(azScheme)
 		}
 		if lastSlash >= minPrefix {
 			return target[:lastSlash+1], target[lastSlash+1:]
