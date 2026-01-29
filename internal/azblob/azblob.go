@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -75,6 +76,8 @@ const (
 	uploadStreamBlockMinEnv  = "AZ_BLOB_UPLOAD_STREAM_BLOCK_MIN_MIB"
 	uploadStreamBlockMaxEnv  = "AZ_BLOB_UPLOAD_STREAM_BLOCK_MAX_MIB"
 	uploadStreamBlockBaseEnv = "AZ_BLOB_UPLOAD_STREAM_BLOCK_BASE_MIB"
+	azBlobSrcTenantEnv       = "AZ_BLOB_SRC_TENANT"
+	azBlobDstTenantEnv       = "AZ_BLOB_DST_TENANT"
 )
 
 // IsBlobURL performs a lightweight check whether the provided string is a blob endpoint URL.
@@ -230,8 +233,70 @@ type BlobMeta struct {
 }
 
 // List lists immediate children (non-recursive). If dir-like path provided, lists under it.
+type tenantContextKey struct{}
+
+var tenantCredMu sync.Mutex
+var tenantCreds = make(map[string]azcore.TokenCredential)
+
+var errCrossTenantMissing = errors.New("cross-account copy requires AZ_BLOB_SRC_TENANT and AZ_BLOB_DST_TENANT")
+
+func WithSourceTenant(ctx context.Context) context.Context {
+	return withTenant(ctx, sourceTenant())
+}
+
+func WithDestinationTenant(ctx context.Context) context.Context {
+	return withTenant(ctx, destinationTenant())
+}
+
+func withTenant(ctx context.Context, tenantID string) context.Context {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, tenantContextKey{}, tenantID)
+}
+
+func sourceTenant() string {
+	return strings.TrimSpace(os.Getenv(azBlobSrcTenantEnv))
+}
+
+func destinationTenant() string {
+	return strings.TrimSpace(os.Getenv(azBlobDstTenantEnv))
+}
+
+func tenantFromContext(ctx context.Context) string {
+	if tenantID, ok := ctx.Value(tenantContextKey{}).(string); ok {
+		return tenantID
+	}
+	return ""
+}
+
+func tenantCredential(tenantID string) (azcore.TokenCredential, error) {
+	tenantCredMu.Lock()
+	defer tenantCredMu.Unlock()
+	if cred, ok := tenantCreds[tenantID]; ok {
+		return cred, nil
+	}
+	fmt.Fprintf(os.Stderr, "Authenticating Azure tenant %s\n", tenantID)
+	cred, err := azidentity.NewInteractiveBrowserCredential(&azidentity.InteractiveBrowserCredentialOptions{
+		TenantID: tenantID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	tenantCreds[tenantID] = cred
+	return cred, nil
+}
+
 func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
 	endpoint := getEndpoint(account)
+	if tenantID := tenantFromContext(ctx); tenantID != "" {
+		cred, err := tenantCredential(tenantID)
+		if err != nil {
+			return nil, err
+		}
+		return azblob.NewClient(endpoint, cred, nil)
+	}
 	if key := os.Getenv("BBB_AZBLOB_ACCOUNTKEY"); key != "" {
 		cred, err := azblob.NewSharedKeyCredential(account, key)
 		if err != nil {
@@ -570,7 +635,12 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 		return errors.New("destination path is directory-like")
 	}
 	if src.Account != dst.Account {
-		return errors.New("server-side copy requires same storage account")
+		srcTenant := sourceTenant()
+		dstTenant := destinationTenant()
+		if srcTenant == "" || dstTenant == "" {
+			return errCrossTenantMissing
+		}
+		return copyBlobClientSide(ctx, src, dst, srcTenant, dstTenant)
 	}
 	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
 		return bloberror.MissingSharedKeyCredential
@@ -632,6 +702,19 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 		return fmt.Errorf("copy failed with status %s", copyStatus)
 	}
 	return nil
+}
+
+func copyBlobClientSide(ctx context.Context, src AzurePath, dst AzurePath, srcTenant string, dstTenant string) error {
+	srcCtx := withTenant(ctx, srcTenant)
+	dstCtx := withTenant(ctx, dstTenant)
+	reader, err := DownloadStream(srcCtx, src)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = reader.Close()
+	}()
+	return UploadStream(dstCtx, dst, reader)
 }
 
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {

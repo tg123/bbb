@@ -201,6 +201,8 @@ func main() {
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
+					&cli.StringFlag{Name: "src-tenant", Usage: "Source Azure tenant ID", Sources: cli.EnvVars("AZ_BLOB_SRC_TENANT")},
+					&cli.StringFlag{Name: "dst-tenant", Usage: "Destination Azure tenant ID", Sources: cli.EnvVars("AZ_BLOB_DST_TENANT")},
 				},
 				Action: cmdCP,
 			},
@@ -1087,6 +1089,18 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
+	if srcTenant := strings.TrimSpace(c.String("src-tenant")); srcTenant != "" {
+		if err := os.Setenv("AZ_BLOB_SRC_TENANT", srcTenant); err != nil {
+			return err
+		}
+	}
+	if dstTenant := strings.TrimSpace(c.String("dst-tenant")); dstTenant != "" {
+		if err := os.Setenv("AZ_BLOB_DST_TENANT", dstTenant); err != nil {
+			return err
+		}
+	}
+	srcCtx := azblob.WithSourceTenant(ctx)
+	dstCtx := azblob.WithDestinationTenant(ctx)
 	srcs := make([]string, c.Args().Len()-1)
 	for i := 0; i < len(srcs); i++ {
 		srcs[i] = c.Args().Get(i)
@@ -1211,7 +1225,8 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			os.Exit(1)
 		}
 	}
-	if err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
+	ctx = dstCtx
+	if err := runOpPoolWithRetryProgress(dstCtx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
 			if err := sendOp(ctx, pending, op); err != nil {
 				return err
@@ -1224,12 +1239,18 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 		if op.srcAz && op.dstAz {
 			dap, _ := azblob.Parse(op.dst)
-			if !overwrite {
-				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
+			if op.srcAzPath.Account != dap.Account {
+				if !overwrite {
+					if _, err := azblob.HeadBlob(dstCtx, dap); err == nil {
+						return errors.New("cp: destination exists")
+					}
+				}
+			} else if !overwrite {
+				if _, err := azblob.HeadBlob(dstCtx, dap); err == nil {
 					return errors.New("cp: destination exists")
 				}
 			}
-			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap); err != nil {
+			if err := azblob.CopyBlobServerSide(dstCtx, op.srcAzPath, dap); err != nil {
 				return err
 			}
 			if !quiet {
@@ -1238,7 +1259,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			return nil
 		}
 		if op.srcAz && !op.dstAz {
-			reader, err := azblob.DownloadStream(ctx, op.srcAzPath)
+			reader, err := azblob.DownloadStream(srcCtx, op.srcAzPath)
 			if err != nil {
 				return err
 			}
@@ -1267,7 +1288,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 				return err
 			}
 			if !overwrite {
-				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
+				if _, err := azblob.HeadBlob(dstCtx, dap); err == nil {
 					if cerr := reader.Close(); cerr != nil {
 						return cerr
 					}
@@ -1275,7 +1296,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 				}
 			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return azblob.UploadStream(ctx, dap, r)
+				return azblob.UploadStream(dstCtx, dap, r)
 			}); err != nil {
 				return err
 			}
@@ -1303,6 +1324,8 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		// naive recursive copy via listing + per-blob cp
 		srcAz, dstAz := isAz(src), isAz(dst)
 		if srcAz && dstAz {
+			srcCtx := azblob.WithSourceTenant(ctx)
+			dstCtx := azblob.WithDestinationTenant(ctx)
 			sap, _ := azblob.Parse(src)
 			dap, _ := azblob.Parse(dst)
 			list, err := azblob.ListRecursive(ctx, sap)
@@ -1320,13 +1343,13 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				return nil
 			}, func(work azToAzOp) error {
-				reader, err := azblob.DownloadStream(ctx, sap.Child(work.name))
+				reader, err := azblob.DownloadStream(srcCtx, sap.Child(work.name))
 				if err != nil {
 					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 					return err
 				}
 				if !overwrite {
-					if _, err := azblob.HeadBlob(ctx, dap.Child(work.name)); err == nil {
+					if _, err := azblob.HeadBlob(dstCtx, dap.Child(work.name)); err == nil {
 						if cerr := reader.Close(); cerr != nil {
 							return cerr
 						}
@@ -1334,7 +1357,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					}
 				}
 				if err := withReadCloser(reader, func(r io.Reader) error {
-					return azblob.UploadStream(ctx, dap.Child(work.name), r)
+					return azblob.UploadStream(dstCtx, dap.Child(work.name), r)
 				}); err != nil {
 					lockedFprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, work.name, err)
 					return err
@@ -1346,6 +1369,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			})
 		}
 		if srcAz && !dstAz { // Azure -> local
+			srcCtx := azblob.WithSourceTenant(ctx)
 			sap, _ := azblob.Parse(src)
 			list, err := azblob.ListRecursive(ctx, sap)
 			if err != nil {
@@ -1362,7 +1386,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				return nil
 			}, func(work azToLocalOp) error {
-				reader, err := azblob.DownloadStream(ctx, sap.Child(work.name))
+				reader, err := azblob.DownloadStream(srcCtx, sap.Child(work.name))
 				if err != nil {
 					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 					return err
@@ -1389,6 +1413,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			})
 		}
 		if !srcAz && dstAz { // local -> Azure
+			dstCtx := azblob.WithDestinationTenant(ctx)
 			dap, _ := azblob.Parse(dst)
 			// walk local
 			type localToAzOp struct {
@@ -1434,7 +1459,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					return err
 				}
 				if !overwrite {
-					if _, err := azblob.HeadBlob(ctx, dap.Child(work.rel)); err == nil {
+					if _, err := azblob.HeadBlob(dstCtx, dap.Child(work.rel)); err == nil {
 						if cerr := reader.Close(); cerr != nil {
 							return cerr
 						}
@@ -1442,7 +1467,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					}
 				}
 				if err := withReadCloser(reader, func(r io.Reader) error {
-					return azblob.UploadStream(ctx, dap.Child(work.rel), r)
+					return azblob.UploadStream(dstCtx, dap.Child(work.rel), r)
 				}); err != nil {
 					lockedFprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, work.rel, err)
 					return err
@@ -1504,6 +1529,9 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 }
 
 func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, overwrite, quiet, dstDir bool) error {
+	if dstAz {
+		ctx = azblob.WithDestinationTenant(ctx)
+	}
 	dstPath, err := resolveDstPath(dst, dstAz, base, dstDir)
 	if err != nil {
 		return err
@@ -1562,6 +1590,9 @@ func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, ov
 }
 
 func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite, quiet bool, concurrency int, retryCount int) error {
+	if dstAz {
+		ctx = azblob.WithDestinationTenant(ctx)
+	}
 	files, err := hf.ListFiles(ctx, hfPath)
 	if err != nil {
 		return err

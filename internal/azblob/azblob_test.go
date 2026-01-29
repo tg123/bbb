@@ -84,8 +84,8 @@ func TestCopyBlobServerSideRequiresSameAccount(t *testing.T) {
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
 	err := CopyBlobServerSide(ctx, src, dst)
-	if err == nil {
-		t.Fatal("expected error for cross-account copy")
+	if !errors.Is(err, errCrossTenantMissing) {
+		t.Fatalf("expected missing tenant error, got %v", err)
 	}
 }
 
@@ -97,6 +97,22 @@ func TestCopyBlobServerSideRequiresSharedKey(t *testing.T) {
 	err := CopyBlobServerSide(ctx, src, dst)
 	if !errors.Is(err, bloberror.MissingSharedKeyCredential) {
 		t.Fatalf("expected missing shared key error, got %v", err)
+	}
+}
+
+func TestTenantContextHelpers(t *testing.T) {
+	t.Setenv("AZ_BLOB_SRC_TENANT", "tenant-src")
+	t.Setenv("AZ_BLOB_DST_TENANT", "tenant-dst")
+	srcCtx := WithSourceTenant(context.Background())
+	if got := tenantFromContext(srcCtx); got != "tenant-src" {
+		t.Fatalf("expected src tenant, got %q", got)
+	}
+	dstCtx := WithDestinationTenant(context.Background())
+	if got := tenantFromContext(dstCtx); got != "tenant-dst" {
+		t.Fatalf("expected dst tenant, got %q", got)
+	}
+	if got := tenantFromContext(context.Background()); got != "" {
+		t.Fatalf("expected empty tenant, got %q", got)
 	}
 }
 
