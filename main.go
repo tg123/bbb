@@ -1185,37 +1185,25 @@ func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, ov
 	if err != nil {
 		return err
 	}
-	reader, err := bbbfs.Resolve(hfPath.String()).Read(ctx, hfPath.String())
-	if err != nil {
-		return err
-	}
 	if !overwrite {
 		if dstAz {
 			dap, err := azblob.Parse(dstPath)
 			if err != nil {
-				if cerr := reader.Close(); cerr != nil {
-					return cerr
-				}
 				return err
 			}
 			if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-				if cerr := reader.Close(); cerr != nil {
-					return cerr
-				}
 				return errors.New("cp: destination must be a blob path")
 			}
 			if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-				if cerr := reader.Close(); cerr != nil {
-					return cerr
-				}
 				return errors.New("cp: destination exists")
 			}
 		} else if _, err := os.Stat(dstPath); err == nil {
-			if cerr := reader.Close(); cerr != nil {
-				return cerr
-			}
 			return errors.New("cp: destination exists")
 		}
+	}
+	reader, err := bbbfs.Resolve(hfPath.String()).Read(ctx, hfPath.String())
+	if err != nil {
+		return err
 	}
 	if err := withReadCloser(reader, func(r io.Reader) error {
 		return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
@@ -1249,37 +1237,25 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 		if err != nil {
 			return err
 		}
-		reader, err := bbbfs.Resolve(filePath.String()).Read(ctx, filePath.String())
-		if err != nil {
-			return err
-		}
 		if !overwrite {
 			if dstAz {
 				dap, err := azblob.Parse(dstPath)
 				if err != nil {
-					if cerr := reader.Close(); cerr != nil {
-						return cerr
-					}
 					return err
 				}
 				if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-					if cerr := reader.Close(); cerr != nil {
-						return cerr
-					}
 					return errors.New("cp: destination must be a blob path")
 				}
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-					if cerr := reader.Close(); cerr != nil {
-						return cerr
-					}
 					return nil
 				}
 			} else if _, err := os.Stat(dstPath); err == nil {
-				if cerr := reader.Close(); cerr != nil {
-					return cerr
-				}
 				return nil
 			}
+		}
+		reader, err := bbbfs.Resolve(filePath.String()).Read(ctx, filePath.String())
+		if err != nil {
+			return err
 		}
 		if err := withReadCloser(reader, func(r io.Reader) error {
 			return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
