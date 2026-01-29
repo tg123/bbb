@@ -239,7 +239,7 @@ var tenantCredMu sync.Mutex
 var tenantCreds = make(map[string]azcore.TokenCredential)
 
 // ErrCrossTenantMissing is returned when cross-account copy lacks tenant configuration.
-var ErrCrossTenantMissing = errors.New("cross-account copy requires AZ_BLOB_SRC_TENANT and AZ_BLOB_DST_TENANT (or --src-tenant/--dst-tenant)")
+var ErrCrossTenantMissing = errors.New("cross-account copy requires AZ_BLOB_SRC_TENANT and AZ_BLOB_DST_TENANT")
 
 // WithSourceTenant adds the source tenant from AZ_BLOB_SRC_TENANT to the context.
 func WithSourceTenant(ctx context.Context) context.Context {

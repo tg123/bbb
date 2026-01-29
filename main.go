@@ -194,15 +194,13 @@ func main() {
 			{
 				Name:      "cp",
 				Usage:     "Copy files or directories",
-				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] [--src-tenant TENANT] [--dst-tenant TENANT] srcs [srcs ...] dst",
+				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
 				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
-					&cli.StringFlag{Name: "src-tenant", Usage: "Source Azure tenant ID", Sources: cli.EnvVars("AZ_BLOB_SRC_TENANT")},
-					&cli.StringFlag{Name: "dst-tenant", Usage: "Destination Azure tenant ID", Sources: cli.EnvVars("AZ_BLOB_DST_TENANT")},
 				},
 				Action: cmdCP,
 			},
@@ -1089,16 +1087,6 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
-	if srcTenant := strings.TrimSpace(c.String("src-tenant")); srcTenant != "" {
-		if err := os.Setenv("AZ_BLOB_SRC_TENANT", srcTenant); err != nil {
-			return err
-		}
-	}
-	if dstTenant := strings.TrimSpace(c.String("dst-tenant")); dstTenant != "" {
-		if err := os.Setenv("AZ_BLOB_DST_TENANT", dstTenant); err != nil {
-			return err
-		}
-	}
 	crossTenantOK := azblob.CrossTenantConfigured()
 	srcCtx := ctx
 	dstCtx := ctx
