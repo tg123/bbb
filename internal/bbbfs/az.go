@@ -88,14 +88,3 @@ func azChildPath(ap azblob.AzurePath, name string) string {
 	trimmed := strings.TrimSuffix(name, "/")
 	return ap.Child(trimmed).String()
 }
-
-func pathBase(name string) string {
-	if name == "" {
-		return ""
-	}
-	trimmed := strings.TrimSuffix(name, "/")
-	if trimmed == "" {
-		return ""
-	}
-	return path.Base(trimmed)
-}

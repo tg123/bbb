@@ -402,6 +402,8 @@ func splitWildcard(target string) (string, string) {
 		minPrefix := 0
 		if strings.HasPrefix(target, hfScheme) {
 			minPrefix = len(hfScheme)
+		} else if strings.HasPrefix(target, "az://") {
+			minPrefix = len("az://")
 		}
 		if lastSlash >= minPrefix {
 			return target[:lastSlash+1], target[lastSlash+1:]

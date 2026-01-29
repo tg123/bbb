@@ -36,7 +36,7 @@ func (hfFS) List(ctx context.Context, target string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	hp.File = hfFilterPrefix(hp.File)
+	hp.File = normalizeHFPrefix(hp.File)
 	files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 	if err != nil {
 		return nil, err
