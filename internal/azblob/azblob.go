@@ -547,10 +547,10 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 	size := readerSize(reader)
 	minBlockSize, maxBlockSize, baseBlockSize := uploadStreamBlockLimits()
 	blockSize := uploadStreamBlockSizeWithLimits(size, minBlockSize, maxBlockSize, baseBlockSize)
-	if size >= 0 && blockSize == maxBlockSize {
-		maxSize := int64(uploadStreamMaxBlocks) * maxBlockSize
-		if size > maxSize {
-			return fmt.Errorf("put failed: stream size %d exceeds %d", size, maxSize)
+	if size >= 0 {
+		numBlocks := (size + blockSize - 1) / blockSize
+		if numBlocks > int64(uploadStreamMaxBlocks) {
+			return fmt.Errorf("put failed: stream size %d with block size %d would require %d blocks, exceeding limit of %d", size, blockSize, numBlocks, uploadStreamMaxBlocks)
 		}
 	}
 	_, err = blobClient.UploadStream(ctx, reader, &azblob.UploadStreamOptions{

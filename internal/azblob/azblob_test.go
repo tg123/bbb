@@ -172,6 +172,41 @@ func TestUploadStreamBlockLimitsClampEnv(t *testing.T) {
 	}
 }
 
+func TestUploadStreamBlockSizePreventsExceedingBlockLimit(t *testing.T) {
+	// Test case: size slightly above 100,000 * minBlockSize should increase block size
+	// to avoid exceeding the 100,000 block limit
+	size := (int64(uploadStreamMaxBlocks) * uploadStreamBlockMin) + 1
+	blockSize := uploadStreamBlockSize(size)
+	numBlocks := (size + blockSize - 1) / blockSize
+	if numBlocks > uploadStreamMaxBlocks {
+		t.Fatalf("block count %d exceeds max %d (blockSize=%d, size=%d)", 
+			numBlocks, uploadStreamMaxBlocks, blockSize, size)
+	}
+}
+
+func TestUploadStreamRejectsExcessiveBlocks(t *testing.T) {
+	// Create a size that would exceed the block limit with minimum block size
+	// Size: Just over 100,000 * minBlockSize
+	size := (int64(uploadStreamMaxBlocks) * uploadStreamBlockMin) + uploadStreamBlockMin
+	
+	// Calculate what would happen with this size
+	blockSize := uploadStreamBlockSize(size)
+	numBlocks := (size + blockSize - 1) / blockSize
+	
+	// Our fix should ensure numBlocks <= uploadStreamMaxBlocks
+	if numBlocks > uploadStreamMaxBlocks {
+		t.Fatalf("validation should prevent uploads with %d blocks (limit: %d, blockSize: %d, size: %d)",
+			numBlocks, uploadStreamMaxBlocks, blockSize, size)
+	}
+	
+	// Verify the block size was increased appropriately
+	expectedMinBlockSize := (size + uploadStreamMaxBlocks - 1) / uploadStreamMaxBlocks
+	if blockSize < expectedMinBlockSize {
+		t.Fatalf("block size %d is too small for size %d (should be at least %d to stay within %d blocks)",
+			blockSize, size, expectedMinBlockSize, uploadStreamMaxBlocks)
+	}
+}
+
 func TestReaderSizeUsesFileInfo(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/data.bin"
