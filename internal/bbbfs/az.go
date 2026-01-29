@@ -58,33 +58,6 @@ func (azFS) List(ctx context.Context, path string) ([]Entry, error) {
 	return entries, nil
 }
 
-func (azFS) ListRecursive(ctx context.Context, path string) ([]Entry, error) {
-	ap, err := azblob.Parse(path)
-	if err != nil {
-		return nil, err
-	}
-	list, err := azblob.ListRecursive(ctx, ap)
-	if err != nil {
-		return nil, err
-	}
-	entries := make([]Entry, 0, len(list))
-	for _, bm := range list {
-		name := bm.Name
-		if name == "" || strings.HasSuffix(name, "/") {
-			continue
-		}
-		full := ap.Child(name).String()
-		entries = append(entries, Entry{
-			Name:    name,
-			Path:    full,
-			Size:    bm.Size,
-			IsDir:   false,
-			ModTime: time.Time{},
-		})
-	}
-	return entries, nil
-}
-
 func (azFS) Stat(ctx context.Context, target string) (Entry, error) {
 	ap, err := azblob.Parse(target)
 	if err != nil {

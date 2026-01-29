@@ -61,36 +61,6 @@ func (hfFS) List(ctx context.Context, target string) ([]Entry, error) {
 	return out, nil
 }
 
-func (hfFS) ListRecursive(ctx context.Context, target string) ([]Entry, error) {
-	hp, err := hf.Parse(target)
-	if err != nil {
-		return nil, err
-	}
-	hp.File = hfFilterPrefix(hp.File)
-	files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
-	if err != nil {
-		return nil, err
-	}
-	list := hfFilterFiles(files, hp.File)
-	sort.Strings(list)
-	out := make([]Entry, 0, len(list))
-	for _, name := range list {
-		if name == "" {
-			continue
-		}
-		fullFile := path.Join(hp.File, name)
-		fullpath := hf.Path{Repo: hp.Repo, File: fullFile}.String()
-		out = append(out, Entry{
-			Name:    name,
-			Path:    fullpath,
-			Size:    hfUnknownSize, // HF API list doesn't expose size/modtime.
-			IsDir:   strings.HasSuffix(name, "/"),
-			ModTime: time.Time{},
-		})
-	}
-	return out, nil
-}
-
 func (hfFS) Stat(ctx context.Context, target string) (Entry, error) {
 	hp, err := hf.Parse(target)
 	if err != nil {

@@ -10,11 +10,11 @@ import (
 // ListRecursive lists all files under the path using List and Stat metadata.
 func ListRecursive(ctx context.Context, root string) ([]Entry, error) {
 	fs := Resolve(root)
-	remote := IsAz(root) || IsHF(root)
-	return listRecursive(ctx, fs, root, root, "", remote)
+	isRemote := strings.Contains(root, "://")
+	return listRecursive(ctx, fs, root, "", isRemote)
 }
 
-func listRecursive(ctx context.Context, fs FS, root, current, relPrefix string, remote bool) ([]Entry, error) {
+func listRecursive(ctx context.Context, fs FS, current, relPrefix string, isRemote bool) ([]Entry, error) {
 	entries, err := fs.List(ctx, current)
 	if err != nil {
 		return nil, err
@@ -29,15 +29,15 @@ func listRecursive(ctx context.Context, fs FS, root, current, relPrefix string, 
 			continue
 		}
 		childPath := entry.Path
-		if strings.HasSuffix(entry.Name, "/") && !strings.HasSuffix(childPath, "/") {
+		if entry.IsDir && !strings.HasSuffix(childPath, "/") && strings.Contains(childPath, "://") {
 			childPath += "/"
 		}
-		if !remote && !filepath.IsAbs(childPath) {
+		if !isRemote && !filepath.IsAbs(childPath) {
 			childPath = filepath.Join(current, childPath)
 		}
 		childRel := childName
 		if relPrefix != "" {
-			if remote {
+			if isRemote {
 				childRel = path.Join(relPrefix, childName)
 			} else {
 				childRel = filepath.Join(relPrefix, childName)
@@ -48,7 +48,7 @@ func listRecursive(ctx context.Context, fs FS, root, current, relPrefix string, 
 			return nil, err
 		}
 		if stat.IsDir {
-			childEntries, err := listRecursive(ctx, fs, root, childPath, childRel, remote)
+			childEntries, err := listRecursive(ctx, fs, childPath, childRel, isRemote)
 			if err != nil {
 				return nil, err
 			}
