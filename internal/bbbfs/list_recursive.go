@@ -10,7 +10,7 @@ import (
 // ListRecursive lists all files under the path using List and Stat metadata.
 func ListRecursive(ctx context.Context, root string) ([]Entry, error) {
 	fs := Resolve(root)
-	isRemote := strings.Contains(root, "://")
+	isRemote := IsAz(root) || IsHF(root)
 	return listRecursive(ctx, fs, root, "", isRemote)
 }
 
