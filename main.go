@@ -375,12 +375,6 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 			mod := "-"
 			if !entry.ModTime.IsZero() {
 				mod = entry.ModTime.Format(time.RFC3339)
-			info, serr := os.Stat(p)
-			var size int64
-			modStr := "-"
-			if serr == nil {
-				size = info.Size()
-				modStr = info.ModTime().Format(time.RFC3339)
 			}
 			if machine {
 				fmt.Printf("f\t%d\t%s\t%s\n", entry.Size, mod, display)

@@ -43,17 +43,17 @@ func listRecursive(ctx context.Context, fs FS, root, current, relPrefix string, 
 				childRel = filepath.Join(relPrefix, childName)
 			}
 		}
-		stat, err := fs.Stat(ctx, childPath)
-		if err != nil {
-			return nil, err
-		}
-		if stat.IsDir {
+		if entry.IsDir {
 			childEntries, err := listRecursive(ctx, fs, root, childPath, childRel, isRemote)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, childEntries...)
 			continue
+		}
+		stat, err := fs.Stat(ctx, childPath)
+		if err != nil {
+			return nil, err
 		}
 		if !isRemote {
 			if relPath, relErr := filepath.Rel(root, stat.Path); relErr == nil {
