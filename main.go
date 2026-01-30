@@ -1231,18 +1231,12 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 		if op.srcAz && op.dstAz {
 			dap, _ := azblob.Parse(op.dst)
-			if op.srcAzPath.Account != dap.Account {
-				if !overwrite {
-					if _, err := azblob.HeadBlob(dstCtx, dap); err == nil {
-						return errors.New("cp: destination exists")
-					}
-				}
-			} else if !overwrite {
+			if !overwrite {
 				if _, err := azblob.HeadBlob(dstCtx, dap); err == nil {
 					return errors.New("cp: destination exists")
 				}
 			}
-			if err := azblob.CopyBlobServerSide(dstCtx, op.srcAzPath, dap); err != nil {
+			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap); err != nil {
 				return err
 			}
 			if !quiet {
@@ -1689,12 +1683,18 @@ func writeStreamToFile(dstPath string, reader io.Reader, perm os.FileMode) error
 }
 
 func withReadCloser(reader io.ReadCloser, fn func(io.Reader) error) error {
-	defer func() {
-		if err := reader.Close(); err != nil {
-			slog.Debug("failed to close reader", "error", err)
+	err := fn(reader)
+	closeErr := reader.Close()
+	if err != nil {
+		if closeErr != nil {
+			slog.Debug("failed to close reader", "error", closeErr)
 		}
-	}()
-	return fn(reader)
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return nil
 }
 
 func resolveDstPath(dst string, dstAz bool, base string, mustBeDir bool) (string, error) {
