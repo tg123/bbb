@@ -400,6 +400,9 @@ func splitWildcard(target string) (string, string) {
 		starIdx := strings.Index(target, "*")
 		lastSlash := strings.LastIndex(target[:starIdx], "/")
 		if lastSlash >= 0 {
+			if lastSlash > 0 && strings.HasSuffix(target[:lastSlash+1], "://") {
+				return target, "*"
+			}
 			return target[:lastSlash+1], target[lastSlash+1:]
 		}
 		return target, "*"
