@@ -424,24 +424,19 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		list, err := azblob.List(ctx, ap)
-		if err != nil {
-			return err
-		}
-		sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
-		for _, bm := range list {
+		err = azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
 			name := bm.Name
 			if name == "" {
-				continue
+				return nil
 			}
 			if !all && name[0] == '.' {
-				continue
+				return nil
 			}
 			// Wildcard filtering
 			if pattern != "" {
 				matched, _ := path.Match(pattern, strings.TrimSuffix(name, "/"))
 				if !matched {
-					continue
+					return nil
 				}
 			}
 			var fullpath string
@@ -470,6 +465,10 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 			} else {
 				fmt.Println(displayPath)
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 		return nil
 	}
@@ -2318,8 +2317,11 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			os.Exit(1)
 		}
 		ctx := context.Background()
-		list, err := azblob.List(ctx, ap)
-		if err != nil {
+		var list []azblob.BlobMeta
+		if err := azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
+			list = append(list, bm)
+			return nil
+		}); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

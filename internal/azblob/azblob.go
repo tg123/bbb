@@ -229,6 +229,80 @@ type BlobMeta struct {
 	Size int64
 }
 
+// ListStream streams immediate children (non-recursive). If dir-like path provided, lists under it.
+func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) error {
+	if ap.Container == "" { // account root: list containers
+		client, err := getAzBlobClient(ctx, ap.Account)
+		if err != nil {
+			return err
+		}
+		pager := client.ServiceClient().NewListContainersPager(nil)
+		for pager.More() {
+			resp, err := pager.NextPage(ctx)
+			if err != nil {
+				return err
+			}
+			for _, c := range resp.ContainerItems {
+				if err := cb(BlobMeta{Name: *c.Name, Size: 0}); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	ap = ap.WithDir()
+	prefix := ap.Blob
+	client, err := getAzBlobClient(ctx, ap.Account)
+	if err != nil {
+		return err
+	}
+	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
+	pager := containerClient.NewListBlobsFlatPager(&azblob.ListBlobsFlatOptions{
+		Prefix:  &prefix,
+		Include: azblob.ListBlobsInclude{Metadata: true},
+	})
+	firstLevel := make(map[string]*BlobMeta)
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
+		if err != nil {
+			return err
+		}
+		if resp.Segment == nil {
+			return nil
+		}
+		for _, blob := range resp.Segment.BlobItems {
+			if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
+				continue
+			}
+			rel := strings.TrimPrefix(*blob.Name, prefix)
+			parts := strings.SplitN(rel, "/", 2)
+			if len(parts) == 1 {
+				// file at first level
+				if _, exists := firstLevel[parts[0]]; exists {
+					continue
+				}
+				bm := &BlobMeta{Name: parts[0], Size: *blob.Properties.ContentLength}
+				firstLevel[parts[0]] = bm
+				if err := cb(*bm); err != nil {
+					return err
+				}
+			} else if len(parts) == 2 {
+				// directory
+				dirName := parts[0] + "/"
+				if _, exists := firstLevel[dirName]; exists {
+					continue
+				}
+				bm := &BlobMeta{Name: dirName, Size: 0}
+				firstLevel[dirName] = bm
+				if err := cb(*bm); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // List lists immediate children (non-recursive). If dir-like path provided, lists under it.
 func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
 	endpoint := getEndpoint(account)
@@ -266,55 +340,12 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 }
 
 func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
-	if ap.Container == "" { // account root: list containers
-		return ListContainers(ctx, ap.Account)
-	}
-	ap = ap.WithDir()
-	prefix := ap.Blob
-	client, err := getAzBlobClient(ctx, ap.Account)
-	if err != nil {
-		return nil, err
-	}
-	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
-	pager := containerClient.NewListBlobsFlatPager(&azblob.ListBlobsFlatOptions{
-		Prefix:  &prefix,
-		Include: azblob.ListBlobsInclude{Metadata: true},
-	})
-	firstLevel := make(map[string]*BlobMeta)
-	for pager.More() {
-		resp, err := pager.NextPage(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if resp.Segment == nil {
-			var respErr *azcore.ResponseError
-			if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerNotFound" {
-				return nil, fmt.Errorf("container '%s' not found", ap.Container)
-			}
-			return []BlobMeta{}, nil
-		}
-		for _, blob := range resp.Segment.BlobItems {
-			if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
-				continue
-			}
-			rel := strings.TrimPrefix(*blob.Name, prefix)
-			parts := strings.SplitN(rel, "/", 2)
-			if len(parts) == 1 {
-				// file at first level
-				firstLevel[parts[0]] = &BlobMeta{Name: parts[0], Size: *blob.Properties.ContentLength}
-			} else if len(parts) == 2 {
-				// directory
-				dirName := parts[0] + "/"
-				if _, exists := firstLevel[dirName]; !exists {
-					firstLevel[dirName] = &BlobMeta{Name: dirName, Size: 0}
-				}
-			}
-		}
-	}
-	// Collect results in sorted order
 	var out []BlobMeta
-	for _, bm := range firstLevel {
-		out = append(out, *bm)
+	if err := ListStream(ctx, ap, func(bm BlobMeta) error {
+		out = append(out, bm)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
