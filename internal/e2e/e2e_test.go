@@ -2,10 +2,14 @@ package e2e_test
 
 import (
 	"bytes"
+	"context"
+	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,27 +19,50 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/tg123/bbb/internal/hf"
 )
 
-const waitTimeout = time.Second * 10
+const (
+	waitTimeout    = time.Second * 10
+	azuriteAccount = "devstoreaccount1"
+	azuriteHost    = azuriteAccount + ".blob.localhost:10000"
+	hfSyncEnv      = "BBB_E2E_HF_SYNC"
+)
 
-func waitForEndpointReady(addr string) {
-	waitForEndpointReadyWithTimeout(addr, waitTimeout)
+var (
+	preferredHFFileNames = []string{"config.json", "README.md", "tokenizer.json"}
+	hfAzCopyPrefix       = fmt.Sprintf("az://%s/test/hf-copy", azuriteAccount)
+	hfAzSyncPrefix       = fmt.Sprintf("az://%s/test/hf-sync", azuriteAccount)
+)
+
+func parseMD5Output(out []byte) string {
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
 }
 
-func waitForEndpointReadyWithTimeout(addr string, timeout time.Duration) {
+func waitForEndpointReady(addr string) bool {
+	return waitForEndpointReadyWithTimeout(addr, waitTimeout)
+}
+
+func waitForEndpointReadyWithTimeout(addr string, timeout time.Duration) bool {
 	now := time.Now()
 	timeout = max(timeout, waitTimeout)
 	for {
 		if time.Since(now) > timeout {
-			log.Panic("timeout waiting for endpoint " + addr)
+			log.Printf("timeout waiting for endpoint %s", addr)
+			return false
 		}
 
 		conn, err := net.Dial("tcp", addr)
 		if err == nil {
 			log.Printf("endpoint %s is ready", addr)
-			conn.Close()
-			break
+			if cerr := conn.Close(); cerr != nil {
+				log.Printf("failed to close connection: %v", cerr)
+			}
+			return true
 		}
 		time.Sleep(time.Second)
 	}
@@ -136,12 +163,16 @@ func cleanFolder(t *testing.T, path string) {
 }
 
 func TestBasic(t *testing.T) {
-
-	waitForEndpointReady("devstoreaccount1.blob.localhost:10000")
+	if testing.Short() {
+		t.Skip("skipping e2e tests in short mode")
+	}
+	if !waitForEndpointReady(azuriteHost) {
+		t.Skipf("azurite endpoint %s not reachable", azuriteHost)
+	}
 
 	// create container
 	{
-		_, err := runBBB("mkcontainer", "az://devstoreaccount1/test")
+		_, err := runBBB("az", "mkcontainer", "az://"+azuriteAccount+"/test")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -149,41 +180,41 @@ func TestBasic(t *testing.T) {
 
 	// ls containers
 	{
-		stdout, err := runBBB("ls", "az://devstoreaccount1/")
+		stdout, err := runBBB("ls", "az://"+azuriteAccount+"/")
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		output := strings.TrimSpace(string(stdout))
 
-		if output != "az://devstoreaccount1/test" {
+		if output != "az://"+azuriteAccount+"/test" {
 			t.Errorf("unexpected ls output: %s", output)
 		}
 	}
 
 	{
-		stdout, err := runBBB("ls", "az://devstoreaccount1")
+		stdout, err := runBBB("ls", "az://"+azuriteAccount)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		output := strings.TrimSpace(string(stdout))
 
-		if output != "az://devstoreaccount1/test" {
+		if output != "az://"+azuriteAccount+"/test" {
 			t.Errorf("unexpected ls output: %s", output)
 		}
 	}
 
 	{
-		cleanFolder(t, "az://devstoreaccount1/test")
+		cleanFolder(t, "az://"+azuriteAccount+"/test")
 	}
 
 	{
-		touchPath := "az://devstoreaccount1/test/touched.txt"
+		touchPath := "az://" + azuriteAccount + "/test/touched.txt"
 		if _, err := runBBB("touch", touchPath); err != nil {
 			t.Fatal(err)
 		}
-		files, err := bbbLs("az://devstoreaccount1/test", false)
+		files, err := bbbLs("az://"+azuriteAccount+"/test", false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -200,7 +231,11 @@ func TestBasic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(tmpFile.Name())
+	defer func() {
+		if rerr := os.Remove(tmpFile.Name()); rerr != nil {
+			t.Logf("cleanup temp file: %v", rerr)
+		}
+	}()
 
 	content := []byte("hello world")
 	if _, err := tmpFile.Write(content); err != nil {
@@ -212,7 +247,7 @@ func TestBasic(t *testing.T) {
 
 	// upload
 	{
-		_, err := runBBB("cp", tmpFile.Name(), "az://devstoreaccount1/test")
+		_, err := runBBB("cp", tmpFile.Name(), "az://"+azuriteAccount+"/test")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -220,7 +255,7 @@ func TestBasic(t *testing.T) {
 
 	// upload
 	{
-		_, err := runBBB("cp", tmpFile.Name(), "az://devstoreaccount1/test/testfile.txt")
+		_, err := runBBB("cp", tmpFile.Name(), "az://"+azuriteAccount+"/test/testfile.txt")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -228,7 +263,7 @@ func TestBasic(t *testing.T) {
 
 	// upload
 	{
-		_, err := runBBB("cp", tmpFile.Name(), "az://devstoreaccount1/test/dir/testfile.txt")
+		_, err := runBBB("cp", tmpFile.Name(), "az://"+azuriteAccount+"/test/dir/testfile.txt")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -236,15 +271,15 @@ func TestBasic(t *testing.T) {
 
 	// ls
 	{
-		files, err := bbbLs("az://devstoreaccount1/test", false)
+		files, err := bbbLs("az://"+azuriteAccount+"/test", false)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		expected := []string{
-			fmt.Sprintf("az://devstoreaccount1/test/%s", tmpFile.Name()[len(os.TempDir())+1:]),
-			"az://devstoreaccount1/test/dir",
-			"az://devstoreaccount1/test/testfile.txt",
+			fmt.Sprintf("az://%s/test/%s", azuriteAccount, tmpFile.Name()[len(os.TempDir())+1:]),
+			"az://" + azuriteAccount + "/test/dir",
+			"az://" + azuriteAccount + "/test/testfile.txt",
 		}
 
 		if !slices.Equal(files, expected) {
@@ -255,15 +290,15 @@ func TestBasic(t *testing.T) {
 
 	// lsr
 	{
-		files, err := bbbLs("az://devstoreaccount1/test", true)
+		files, err := bbbLs("az://"+azuriteAccount+"/test", true)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		expected := []string{
-			fmt.Sprintf("az://devstoreaccount1/test/%s", tmpFile.Name()[len(os.TempDir())+1:]),
-			"az://devstoreaccount1/test/dir/testfile.txt",
-			"az://devstoreaccount1/test/testfile.txt",
+			fmt.Sprintf("az://%s/test/%s", azuriteAccount, tmpFile.Name()[len(os.TempDir())+1:]),
+			"az://" + azuriteAccount + "/test/dir/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile.txt",
 		}
 
 		if !slices.Equal(files, expected) {
@@ -273,19 +308,61 @@ func TestBasic(t *testing.T) {
 
 	// cp az az
 	{
-		_, err := runBBB("cp", "az://devstoreaccount1/test/testfile.txt", "az://devstoreaccount1/test/testfile2.txt")
+		_, err := runBBB("cp", "az://"+azuriteAccount+"/test/testfile.txt", "az://"+azuriteAccount+"/test/testfile2.txt")
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		files, err := bbbLs("az://devstoreaccount1/test/testfile*", false)
+		files, err := bbbLs("az://"+azuriteAccount+"/test/testfile*", false)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		expected := []string{
-			"az://devstoreaccount1/test/testfile.txt",
-			"az://devstoreaccount1/test/testfile2.txt",
+			"az://" + azuriteAccount + "/test/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("unexpected files: got %v, want %v", files, expected)
+		}
+	}
+
+	// cp az az (directory-style destination)
+	{
+		_, err := runBBB("cp", "az://"+azuriteAccount+"/test/testfile.txt", "az://"+azuriteAccount+"/test/dir2/")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		files, err := bbbLs("az://"+azuriteAccount+"/test/dir2/testfile*", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/dir2/testfile.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("unexpected files: got %v, want %v", files, expected)
+		}
+	}
+
+	// cp az az (explicit file destination)
+	{
+		_, err := runBBB("cp", "az://"+azuriteAccount+"/test/testfile.txt", "az://"+azuriteAccount+"/test/dir/testfile3.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		files, err := bbbLs("az://"+azuriteAccount+"/test/dir/testfile3.txt*", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/dir/testfile3.txt",
 		}
 
 		if !slices.Equal(files, expected) {
@@ -295,7 +372,7 @@ func TestBasic(t *testing.T) {
 
 	// cat
 	{
-		stdout, err := runBBB("cat", "az://devstoreaccount1/test/testfile.txt")
+		stdout, err := runBBB("cat", "az://"+azuriteAccount+"/test/testfile.txt")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -306,9 +383,28 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+	// md5sum
+	{
+		expected := fmt.Sprintf("%x", md5.Sum(content))
+		stdout, err := runBBB("md5sum", "az://"+azuriteAccount+"/test/testfile.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parseMD5Output(stdout); got != expected {
+			t.Fatalf("unexpected az md5sum: got %s, want %s", got, expected)
+		}
+		stdout, err = runBBB("md5sum", tmpFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parseMD5Output(stdout); got != expected {
+			t.Fatalf("unexpected local md5sum: got %s, want %s", got, expected)
+		}
+	}
+
 	// cat via http blob URL
 	{
-		httpURL := "http://devstoreaccount1.blob.localhost:10000/test/testfile.txt"
+		httpURL := fmt.Sprintf("http://%s/test/testfile.txt", azuriteHost)
 		stdout, err := runBBB("cat", httpURL)
 		if err != nil {
 			t.Fatal(err)
@@ -317,13 +413,56 @@ func TestBasic(t *testing.T) {
 			t.Errorf("unexpected cat output via http: %s", stdout)
 		}
 	}
+	t.Run("cat hf", func(t *testing.T) {
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		files, err := hfListFiles(t, repo)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		if len(files) == 0 {
+			t.Fatal("no huggingface files returned")
+		}
+		candidate := ""
+		for _, name := range preferredHFFileNames {
+			if slices.Contains(files, name) {
+				candidate = name
+				break
+			}
+		}
+		if candidate == "" {
+			candidate = files[0]
+		}
+		expected, err := hfDownload(t, repo, candidate)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		stdout, err := runBBB("cat", "hf://"+repo+"/"+candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		normalized := bytes.ReplaceAll(stdout, []byte("\r"), nil)
+		expectedNormalized := bytes.ReplaceAll(expected, []byte("\r"), nil)
+		if !bytes.Equal(normalized, expectedNormalized) {
+			t.Fatalf("unexpected cat output for hf file %s", candidate)
+		}
+	})
 
 	// download
 	{
 		downloadPath := tmpFile.Name() + ".downloaded"
-		defer os.Remove(downloadPath)
+		defer func() {
+			if rerr := os.Remove(downloadPath); rerr != nil {
+				t.Logf("cleanup download file: %v", rerr)
+			}
+		}()
 
-		_, err := runBBB("cp", "az://devstoreaccount1/test/testfile.txt", downloadPath)
+		_, err := runBBB("cp", "az://"+azuriteAccount+"/test/testfile.txt", downloadPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -341,9 +480,13 @@ func TestBasic(t *testing.T) {
 	// download via http blob URL
 	{
 		downloadPath := tmpFile.Name() + ".http.downloaded"
-		defer os.Remove(downloadPath)
+		defer func() {
+			if rerr := os.Remove(downloadPath); rerr != nil {
+				t.Logf("cleanup download file: %v", rerr)
+			}
+		}()
 
-		httpURL := "http://devstoreaccount1.blob.localhost:10000/test/testfile.txt"
+		httpURL := fmt.Sprintf("http://%s/test/testfile.txt", azuriteHost)
 		if _, err := runBBB("cp", httpURL, downloadPath); err != nil {
 			t.Fatal(err)
 		}
@@ -362,7 +505,11 @@ func TestBasic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer os.RemoveAll(localDir)
+		defer func() {
+			if rerr := os.RemoveAll(localDir); rerr != nil {
+				t.Logf("cleanup local dir: %v", rerr)
+			}
+		}()
 		localFile := filepath.Join(localDir, "new.txt")
 		if _, err := runBBB("touch", localFile); err != nil {
 			t.Fatal(err)
@@ -380,7 +527,7 @@ func TestBasic(t *testing.T) {
 	}
 
 	{
-		cleanFolder(t, "az://devstoreaccount1/test/")
+		cleanFolder(t, "az://"+azuriteAccount+"/test/")
 	}
 
 	// cpr
@@ -389,7 +536,11 @@ func TestBasic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer os.RemoveAll(localDir)
+		defer func() {
+			if rerr := os.RemoveAll(localDir); rerr != nil {
+				t.Logf("cleanup local dir: %v", rerr)
+			}
+		}()
 
 		if err := os.WriteFile(localDir+"/1.txt", content, 0o644); err != nil {
 			t.Fatal(err)
@@ -404,19 +555,19 @@ func TestBasic(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := runBBB("cpr", localDir, "az://devstoreaccount1/test/"); err != nil {
+		if _, err := runBBB("cpr", localDir, "az://"+azuriteAccount+"/test/"); err != nil {
 			t.Fatal(err)
 		}
 
-		files, err := bbbLs("az://devstoreaccount1/test", true)
+		files, err := bbbLs("az://"+azuriteAccount+"/test", true)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		expected := []string{
-			"az://devstoreaccount1/test/1.txt",
-			"az://devstoreaccount1/test/2.txt",
-			"az://devstoreaccount1/test/test/3.txt",
+			"az://" + azuriteAccount + "/test/1.txt",
+			"az://" + azuriteAccount + "/test/2.txt",
+			"az://" + azuriteAccount + "/test/test/3.txt",
 		}
 
 		if !slices.Equal(files, expected) {
@@ -430,9 +581,13 @@ func TestBasic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer os.RemoveAll(localOut)
+		defer func() {
+			if rerr := os.RemoveAll(localOut); rerr != nil {
+				t.Logf("cleanup local out: %v", rerr)
+			}
+		}()
 
-		if _, err := runBBB("cpr", "az://devstoreaccount1/test/", localOut); err != nil {
+		if _, err := runBBB("cpr", "az://"+azuriteAccount+"/test/", localOut); err != nil {
 			t.Fatal(err)
 		}
 
@@ -443,7 +598,7 @@ func TestBasic(t *testing.T) {
 		}
 
 		for _, rel := range expectedLocal {
-			full := localOut + "/" + rel
+			full := filepath.Join(localOut, rel)
 			st, err := os.Stat(full)
 			if err != nil {
 				t.Fatalf("expected file missing: %s (%v)", full, err)
@@ -469,7 +624,7 @@ func TestBasic(t *testing.T) {
 			if d.IsDir() {
 				return nil
 			}
-			rel, _ := strings.CutPrefix(path, localOut+"/")
+			rel, _ := strings.CutPrefix(path, localOut+string(filepath.Separator))
 			collected[rel] = struct{}{}
 			return nil
 		})
@@ -487,4 +642,270 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+	t.Run("hf to az", func(t *testing.T) {
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		candidate, hfData := hfCandidateData(t, repo)
+		{
+			expected := fmt.Sprintf("%x", md5.Sum(hfData))
+			stdout, err := runBBB("md5sum", "hf://"+repo+"/"+candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := parseMD5Output(stdout); got != expected {
+				t.Fatalf("unexpected hf md5sum: got %s, want %s", got, expected)
+			}
+		}
+		dstPrefix := hfAzCopyPrefix
+		cleanFolder(t, dstPrefix)
+		if _, err := runBBB("cp", "hf://"+repo, dstPrefix); err != nil {
+			t.Fatal(err)
+		}
+		normalized := strings.ReplaceAll(candidate, "\\", "/")
+		azFile, err := url.JoinPath(strings.TrimSuffix(dstPrefix, "/"), normalized)
+		if err != nil {
+			t.Fatal(err)
+		}
+		list, err := bbbLs(dstPrefix, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(list, azFile) {
+			t.Fatalf("expected az file missing: %s", azFile)
+		}
+		outPath := tempOutPath(t, "bbb-hf-az-")
+		if _, err := runBBB("cp", azFile, outPath); err != nil {
+			t.Fatal(err)
+		}
+		azData, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		azNormalized := bytes.ReplaceAll(azData, []byte("\r"), nil)
+		hfNormalized := bytes.ReplaceAll(hfData, []byte("\r"), nil)
+		if !bytes.Equal(azNormalized, hfNormalized) {
+			t.Fatalf("hf to az content mismatch for %s", candidate)
+		}
+	})
+
+	t.Run("hf sync to az", func(t *testing.T) {
+		if os.Getenv(hfSyncEnv) == "" {
+			t.Skipf("%s not set", hfSyncEnv)
+		}
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		candidate, hfData := hfCandidateData(t, repo)
+		dstPrefix := hfAzSyncPrefix
+		cleanFolder(t, dstPrefix)
+		if _, err := runBBB("sync", "hf://"+repo, dstPrefix); err != nil {
+			t.Fatal(err)
+		}
+		normalized := strings.ReplaceAll(candidate, "\\", "/")
+		azFile, err := url.JoinPath(strings.TrimSuffix(dstPrefix, "/"), normalized)
+		if err != nil {
+			t.Fatal(err)
+		}
+		list, err := bbbLs(dstPrefix, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(list, azFile) {
+			t.Fatalf("expected az file missing: %s", azFile)
+		}
+		outPath := tempOutPath(t, "bbb-hf-sync-")
+		if _, err := runBBB("cp", azFile, outPath); err != nil {
+			t.Fatal(err)
+		}
+		azData, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		azNormalized := bytes.ReplaceAll(azData, []byte("\r"), nil)
+		hfNormalized := bytes.ReplaceAll(hfData, []byte("\r"), nil)
+		if !bytes.Equal(azNormalized, hfNormalized) {
+			t.Fatalf("hf sync to az content mismatch for %s", candidate)
+		}
+	})
+
+	t.Run("hf ls", func(t *testing.T) {
+		repo := "hf-internal-testing/tiny-random-BertModel"
+		files, err := hfListFiles(t, repo)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		expected := ""
+		// bbb ls defaults to hiding dotfiles unless -a is provided
+		for _, file := range files {
+			if strings.Contains(file, "/") {
+				continue
+			}
+			if strings.HasPrefix(file, ".") {
+				continue
+			}
+			expected = file
+			break
+		}
+		if expected == "" {
+			// Fallback: accept any root entry (including dotfiles) if that's all there is.
+			for _, file := range files {
+				if file == "" {
+					continue
+				}
+				parts := strings.SplitN(file, "/", 2)
+				if parts[0] == "" {
+					continue
+				}
+				expected = parts[0]
+				break
+			}
+			if expected == "" {
+				t.Fatal("no huggingface root entries returned")
+			}
+		}
+		list, err := bbbLs("hf://"+repo, false)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		expectedPath := "hf://" + repo + "/" + expected
+		if !slices.Contains(list, expectedPath) {
+			t.Fatalf("expected hf file missing: %s", expected)
+		}
+	})
+
+}
+
+func TestHuggingFaceDownload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e tests in short mode")
+	}
+	repo := "hf-internal-testing/tiny-random-BertModel"
+	files, err := hfListFiles(t, repo)
+	if err != nil {
+		if isNetworkError(err) {
+			t.Skipf("huggingface unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	tempDir, err := os.MkdirTemp("", "bbb-hf-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if rerr := os.RemoveAll(tempDir); rerr != nil {
+			t.Logf("cleanup temp dir: %v", rerr)
+		}
+	}()
+
+	if _, err := runBBB("cp", "hf://"+repo, tempDir); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, file := range files {
+		localPath := filepath.Join(tempDir, filepath.FromSlash(file))
+		localData, err := os.ReadFile(localPath)
+		if err != nil {
+			t.Fatalf("missing local file %s: %v", file, err)
+		}
+		remoteData, err := hfDownload(t, repo, file)
+		if err != nil {
+			if isNetworkError(err) {
+				t.Skipf("huggingface unavailable: %v", err)
+			}
+			t.Fatalf("download failed for %s: %v", file, err)
+		}
+		localNormalized := bytes.ReplaceAll(localData, []byte("\r"), nil)
+		remoteNormalized := bytes.ReplaceAll(remoteData, []byte("\r"), nil)
+		if !bytes.Equal(localNormalized, remoteNormalized) {
+			t.Fatalf("content mismatch for %s", file)
+		}
+	}
+}
+
+func hfListFiles(t *testing.T, repo string) ([]string, error) {
+	ctx, cancel := hfTestContext(t)
+	defer cancel()
+	files, err := hf.ListFiles(ctx, hf.Path{Repo: repo})
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(files)
+	return files, nil
+}
+
+func hfDownload(t *testing.T, repo, file string) ([]byte, error) {
+	ctx, cancel := hfTestContext(t)
+	defer cancel()
+	return hf.Download(ctx, hf.Path{Repo: repo, File: file})
+}
+
+func hfTestContext(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+	if deadline, ok := t.Deadline(); ok {
+		return context.WithDeadline(context.Background(), deadline)
+	}
+	return context.WithTimeout(context.Background(), 30*time.Second)
+}
+
+func hfCandidateData(t *testing.T, repo string) (string, []byte) {
+	t.Helper()
+	files, err := hfListFiles(t, repo)
+	if err != nil {
+		if isNetworkError(err) {
+			t.Skipf("huggingface unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no huggingface files returned")
+	}
+	candidate := ""
+	for _, name := range preferredHFFileNames {
+		if slices.Contains(files, name) {
+			candidate = name
+			break
+		}
+	}
+	if candidate == "" {
+		candidate = files[0]
+	}
+	hfData, err := hfDownload(t, repo, candidate)
+	if err != nil {
+		if isNetworkError(err) {
+			t.Skipf("huggingface unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	return candidate, hfData
+}
+
+func tempOutPath(t *testing.T, prefix string) string {
+	t.Helper()
+	out, err := os.CreateTemp("", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outPath := out.Name()
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(outPath); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Remove(outPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Logf("cleanup temp file %s: %v", outPath, err)
+		}
+	})
+	return outPath
+}
+
+func isNetworkError(err error) bool {
+	var dnsErr *net.DNSError
+	var urlErr *url.Error
+	var opErr *net.OpError
+	return errors.As(err, &dnsErr) || errors.As(err, &urlErr) || errors.As(err, &opErr)
 }
