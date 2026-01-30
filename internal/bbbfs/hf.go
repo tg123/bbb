@@ -16,7 +16,7 @@ type hfFS struct{}
 const hfUnknownSize = int64(0)
 
 func (hfFS) Match(path string) bool {
-	return IsHF(path)
+	return strings.HasPrefix(path, HFScheme)
 }
 
 func (hfFS) Read(ctx context.Context, path string) (io.ReadCloser, error) {

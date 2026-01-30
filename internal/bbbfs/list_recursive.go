@@ -20,7 +20,7 @@ func ListRecursive(ctx context.Context, root string) ([]Entry, error) {
 	if rl, ok := fs.(recursiveLister); ok {
 		return rl.ListRecursive(ctx, root)
 	}
-	isRemote := IsAz(root) || IsHF(root)
+	isRemote := strings.Contains(root, "://")
 	return listRecursive(ctx, fs, root, root, "", isRemote)
 }
 

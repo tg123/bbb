@@ -13,7 +13,7 @@ import (
 type azFS struct{}
 
 func (azFS) Match(path string) bool {
-	return IsAz(path)
+	return strings.HasPrefix(path, "az://") || azblob.IsBlobURL(path)
 }
 
 func (azFS) Read(ctx context.Context, path string) (io.ReadCloser, error) {

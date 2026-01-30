@@ -56,11 +56,11 @@ func version() string {
 }
 
 func isAz(s string) bool {
-	return bbbfs.IsAz(s)
+	return strings.HasPrefix(s, "az://") || azblob.IsBlobURL(s)
 }
 
 func isHF(s string) bool {
-	return bbbfs.IsHF(s)
+	return strings.HasPrefix(s, hfScheme)
 }
 
 func main() {
