@@ -79,16 +79,6 @@ func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 	}
 }
 
-func TestCopyBlobServerSideRequiresSameAccount(t *testing.T) {
-	ctx := context.Background()
-	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
-	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
-	err := CopyBlobServerSide(ctx, src, dst)
-	if !errors.Is(err, ErrCrossTenantMissing) {
-		t.Fatalf("expected missing tenant error, got %v", err)
-	}
-}
-
 func TestCopyBlobServerSideRequiresSharedKey(t *testing.T) {
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
 	ctx := context.Background()
@@ -97,6 +87,17 @@ func TestCopyBlobServerSideRequiresSharedKey(t *testing.T) {
 	err := CopyBlobServerSide(ctx, src, dst)
 	if !errors.Is(err, bloberror.MissingSharedKeyCredential) {
 		t.Fatalf("expected missing shared key error, got %v", err)
+	}
+}
+
+func TestCopyBlobServerSideCrossTenantRequiresTenants(t *testing.T) {
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
+	ctx := context.Background()
+	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
+	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
+	err := CopyBlobServerSide(ctx, src, dst)
+	if !errors.Is(err, ErrCrossTenantMissing) {
+		t.Fatalf("expected missing tenant error, got %v", err)
 	}
 }
 
