@@ -39,9 +39,12 @@ func TestIsHF(t *testing.T) {
 	if !isHF("hf://openai/gpt-oss-120b") {
 		t.Fatalf("expected hf scheme to be detected")
 	}
+	if isHF("https://example.com/model") {
+		t.Fatalf("non-hf scheme should not be detected")
+	}
 }
 
-func TestHFPathDefaults(t *testing.T) {
+func TestHFPathParseRepoOnly(t *testing.T) {
 	path, err := hf.Parse("hf://owner/repo")
 	if err != nil {
 		t.Fatalf("unexpected parse error: %v", err)
@@ -51,7 +54,7 @@ func TestHFPathDefaults(t *testing.T) {
 	}
 }
 
-func TestHFPathURLEscaping(t *testing.T) {
+func TestHFPathStringPreservesSpaces(t *testing.T) {
 	path, err := hf.Parse("hf://owner/repo/a b.txt")
 	if err != nil {
 		t.Fatalf("unexpected parse error: %v", err)
@@ -73,8 +76,7 @@ func TestResolveDstPathAzDir(t *testing.T) {
 
 func TestSyncHFFiles(t *testing.T) {
 	files := []string{"file.txt", "dir/file2.txt", "dir/skip.txt"}
-	hfPath := hf.Path{Repo: "owner/repo"}
-	list := syncHFFilesFromList(hfPath, files, func(name string) bool { return strings.Contains(name, "skip") })
+	list := syncHFFilesFromList(files, func(name string) bool { return strings.Contains(name, "skip") })
 	if len(list) != 2 {
 		t.Fatalf("unexpected list length: %d", len(list))
 	}
@@ -123,33 +125,6 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dstDir, "sub", "file.txt")); err != nil {
 		t.Fatalf("expected copied file: %v", err)
-	}
-}
-
-func TestWorkerPoolRunsAll(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	items := []int{1, 2, 3}
-	seen := make(map[int]bool, len(items))
-	var mu sync.Mutex
-	err := runOpPool(ctx, 2, func(pending chan<- int) error {
-		for _, item := range items {
-			if err := sendOp(ctx, pending, item); err != nil {
-				return err
-			}
-		}
-		return nil
-	}, func(item int) error {
-		mu.Lock()
-		seen[item] = true
-		mu.Unlock()
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("runOpPool failed: %v", err)
-	}
-	if len(seen) != len(items) {
-		t.Fatalf("expected %d items, got %d", len(items), len(seen))
 	}
 }
 

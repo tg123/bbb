@@ -1511,10 +1511,10 @@ func syncHFFiles(ctx context.Context, hfPath hf.Path, excludeMatch func(string) 
 	if err != nil {
 		return nil, err
 	}
-	return syncHFFilesFromList(hfPath, files, excludeMatch), nil
+	return syncHFFilesFromList(files, excludeMatch), nil
 }
 
-func syncHFFilesFromList(hfPath hf.Path, files []string, excludeMatch func(string) bool) []string {
+func syncHFFilesFromList(files []string, excludeMatch func(string) bool) []string {
 	out := make([]string, 0, len(files))
 	for _, file := range files {
 		if excludeMatch(file) {
