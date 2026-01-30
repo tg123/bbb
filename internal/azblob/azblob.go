@@ -24,6 +24,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 )
 
@@ -642,32 +643,46 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
 		return errors.New("destination path is directory-like")
 	}
-	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
-		return bloberror.MissingSharedKeyCredential
-	}
-	copyCtx := ctx
 	if src.Account != dst.Account {
 		srcTenant := sourceTenant()
 		dstTenant := destinationTenant()
 		if srcTenant == "" || dstTenant == "" {
 			return ErrCrossTenantMissing
 		}
-		copyCtx = withTenant(ctx, dstTenant)
+		srcCtx := withTenant(ctx, srcTenant)
+		dstCtx := withTenant(ctx, dstTenant)
+		srcClient, err := getAzBlobClient(srcCtx, src.Account)
+		if err != nil {
+			return err
+		}
+		srcURL := srcClient.ServiceClient().NewContainerClient(src.Container).NewBlobClient(src.Blob).URL()
+		token, err := copySourceBearerToken(srcCtx)
+		if err != nil {
+			return err
+		}
+		dstClient, err := getAzBlobClient(dstCtx, dst.Account)
+		if err != nil {
+			return err
+		}
+		dstBlobClient := dstClient.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
+		_, err = dstBlobClient.UploadBlobFromURL(dstCtx, srcURL, &blockblob.UploadBlobFromURLOptions{
+			CopySourceAuthorization: &token,
+		})
+		return err
 	}
-	client, err := getAzBlobClient(copyCtx, dst.Account)
+	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
+		return bloberror.MissingSharedKeyCredential
+	}
+	client, err := getAzBlobClient(ctx, dst.Account)
 	if err != nil {
 		return err
 	}
 	blobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlobClient(dst.Blob)
-	copySourceCtx := ctx
-	if src.Account != dst.Account {
-		copySourceCtx = withTenant(ctx, sourceTenant())
-	}
-	copySource, err := blobSASURL(copySourceCtx, src)
+	copySource, err := blobSASURL(ctx, src)
 	if err != nil {
 		return err
 	}
-	startCopy, err := blobClient.StartCopyFromURL(copyCtx, copySource, nil)
+	startCopy, err := blobClient.StartCopyFromURL(ctx, copySource, nil)
 	if err != nil {
 		return err
 	}
@@ -761,6 +776,22 @@ func copySASDuration() time.Duration {
 		}
 	}
 	return defaultCopySASExpiry
+}
+
+func copySourceBearerToken(ctx context.Context) (string, error) {
+	tenantID := tenantFromContext(ctx)
+	if tenantID == "" {
+		return "", errors.New("source tenant is required for cross-account copy")
+	}
+	cred, err := tenantCredential(tenantID)
+	if err != nil {
+		return "", err
+	}
+	tok, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
+	if err != nil {
+		return "", err
+	}
+	return "Bearer " + tok.Token, nil
 }
 
 // Delete deletes a single blob
