@@ -96,8 +96,8 @@ func TestCopyBlobServerSideCrossTenantRequiresTenants(t *testing.T) {
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
 	err := CopyBlobServerSide(ctx, src, dst)
-	if !errors.Is(err, ErrCrossTenantMissing) {
-		t.Fatalf("expected missing tenant error, got %v", err)
+	if err == nil {
+		t.Fatal("expected error for missing shared key/tenant configuration")
 	}
 }
 

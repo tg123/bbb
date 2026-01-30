@@ -642,18 +642,18 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
 		return errors.New("destination path is directory-like")
 	}
-	if src.Account != dst.Account {
-		srcTenant := sourceTenant()
-		dstTenant := destinationTenant()
-		if srcTenant == "" || dstTenant == "" {
-			return ErrCrossTenantMissing
-		}
-		return copyBlobClientSide(ctx, src, dst, srcTenant, dstTenant)
-	}
 	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
 		return bloberror.MissingSharedKeyCredential
 	}
-	client, err := getAzBlobClient(ctx, dst.Account)
+	dstCtx := ctx
+	if src.Account != dst.Account {
+		dstTenant := destinationTenant()
+		if dstTenant == "" {
+			return ErrCrossTenantMissing
+		}
+		dstCtx = withTenant(ctx, dstTenant)
+	}
+	client, err := getAzBlobClient(dstCtx, dst.Account)
 	if err != nil {
 		return err
 	}
@@ -662,7 +662,7 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 	if err != nil {
 		return err
 	}
-	startCopy, err := blobClient.StartCopyFromURL(ctx, copySource, nil)
+	startCopy, err := blobClient.StartCopyFromURL(dstCtx, copySource, nil)
 	if err != nil {
 		return err
 	}
