@@ -1511,6 +1511,10 @@ func syncHFFiles(ctx context.Context, hfPath hf.Path, excludeMatch func(string) 
 	if err != nil {
 		return nil, err
 	}
+	return syncHFFilesFromList(hfPath, files, excludeMatch), nil
+}
+
+func syncHFFilesFromList(hfPath hf.Path, files []string, excludeMatch func(string) bool) []string {
 	out := make([]string, 0, len(files))
 	for _, file := range files {
 		if excludeMatch(file) {
@@ -1518,7 +1522,7 @@ func syncHFFiles(ctx context.Context, hfPath hf.Path, excludeMatch func(string) 
 		}
 		out = append(out, file)
 	}
-	return out, nil
+	return out
 }
 
 func cmdSync(ctx context.Context, c *cli.Command) error {

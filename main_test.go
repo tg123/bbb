@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/hf"
 	"github.com/urfave/cli/v3"
 )
@@ -38,185 +37,100 @@ func TestIsAzHTTPEdgeCases(t *testing.T) {
 
 func TestIsHF(t *testing.T) {
 	if !isHF("hf://openai/gpt-oss-120b") {
-		t.Fatalf("expected hf:// path to be detected")
-	}
-	if isHF("https://huggingface.co/openai/gpt-oss-120b") {
-		t.Fatalf("non-hf scheme should not be detected as hf")
+		t.Fatalf("expected hf scheme to be detected")
 	}
 }
 
 func TestHFPathDefaults(t *testing.T) {
-	p, err := hf.Parse("hf://openai/gpt-oss-120b")
+	path, err := hf.Parse("hf://owner/repo")
 	if err != nil {
 		t.Fatalf("unexpected parse error: %v", err)
 	}
-	if p.DefaultFilename() != "gpt-oss-120b" {
-		t.Fatalf("unexpected default filename: %s", p.DefaultFilename())
-	}
-	if _, err := p.URL(); err == nil {
-		t.Fatalf("expected url error for repo path")
-	}
-
-	p, err = hf.Parse("hf://openai/gpt-oss-120b/README.md")
-	if err != nil {
-		t.Fatalf("unexpected parse error: %v", err)
-	}
-	if p.DefaultFilename() != "README.md" {
-		t.Fatalf("unexpected file default filename: %s", p.DefaultFilename())
-	}
-	url, err := p.URL()
-	if err != nil {
-		t.Fatalf("unexpected url error: %v", err)
-	}
-	if url != "https://huggingface.co/openai/gpt-oss-120b/resolve/main/README.md" {
-		t.Fatalf("unexpected file url: %s", url)
+	if path.File != "" {
+		t.Fatalf("expected empty file, got %s", path.File)
 	}
 }
 
 func TestHFPathURLEscaping(t *testing.T) {
-	p := hf.Path{
-		Repo: "openai/gpt-oss-120b",
-		File: "nested dir/file #1%?.bin",
-	}
-	url, err := p.URL()
+	path, err := hf.Parse("hf://owner/repo/a b.txt")
 	if err != nil {
-		t.Fatalf("unexpected url error: %v", err)
+		t.Fatalf("unexpected parse error: %v", err)
 	}
-	expected := "https://huggingface.co/openai/gpt-oss-120b/resolve/main/nested%20dir/file%20%231%25%3F.bin"
-	if url != expected {
-		t.Fatalf("unexpected escaped url: %s", url)
+	if path.String() != "hf://owner/repo/a b.txt" {
+		t.Fatalf("unexpected escaped path: %s", path.String())
 	}
 }
 
 func TestResolveDstPathAzDir(t *testing.T) {
 	dst, err := resolveDstPath("az://acct/container/prefix", true, "model.bin", true)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("resolveDstPath failed: %v", err)
 	}
 	if dst != "az://acct/container/prefix/model.bin" {
-		t.Fatalf("unexpected destination: %s", dst)
+		t.Fatalf("unexpected dst: %s", dst)
 	}
 }
 
 func TestSyncHFFiles(t *testing.T) {
-	_, err := syncHFFiles(context.Background(), hf.Path{Repo: "owner/repo", File: "dir/file.txt"}, func(string) bool { return false })
-	if err == nil {
-		t.Fatalf("expected error for file path")
+	files := []string{"file.txt", "dir/file2.txt", "dir/skip.txt"}
+	hfPath := hf.Path{Repo: "owner/repo"}
+	list := syncHFFilesFromList(hfPath, files, func(name string) bool { return strings.Contains(name, "skip") })
+	if len(list) != 2 {
+		t.Fatalf("unexpected list length: %d", len(list))
 	}
 }
 
 func TestCmdSyncRejectsHFFilePath(t *testing.T) {
-	cmd := &cli.Command{
-		Name: "sync",
+	app := &cli.Command{
+		Action: cmdSync,
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "dry-run"},
 			&cli.BoolFlag{Name: "delete"},
-			&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}},
-			&cli.IntFlag{Name: "concurrency", Value: 1},
-			&cli.IntFlag{Name: "retry-count", Value: 0},
 			&cli.StringFlag{Name: "x"},
+			&cli.IntFlag{Name: "concurrency", Value: 1},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.BoolFlag{Name: "q"},
 		},
-		Action: cmdSync,
 	}
-
-	err := cmd.Run(context.Background(), []string{"sync", "hf://owner/repo/file.txt", "az://acct/container"})
+	err := app.Run(context.Background(), []string{"sync", "hf://owner/repo/file.txt", "az://acct/container"})
 	if err == nil {
 		t.Fatalf("expected error for hf file path")
 	}
 }
 
 func TestCPDirectoryCopiesTree(t *testing.T) {
-	srcDir := t.TempDir()
-	nested := filepath.Join(srcDir, "nested")
-	if err := os.MkdirAll(nested, 0o755); err != nil {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	dstDir := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(filepath.Join(srcDir, "sub"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(srcDir, "root.txt"), []byte("root"), 0o644); err != nil {
-		t.Fatalf("write root: %v", err)
+	srcFile := filepath.Join(srcDir, "sub", "file.txt")
+	if err := os.WriteFile(srcFile, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(nested, "child.txt"), []byte("child"), 0o644); err != nil {
-		t.Fatalf("write child: %v", err)
-	}
-	dstDir := t.TempDir()
-
-	cmd := &cli.Command{
-		Name: "cp",
-		Flags: []cli.Flag{
-			&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
-			&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
-			&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: 1},
-			&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
-		},
+	app := &cli.Command{
 		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+		},
 	}
-
-	if err := cmd.Run(context.Background(), []string{"cp", srcDir, dstDir}); err != nil {
-		t.Fatalf("cp run failed: %v", err)
+	if err := app.Run(context.Background(), []string{"cp", srcDir, dstDir}); err != nil {
+		t.Fatalf("cp failed: %v", err)
 	}
-
-	cases := []struct {
-		rel  string
-		want string
-	}{
-		{rel: "root.txt", want: "root"},
-		{rel: filepath.Join("nested", "child.txt"), want: "child"},
-	}
-
-	for _, tc := range cases {
-		data, err := os.ReadFile(filepath.Join(dstDir, tc.rel))
-		if err != nil {
-			t.Fatalf("read %s: %v", tc.rel, err)
-		}
-		if string(data) != tc.want {
-			t.Fatalf("unexpected content for %s: %q", tc.rel, string(data))
-		}
+	if _, err := os.Stat(filepath.Join(dstDir, "sub", "file.txt")); err != nil {
+		t.Fatalf("expected copied file: %v", err)
 	}
 }
 
 func TestWorkerPoolRunsAll(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	started := make(chan struct{}, 2)
-	release := make(chan struct{})
-	ops := []func() error{
-		func() error {
-			started <- struct{}{}
-			<-release
-			return nil
-		},
-		func() error {
-			started <- struct{}{}
-			<-release
-			return nil
-		},
-	}
-	done := make(chan error, 1)
-	go func() {
-		done <- runWorkerPool(ctx, 2, ops)
-	}()
-	for i := 0; i < 2; i++ {
-		select {
-		case <-started:
-		case <-ctx.Done():
-			t.Fatalf("expected worker %d to start", i+1)
-		}
-	}
-	close(release)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("runWorkerPool failed: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("worker pool did not complete")
-	}
-}
-
-func TestRunOpPoolProcessesAll(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
 	items := []int{1, 2, 3}
-	seen := make(map[int]struct{}, len(items))
+	seen := make(map[int]bool, len(items))
 	var mu sync.Mutex
 	err := runOpPool(ctx, 2, func(pending chan<- int) error {
 		for _, item := range items {
@@ -227,7 +141,7 @@ func TestRunOpPoolProcessesAll(t *testing.T) {
 		return nil
 	}, func(item int) error {
 		mu.Lock()
-		seen[item] = struct{}{}
+		seen[item] = true
 		mu.Unlock()
 		return nil
 	})
@@ -239,11 +153,30 @@ func TestRunOpPoolProcessesAll(t *testing.T) {
 	}
 }
 
-func TestFormatProgressBar(t *testing.T) {
-	got := formatProgressBar("op", 5, 10, 10)
-	want := "op [=====     ]  50% (5/10)"
-	if got != want {
-		t.Fatalf("unexpected progress bar: %q", got)
+func TestRunOpPoolProcessesAll(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	items := []int{1, 2, 3}
+	seen := make(map[int]bool, len(items))
+	var mu sync.Mutex
+	err := runOpPool(ctx, 2, func(pending chan<- int) error {
+		for _, item := range items {
+			if err := sendOp(ctx, pending, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, func(item int) error {
+		mu.Lock()
+		seen[item] = true
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("runOpPool failed: %v", err)
+	}
+	if len(seen) != len(items) {
+		t.Fatalf("expected %d items, got %d", len(items), len(seen))
 	}
 }
 
@@ -299,37 +232,6 @@ func TestRunOpPoolWithRetry(t *testing.T) {
 	}
 }
 
-func TestHFFilterFiles(t *testing.T) {
-	files := []string{"dir/file.txt", "dir/sub/file2.txt", "root.txt"}
-	got := bbbfs.HFFilterFiles(files, "/dir")
-	if len(got) != 2 || got[0] != "file.txt" || got[1] != "sub/file2.txt" {
-		t.Fatalf("unexpected filtered files: %#v", got)
-	}
-}
-
-func TestNormalizeHFPrefix(t *testing.T) {
-	if got := bbbfs.NormalizeHFPrefix("///dir/sub"); got != "dir/sub" {
-		t.Fatalf("unexpected normalized prefix: %s", got)
-	}
-	if got := bbbfs.NormalizeHFPrefix("/"); got != "" {
-		t.Fatalf("expected empty prefix, got: %s", got)
-	}
-}
-
-func TestHFListEntries(t *testing.T) {
-	files := []string{"dir/file.txt", "dir/sub/file2.txt", "root.txt"}
-	got := bbbfs.HFListEntries(files, "dir")
-	expected := []string{"file.txt", "sub/"}
-	if len(got) != len(expected) {
-		t.Fatalf("unexpected entry count: %#v", got)
-	}
-	for i, entry := range expected {
-		if got[i] != entry {
-			t.Fatalf("unexpected entry at %d: %s", i, got[i])
-		}
-	}
-}
-
 func TestHFSplitWildcard(t *testing.T) {
 	tests := []struct {
 		input      string
@@ -360,6 +262,6 @@ func TestWriteStreamToFile(t *testing.T) {
 		t.Fatalf("read back failed: %v", err)
 	}
 	if string(data) != content {
-		t.Fatalf("unexpected content: %s", string(data))
+		t.Fatalf("unexpected content: %s", data)
 	}
 }

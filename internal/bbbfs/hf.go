@@ -84,16 +84,6 @@ func (hfFS) Stat(ctx context.Context, target string) (Entry, error) {
 	}, nil
 }
 
-// HFFilterFiles exposes HF filtering for tests/shared logic.
-func HFFilterFiles(files []string, prefix string) []string {
-	return hfFilterFiles(files, prefix)
-}
-
-// HFListEntries exposes HF entry listing for tests/shared logic.
-func HFListEntries(files []string, prefix string) []string {
-	return hfListEntries(files, prefix)
-}
-
 func normalizeHFPrefix(prefix string) string {
 	for strings.HasPrefix(prefix, "/") {
 		prefix = strings.TrimPrefix(prefix, "/")
@@ -156,9 +146,4 @@ func hfListEntries(files []string, prefix string) []string {
 	}
 	sort.Strings(entries)
 	return entries
-}
-
-// NormalizeHFPrefix exposes HF prefix normalization for tests/shared logic.
-func NormalizeHFPrefix(prefix string) string {
-	return normalizeHFPrefix(prefix)
 }
