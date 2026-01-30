@@ -1232,9 +1232,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if op.srcAz && op.dstAz {
 			dap, _ := azblob.Parse(op.dst)
 			if op.srcAzPath.Account != dap.Account && !crossTenantOK {
-				if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
-					return azblob.ErrCrossTenantMissing
-				}
+				return azblob.ErrCrossTenantMissing
 			}
 			if op.srcAzPath.Account != dap.Account {
 				if !overwrite {
@@ -1345,7 +1343,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				return nil
 			}, func(work azToAzOp) error {
-				if !crossTenantOK && sap.Account != dap.Account && os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
+				if !crossTenantOK && sap.Account != dap.Account {
 					return azblob.ErrCrossTenantMissing
 				}
 				reader, err := azblob.DownloadStream(srcCtx, sap.Child(work.name))
