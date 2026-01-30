@@ -1691,10 +1691,7 @@ func withReadCloser(reader io.ReadCloser, fn func(io.Reader) error) error {
 		}
 		return err
 	}
-	if closeErr != nil {
-		return closeErr
-	}
-	return nil
+	return closeErr
 }
 
 func resolveDstPath(dst string, dstAz bool, base string, mustBeDir bool) (string, error) {
