@@ -398,11 +398,13 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 func splitWildcard(target string) (string, string) {
 	if strings.Contains(target, "*") {
 		starIdx := strings.Index(target, "*")
-		lastSlash := strings.LastIndex(target[:starIdx], "/")
-		if lastSlash >= 0 {
-			if lastSlash > 0 && strings.HasSuffix(target[:lastSlash+1], "://") {
+		if schemeIdx := strings.Index(target, "://"); schemeIdx >= 0 && schemeIdx < starIdx {
+			pathStart := schemeIdx + len("://")
+			if !strings.Contains(target[pathStart:starIdx], "/") {
 				return target, "*"
 			}
+		}
+		if lastSlash := strings.LastIndex(target[:starIdx], "/"); lastSlash >= 0 {
 			return target[:lastSlash+1], target[lastSlash+1:]
 		}
 		return target, "*"
