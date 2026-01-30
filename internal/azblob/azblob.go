@@ -645,24 +645,29 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
 		return bloberror.MissingSharedKeyCredential
 	}
-	dstCtx := ctx
+	copyCtx := ctx
 	if src.Account != dst.Account {
+		srcTenant := sourceTenant()
 		dstTenant := destinationTenant()
-		if dstTenant == "" {
+		if srcTenant == "" || dstTenant == "" {
 			return ErrCrossTenantMissing
 		}
-		dstCtx = withTenant(ctx, dstTenant)
+		copyCtx = withTenant(ctx, dstTenant)
 	}
-	client, err := getAzBlobClient(dstCtx, dst.Account)
+	client, err := getAzBlobClient(copyCtx, dst.Account)
 	if err != nil {
 		return err
 	}
 	blobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlobClient(dst.Blob)
-	copySource, err := blobSASURL(ctx, src)
+	copySourceCtx := ctx
+	if src.Account != dst.Account {
+		copySourceCtx = withTenant(ctx, sourceTenant())
+	}
+	copySource, err := blobSASURL(copySourceCtx, src)
 	if err != nil {
 		return err
 	}
-	startCopy, err := blobClient.StartCopyFromURL(dstCtx, copySource, nil)
+	startCopy, err := blobClient.StartCopyFromURL(copyCtx, copySource, nil)
 	if err != nil {
 		return err
 	}
