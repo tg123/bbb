@@ -732,19 +732,6 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 	return nil
 }
 
-func copyBlobClientSide(ctx context.Context, src AzurePath, dst AzurePath, srcTenant string, dstTenant string) error {
-	srcCtx := withTenant(ctx, srcTenant)
-	dstCtx := withTenant(ctx, dstTenant)
-	reader, err := DownloadStream(srcCtx, src)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = reader.Close()
-	}()
-	return UploadStream(dstCtx, dst, reader)
-}
-
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
 	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
