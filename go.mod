@@ -1,6 +1,6 @@
 module github.com/tg123/bbb
 
-go 1.24.6
+go 1.26.0
 
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.21.0
