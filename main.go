@@ -2316,21 +2316,13 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		ctx := context.Background()
-		var list []azblob.BlobMeta
-		if err := azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
-			list = append(list, bm)
-			return nil
-		}); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
 		var totalSize int64
 		var count int
-		for _, bm := range list {
+		ctx := context.Background()
+		if err := azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
 			name := bm.Name
 			if name == "" || strings.HasSuffix(name, "/") {
-				continue // skip directories
+				return nil // skip directories
 			}
 			fullpath := fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
 			fullpath = strings.TrimSuffix(fullpath, "/")
@@ -2347,6 +2339,10 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			}
 			totalSize += bm.Size
 			count++
+			return nil
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
 		if !machine {
 			fmt.Printf("Listed %d files summing to %d bytes (%.1f MiB)\n", count, totalSize, float64(totalSize)/(1024*1024))
