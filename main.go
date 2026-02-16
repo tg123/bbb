@@ -424,24 +424,19 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		list, err := azblob.List(ctx, ap)
-		if err != nil {
-			return err
-		}
-		sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
-		for _, bm := range list {
+		err = azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
 			name := bm.Name
 			if name == "" {
-				continue
+				return nil
 			}
 			if !all && name[0] == '.' {
-				continue
+				return nil
 			}
 			// Wildcard filtering
 			if pattern != "" {
 				matched, _ := path.Match(pattern, strings.TrimSuffix(name, "/"))
 				if !matched {
-					continue
+					return nil
 				}
 			}
 			var fullpath string
@@ -470,6 +465,10 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 			} else {
 				fmt.Println(displayPath)
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 		return nil
 	}
@@ -2317,18 +2316,13 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		ctx := context.Background()
-		list, err := azblob.List(ctx, ap)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
 		var totalSize int64
 		var count int
-		for _, bm := range list {
+		ctx := context.Background()
+		if err := azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
 			name := bm.Name
 			if name == "" || strings.HasSuffix(name, "/") {
-				continue // skip directories
+				return nil // skip directories
 			}
 			fullpath := fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
 			fullpath = strings.TrimSuffix(fullpath, "/")
@@ -2345,6 +2339,10 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			}
 			totalSize += bm.Size
 			count++
+			return nil
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
 		if !machine {
 			fmt.Printf("Listed %d files summing to %d bytes (%.1f MiB)\n", count, totalSize, float64(totalSize)/(1024*1024))
