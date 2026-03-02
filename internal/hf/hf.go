@@ -34,13 +34,22 @@ func Parse(raw string) (Path, error) {
 	if rest == "" {
 		return Path{}, errors.New("expected hf://owner/repo[/file]")
 	}
-	parts := strings.SplitN(rest, "/", 3)
-	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+	parts := strings.Split(rest, "/")
+	repoParts := 2
+	if parts[0] == "datasets" {
+		repoParts = 3
+	}
+	if len(parts) < repoParts {
 		return Path{}, errors.New("expected hf://owner/repo[/file]")
 	}
-	p := Path{Repo: parts[0] + "/" + parts[1]}
-	if len(parts) == 3 {
-		p.File = parts[2]
+	for _, part := range parts[:repoParts] {
+		if part == "" {
+			return Path{}, errors.New("expected hf://owner/repo[/file]")
+		}
+	}
+	p := Path{Repo: strings.Join(parts[:repoParts], "/")}
+	if len(parts) > repoParts {
+		p.File = strings.Join(parts[repoParts:], "/")
 	}
 	return p, nil
 }
@@ -128,6 +137,9 @@ func ListFiles(ctx context.Context, p Path) ([]string, error) {
 		return nil, errors.New("path is not directory-like")
 	}
 	apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s?blobs=true", p.Repo)
+	if strings.HasPrefix(p.Repo, "datasets/") {
+		apiURL = fmt.Sprintf("https://huggingface.co/api/datasets/%s?blobs=true", strings.TrimPrefix(p.Repo, "datasets/"))
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return nil, err
