@@ -8,12 +8,6 @@ import (
 	"testing"
 )
 
-type roundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
-}
-
 func TestListFilesAPIEndpoint(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -34,20 +28,18 @@ func TestListFilesAPIEndpoint(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			original := http.DefaultClient
-			http.DefaultClient = &http.Client{
-				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-					if req.URL.String() != tc.wantURL {
-						t.Fatalf("unexpected list url: %s", req.URL.String())
-					}
-					return &http.Response{
-						StatusCode: http.StatusOK,
-						Body:       io.NopCloser(strings.NewReader(`{"siblings":[{"rfilename":"README.md"}]}`)),
-						Header:     make(http.Header),
-					}, nil
-				}),
+			original := doRequest
+			doRequest = func(req *http.Request) (*http.Response, error) {
+				if req.URL.String() != tc.wantURL {
+					t.Fatalf("unexpected list url: %s", req.URL.String())
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"siblings":[{"rfilename":"README.md"}]}`)),
+					Header:     make(http.Header),
+				}, nil
 			}
-			t.Cleanup(func() { http.DefaultClient = original })
+			t.Cleanup(func() { doRequest = original })
 
 			files, err := ListFiles(context.Background(), Path{Repo: tc.repo})
 			if err != nil {

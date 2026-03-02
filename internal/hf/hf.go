@@ -12,6 +12,10 @@ import (
 	"strings"
 )
 
+var doRequest = func(req *http.Request) (*http.Response, error) {
+	return http.DefaultClient.Do(req)
+}
+
 // Path represents a Hugging Face repository or file.
 type Path struct {
 	Repo string // owner/name
@@ -27,12 +31,13 @@ func (p Path) String() string {
 
 // Parse parses hf://owner/repo[/file] paths.
 func Parse(raw string) (Path, error) {
+	const expectedPathErr = "expected hf://owner/repo[/file] or hf://datasets/owner/repo[/file]"
 	if !strings.HasPrefix(raw, "hf://") {
-		return Path{}, errors.New("expected hf://owner/repo[/file]")
+		return Path{}, errors.New(expectedPathErr)
 	}
 	rest := strings.TrimPrefix(raw, "hf://")
 	if rest == "" {
-		return Path{}, errors.New("expected hf://owner/repo[/file]")
+		return Path{}, errors.New(expectedPathErr)
 	}
 	parts := strings.Split(rest, "/")
 	repoParts := 2
@@ -40,11 +45,11 @@ func Parse(raw string) (Path, error) {
 		repoParts = 3
 	}
 	if len(parts) < repoParts {
-		return Path{}, errors.New("expected hf://owner/repo[/file]")
+		return Path{}, errors.New(expectedPathErr)
 	}
 	for _, part := range parts[:repoParts] {
 		if part == "" {
-			return Path{}, errors.New("expected hf://owner/repo[/file]")
+			return Path{}, errors.New(expectedPathErr)
 		}
 	}
 	p := Path{Repo: strings.Join(parts[:repoParts], "/")}
@@ -102,7 +107,7 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doRequest(req)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +149,7 @@ func ListFiles(ctx context.Context, p Path) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doRequest(req)
 	if err != nil {
 		return nil, err
 	}
