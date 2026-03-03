@@ -434,7 +434,10 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 			}
 			// Wildcard filtering
 			if pattern != "" {
-				matched, _ := path.Match(pattern, strings.TrimSuffix(name, "/"))
+				matched, err := path.Match(pattern, strings.TrimSuffix(name, "/"))
+				if err != nil {
+					return err
+				}
 				if !matched {
 					return nil
 				}
@@ -2318,7 +2321,6 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 		}
 		var totalSize int64
 		var count int
-		ctx := context.Background()
 		if err := azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
 			name := bm.Name
 			if name == "" || strings.HasSuffix(name, "/") {

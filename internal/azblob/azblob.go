@@ -275,6 +275,9 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 				continue
 			}
 			rel := strings.TrimPrefix(*blob.Name, prefix)
+			if rel == "" {
+				continue
+			}
 			parts := strings.SplitN(rel, "/", 2)
 			if len(parts) == 1 {
 				// file at first level
@@ -303,7 +306,8 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 	return nil
 }
 
-// List lists immediate children (non-recursive). If dir-like path provided, lists under it.
+// getAzBlobClient returns an Azure Blob client for the given account using either a shared key
+// from BBB_AZBLOB_ACCOUNTKEY or the default Azure credential.
 func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
 	endpoint := getEndpoint(account)
 	if key := os.Getenv("BBB_AZBLOB_ACCOUNTKEY"); key != "" {
