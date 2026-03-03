@@ -105,6 +105,25 @@ func TestHFPathDatasetURL(t *testing.T) {
 	}
 }
 
+func TestHFPathDatasetDefaults(t *testing.T) {
+	p, err := hf.Parse("hf://datasets/allenai/tulu-3-sft-mixture")
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if p.Repo != "datasets/allenai/tulu-3-sft-mixture" {
+		t.Fatalf("unexpected dataset repo: %s", p.Repo)
+	}
+	if p.File != "" {
+		t.Fatalf("expected empty file for dataset repo path, got: %s", p.File)
+	}
+	if p.DefaultFilename() != "tulu-3-sft-mixture" {
+		t.Fatalf("unexpected default filename: %s", p.DefaultFilename())
+	}
+	if _, err := p.URL(); err == nil {
+		t.Fatalf("expected url error for dataset repo path")
+	}
+}
+
 func TestResolveDstPathAzDir(t *testing.T) {
 	dst, err := resolveDstPath("az://acct/container/prefix", true, "model.bin", true)
 	if err != nil {

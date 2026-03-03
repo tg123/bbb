@@ -29,7 +29,7 @@ func (p Path) String() string {
 	return "hf://" + p.Repo + "/" + p.File
 }
 
-// Parse parses hf://owner/repo[/file] paths.
+// Parse parses hf://owner/repo[/file] and hf://datasets/owner/repo[/file] paths.
 func Parse(raw string) (Path, error) {
 	const expectedPathErr = "expected hf://owner/repo[/file] or hf://datasets/owner/repo[/file]"
 	if !strings.HasPrefix(raw, "hf://") {
