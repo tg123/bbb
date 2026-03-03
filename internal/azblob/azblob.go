@@ -343,6 +343,7 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 	return azblob.NewClient(endpoint, cred, nil)
 }
 
+// List lists immediate children (non-recursive). If dir-like path provided, lists under it.
 func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 	var out []BlobMeta
 	if err := ListStream(ctx, ap, func(bm BlobMeta) error {
