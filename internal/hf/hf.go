@@ -12,6 +12,10 @@ import (
 	"strings"
 )
 
+var doRequest = func(req *http.Request) (*http.Response, error) {
+	return http.DefaultClient.Do(req)
+}
+
 // Path represents a Hugging Face repository or file.
 type Path struct {
 	Repo string // owner/name
@@ -25,22 +29,32 @@ func (p Path) String() string {
 	return "hf://" + p.Repo + "/" + p.File
 }
 
-// Parse parses hf://owner/repo[/file] paths.
+// Parse parses hf://owner/repo[/file] and hf://datasets/owner/repo[/file] paths.
 func Parse(raw string) (Path, error) {
+	const expectedPathErr = "expected hf://owner/repo[/file] or hf://datasets/owner/repo[/file]"
 	if !strings.HasPrefix(raw, "hf://") {
-		return Path{}, errors.New("expected hf://owner/repo[/file]")
+		return Path{}, errors.New(expectedPathErr)
 	}
 	rest := strings.TrimPrefix(raw, "hf://")
 	if rest == "" {
-		return Path{}, errors.New("expected hf://owner/repo[/file]")
+		return Path{}, errors.New(expectedPathErr)
 	}
-	parts := strings.SplitN(rest, "/", 3)
-	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
-		return Path{}, errors.New("expected hf://owner/repo[/file]")
+	parts := strings.Split(rest, "/")
+	repoParts := 2
+	if parts[0] == "datasets" {
+		repoParts = 3
 	}
-	p := Path{Repo: parts[0] + "/" + parts[1]}
-	if len(parts) == 3 {
-		p.File = parts[2]
+	if len(parts) < repoParts {
+		return Path{}, errors.New(expectedPathErr)
+	}
+	for _, part := range parts[:repoParts] {
+		if part == "" {
+			return Path{}, errors.New(expectedPathErr)
+		}
+	}
+	p := Path{Repo: strings.Join(parts[:repoParts], "/")}
+	if len(parts) > repoParts {
+		p.File = strings.Join(parts[repoParts:], "/")
 	}
 	return p, nil
 }
@@ -93,7 +107,7 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doRequest(req)
 	if err != nil {
 		return nil, err
 	}
@@ -128,11 +142,14 @@ func ListFiles(ctx context.Context, p Path) ([]string, error) {
 		return nil, errors.New("path is not directory-like")
 	}
 	apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s?blobs=true", p.Repo)
+	if strings.HasPrefix(p.Repo, "datasets/") {
+		apiURL = fmt.Sprintf("https://huggingface.co/api/datasets/%s?blobs=true", strings.TrimPrefix(p.Repo, "datasets/"))
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doRequest(req)
 	if err != nil {
 		return nil, err
 	}
