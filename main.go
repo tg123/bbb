@@ -301,54 +301,6 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 			if !matched {
 				continue
 			}
-		err = azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
-			name := bm.Name
-			if name == "" {
-				return nil
-			}
-			if !all && name[0] == '.' {
-				return nil
-			}
-			// Wildcard filtering
-			if pattern != "" {
-				matched, err := path.Match(pattern, strings.TrimSuffix(name, "/"))
-				if err != nil {
-					return err
-				}
-				if !matched {
-					return nil
-				}
-			}
-			var fullpath string
-			if ap.Container == "" {
-				fullpath = fmt.Sprintf("az://%s/%s", ap.Account, strings.TrimSuffix(name, "/"))
-			} else if ap.Blob == "" {
-				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, strings.TrimSuffix(name, "/"))
-			} else {
-				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
-				fullpath = strings.TrimSuffix(fullpath, "/")
-			}
-			displayPath := fullpath
-			if relFlag {
-				displayPath = strings.TrimSuffix(name, "/")
-			}
-			if long {
-				typ := "-"
-				if strings.HasSuffix(name, "/") || (bm.Size == 0 && strings.HasSuffix(ap.Blob, "/")) || ap.Container == "" {
-					typ = "d"
-				}
-				if machine {
-					fmt.Printf("%s\t%d\t-\t%s\n", typ, bm.Size, displayPath)
-				} else {
-					fmt.Printf("%1s %10d %s %s\n", typ, bm.Size, "-", displayPath)
-				}
-			} else {
-				fmt.Println(displayPath)
-			}
-			return nil
-		})
-		if err != nil {
-			return err
 		}
 		displayPath := entry.Path
 		if relFlag {
@@ -1893,7 +1845,7 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 	relFlag := c.Bool("s")
 	parentPath, pattern := splitWildcard(target)
 	fs := bbbfs.Resolve(parentPath)
-	list, err := fs.List(ctx, parentPath)
+	list, listErr := fs.List(ctx, parentPath)
 	if isAz(target) {
 		ap, err := azblob.Parse(target)
 		if err != nil {
@@ -1932,10 +1884,8 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 		}
 		return nil
 	}
-	// fallback: local
-	entries, err := fsops.List(target)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	if listErr != nil {
+		fmt.Fprintln(os.Stderr, listErr)
 		os.Exit(1)
 	}
 	var totalSize int64
