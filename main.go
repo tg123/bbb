@@ -770,12 +770,16 @@ func appendTaskState(path, taskKey string) error {
 	}
 
 	if _, err := file.WriteString(taskKey + "\n"); err != nil {
-		_ = file.Close()
+		if cerr := file.Close(); cerr != nil {
+			return errors.Join(err, cerr)
+		}
 		return err
 	}
 
 	if err := file.Sync(); err != nil {
-		_ = file.Close()
+		if cerr := file.Close(); cerr != nil {
+			return errors.Join(err, cerr)
+		}
 		return err
 	}
 
