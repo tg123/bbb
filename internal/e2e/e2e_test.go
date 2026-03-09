@@ -281,6 +281,9 @@ func TestBasic(t *testing.T) {
 		}
 		taskfile := filepath.Join(taskDir, "cp.tasks")
 		dstPrefix := fmt.Sprintf("az://%s/test/taskfile-%d/", azuriteAccount, time.Now().UnixNano())
+		t.Cleanup(func() {
+			cleanFolder(t, dstPrefix)
+		})
 		content := strings.Join([]string{
 			srcA + " " + dstPrefix,
 			srcB + " " + dstPrefix,
