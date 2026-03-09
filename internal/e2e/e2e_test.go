@@ -3,8 +3,8 @@ package e2e_test
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
