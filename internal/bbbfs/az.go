@@ -100,8 +100,8 @@ func (azFS) ListRecursive(ctx context.Context, target string) ([]Entry, error) {
 			continue
 		}
 		out = append(out, Entry{
-			Name:    bm.Name,
-			Path:    azChildPath(ap, bm.Name),
+			Name:    name,
+			Path:    azChildPath(ap, name),
 			Size:    bm.Size,
 			IsDir:   false,
 			ModTime: time.Time{},
