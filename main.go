@@ -802,18 +802,101 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
+		type cpTask struct {
+			src string
+			dst string
+			key string
+		}
+		pending := make([]cpTask, 0, len(tasks))
+		seen := make(map[string]struct{}, len(state)+len(tasks))
+		for key := range state {
+			seen[key] = struct{}{}
+		}
 		for _, task := range tasks {
 			key := taskStateKey(task.src, task.dst)
-			if _, ok := state[key]; ok {
+			if _, ok := seen[key]; ok {
 				continue
 			}
-			if err := cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, []string{task.src}, task.dst); err != nil {
-				return err
+			seen[key] = struct{}{}
+			pending = append(pending, cpTask{src: task.src, dst: task.dst, key: key})
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+
+		innerConcurrency := concurrency
+		if innerConcurrency < 1 {
+			innerConcurrency = 1
+		}
+		workers := 1
+		if len(pending) > 1 {
+			workers = innerConcurrency
+			innerConcurrency = 1
+			if workers > len(pending) {
+				workers = len(pending)
 			}
-			if err := appendTaskState(taskfileState, key); err != nil {
-				return err
+		}
+		workerCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		var wg sync.WaitGroup
+		taskCh := make(chan cpTask, workers)
+		var stateMu sync.Mutex
+		var firstErr error
+		var firstErrMu sync.Mutex
+
+		setErr := func(err error) {
+			firstErrMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+				cancel()
 			}
-			state[key] = struct{}{}
+			firstErrMu.Unlock()
+		}
+
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-workerCtx.Done():
+						return
+					case task, ok := <-taskCh:
+						if !ok {
+							return
+						}
+						if err := cmdCPPaths(workerCtx, overwrite, quiet, innerConcurrency, retryCount, []string{task.src}, task.dst); err != nil {
+							setErr(err)
+							return
+						}
+						if taskfileState != "" {
+							stateMu.Lock()
+							err := appendTaskState(taskfileState, task.key)
+							stateMu.Unlock()
+							if err != nil {
+								setErr(err)
+								return
+							}
+						}
+					}
+				}
+			}()
+		}
+
+	enqueueLoop:
+		for _, task := range pending {
+			select {
+			case <-workerCtx.Done():
+				break enqueueLoop
+			case taskCh <- task:
+			}
+		}
+		close(taskCh)
+		wg.Wait()
+
+		if firstErr != nil {
+			return firstErr
 		}
 		return nil
 	}
