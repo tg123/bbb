@@ -493,6 +493,7 @@ type progressBar struct {
 	label       string
 	total       int64
 	width       int
+	startedAt   time.Time
 	done        atomic.Int64
 	lastPercent atomic.Int64
 	finished    atomic.Bool
@@ -503,9 +504,10 @@ func newProgressBar(total int, label string, quiet bool) *progressBar {
 		return nil
 	}
 	bar := &progressBar{
-		label: label,
-		total: int64(total),
-		width: 28,
+		label:     label,
+		total:     int64(total),
+		width:     28,
+		startedAt: time.Now(),
 	}
 	bar.render(0)
 	return bar
@@ -554,14 +556,19 @@ func (p *progressBar) render(done int64) {
 	} else if !p.finished.CompareAndSwap(false, true) {
 		return
 	}
-	line := formatProgressBar(p.label, done, p.total, p.width)
+	elapsed := time.Since(p.startedAt).Seconds()
+	speed := 0.0
+	if elapsed > 0 {
+		speed = float64(done) / elapsed
+	}
+	line := formatProgressBar(p.label, done, p.total, p.width, speed)
 	lockedFprintf(os.Stderr, "\r%s", line)
 	if done == p.total {
 		lockedFprintf(os.Stderr, "\n")
 	}
 }
 
-func formatProgressBar(label string, done, total int64, width int) string {
+func formatProgressBar(label string, done, total int64, width int, speed float64) string {
 	if width < 1 {
 		width = 1
 	}
@@ -580,7 +587,10 @@ func formatProgressBar(label string, done, total int64, width int) string {
 		filled = width
 	}
 	bar := strings.Repeat("=", filled) + strings.Repeat(" ", width-filled)
-	return fmt.Sprintf("%s [%s] %3d%% (%d/%d)", label, bar, percent, done, total)
+	if speed < 0 {
+		speed = 0
+	}
+	return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %.1f/s)", label, bar, percent, done, total, speed)
 }
 
 func sendOp[T any](ctx context.Context, ch chan<- T, op T) error {

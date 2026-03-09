@@ -244,6 +244,20 @@ func TestRunOpPoolWithRetry(t *testing.T) {
 	}
 }
 
+func TestFormatProgressBarIncludesSpeed(t *testing.T) {
+	line := formatProgressBar("cp", 5, 10, 10, 2.5)
+	if !strings.Contains(line, "cp [=====     ]  50% (5/10, 2.5/s)") {
+		t.Fatalf("unexpected progress bar output: %s", line)
+	}
+}
+
+func TestFormatProgressBarNormalizesInputs(t *testing.T) {
+	line := formatProgressBar("cp", 7, 5, 0, -2)
+	if !strings.Contains(line, "[=] 100% (5/5, 0.0/s)") {
+		t.Fatalf("unexpected normalized output: %s", line)
+	}
+}
+
 func TestHFSplitWildcard(t *testing.T) {
 	tests := []struct {
 		input      string
