@@ -703,7 +703,9 @@ func loadTaskPairs(taskfile string) ([]taskPair, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer file.Close()
+		defer func() {
+			_ = file.Close()
+		}()
 		reader = file
 	}
 
@@ -739,7 +741,9 @@ func loadTaskState(path string) (map[string]struct{}, error) {
 		}
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -764,13 +768,18 @@ func appendTaskState(path, taskKey string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 
 	if _, err := file.WriteString(taskKey + "\n"); err != nil {
+		_ = file.Close()
 		return err
 	}
 
-	return file.Sync()
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+
+	return file.Close()
 }
 
 func taskStateKey(src, dst string) string {

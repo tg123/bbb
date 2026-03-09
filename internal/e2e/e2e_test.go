@@ -269,6 +269,41 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+	t.Run("cp taskfile parallel", func(t *testing.T) {
+		taskDir := t.TempDir()
+		srcA := filepath.Join(taskDir, "task-a.txt")
+		srcB := filepath.Join(taskDir, "task-b.txt")
+		if err := os.WriteFile(srcA, []byte("task-a"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(srcB, []byte("task-b"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		taskfile := filepath.Join(taskDir, "cp.tasks")
+		dstPrefix := fmt.Sprintf("az://%s/test/taskfile-%d/", azuriteAccount, time.Now().UnixNano())
+		content := strings.Join([]string{
+			srcA + " " + dstPrefix,
+			srcB + " " + dstPrefix,
+		}, "\n") + "\n"
+		if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runBBB("cp", "--taskfile", taskfile, "--concurrency", "2"); err != nil {
+			t.Fatal(err)
+		}
+		files, err := bbbLs(dstPrefix, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{
+			strings.TrimSuffix(dstPrefix, "/") + "/task-a.txt",
+			strings.TrimSuffix(dstPrefix, "/") + "/task-b.txt",
+		}
+		if !slices.Equal(files, expected) {
+			t.Fatalf("unexpected taskfile cp files: got %v, want %v", files, expected)
+		}
+	})
+
 	// ls
 	{
 		files, err := bbbLs("az://"+azuriteAccount+"/test", false)
