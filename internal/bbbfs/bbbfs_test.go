@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -39,4 +40,40 @@ func readDummy(fs FS, path string) error {
 		return err
 	}
 	return rc.Close()
+}
+
+func TestListRecursiveLocalNestedPaths(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sub", "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatalf("write sub/b.txt: %v", err)
+	}
+
+	entries, err := ListRecursive(context.Background(), root)
+	if err != nil {
+		t.Fatalf("ListRecursive failed: %v", err)
+	}
+
+	got := make([]string, 0, len(entries))
+	for _, e := range entries {
+		got = append(got, e.Name)
+	}
+	want := []string{"a.txt", filepath.Join("sub", "b.txt")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected recursive entries: got %v want %v", got, want)
+	}
+}
+
+func TestProvidersImplementRecursiveLister(t *testing.T) {
+	if _, ok := any(azFS{}).(recursiveLister); !ok {
+		t.Fatalf("azFS should implement recursiveLister")
+	}
+	if _, ok := any(hfFS{}).(recursiveLister); !ok {
+		t.Fatalf("hfFS should implement recursiveLister")
+	}
 }

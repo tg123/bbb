@@ -42,9 +42,6 @@ func listRecursive(ctx context.Context, fs FS, root, current, relPrefix string, 
 		if entry.IsDir && !strings.HasSuffix(childPath, "/") && isRemote {
 			childPath += "/"
 		}
-		if !isRemote && !filepath.IsAbs(childPath) {
-			childPath = filepath.Join(current, childPath)
-		}
 		childRel := childName
 		if relPrefix != "" {
 			if isRemote {

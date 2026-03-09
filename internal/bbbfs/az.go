@@ -84,6 +84,32 @@ func (azFS) Stat(ctx context.Context, target string) (Entry, error) {
 	}, nil
 }
 
+func (azFS) ListRecursive(ctx context.Context, target string) ([]Entry, error) {
+	ap, err := azblob.Parse(target)
+	if err != nil {
+		return nil, err
+	}
+	list, err := azblob.ListRecursive(ctx, ap)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Entry, 0, len(list))
+	for _, bm := range list {
+		name := strings.TrimSuffix(bm.Name, "/")
+		if name == "" {
+			continue
+		}
+		out = append(out, Entry{
+			Name:    bm.Name,
+			Path:    azChildPath(ap, bm.Name),
+			Size:    bm.Size,
+			IsDir:   false,
+			ModTime: time.Time{},
+		})
+	}
+	return out, nil
+}
+
 func azChildPath(ap azblob.AzurePath, name string) string {
 	trimmed := strings.TrimSuffix(name, "/")
 	return ap.Child(trimmed).String()
