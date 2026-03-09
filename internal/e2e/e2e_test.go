@@ -3,7 +3,9 @@ package e2e_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -304,6 +306,47 @@ func TestBasic(t *testing.T) {
 		}
 		if !slices.Equal(files, expected) {
 			t.Fatalf("unexpected taskfile cp files: got %v, want %v", files, expected)
+		}
+	})
+
+	t.Run("cp taskfile state recovery skip finished", func(t *testing.T) {
+		taskDir := t.TempDir()
+		srcMissing := filepath.Join(taskDir, "missing.txt")
+		srcOK := filepath.Join(taskDir, "task-ok.txt")
+		if err := os.WriteFile(srcOK, []byte("task-ok"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		taskfile := filepath.Join(taskDir, "cp-recovery.tasks")
+		dstPrefix := fmt.Sprintf("az://%s/test/taskfile-recovery-%d/", azuriteAccount, time.Now().UnixNano())
+		t.Cleanup(func() {
+			cleanFolder(t, dstPrefix)
+		})
+		content := strings.Join([]string{
+			srcMissing + " " + dstPrefix,
+			srcOK + " " + dstPrefix,
+		}, "\n") + "\n"
+		if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		stateFile := filepath.Join(taskDir, "cp-recovery.state")
+		hasher := sha256.New()
+		hasher.Write([]byte(srcMissing))
+		hasher.Write([]byte{0})
+		hasher.Write([]byte(dstPrefix))
+		skippedKey := hex.EncodeToString(hasher.Sum(nil))
+		if err := os.WriteFile(stateFile, []byte(skippedKey+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runBBB("cp", "--taskfile", taskfile, "--taskfile-state", stateFile, "--concurrency", "2"); err != nil {
+			t.Fatal(err)
+		}
+		files, err := bbbLs(dstPrefix, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{strings.TrimSuffix(dstPrefix, "/") + "/task-ok.txt"}
+		if !slices.Equal(files, expected) {
+			t.Fatalf("unexpected taskfile recovery files: got %v, want %v", files, expected)
 		}
 	})
 

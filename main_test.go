@@ -211,6 +211,118 @@ func TestCmdCPTaskfileStateRecovery(t *testing.T) {
 	}
 }
 
+func TestCmdCPTaskfileStateRecoverySkipsFinishedTask(t *testing.T) {
+	dir := t.TempDir()
+	srcMissing := filepath.Join(dir, "missing.txt")
+	srcOK := filepath.Join(dir, "ok.txt")
+	dstDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	if err := os.WriteFile(srcOK, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(strings.Join([]string{
+		srcMissing + " " + dstDir,
+		srcOK + " " + dstDir,
+		"",
+	}, "\n")), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+
+	stateFile := filepath.Join(dir, "tasks.state")
+	skippedKey := taskStateKey(srcMissing, dstDir)
+	if err := os.WriteFile(stateFile, []byte(skippedKey+"\n"), 0o644); err != nil {
+		t.Fatalf("write statefile: %v", err)
+	}
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("cp recovery failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, filepath.Base(srcOK))); err != nil {
+		t.Fatalf("expected copied file: %v", err)
+	}
+
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read statefile: %v", err)
+	}
+	stateText := string(stateData)
+	if !strings.Contains(stateText, skippedKey) {
+		t.Fatalf("expected skipped task key in statefile")
+	}
+	if !strings.Contains(stateText, taskStateKey(srcOK, dstDir)) {
+		t.Fatalf("expected completed task key in statefile")
+	}
+}
+
+func TestCmdCPTaskfileStateRecoveryPartialTask(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	dstDir := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write src a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatalf("write src b: %v", err)
+	}
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dstDir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("seed partial dst: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(srcDir+" "+dstDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "tasks.state")
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("cp partial recovery failed: %v", err)
+	}
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if _, err := os.Stat(filepath.Join(dstDir, name)); err != nil {
+			t.Fatalf("expected copied file %s: %v", name, err)
+		}
+	}
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read statefile: %v", err)
+	}
+	if !strings.Contains(string(stateData), taskStateKey(srcDir, dstDir)) {
+		t.Fatalf("expected task key in statefile")
+	}
+}
+
 func TestCmdSyncTaskfile(t *testing.T) {
 	dir := t.TempDir()
 	srcA := filepath.Join(dir, "src-a")
