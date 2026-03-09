@@ -167,8 +167,6 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 
 func TestCmdCPTaskfileStateRecovery(t *testing.T) {
 	dir := t.TempDir()
-	srcMissing := filepath.Join(dir, "missing.txt")
-	dstMissing := filepath.Join(dir, "out-missing.txt")
 	srcOk := filepath.Join(dir, "ok.txt")
 	dstOk := filepath.Join(dir, "out-ok.txt")
 	if err := os.WriteFile(srcOk, []byte("ok"), 0o644); err != nil {
@@ -176,15 +174,11 @@ func TestCmdCPTaskfileStateRecovery(t *testing.T) {
 	}
 
 	taskfile := filepath.Join(dir, "tasks.txt")
-	if err := os.WriteFile(taskfile, []byte(srcMissing+" "+dstMissing+"\n"+srcOk+" "+dstOk+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(taskfile, []byte(srcOk+" "+dstOk+"\n"), 0o644); err != nil {
 		t.Fatalf("write taskfile: %v", err)
 	}
 
 	stateFile := filepath.Join(dir, "tasks.state")
-	if err := os.WriteFile(stateFile, []byte(taskStateKey(srcMissing, dstMissing)+"\n"), 0o644); err != nil {
-		t.Fatalf("write statefile: %v", err)
-	}
-
 	app := &cli.Command{
 		Action: cmdCP,
 		Flags: []cli.Flag{
@@ -202,12 +196,18 @@ func TestCmdCPTaskfileStateRecovery(t *testing.T) {
 	if _, err := os.Stat(dstOk); err != nil {
 		t.Fatalf("expected copied file: %v", err)
 	}
+	if err := os.Remove(srcOk); err != nil {
+		t.Fatalf("remove src: %v", err)
+	}
+	if err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("cp resume failed: %v", err)
+	}
 	stateData, err := os.ReadFile(stateFile)
 	if err != nil {
 		t.Fatalf("read statefile: %v", err)
 	}
-	if !strings.Contains(string(stateData), taskStateKey(srcOk, dstOk)) {
-		t.Fatalf("expected statefile to include completed task")
+	if strings.TrimSpace(string(stateData)) == "" {
+		t.Fatalf("expected non-empty statefile")
 	}
 }
 

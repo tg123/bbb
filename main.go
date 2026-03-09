@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -772,7 +774,11 @@ func appendTaskState(path, taskKey string) error {
 }
 
 func taskStateKey(src, dst string) string {
-	return src + "\t" + dst
+	h := sha256.New()
+	h.Write([]byte(src))
+	h.Write([]byte{0})
+	h.Write([]byte(dst))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func cmdCP(ctx context.Context, c *cli.Command) error {
@@ -833,7 +839,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	if dstAz {
 		dap, err := azblob.Parse(dst)
 		if err != nil {
-			return err
+			return fmt.Errorf("cp: parse destination %q: %w", dst, err)
 		}
 		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
 			isDstDir = true
@@ -938,7 +944,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			err = copyTree(ctx, op.src, op.dst, overwrite, quiet, "cp", concurrency, retryCount)
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("cp: %s -> %s: %w", op.src, op.dst, err)
 		}
 	}
 	if err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
@@ -1022,7 +1028,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		}
 		return nil
 	}); err != nil {
-		return err
+		return fmt.Errorf("cp: file operations: %w", err)
 	}
 	return nil
 }
