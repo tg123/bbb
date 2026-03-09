@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/md5"
 	"errors"
@@ -192,13 +193,15 @@ func main() {
 			{
 				Name:      "cp",
 				Usage:     "Copy files or directories",
-				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
+				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] [--taskfile FILE|--taskfile -] [--taskfile-state FILE] srcs [srcs ...] dst",
 				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
+					&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
+					&cli.StringFlag{Name: "taskfile-state", Usage: "State file for `cp --taskfile` crash recovery"},
 				},
 				Action: cmdCP,
 			},
@@ -240,7 +243,7 @@ func main() {
 			{
 				Name:      "sync",
 				Usage:     "Synchronise two directory trees",
-				UsageText: "bbb sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] src dst",
+				UsageText: "bbb sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] [--taskfile FILE|--taskfile -] src dst",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "dry-run", Usage: "show actions without applying"},
 					&cli.BoolFlag{Name: "delete", Usage: "Delete destination files that don't exist in source"},
@@ -248,6 +251,7 @@ func main() {
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
 					&cli.StringFlag{Name: "x", Aliases: []string{"exclude"}, Usage: "Exclude files matching this regex"},
+					&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
 				},
 				Action: cmdSync,
 			},
@@ -679,20 +683,147 @@ func runOpPoolWithRetryProgress[T any](ctx context.Context, concurrency int, ret
 	return err
 }
 
+type taskPair struct {
+	src string
+	dst string
+}
+
+func loadTaskPairs(taskfile string) ([]taskPair, error) {
+	var (
+		reader io.Reader
+		file   *os.File
+		err    error
+	)
+	if taskfile == "-" {
+		reader = os.Stdin
+	} else {
+		file, err = os.Open(taskfile)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		reader = file
+	}
+
+	var tasks []taskPair
+	scanner := bufio.NewScanner(reader)
+	for lineNo := 1; scanner.Scan(); lineNo++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("taskfile: line %d: expected `src dst`", lineNo)
+		}
+		tasks = append(tasks, taskPair{src: parts[0], dst: parts[1]})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
+func loadTaskState(path string) (map[string]struct{}, error) {
+	state := map[string]struct{}{}
+	if path == "" {
+		return state, nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return state, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		state[line] = struct{}{}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func appendTaskState(path, taskKey string) error {
+	if path == "" {
+		return nil
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if _, err := file.WriteString(taskKey + "\n"); err != nil {
+		return err
+	}
+
+	return file.Sync()
+}
+
+func taskStateKey(src, dst string) string {
+	return src + "\t" + dst
+}
+
 func cmdCP(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdCP called", "args", c.Args().Slice())
-	if c.Args().Len() < 2 {
-		return fmt.Errorf("cp: need srcs dst")
-	}
 	overwrite := c.Bool("f")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
+	taskfile := c.String("taskfile")
+	taskfileState := c.String("taskfile-state")
+
+	if taskfile != "" {
+		if c.Args().Len() != 0 {
+			return fmt.Errorf("cp: cannot use positional args with --taskfile")
+		}
+		tasks, err := loadTaskPairs(taskfile)
+		if err != nil {
+			return err
+		}
+		state, err := loadTaskState(taskfileState)
+		if err != nil {
+			return err
+		}
+		for _, task := range tasks {
+			key := taskStateKey(task.src, task.dst)
+			if _, ok := state[key]; ok {
+				continue
+			}
+			if err := cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, []string{task.src}, task.dst); err != nil {
+				return err
+			}
+			if err := appendTaskState(taskfileState, key); err != nil {
+				return err
+			}
+			state[key] = struct{}{}
+		}
+		return nil
+	}
+
+	if c.Args().Len() < 2 {
+		return fmt.Errorf("cp: need srcs dst")
+	}
 	srcs := make([]string, c.Args().Len()-1)
 	for i := 0; i < len(srcs); i++ {
 		srcs[i] = c.Args().Get(i)
 	}
 	dst := c.Args().Get(c.Args().Len() - 1)
+	return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, srcs, dst)
+}
+
+func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string) error {
 	if isHF(dst) {
 		return fmt.Errorf("cp: hf:// only supported as source")
 	}
@@ -702,8 +833,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	if dstAz {
 		dap, err := azblob.Parse(dst)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return err
 		}
 		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
 			isDstDir = true
@@ -808,8 +938,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			err = copyTree(ctx, op.src, op.dst, overwrite, quiet, "cp", concurrency, retryCount)
 		}
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return err
 		}
 	}
 	if err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
@@ -893,8 +1022,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 		return nil
 	}); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	return nil
 }
@@ -1451,16 +1579,37 @@ func syncHFFilesFromList(files []string, excludeMatch func(string) bool) []strin
 
 func cmdSync(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdSync called", "args", c.Args().Slice())
-	if c.Args().Len() != 2 {
-		return fmt.Errorf("sync: need src dst")
-	}
 	dry := c.Bool("dry-run")
 	del := c.Bool("delete")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	exclude := c.String("x")
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
+	taskfile := c.String("taskfile")
+
+	if taskfile != "" {
+		if c.Args().Len() != 0 {
+			return fmt.Errorf("sync: cannot use positional args with --taskfile")
+		}
+		tasks, err := loadTaskPairs(taskfile)
+		if err != nil {
+			return err
+		}
+		for _, task := range tasks {
+			if err := cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, task.src, task.dst); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if c.Args().Len() != 2 {
+		return fmt.Errorf("sync: need src dst")
+	}
 	src, dst := c.Args().Get(0), c.Args().Get(1)
+	return cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, src, dst)
+}
+
+func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, concurrency, retryCount int, src, dst string) error {
 	if isHF(dst) {
 		return fmt.Errorf("sync: hf:// only supported as source")
 	}

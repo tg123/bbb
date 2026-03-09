@@ -165,6 +165,100 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 	}
 }
 
+func TestCmdCPTaskfileStateRecovery(t *testing.T) {
+	dir := t.TempDir()
+	srcMissing := filepath.Join(dir, "missing.txt")
+	dstMissing := filepath.Join(dir, "out-missing.txt")
+	srcOk := filepath.Join(dir, "ok.txt")
+	dstOk := filepath.Join(dir, "out-ok.txt")
+	if err := os.WriteFile(srcOk, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(srcMissing+" "+dstMissing+"\n"+srcOk+" "+dstOk+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+
+	stateFile := filepath.Join(dir, "tasks.state")
+	if err := os.WriteFile(stateFile, []byte(taskStateKey(srcMissing, dstMissing)+"\n"), 0o644); err != nil {
+		t.Fatalf("write statefile: %v", err)
+	}
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("cp failed: %v", err)
+	}
+	if _, err := os.Stat(dstOk); err != nil {
+		t.Fatalf("expected copied file: %v", err)
+	}
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read statefile: %v", err)
+	}
+	if !strings.Contains(string(stateData), taskStateKey(srcOk, dstOk)) {
+		t.Fatalf("expected statefile to include completed task")
+	}
+}
+
+func TestCmdSyncTaskfile(t *testing.T) {
+	dir := t.TempDir()
+	srcA := filepath.Join(dir, "src-a")
+	dstA := filepath.Join(dir, "dst-a")
+	srcB := filepath.Join(dir, "src-b")
+	dstB := filepath.Join(dir, "dst-b")
+	if err := os.MkdirAll(srcA, 0o755); err != nil {
+		t.Fatalf("mkdir srcA: %v", err)
+	}
+	if err := os.MkdirAll(srcB, 0o755); err != nil {
+		t.Fatalf("mkdir srcB: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcA, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write srcA: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcB, "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatalf("write srcB: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "sync.tasks")
+	content := strings.Join([]string{srcA + " " + dstA, srcB + " " + dstB, ""}, "\n")
+	if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+
+	app := &cli.Command{
+		Action: cmdSync,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "dry-run"},
+			&cli.BoolFlag{Name: "delete"},
+			&cli.StringFlag{Name: "x"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.StringFlag{Name: "taskfile"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"sync", "--taskfile", taskfile}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstA, "a.txt")); err != nil {
+		t.Fatalf("expected synced file A: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstB, "b.txt")); err != nil {
+		t.Fatalf("expected synced file B: %v", err)
+	}
+}
+
 func TestRunOpPoolProcessesAll(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
