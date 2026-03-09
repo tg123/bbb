@@ -195,7 +195,7 @@ func main() {
 			{
 				Name:      "cp",
 				Usage:     "Copy files or directories",
-				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] [--taskfile FILE|--taskfile -] [--taskfile-state FILE] srcs [srcs ...] dst",
+				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] [--taskfile FILE|--taskfile -] [--taskfile-state FILE]\n   or: bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
 				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
