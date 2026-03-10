@@ -590,7 +590,7 @@ func formatProgressBar(label string, done, total int64, width int, speed float64
 	if speed < 0 {
 		speed = 0
 	}
-	return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %.1f/s)", label, bar, percent, done, total, speed)
+	return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %.1f ops/s)", label, bar, percent, done, total, speed)
 }
 
 func sendOp[T any](ctx context.Context, ch chan<- T, op T) error {

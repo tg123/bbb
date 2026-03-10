@@ -246,28 +246,28 @@ func TestRunOpPoolWithRetry(t *testing.T) {
 
 func TestFormatProgressBarIncludesSpeed(t *testing.T) {
 	line := formatProgressBar("cp", 5, 10, 10, 2.5)
-	if line != "cp [=====     ]  50% (5/10, 2.5/s)" {
+	if line != "cp [=====     ]  50% (5/10, 2.5 ops/s)" {
 		t.Fatalf("unexpected progress bar output: %s", line)
 	}
 }
 
 func TestFormatProgressBarClampsDoneToTotal(t *testing.T) {
 	line := formatProgressBar("cp", 7, 5, 10, 1)
-	if line != "cp [==========] 100% (5/5, 1.0/s)" {
+	if line != "cp [==========] 100% (5/5, 1.0 ops/s)" {
 		t.Fatalf("unexpected clamped output: %s", line)
 	}
 }
 
 func TestFormatProgressBarNormalizesWidth(t *testing.T) {
 	line := formatProgressBar("cp", 1, 5, 0, 1)
-	if line != "cp [ ]  20% (1/5, 1.0/s)" {
+	if line != "cp [ ]  20% (1/5, 1.0 ops/s)" {
 		t.Fatalf("unexpected normalized width output: %s", line)
 	}
 }
 
 func TestFormatProgressBarNormalizesNegativeSpeed(t *testing.T) {
 	line := formatProgressBar("cp", 1, 5, 10, -2)
-	if line != "cp [==        ]  20% (1/5, 0.0/s)" {
+	if line != "cp [==        ]  20% (1/5, 0.0 ops/s)" {
 		t.Fatalf("unexpected normalized speed output: %s", line)
 	}
 }
