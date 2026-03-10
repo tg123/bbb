@@ -493,6 +493,7 @@ type progressBar struct {
 	label       string
 	total       int64
 	width       int
+	showSpeed   bool
 	startedAt   time.Time
 	done        atomic.Int64
 	bytesDone   atomic.Int64
@@ -500,7 +501,7 @@ type progressBar struct {
 	finished    atomic.Bool
 }
 
-func newProgressBar(total int, label string, quiet bool) *progressBar {
+func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progressBar {
 	if quiet || total <= 1 || !isTerminal(os.Stderr) {
 		return nil
 	}
@@ -508,6 +509,7 @@ func newProgressBar(total int, label string, quiet bool) *progressBar {
 		label:     label,
 		total:     int64(total),
 		width:     28,
+		showSpeed: showSpeed,
 		startedAt: time.Now(),
 	}
 	bar.render(0)
@@ -566,17 +568,17 @@ func (p *progressBar) render(done int64) {
 	}
 	elapsed := time.Since(p.startedAt).Seconds()
 	speed := 0.0
-	if elapsed > 0 {
+	if p.showSpeed && elapsed > 0 {
 		speed = float64(p.bytesDone.Load()) / elapsed
 	}
-	line := formatProgressBar(p.label, done, p.total, p.width, speed)
+	line := formatProgressBar(p.label, done, p.total, p.width, speed, p.showSpeed)
 	lockedFprintf(os.Stderr, "\r%s", line)
 	if done == p.total {
 		lockedFprintf(os.Stderr, "\n")
 	}
 }
 
-func formatProgressBar(label string, done, total int64, width int, speed float64) string {
+func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
 	if width < 1 {
 		width = 1
 	}
@@ -595,6 +597,9 @@ func formatProgressBar(label string, done, total int64, width int, speed float64
 		filled = width
 	}
 	bar := strings.Repeat("=", filled) + strings.Repeat(" ", width-filled)
+	if !showSpeed {
+		return fmt.Sprintf("%s [%s] %3d%% (%d/%d)", label, bar, percent, done, total)
+	}
 	return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s)", label, bar, percent, done, total, formatByteSpeed(speed))
 }
 
@@ -706,7 +711,7 @@ func runOpPoolWithRetry[T any](ctx context.Context, concurrency int, retryCount 
 }
 
 func runOpPoolWithRetryProgress[T any](ctx context.Context, concurrency int, retryCount int, total int, quiet bool, label string, producer func(chan<- T) error, worker func(T) error) error {
-	progress := newProgressBar(total, label, quiet)
+	progress := newProgressBar(total, label, quiet, false)
 	err := runOpPoolWithRetry(ctx, concurrency, retryCount, producer, func(op T) error {
 		err := worker(op)
 		if progress != nil {
@@ -720,10 +725,11 @@ func runOpPoolWithRetryProgress[T any](ctx context.Context, concurrency int, ret
 	return err
 }
 
-func runOpPoolWithRetryProgressBytes[T any](ctx context.Context, concurrency int, retryCount int, total int, quiet bool, label string, producer func(chan<- T) error, worker func(T) (int64, error)) error {
-	progress := newProgressBar(total, label, quiet)
+func runOpPoolWithRetryProgressBytes[T any](ctx context.Context, concurrency int, retryCount int, total int, quiet bool, label string, producer func(chan<- T) error, worker func(T, bool) (int64, error)) error {
+	progress := newProgressBar(total, label, quiet, true)
 	err := runOpPoolWithRetry(ctx, concurrency, retryCount, producer, func(op T) error {
-		bytesDone, err := worker(op)
+		trackBytes := progress != nil
+		bytesDone, err := worker(op, trackBytes)
 		if progress != nil && err == nil {
 			progress.AddBytes(bytesDone)
 			progress.Increment()
@@ -877,9 +883,9 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			}
 		}
 		return nil
-	}, func(op cpFileOp) (int64, error) {
+	}, func(op cpFileOp, trackBytes bool) (int64, error) {
 		size := op.size
-		if size <= 0 {
+		if trackBytes && size <= 0 {
 			info, err := bbbfs.Resolve(op.src).Stat(ctx, op.src)
 			if err != nil {
 				slog.Debug("unable to stat source size for progress speed", "src", op.src, "error", err)
@@ -1223,16 +1229,11 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 			}
 		}
 		return nil
-	}, func(op hfOp) (int64, error) {
+	}, func(op hfOp, trackBytes bool) (int64, error) {
 		filePath := hf.Path{Repo: hfPath.Repo, File: op.file}
 		dstPath, err := resolveDstPath(dst, dstAz, op.file, true)
 		if err != nil {
 			return 0, err
-		}
-		size := int64(0)
-		info, err := bbbfs.Resolve(filePath.String()).Stat(ctx, filePath.String())
-		if err == nil {
-			size = info.Size
 		}
 		if !overwrite {
 			if dstAz {
@@ -1250,11 +1251,18 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 				return 0, nil
 			}
 		}
+		size := int64(0)
+		if trackBytes {
+			info, err := bbbfs.Resolve(filePath.String()).Stat(ctx, filePath.String())
+			if err == nil {
+				size = info.Size
+			}
+		}
 		reader, err := bbbfs.Resolve(filePath.String()).Read(ctx, filePath.String())
 		if err != nil {
 			return 0, err
 		}
-		if size <= 0 {
+		if trackBytes && size <= 0 {
 			size = sizeOfReader(reader)
 		}
 		if err := withReadCloser(reader, func(r io.Reader) error {
