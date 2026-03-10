@@ -493,19 +493,24 @@ type progressBar struct {
 	label       string
 	total       int64
 	width       int
+	showSpeed   bool
+	startedAt   time.Time
 	done        atomic.Int64
+	bytesDone   atomic.Int64
 	lastPercent atomic.Int64
 	finished    atomic.Bool
 }
 
-func newProgressBar(total int, label string, quiet bool) *progressBar {
+func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progressBar {
 	if quiet || total <= 1 || !isTerminal(os.Stderr) {
 		return nil
 	}
 	bar := &progressBar{
-		label: label,
-		total: int64(total),
-		width: 28,
+		label:     label,
+		total:     int64(total),
+		width:     28,
+		showSpeed: showSpeed,
+		startedAt: time.Now(),
 	}
 	bar.render(0)
 	return bar
@@ -517,6 +522,13 @@ func (p *progressBar) Increment() {
 	}
 	done := p.done.Add(1)
 	p.render(done)
+}
+
+func (p *progressBar) AddBytes(n int64) {
+	if p == nil || n <= 0 {
+		return
+	}
+	p.bytesDone.Add(n)
 }
 
 func (p *progressBar) Finish() {
@@ -554,14 +566,19 @@ func (p *progressBar) render(done int64) {
 	} else if !p.finished.CompareAndSwap(false, true) {
 		return
 	}
-	line := formatProgressBar(p.label, done, p.total, p.width)
+	elapsed := time.Since(p.startedAt).Seconds()
+	speed := 0.0
+	if p.showSpeed && elapsed > 0 {
+		speed = float64(p.bytesDone.Load()) / elapsed
+	}
+	line := formatProgressBar(p.label, done, p.total, p.width, speed, p.showSpeed)
 	lockedFprintf(os.Stderr, "\r%s", line)
 	if done == p.total {
 		lockedFprintf(os.Stderr, "\n")
 	}
 }
 
-func formatProgressBar(label string, done, total int64, width int) string {
+func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
 	if width < 1 {
 		width = 1
 	}
@@ -580,7 +597,36 @@ func formatProgressBar(label string, done, total int64, width int) string {
 		filled = width
 	}
 	bar := strings.Repeat("=", filled) + strings.Repeat(" ", width-filled)
-	return fmt.Sprintf("%s [%s] %3d%% (%d/%d)", label, bar, percent, done, total)
+	if !showSpeed {
+		return fmt.Sprintf("%s [%s] %3d%% (%d/%d)", label, bar, percent, done, total)
+	}
+	return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s)", label, bar, percent, done, total, formatByteSpeed(speed))
+}
+
+func formatByteSpeed(bytesPerSecond float64) string {
+	if bytesPerSecond < 0 {
+		bytesPerSecond = 0
+	}
+	const (
+		mb = 1024.0 * 1024.0
+		gb = 1024.0 * mb
+	)
+	if bytesPerSecond >= gb {
+		return fmt.Sprintf("%.1f GB/s", bytesPerSecond/gb)
+	}
+	return fmt.Sprintf("%.1f MB/s", bytesPerSecond/mb)
+}
+
+func sizeOfReader(reader io.Reader) int64 {
+	sizer, ok := reader.(interface{ Size() int64 })
+	if !ok {
+		return 0
+	}
+	size := sizer.Size()
+	if size <= 0 {
+		return 0
+	}
+	return size
 }
 
 func sendOp[T any](ctx context.Context, ch chan<- T, op T) error {
@@ -665,10 +711,27 @@ func runOpPoolWithRetry[T any](ctx context.Context, concurrency int, retryCount 
 }
 
 func runOpPoolWithRetryProgress[T any](ctx context.Context, concurrency int, retryCount int, total int, quiet bool, label string, producer func(chan<- T) error, worker func(T) error) error {
-	progress := newProgressBar(total, label, quiet)
+	progress := newProgressBar(total, label, quiet, false)
 	err := runOpPoolWithRetry(ctx, concurrency, retryCount, producer, func(op T) error {
 		err := worker(op)
 		if progress != nil {
+			progress.Increment()
+		}
+		return err
+	})
+	if progress != nil {
+		progress.Finish()
+	}
+	return err
+}
+
+func runOpPoolWithRetryProgressBytes[T any](ctx context.Context, concurrency int, retryCount int, total int, quiet bool, label string, producer func(chan<- T) error, worker func(T, bool) (int64, error)) error {
+	progress := newProgressBar(total, label, quiet, true)
+	err := runOpPoolWithRetry(ctx, concurrency, retryCount, producer, func(op T) error {
+		trackBytes := progress != nil
+		bytesDone, err := worker(op, trackBytes)
+		if progress != nil && err == nil {
+			progress.AddBytes(bytesDone)
 			progress.Increment()
 		}
 		return err
@@ -728,6 +791,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		srcAz     bool
 		dstAz     bool
 		srcHF     bool
+		size      int64
 		srcAzPath azblob.AzurePath
 		hf        hf.Path
 		base      string
@@ -812,86 +876,96 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			os.Exit(1)
 		}
 	}
-	if err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
+	if err := runOpPoolWithRetryProgressBytes(ctx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
 			if err := sendOp(ctx, pending, op); err != nil {
 				return err
 			}
 		}
 		return nil
-	}, func(op cpFileOp) error {
+	}, func(op cpFileOp, trackBytes bool) (int64, error) {
+		size := op.size
+		if trackBytes && size <= 0 {
+			info, err := bbbfs.Resolve(op.src).Stat(ctx, op.src)
+			if err != nil {
+				slog.Debug("unable to stat source size for progress speed", "src", op.src, "error", err)
+			} else {
+				size = info.Size
+			}
+		}
 		if op.srcHF {
-			return copyHFFile(ctx, op.hf, op.base, op.dst, op.dstAz, overwrite, quiet, isDstDir)
+			err := copyHFFile(ctx, op.hf, op.base, op.dst, op.dstAz, overwrite, quiet, isDstDir)
+			return size, err
 		}
 		if op.srcAz && op.dstAz {
 			dap, _ := azblob.Parse(op.dst)
 			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-					return errors.New("cp: destination exists")
+					return 0, errors.New("cp: destination exists")
 				}
 			}
 			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap); err != nil {
-				return err
+				return 0, err
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
-			return nil
+			return size, nil
 		}
 		if op.srcAz && !op.dstAz {
 			reader, err := azblob.DownloadStream(ctx, op.srcAzPath)
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if !overwrite {
 				if _, err := os.Stat(op.dst); err == nil {
 					if cerr := reader.Close(); cerr != nil {
-						return cerr
+						return 0, cerr
 					}
-					return errors.New("cp: destination exists")
+					return 0, errors.New("cp: destination exists")
 				}
 			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
 				return writeStreamToFile(op.dst, r, 0o644)
 			}); err != nil {
-				return err
+				return 0, err
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
-			return nil
+			return size, nil
 		}
 		if !op.srcAz && op.dstAz {
 			dap, _ := azblob.Parse(op.dst)
 			reader, err := os.Open(op.src)
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
 					if cerr := reader.Close(); cerr != nil {
-						return cerr
+						return 0, cerr
 					}
-					return errors.New("cp: destination exists")
+					return 0, errors.New("cp: destination exists")
 				}
 			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
 				return azblob.UploadStream(ctx, dap, r)
 			}); err != nil {
-				return err
+				return 0, err
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
-			return nil
+			return size, nil
 		}
 		if err := fsops.CopyFile(op.src, op.dst, overwrite); err != nil {
-			return fmt.Errorf("cp: %w", err)
+			return 0, fmt.Errorf("cp: %w", err)
 		}
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 		}
-		return nil
+		return size, nil
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -1148,48 +1222,58 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 	type hfOp struct {
 		file string
 	}
-	return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(files), quiet, "cp", func(pending chan<- hfOp) error {
+	return runOpPoolWithRetryProgressBytes(ctx, concurrency, retryCount, len(files), quiet, "cp", func(pending chan<- hfOp) error {
 		for _, file := range files {
 			if err := sendOp(ctx, pending, hfOp{file: file}); err != nil {
 				return err
 			}
 		}
 		return nil
-	}, func(op hfOp) error {
+	}, func(op hfOp, trackBytes bool) (int64, error) {
 		filePath := hf.Path{Repo: hfPath.Repo, File: op.file}
 		dstPath, err := resolveDstPath(dst, dstAz, op.file, true)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if !overwrite {
 			if dstAz {
 				dap, err := azblob.Parse(dstPath)
 				if err != nil {
-					return err
+					return 0, err
 				}
 				if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-					return errors.New("cp: destination must be a blob path")
+					return 0, errors.New("cp: destination must be a blob path")
 				}
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-					return nil
+					return 0, nil
 				}
 			} else if _, err := os.Stat(dstPath); err == nil {
-				return nil
+				return 0, nil
+			}
+		}
+		size := int64(0)
+		if trackBytes {
+			info, err := bbbfs.Resolve(filePath.String()).Stat(ctx, filePath.String())
+			if err == nil {
+				size = info.Size
 			}
 		}
 		reader, err := bbbfs.Resolve(filePath.String()).Read(ctx, filePath.String())
 		if err != nil {
-			return err
+			return 0, err
+		}
+		if trackBytes && size <= 0 {
+			size = sizeOfReader(reader)
 		}
 		if err := withReadCloser(reader, func(r io.Reader) error {
 			return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
 		}); err != nil {
-			return err
+			return 0, err
 		}
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", filePath.String(), dstPath)
 		}
-		return nil
+		return size, nil
 	})
 }
 
