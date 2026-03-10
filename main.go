@@ -612,6 +612,18 @@ func formatByteSpeed(bytesPerSecond float64) string {
 	return fmt.Sprintf("%.1f MB/s", bytesPerSecond/mb)
 }
 
+func sizeOfReader(reader io.Reader) int64 {
+	sizer, ok := reader.(interface{ Size() int64 })
+	if !ok {
+		return 0
+	}
+	size := sizer.Size()
+	if size <= 0 {
+		return 0
+	}
+	return size
+}
+
 func sendOp[T any](ctx context.Context, ch chan<- T, op T) error {
 	select {
 	case <-ctx.Done():
@@ -846,13 +858,6 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			srcAzPath: srcAzPath,
 		})
 	}
-	for i := range fileOps {
-		info, err := bbbfs.Resolve(fileOps[i].src).Stat(ctx, fileOps[i].src)
-		if err != nil {
-			continue
-		}
-		fileOps[i].size = info.Size
-	}
 	for _, op := range dirOps {
 		var err error
 		if op.srcHF {
@@ -873,8 +878,18 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 		return nil
 	}, func(op cpFileOp) (int64, error) {
+		size := op.size
+		if size <= 0 {
+			info, err := bbbfs.Resolve(op.src).Stat(ctx, op.src)
+			if err != nil {
+				slog.Debug("unable to stat source size for progress speed", "src", op.src, "error", err)
+			} else {
+				size = info.Size
+			}
+		}
 		if op.srcHF {
-			return op.size, copyHFFile(ctx, op.hf, op.base, op.dst, op.dstAz, overwrite, quiet, isDstDir)
+			err := copyHFFile(ctx, op.hf, op.base, op.dst, op.dstAz, overwrite, quiet, isDstDir)
+			return size, err
 		}
 		if op.srcAz && op.dstAz {
 			dap, _ := azblob.Parse(op.dst)
@@ -889,7 +904,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
-			return op.size, nil
+			return size, nil
 		}
 		if op.srcAz && !op.dstAz {
 			reader, err := azblob.DownloadStream(ctx, op.srcAzPath)
@@ -912,7 +927,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
-			return op.size, nil
+			return size, nil
 		}
 		if !op.srcAz && op.dstAz {
 			dap, _ := azblob.Parse(op.dst)
@@ -936,7 +951,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
-			return op.size, nil
+			return size, nil
 		}
 		if err := fsops.CopyFile(op.src, op.dst, overwrite); err != nil {
 			return 0, fmt.Errorf("cp: %w", err)
@@ -944,7 +959,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 		}
-		return op.size, nil
+		return size, nil
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -1214,6 +1229,11 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 		if err != nil {
 			return 0, err
 		}
+		size := int64(0)
+		info, err := bbbfs.Resolve(filePath.String()).Stat(ctx, filePath.String())
+		if err == nil {
+			size = info.Size
+		}
 		if !overwrite {
 			if dstAz {
 				dap, err := azblob.Parse(dstPath)
@@ -1234,6 +1254,9 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 		if err != nil {
 			return 0, err
 		}
+		if size <= 0 {
+			size = sizeOfReader(reader)
+		}
 		if err := withReadCloser(reader, func(r io.Reader) error {
 			return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
 		}); err != nil {
@@ -1242,11 +1265,7 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", filePath.String(), dstPath)
 		}
-		info, err := bbbfs.Resolve(filePath.String()).Stat(ctx, filePath.String())
-		if err != nil {
-			return 0, nil
-		}
-		return info.Size, nil
+		return size, nil
 	})
 }
 
