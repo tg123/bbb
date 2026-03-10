@@ -45,6 +45,14 @@ func parseMD5Output(out []byte) string {
 	return fields[0]
 }
 
+func taskStateKey(src, dst string) string {
+	hasher := sha256.New()
+	hasher.Write([]byte(src))
+	hasher.Write([]byte{0})
+	hasher.Write([]byte(dst))
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
 func waitForEndpointReady(addr string) bool {
 	return waitForEndpointReadyWithTimeout(addr, waitTimeout)
 }
@@ -329,11 +337,7 @@ func TestBasic(t *testing.T) {
 			t.Fatal(err)
 		}
 		stateFile := filepath.Join(taskDir, "cp-recovery.state")
-		hasher := sha256.New()
-		hasher.Write([]byte(srcMissing))
-		hasher.Write([]byte{0})
-		hasher.Write([]byte(dstPrefix))
-		skippedKey := hex.EncodeToString(hasher.Sum(nil))
+		skippedKey := taskStateKey(srcMissing, dstPrefix)
 		if err := os.WriteFile(stateFile, []byte(skippedKey+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}

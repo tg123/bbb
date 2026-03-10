@@ -211,6 +211,37 @@ func TestCmdCPTaskfileStateRecovery(t *testing.T) {
 	}
 }
 
+func TestLoadTaskPairsLongLine(t *testing.T) {
+	dir := t.TempDir()
+	longSrc := strings.Repeat("a", 70*1024)
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(longSrc+" dst\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	tasks, err := loadTaskPairs(taskfile)
+	if err != nil {
+		t.Fatalf("loadTaskPairs failed: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].src != longSrc || tasks[0].dst != "dst" {
+		t.Fatalf("unexpected parsed tasks: %+v", tasks)
+	}
+}
+
+func TestLoadTaskPairsRejectsWhitespacePaths(t *testing.T) {
+	dir := t.TempDir()
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte("a b c\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	_, err := loadTaskPairs(taskfile)
+	if err == nil {
+		t.Fatal("expected parse error")
+	}
+	if !strings.Contains(err.Error(), "paths with spaces are not supported") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestCmdCPTaskfileStateRecoverySkipsFinishedTask(t *testing.T) {
 	dir := t.TempDir()
 	srcMissing := filepath.Join(dir, "missing.txt")

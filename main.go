@@ -731,10 +731,36 @@ func runOpPoolWithRetryProgress[T any](ctx context.Context, concurrency int, ret
 	return err
 }
 
-<<<<<<< copilot/add-task-list-file-sync
+func runOpPoolWithRetryProgressBytes[T any](ctx context.Context, concurrency int, retryCount int, total int, quiet bool, label string, producer func(chan<- T) error, worker func(T, bool) (int64, error)) error {
+	progress := newProgressBar(total, label, quiet, true)
+	err := runOpPoolWithRetry(ctx, concurrency, retryCount, producer, func(op T) error {
+		trackBytes := progress != nil
+		bytesDone, err := worker(op, trackBytes)
+		if progress != nil && err == nil {
+			progress.AddBytes(bytesDone)
+			progress.Increment()
+		}
+		return err
+	})
+	if progress != nil {
+		progress.Finish()
+	}
+	return err
+}
+
 type taskPair struct {
 	src string
 	dst string
+}
+
+const maxTaskfileLineSize = 4 * 1024 * 1024
+
+func parseTaskPairLine(line string, lineNo int) (taskPair, error) {
+	parts := strings.Fields(line)
+	if len(parts) != 2 {
+		return taskPair{}, fmt.Errorf("taskfile: line %d: expected exactly two whitespace-separated fields `src dst` (paths with spaces are not supported)", lineNo)
+	}
+	return taskPair{src: parts[0], dst: parts[1]}, nil
 }
 
 func loadTaskPairs(taskfile string) ([]taskPair, error) {
@@ -758,16 +784,17 @@ func loadTaskPairs(taskfile string) ([]taskPair, error) {
 
 	var tasks []taskPair
 	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxTaskfileLineSize)
 	for lineNo := 1; scanner.Scan(); lineNo++ {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("taskfile: line %d: expected `src dst`", lineNo)
+		task, err := parseTaskPairLine(line, lineNo)
+		if err != nil {
+			return nil, err
 		}
-		tasks = append(tasks, taskPair{src: parts[0], dst: parts[1]})
+		tasks = append(tasks, task)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -806,31 +833,62 @@ func loadTaskState(path string) (map[string]struct{}, error) {
 	return state, nil
 }
 
-func appendTaskState(path, taskKey string) error {
+type taskStateAppender struct {
+	mu   sync.Mutex
+	file *os.File
+}
+
+func newTaskStateAppender(path string) (*taskStateAppender, error) {
 	if path == "" {
-		return nil
+		return &taskStateAppender{}, nil
 	}
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	return &taskStateAppender{file: file}, nil
+}
+
+func (a *taskStateAppender) append(taskKey string) error {
+	if a.file == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
+		return a.closeOnError(err)
 	}
 
-	if _, err := file.WriteString(taskKey + "\n"); err != nil {
-		if cerr := file.Close(); cerr != nil {
-			return errors.Join(err, cerr)
-		}
-		return err
+	if err := a.file.Sync(); err != nil {
+		return a.closeOnError(err)
 	}
 
-	if err := file.Sync(); err != nil {
-		if cerr := file.Close(); cerr != nil {
-			return errors.Join(err, cerr)
-		}
+	return nil
+}
+
+func (a *taskStateAppender) closeOnError(err error) error {
+	if a.file == nil {
 		return err
 	}
+	if cerr := a.file.Close(); cerr != nil {
+		a.file = nil
+		return errors.Join(err, cerr)
+	}
+	a.file = nil
+	return err
+}
 
-	return file.Close()
+func (a *taskStateAppender) close() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.file == nil {
+		return nil
+	}
+	err := a.file.Close()
+	a.file = nil
+	return err
 }
 
 func taskStateKey(src, dst string) string {
@@ -847,6 +905,9 @@ type cpTask struct {
 	key string
 }
 
+// expandCPTask expands a taskfile pair into file-level copy tasks when the source
+// is directory-like, so resume state can be tracked and skipped per file.
+// For file-like sources it returns one task preserving the original pair.
 func expandCPTask(ctx context.Context, task taskPair) ([]cpTask, error) {
 	if isHF(task.src) {
 		hfPath, err := hf.Parse(task.src)
@@ -866,8 +927,10 @@ func expandCPTask(ctx context.Context, task taskPair) ([]cpTask, error) {
 		if !sap.IsDirLike() {
 			return []cpTask{{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)}}, nil
 		}
-	} else if info, err := os.Stat(task.src); err != nil || !info.IsDir() {
-		return []cpTask{{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)}}, nil
+	} else if !isHF(task.src) {
+		if info, err := os.Stat(task.src); err != nil || !info.IsDir() {
+			return []cpTask{{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)}}, nil
+		}
 	}
 
 	entries, err := bbbfs.ListRecursive(ctx, task.src)
@@ -875,7 +938,7 @@ func expandCPTask(ctx context.Context, task taskPair) ([]cpTask, error) {
 		return nil, err
 	}
 
-	out := make([]cpTask, 0, len(entries))
+	var out []cpTask
 	if isAz(task.dst) {
 		dap, err := azblob.Parse(task.dst)
 		if err != nil {
@@ -904,23 +967,6 @@ func expandCPTask(ctx context.Context, task taskPair) ([]cpTask, error) {
 		})
 	}
 	return out, nil
-=======
-func runOpPoolWithRetryProgressBytes[T any](ctx context.Context, concurrency int, retryCount int, total int, quiet bool, label string, producer func(chan<- T) error, worker func(T, bool) (int64, error)) error {
-	progress := newProgressBar(total, label, quiet, true)
-	err := runOpPoolWithRetry(ctx, concurrency, retryCount, producer, func(op T) error {
-		trackBytes := progress != nil
-		bytesDone, err := worker(op, trackBytes)
-		if progress != nil && err == nil {
-			progress.AddBytes(bytesDone)
-			progress.Increment()
-		}
-		return err
-	})
-	if progress != nil {
-		progress.Finish()
-	}
-	return err
->>>>>>> main
 }
 
 func cmdCP(ctx context.Context, c *cli.Command) error {
@@ -965,6 +1011,10 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if len(pending) == 0 {
 			return nil
 		}
+		stateAppender, err := newTaskStateAppender(taskfileState)
+		if err != nil {
+			return err
+		}
 
 		innerConcurrency := concurrency
 		if innerConcurrency < 1 {
@@ -983,7 +1033,6 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 
 		var wg sync.WaitGroup
 		taskCh := make(chan cpTask, workers)
-		var stateMu sync.Mutex
 		var firstErr error
 		var firstErrMu sync.Mutex
 
@@ -1013,10 +1062,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 							return
 						}
 						if taskfileState != "" {
-							stateMu.Lock()
-							err := appendTaskState(taskfileState, task.key)
-							stateMu.Unlock()
-							if err != nil {
+							if err := stateAppender.append(task.key); err != nil {
 								setErr(err)
 								return
 							}
@@ -1038,7 +1084,11 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		wg.Wait()
 
 		if firstErr != nil {
+			_ = stateAppender.close()
 			return firstErr
+		}
+		if err := stateAppender.close(); err != nil {
+			return err
 		}
 		return nil
 	}
