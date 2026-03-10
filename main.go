@@ -794,6 +794,71 @@ func taskStateKey(src, dst string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+type cpTask struct {
+	src string
+	dst string
+	key string
+}
+
+func expandCPTask(ctx context.Context, task taskPair) ([]cpTask, error) {
+	if isHF(task.src) {
+		hfPath, err := hf.Parse(task.src)
+		if err != nil {
+			return nil, err
+		}
+		if hfPath.File != "" {
+			return []cpTask{{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)}}, nil
+		}
+	}
+
+	if isAz(task.src) {
+		sap, err := azblob.Parse(task.src)
+		if err != nil {
+			return nil, err
+		}
+		if !sap.IsDirLike() {
+			return []cpTask{{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)}}, nil
+		}
+	} else if info, err := os.Stat(task.src); err != nil || !info.IsDir() {
+		return []cpTask{{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)}}, nil
+	}
+
+	entries, err := bbbfs.ListRecursive(ctx, task.src)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]cpTask, 0, len(entries))
+	if isAz(task.dst) {
+		dap, err := azblob.Parse(task.dst)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range entries {
+			if entry.IsDir {
+				continue
+			}
+			out = append(out, cpTask{
+				src: entry.Path,
+				dst: dap.Child(entry.Name).String(),
+				key: taskStateKey(entry.Path, task.dst),
+			})
+		}
+		return out, nil
+	}
+	for _, entry := range entries {
+		if entry.IsDir {
+			continue
+		}
+		out = append(out, cpTask{
+			src: entry.Path,
+			dst: filepath.Join(task.dst, entry.Name),
+			key: taskStateKey(entry.Path, task.dst),
+		})
+	}
+	return out, nil
+}
+
 func cmdCP(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdCP called", "args", c.Args().Slice())
 	overwrite := c.Bool("f")
@@ -815,23 +880,23 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		type cpTask struct {
-			src string
-			dst string
-			key string
-		}
 		pending := make([]cpTask, 0, len(tasks))
 		seen := make(map[string]struct{}, len(state)+len(tasks))
 		for key := range state {
 			seen[key] = struct{}{}
 		}
 		for _, task := range tasks {
-			key := taskStateKey(task.src, task.dst)
-			if _, ok := seen[key]; ok {
-				continue
+			expandedTasks, err := expandCPTask(ctx, task)
+			if err != nil {
+				return fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err)
 			}
-			seen[key] = struct{}{}
-			pending = append(pending, cpTask{src: task.src, dst: task.dst, key: key})
+			for _, expandedTask := range expandedTasks {
+				if _, ok := seen[expandedTask.key]; ok {
+					continue
+				}
+				seen[expandedTask.key] = struct{}{}
+				pending = append(pending, expandedTask)
+			}
 		}
 		if len(pending) == 0 {
 			return nil

@@ -318,8 +318,68 @@ func TestCmdCPTaskfileStateRecoveryPartialTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read statefile: %v", err)
 	}
-	if !strings.Contains(string(stateData), taskStateKey(srcDir, dstDir)) {
-		t.Fatalf("expected task key in statefile")
+	stateText := string(stateData)
+	if !strings.Contains(stateText, taskStateKey(filepath.Join(srcDir, "a.txt"), dstDir)) {
+		t.Fatalf("expected a.txt task key in statefile")
+	}
+	if !strings.Contains(stateText, taskStateKey(filepath.Join(srcDir, "b.txt"), dstDir)) {
+		t.Fatalf("expected b.txt task key in statefile")
+	}
+}
+
+func TestCmdCPTaskfileStateRecoveryPartialTaskSkipsFinishedFile(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	dstDir := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "a.txt"), []byte("new-a"), 0o644); err != nil {
+		t.Fatalf("write src a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "b.txt"), []byte("new-b"), 0o644); err != nil {
+		t.Fatalf("write src b: %v", err)
+	}
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dstDir, "a.txt"), []byte("old-a"), 0o644); err != nil {
+		t.Fatalf("seed dst a: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(srcDir+" "+dstDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "tasks.state")
+	skippedKey := taskStateKey(filepath.Join(srcDir, "a.txt"), dstDir)
+	if err := os.WriteFile(stateFile, []byte(skippedKey+"\n"), 0o644); err != nil {
+		t.Fatalf("write statefile: %v", err)
+	}
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("cp partial recovery failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, "b.txt")); err != nil {
+		t.Fatalf("expected copied file b.txt: %v", err)
+	}
+	dstA, err := os.ReadFile(filepath.Join(dstDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("read dst a: %v", err)
+	}
+	if string(dstA) != "old-a" {
+		t.Fatalf("expected a.txt to be skipped, got content %q", string(dstA))
 	}
 }
 
