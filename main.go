@@ -1029,6 +1029,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			workers = 1
 		}
 		innerConcurrency := 1
+		innerQuiet := true
 		workerCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
@@ -1059,7 +1060,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 						if !ok {
 							return
 						}
-						if err := cmdCPPaths(workerCtx, overwrite, quiet, innerConcurrency, retryCount, []string{task.src}, task.dst); err != nil {
+						if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst); err != nil {
 							setErr(err)
 							return
 						}
