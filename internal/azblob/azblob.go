@@ -624,6 +624,7 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, onPro
 		var respErr *azcore.ResponseError
 		if errors.As(err, &respErr) && respErr.ErrorCode == "PendingCopyOperation" {
 			slog.Info("pending copy operation detected, polling progress", "dst", dst.String())
+			err = nil // handled; fall through to polling
 		} else {
 			return err
 		}
@@ -631,7 +632,7 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, onPro
 	var lastProps blob.GetPropertiesResponse
 	hasProps := false
 	copyStatus := blob.CopyStatusTypePending
-	if err == nil && startCopy.CopyStatus != nil {
+	if startCopy.CopyStatus != nil {
 		copyStatus = *startCopy.CopyStatus
 	}
 	if copyStatus != blob.CopyStatusTypePending {

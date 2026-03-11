@@ -920,9 +920,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 					return
 				}
 				copyBar.bytesDone.Store(copied)
-				pct := copied * 100 / total
-				copyBar.total = 100
-				copyBar.render(pct)
+				copyBar.render(copied * 100 / total)
 			}); err != nil {
 				if copyBar != nil {
 					lockedFprintf(os.Stderr, "\n")
