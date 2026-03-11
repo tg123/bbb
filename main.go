@@ -1233,7 +1233,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 						if taskfileState != "" {
 							tracker = &taskTracker{key: cpKey}
 						}
-						pending := int64(0)
+						var pendingTasks []cpTask
 						for _, expandedTask := range expandedTasks {
 							seenMu.Lock()
 							_, alreadySeen := seen[expandedTask.key]
@@ -1249,23 +1249,25 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								continue
 							}
 							expandedTask.tracker = tracker
-							pending++
-							select {
-							case <-workerCtx.Done():
-								return
-							case taskCh <- expandedTask:
-								queued.Store(true)
-								if taskProgress != nil {
-									taskProgress.SetTotal(totalPending.Add(1))
-								}
-							}
+							pendingTasks = append(pendingTasks, expandedTask)
 						}
 						if tracker != nil {
-							tracker.remaining.Store(pending)
-							if pending == 0 {
+							tracker.remaining.Store(int64(len(pendingTasks)))
+							if len(pendingTasks) == 0 {
 								if err := stateAppender.append(cpKey); err != nil {
 									setErr(err)
 									return
+								}
+							}
+						}
+						for _, pt := range pendingTasks {
+							select {
+							case <-workerCtx.Done():
+								return
+							case taskCh <- pt:
+								queued.Store(true)
+								if taskProgress != nil {
+									taskProgress.SetTotal(totalPending.Add(1))
 								}
 							}
 						}
