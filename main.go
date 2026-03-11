@@ -1278,14 +1278,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			}
 			var copyBar *progressBar
 			if !quiet && isTerminal(os.Stderr) {
-				copyBar = &progressBar{
-					label:     path.Base(op.src),
-					total:     100,
-					width:     28,
-					showSpeed: true,
-					startedAt: time.Now(),
-				}
-				copyBar.render(0)
+				copyBar = newProgressBar(100, path.Base(op.src), false, true)
 			}
 			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, func(copied, total int64) {
 				if copyBar == nil || total <= 0 {
