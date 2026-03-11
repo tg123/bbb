@@ -22,8 +22,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
 
 // MkContainer creates a new Azure Blob container
@@ -598,18 +598,17 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 	return nil
 }
 
-func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error {
+// CopyProgress is called during server-side copy polling with the number of
+// bytes copied so far and the total size in bytes. Either value may be zero
+// when progress information is unavailable.
+type CopyProgress func(copied, total int64)
+
+func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, onProgress CopyProgress) error {
 	if src.Blob == "" || strings.HasSuffix(src.Blob, "/") {
 		return errors.New("source path is directory-like")
 	}
 	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
 		return errors.New("destination path is directory-like")
-	}
-	if src.Account != dst.Account {
-		return errors.New("server-side copy requires same storage account")
-	}
-	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
-		return bloberror.MissingSharedKeyCredential
 	}
 	client, err := getAzBlobClient(ctx, dst.Account)
 	if err != nil {
@@ -622,20 +621,27 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 	}
 	startCopy, err := blobClient.StartCopyFromURL(ctx, copySource, nil)
 	if err != nil {
-		return err
-	}
-	if startCopy.CopyStatus == nil {
-		return errors.New("copy status missing")
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.ErrorCode == "PendingCopyOperation" {
+			slog.Info("pending copy operation detected, polling progress", "dst", dst.String())
+			// handled; fall through to polling
+		} else {
+			return err
+		}
 	}
 	var lastProps blob.GetPropertiesResponse
 	hasProps := false
-	copyStatus := *startCopy.CopyStatus
+	copyStatus := blob.CopyStatusTypePending
+	if startCopy.CopyStatus != nil {
+		copyStatus = *startCopy.CopyStatus
+	}
 	if copyStatus != blob.CopyStatusTypePending {
 		props, err := blobClient.GetProperties(ctx, nil)
 		if err == nil && props.CopyStatus != nil {
 			lastProps = props
 			hasProps = true
 			copyStatus = *props.CopyStatus
+			reportCopyProgress(props.CopyProgress, onProgress)
 		}
 	}
 	pollDelay := copyPollInitialDelay
@@ -656,6 +662,7 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 		lastProps = props
 		hasProps = true
 		copyStatus = *props.CopyStatus
+		reportCopyProgress(props.CopyProgress, onProgress)
 	}
 	if copyStatus != blob.CopyStatusTypeSuccess {
 		statusDescription := ""
@@ -667,20 +674,96 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 		}
 		return fmt.Errorf("copy failed with status %s", copyStatus)
 	}
+	if onProgress != nil && hasProps && lastProps.ContentLength != nil {
+		onProgress(*lastProps.ContentLength, *lastProps.ContentLength)
+	}
 	return nil
 }
 
+// reportCopyProgress parses the "bytes_copied/total_bytes" progress string
+// from Azure Blob CopyProgress and invokes the callback.
+func reportCopyProgress(progress *string, onProgress CopyProgress) {
+	if onProgress == nil || progress == nil {
+		return
+	}
+	copied, total, ok := parseCopyProgress(*progress)
+	if ok {
+		onProgress(copied, total)
+	}
+}
+
+// parseCopyProgress parses the Azure "bytes_copied/total_bytes" format.
+func parseCopyProgress(s string) (copied, total int64, ok bool) {
+	parts := strings.SplitN(s, "/", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	c, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	t, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return c, t, true
+}
+
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
-	client, err := getAzBlobClient(ctx, ap.Account)
-	if err != nil {
-		return "", err
+	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") != "" {
+		client, err := getAzBlobClient(ctx, ap.Account)
+		if err != nil {
+			return "", err
+		}
+		blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob)
+		sasURL, err := blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(copySASDuration()), nil)
+		if err != nil {
+			return "", fmt.Errorf("generate SAS URL: %w", err)
+		}
+		return sasURL, nil
 	}
-	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob)
-	sasURL, err := blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(copySASDuration()), nil)
+	return blobDelegationSASURL(ctx, ap)
+}
+
+// blobDelegationSASURL generates a SAS URL using a User Delegation Key obtained
+// via OAuth. This enables cross-account server-side copy within the same tenant.
+func blobDelegationSASURL(ctx context.Context, ap AzurePath) (string, error) {
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
-		return "", fmt.Errorf("generate SAS URL: %w", err)
+		return "", fmt.Errorf("default credential: %w", err)
 	}
-	return sasURL, nil
+	endpoint := getEndpoint(ap.Account)
+	svcClient, err := service.NewClient(endpoint, cred, nil)
+	if err != nil {
+		return "", fmt.Errorf("service client: %w", err)
+	}
+	now := time.Now().UTC().Add(-5 * time.Minute) // backdate to tolerate clock skew
+	expiry := now.Add(copySASDuration())
+	startStr := now.Format(sas.TimeFormat)
+	expiryStr := expiry.Format(sas.TimeFormat)
+	udc, err := svcClient.GetUserDelegationCredential(ctx, service.KeyInfo{
+		Start:  &startStr,
+		Expiry: &expiryStr,
+	}, nil)
+	if err != nil {
+		return "", fmt.Errorf("get user delegation credential: %w", err)
+	}
+	sasValues := sas.BlobSignatureValues{
+		Protocol:      sas.ProtocolHTTPS,
+		StartTime:     now,
+		ExpiryTime:    expiry,
+		Permissions:   (&sas.BlobPermissions{Read: true}).String(),
+		ContainerName: ap.Container,
+		BlobName:      ap.Blob,
+	}
+	qp, err := sasValues.SignWithUserDelegation(udc)
+	if err != nil {
+		return "", fmt.Errorf("sign user delegation SAS: %w", err)
+	}
+	containerClient := svcClient.NewContainerClient(ap.Container)
+	blobClient := containerClient.NewBlobClient(ap.Blob)
+	blobURL := blobClient.URL()
+	return fmt.Sprintf("%s?%s", blobURL, qp.Encode()), nil
 }
 
 func nextPollDelay(current time.Duration) time.Duration {

@@ -1276,8 +1276,31 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 					return 0, errors.New("cp: destination exists")
 				}
 			}
-			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap); err != nil {
+			var copyBar *progressBar
+			if !quiet && isTerminal(os.Stderr) {
+				copyBar = &progressBar{
+					label:     path.Base(op.src),
+					total:     100,
+					width:     28,
+					showSpeed: true,
+					startedAt: time.Now(),
+				}
+				copyBar.render(0)
+			}
+			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, func(copied, total int64) {
+				if copyBar == nil || total <= 0 {
+					return
+				}
+				copyBar.bytesDone.Store(copied)
+				copyBar.render(copied * 100 / total)
+			}); err != nil {
+				if copyBar != nil {
+					lockedFprintf(os.Stderr, "\n")
+				}
 				return 0, err
+			}
+			if copyBar != nil {
+				copyBar.Finish()
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
