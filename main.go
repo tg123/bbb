@@ -1215,6 +1215,10 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 							if !quiet {
 								lockedFprintf(os.Stderr, "cp: skip already completed task %s -> %s\n", task.src, task.dst)
 							}
+							if taskProgress != nil {
+								taskProgress.SetTotal(totalPending.Add(1))
+								taskProgress.Increment()
+							}
 							continue
 						}
 						if !quiet {
@@ -1245,6 +1249,10 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								_, inState := state[expandedTask.key]
 								if !quiet && inState {
 									lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
+								}
+								if taskProgress != nil && inState {
+									taskProgress.SetTotal(totalPending.Add(1))
+									taskProgress.Increment()
 								}
 								continue
 							}
