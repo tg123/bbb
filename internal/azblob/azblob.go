@@ -705,6 +705,7 @@ func blobDelegationSASURL(ctx context.Context, ap AzurePath) (string, error) {
 	}
 	sasValues := sas.BlobSignatureValues{
 		Protocol:      sas.ProtocolHTTPS,
+		StartTime:     now,
 		ExpiryTime:    expiry,
 		Permissions:   (&sas.BlobPermissions{Read: true}).String(),
 		ContainerName: ap.Container,

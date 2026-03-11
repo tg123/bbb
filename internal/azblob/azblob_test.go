@@ -79,7 +79,7 @@ func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 	}
 }
 
-func TestCopyBlobServerSideCrossAccountNeedsCredentials(t *testing.T) {
+func TestCopyBlobServerSideCrossAccountRequiresCredentials(t *testing.T) {
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
 	ctx := context.Background()
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
