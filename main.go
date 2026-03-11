@@ -1196,8 +1196,12 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 						if !quiet {
 							lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
 						}
-						expandedTasks, err := expandCPTask(workerCtx, task)
-						if err != nil {
+						var expandedTasks []cpTask
+						if err := retryOp(workerCtx, retryCount, func() error {
+							var expandErr error
+							expandedTasks, expandErr = expandCPTask(workerCtx, task)
+							return expandErr
+						}); err != nil {
 							setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
 							return
 						}
@@ -1242,7 +1246,9 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		close(taskCh)
 		wg.Wait()
 		if !queued.Load() && firstErr == nil {
-			_ = stateAppender.close()
+			if err := stateAppender.close(); err != nil {
+				return err
+			}
 			return nil
 		}
 
