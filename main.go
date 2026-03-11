@@ -990,44 +990,20 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		pending := make([]cpTask, 0, len(tasks))
 		seen := make(map[string]struct{}, len(state)+len(tasks))
 		for key := range state {
 			seen[key] = struct{}{}
-		}
-		for _, task := range tasks {
-			expandedTasks, err := expandCPTask(ctx, task)
-			if err != nil {
-				return fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err)
-			}
-			for _, expandedTask := range expandedTasks {
-				if _, ok := seen[expandedTask.key]; ok {
-					continue
-				}
-				seen[expandedTask.key] = struct{}{}
-				pending = append(pending, expandedTask)
-			}
-		}
-		if len(pending) == 0 {
-			return nil
 		}
 		stateAppender, err := newTaskStateAppender(taskfileState)
 		if err != nil {
 			return err
 		}
 
-		innerConcurrency := concurrency
-		if innerConcurrency < 1 {
-			innerConcurrency = 1
+		workers := concurrency
+		if workers < 1 {
+			workers = 1
 		}
-		workers := 1
-		if len(pending) > 1 {
-			workers = innerConcurrency
-			innerConcurrency = 1
-			if workers > len(pending) {
-				workers = len(pending)
-			}
-		}
+		innerConcurrency := 1
 		workerCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
@@ -1072,16 +1048,33 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			}()
 		}
 
+		queued := false
 	enqueueLoop:
-		for _, task := range pending {
-			select {
-			case <-workerCtx.Done():
+		for _, task := range tasks {
+			expandedTasks, err := expandCPTask(workerCtx, task)
+			if err != nil {
+				setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
 				break enqueueLoop
-			case taskCh <- task:
+			}
+			for _, expandedTask := range expandedTasks {
+				if _, ok := seen[expandedTask.key]; ok {
+					continue
+				}
+				seen[expandedTask.key] = struct{}{}
+				select {
+				case <-workerCtx.Done():
+					break enqueueLoop
+				case taskCh <- expandedTask:
+					queued = true
+				}
 			}
 		}
 		close(taskCh)
 		wg.Wait()
+		if !queued && firstErr == nil {
+			_ = stateAppender.close()
+			return nil
+		}
 
 		if firstErr != nil {
 			_ = stateAppender.close()
