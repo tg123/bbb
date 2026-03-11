@@ -465,26 +465,48 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
-var outputMu sync.Mutex
+var (
+	outputMu     sync.Mutex
+	activeBarPtr *progressBar // guarded by outputMu
+	stderrIsTerm = isTerminal(os.Stderr)
+)
+
+func clearActiveBar() {
+	if activeBarPtr != nil && stderrIsTerm {
+		fmt.Fprintf(os.Stderr, "\r\033[K")
+	}
+}
+
+func rerenderActiveBar() {
+	if activeBarPtr != nil {
+		activeBarPtr.renderUnlocked()
+	}
+}
 
 func lockedPrintf(format string, args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
+	clearActiveBar()
 	fmt.Printf(format, args...)
+	rerenderActiveBar()
 }
 
 func lockedPrintln(args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
+	clearActiveBar()
 	fmt.Println(args...)
+	rerenderActiveBar()
 }
 
 func lockedFprintf(w io.Writer, format string, args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
+	clearActiveBar()
 	if _, err := fmt.Fprintf(w, format, args...); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
+	rerenderActiveBar()
 }
 
 func isTerminal(f *os.File) bool {
@@ -571,8 +593,43 @@ func (p *progressBar) Finish() {
 		total = 1
 	}
 	p.done.Store(total)
-	p.render(total)
-	lockedFprintf(os.Stderr, "\n")
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	p.renderUnlocked()
+	fmt.Fprintf(os.Stderr, "\n")
+	if activeBarPtr == p {
+		activeBarPtr = nil
+	}
+}
+
+// renderUnlocked writes the progress bar to stderr. outputMu must be held.
+func (p *progressBar) renderUnlocked() {
+	if p == nil {
+		return
+	}
+	done := p.done.Load()
+	total := p.total.Load()
+	if total <= 0 {
+		return
+	}
+	if done < 0 {
+		done = 0
+	}
+	if done > total {
+		done = total
+	}
+	elapsed := time.Since(p.startedAt).Seconds()
+	speed := 0.0
+	if p.showSpeed && elapsed > 0 {
+		speed = float64(p.bytesDone.Load()) / elapsed
+	}
+	if stderrIsTerm {
+		line := formatFancyBar(p.label, done, total, p.width, speed, p.showSpeed)
+		fmt.Fprintf(os.Stderr, "\r\033[K%s", line)
+	} else {
+		line := formatProgressBar(p.label, done, total, p.width, speed, p.showSpeed)
+		fmt.Fprintf(os.Stderr, "\r%s", line)
+	}
 }
 
 func (p *progressBar) render(done int64) {
@@ -594,13 +651,10 @@ func (p *progressBar) render(done int64) {
 	}
 	p.lastDone.Store(done)
 	p.lastTotal.Store(total)
-	elapsed := time.Since(p.startedAt).Seconds()
-	speed := 0.0
-	if p.showSpeed && elapsed > 0 {
-		speed = float64(p.bytesDone.Load()) / elapsed
-	}
-	line := formatProgressBar(p.label, done, total, p.width, speed, p.showSpeed)
-	lockedFprintf(os.Stderr, "\r%s", line)
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	activeBarPtr = p
+	p.renderUnlocked()
 }
 
 func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
@@ -626,6 +680,37 @@ func formatProgressBar(label string, done, total int64, width int, speed float64
 		return fmt.Sprintf("%s [%s] %3d%% (%d/%d)", label, bar, percent, done, total)
 	}
 	return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s)", label, bar, percent, done, total, formatByteSpeed(speed))
+}
+
+func formatFancyBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
+	if width < 1 {
+		width = 1
+	}
+	if total < 1 {
+		total = 1
+	}
+	if done < 0 {
+		done = 0
+	}
+	if done > total {
+		done = total
+	}
+	percent := done * 100 / total
+	filled := int(done * int64(width) / total)
+	if filled > width {
+		filled = width
+	}
+	bar := "\033[32m" + strings.Repeat("━", filled) + "\033[90m" + strings.Repeat("━", width-filled) + "\033[0m"
+	pctColor := "\033[36m"
+	suffix := ""
+	if done == total {
+		pctColor = "\033[32m"
+		suffix = " \033[32m✓\033[0m"
+	}
+	if !showSpeed {
+		return fmt.Sprintf("\033[1m%s\033[0m %s %s%3d%%\033[0m (%d/%d)%s", label, bar, pctColor, percent, done, total, suffix)
+	}
+	return fmt.Sprintf("\033[1m%s\033[0m %s %s%3d%%\033[0m (%d/%d, %s)%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), suffix)
 }
 
 func formatByteSpeed(bytesPerSecond float64) string {
@@ -1334,7 +1419,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				copyBar.render(copied * 100 / total)
 			}); err != nil {
 				if copyBar != nil {
-					lockedFprintf(os.Stderr, "\n")
+					copyBar.Finish()
 				}
 				return 0, err
 			}
