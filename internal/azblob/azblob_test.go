@@ -61,20 +61,20 @@ func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 	ctx := context.Background()
 	src := AzurePath{Account: "acct", Container: "container"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
-	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
 		t.Fatal("expected error for dir-like source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
 		t.Fatal("expected error for trailing slash source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst = AzurePath{Account: "acct", Container: "container"}
-	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
 		t.Fatal("expected error for dir-like destination")
 	}
 	dst = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
 		t.Fatal("expected error for trailing slash destination")
 	}
 }
@@ -84,7 +84,7 @@ func TestCopyBlobServerSideCrossAccountRequiresCredentials(t *testing.T) {
 	ctx := context.Background()
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
-	err := CopyBlobServerSide(ctx, src, dst)
+	err := CopyBlobServerSide(ctx, src, dst, nil)
 	if err == nil {
 		t.Fatal("expected error for cross-account copy without credentials")
 	}
@@ -95,7 +95,7 @@ func TestCopyBlobServerSideFallsBackToUserDelegation(t *testing.T) {
 	ctx := context.Background()
 	src := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "other.txt"}
-	err := CopyBlobServerSide(ctx, src, dst)
+	err := CopyBlobServerSide(ctx, src, dst, nil)
 	// Without real Azure credentials the user delegation path will fail,
 	// but it must NOT be a MissingSharedKeyCredential error since we now
 	// attempt the delegation path instead.
@@ -104,6 +104,26 @@ func TestCopyBlobServerSideFallsBackToUserDelegation(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("expected error without real credentials")
+	}
+}
+
+func TestParseCopyProgress(t *testing.T) {
+	copied, total, ok := parseCopyProgress("1024/2048")
+	if !ok || copied != 1024 || total != 2048 {
+		t.Fatalf("expected 1024/2048, got %d/%d ok=%v", copied, total, ok)
+	}
+	copied, total, ok = parseCopyProgress("0/0")
+	if !ok || copied != 0 || total != 0 {
+		t.Fatalf("expected 0/0, got %d/%d ok=%v", copied, total, ok)
+	}
+	if _, _, ok := parseCopyProgress("invalid"); ok {
+		t.Fatal("expected false for invalid input")
+	}
+	if _, _, ok := parseCopyProgress("abc/def"); ok {
+		t.Fatal("expected false for non-numeric input")
+	}
+	if _, _, ok := parseCopyProgress(""); ok {
+		t.Fatal("expected false for empty input")
 	}
 }
 

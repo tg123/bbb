@@ -598,7 +598,12 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 	return nil
 }
 
-func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error {
+// CopyProgress is called during server-side copy polling with the number of
+// bytes copied so far and the total size in bytes. Either value may be zero
+// when progress information is unavailable.
+type CopyProgress func(copied, total int64)
+
+func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, onProgress CopyProgress) error {
 	if src.Blob == "" || strings.HasSuffix(src.Blob, "/") {
 		return errors.New("source path is directory-like")
 	}
@@ -616,20 +621,26 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 	}
 	startCopy, err := blobClient.StartCopyFromURL(ctx, copySource, nil)
 	if err != nil {
-		return err
-	}
-	if startCopy.CopyStatus == nil {
-		return errors.New("copy status missing")
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.ErrorCode == "PendingCopyOperation" {
+			slog.Info("pending copy operation detected, polling progress", "dst", dst.String())
+		} else {
+			return err
+		}
 	}
 	var lastProps blob.GetPropertiesResponse
 	hasProps := false
-	copyStatus := *startCopy.CopyStatus
+	copyStatus := blob.CopyStatusTypePending
+	if err == nil && startCopy.CopyStatus != nil {
+		copyStatus = *startCopy.CopyStatus
+	}
 	if copyStatus != blob.CopyStatusTypePending {
 		props, err := blobClient.GetProperties(ctx, nil)
 		if err == nil && props.CopyStatus != nil {
 			lastProps = props
 			hasProps = true
 			copyStatus = *props.CopyStatus
+			reportCopyProgress(props.CopyProgress, onProgress)
 		}
 	}
 	pollDelay := copyPollInitialDelay
@@ -650,6 +661,7 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 		lastProps = props
 		hasProps = true
 		copyStatus = *props.CopyStatus
+		reportCopyProgress(props.CopyProgress, onProgress)
 	}
 	if copyStatus != blob.CopyStatusTypeSuccess {
 		statusDescription := ""
@@ -661,7 +673,39 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 		}
 		return fmt.Errorf("copy failed with status %s", copyStatus)
 	}
+	if onProgress != nil && hasProps && lastProps.ContentLength != nil {
+		onProgress(*lastProps.ContentLength, *lastProps.ContentLength)
+	}
 	return nil
+}
+
+// reportCopyProgress parses the "bytes_copied/total_bytes" progress string
+// from Azure Blob CopyProgress and invokes the callback.
+func reportCopyProgress(progress *string, onProgress CopyProgress) {
+	if onProgress == nil || progress == nil {
+		return
+	}
+	copied, total, ok := parseCopyProgress(*progress)
+	if ok {
+		onProgress(copied, total)
+	}
+}
+
+// parseCopyProgress parses the Azure "bytes_copied/total_bytes" format.
+func parseCopyProgress(s string) (copied, total int64, ok bool) {
+	parts := strings.SplitN(s, "/", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	c, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	t, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return c, t, true
 }
 
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
