@@ -737,7 +737,7 @@ func blobDelegationSASURL(ctx context.Context, ap AzurePath) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("service client: %w", err)
 	}
-	now := time.Now().UTC()
+	now := time.Now().UTC().Add(-5 * time.Minute) // backdate to tolerate clock skew
 	expiry := now.Add(copySASDuration())
 	startStr := now.Format(sas.TimeFormat)
 	expiryStr := expiry.Format(sas.TimeFormat)
@@ -760,7 +760,9 @@ func blobDelegationSASURL(ctx context.Context, ap AzurePath) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("sign user delegation SAS: %w", err)
 	}
-	blobURL := fmt.Sprintf("%s/%s/%s", endpoint, ap.Container, ap.Blob)
+	containerClient := svcClient.NewContainerClient(ap.Container)
+	blobClient := containerClient.NewBlobClient(ap.Blob)
+	blobURL := blobClient.URL()
 	return fmt.Sprintf("%s?%s", blobURL, qp.Encode()), nil
 }
 

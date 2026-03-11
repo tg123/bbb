@@ -81,7 +81,8 @@ func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 
 func TestCopyBlobServerSideCrossAccountRequiresCredentials(t *testing.T) {
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
 	err := CopyBlobServerSide(ctx, src, dst, nil)
@@ -92,7 +93,8 @@ func TestCopyBlobServerSideCrossAccountRequiresCredentials(t *testing.T) {
 
 func TestCopyBlobServerSideFallsBackToUserDelegation(t *testing.T) {
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "other.txt"}
 	err := CopyBlobServerSide(ctx, src, dst, nil)
