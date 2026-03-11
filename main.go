@@ -990,6 +990,12 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
+		taskProgress := newProgressBar(len(tasks), "cp tasks", quiet, false)
+		defer func() {
+			if taskProgress != nil {
+				taskProgress.Finish()
+			}
+		}()
 		seen := make(map[string]struct{}, len(state)+len(tasks))
 		for key := range state {
 			seen[key] = struct{}{}
@@ -1051,7 +1057,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		queued := false
 	enqueueLoop:
 		for _, task := range tasks {
-			expandedTasks, err := expandCPTask(workerCtx, task)
+			expandedTasks, err := expandCPTask(ctx, task)
 			if err != nil {
 				setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
 				break enqueueLoop
@@ -1067,6 +1073,9 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 				case taskCh <- expandedTask:
 					queued = true
 				}
+			}
+			if taskProgress != nil {
+				taskProgress.Increment()
 			}
 		}
 		close(taskCh)
