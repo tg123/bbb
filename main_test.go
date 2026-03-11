@@ -306,6 +306,14 @@ func TestCmdCPTaskfileStateRecoverySkipsFinishedTask(t *testing.T) {
 	if !strings.Contains(string(stderrOut), expectedSkipMsg) {
 		t.Fatalf("expected skip message in stderr, got %q", string(stderrOut))
 	}
+	expectedListingMissing := "cp: listing " + srcMissing + " -> " + dstDir
+	if !strings.Contains(string(stderrOut), expectedListingMissing) {
+		t.Fatalf("expected listing message for first task in stderr, got %q", string(stderrOut))
+	}
+	expectedListingOK := "cp: listing " + srcOK + " -> " + dstDir
+	if !strings.Contains(string(stderrOut), expectedListingOK) {
+		t.Fatalf("expected listing message for second task in stderr, got %q", string(stderrOut))
+	}
 	if _, err := os.Stat(filepath.Join(dstDir, filepath.Base(srcOK))); err != nil {
 		t.Fatalf("expected copied file: %v", err)
 	}

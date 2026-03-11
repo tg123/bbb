@@ -1081,6 +1081,9 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		queued := false
 	enqueueLoop:
 		for _, task := range tasks {
+			if !quiet {
+				lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
+			}
 			expandedTasks, err := expandCPTask(ctx, task)
 			if err != nil {
 				setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
