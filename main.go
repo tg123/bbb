@@ -1038,6 +1038,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		var firstErr error
 		var firstErrMu sync.Mutex
 		var totalPending atomic.Int64
+		var queued atomic.Bool
 
 		setErr := func(err error) {
 			firstErrMu.Lock()
@@ -1078,41 +1079,77 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			}()
 		}
 
-		queued := false
-	enqueueLoop:
-		for _, task := range tasks {
-			if !quiet {
-				lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
-			}
-			expandedTasks, err := expandCPTask(ctx, task)
-			if err != nil {
-				setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
-				break enqueueLoop
-			}
-			for _, expandedTask := range expandedTasks {
-				if _, ok := seen[expandedTask.key]; ok {
-					if !quiet {
-						if _, inState := state[expandedTask.key]; inState {
-							lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
+		pairCh := make(chan taskPair, workers)
+		var seenMu sync.Mutex
+		expanders := workers
+		if expanders > len(tasks) {
+			expanders = len(tasks)
+		}
+		if expanders < 1 {
+			expanders = 1
+		}
+		var expandWG sync.WaitGroup
+		for i := 0; i < expanders; i++ {
+			expandWG.Add(1)
+			go func() {
+				defer expandWG.Done()
+				for {
+					select {
+					case <-workerCtx.Done():
+						return
+					case task, ok := <-pairCh:
+						if !ok {
+							return
+						}
+						if !quiet {
+							lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
+						}
+						expandedTasks, err := expandCPTask(workerCtx, task)
+						if err != nil {
+							setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
+							return
+						}
+						for _, expandedTask := range expandedTasks {
+							seenMu.Lock()
+							_, alreadySeen := seen[expandedTask.key]
+							if !alreadySeen {
+								seen[expandedTask.key] = struct{}{}
+							}
+							seenMu.Unlock()
+							if alreadySeen {
+								_, inState := state[expandedTask.key]
+								if !quiet && inState {
+									lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
+								}
+								continue
+							}
+							select {
+							case <-workerCtx.Done():
+								return
+							case taskCh <- expandedTask:
+								queued.Store(true)
+								if taskProgress != nil {
+									taskProgress.SetTotal(totalPending.Add(1))
+								}
+							}
 						}
 					}
-					continue
 				}
-				seen[expandedTask.key] = struct{}{}
-				select {
-				case <-workerCtx.Done():
-					break enqueueLoop
-				case taskCh <- expandedTask:
-					queued = true
-					if taskProgress != nil {
-						taskProgress.SetTotal(totalPending.Add(1))
-					}
-				}
+			}()
+		}
+	enqueueTasks:
+		for _, task := range tasks {
+			select {
+			case <-workerCtx.Done():
+				break enqueueTasks
+			case pairCh <- task:
 			}
 		}
+		close(pairCh)
+		expandWG.Wait()
 		close(taskCh)
 		wg.Wait()
-		if !queued && firstErr == nil {
+		if !queued.Load() && firstErr == nil {
 			_ = stateAppender.close()
 			return nil
 		}
