@@ -473,7 +473,7 @@ var (
 
 func clearActiveBar() {
 	if activeBarPtr != nil && stderrIsTerm {
-		fmt.Fprintf(os.Stderr, "\r\033[K")
+		fmt.Fprintf(os.Stderr, "\r"+ansiClear)
 	}
 }
 
@@ -533,6 +533,13 @@ type progressBar struct {
 const (
 	progressUninitialized = int64(-1)
 	minProgressTotal      = 2
+
+	ansiReset = "\033[0m"
+	ansiBold  = "\033[1m"
+	ansiGreen = "\033[32m"
+	ansiCyan  = "\033[36m"
+	ansiGray  = "\033[90m"
+	ansiClear = "\033[K"
 )
 
 func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progressBar {
@@ -612,12 +619,7 @@ func (p *progressBar) renderUnlocked() {
 	if total <= 0 {
 		return
 	}
-	if done < 0 {
-		done = 0
-	}
-	if done > total {
-		done = total
-	}
+	done, total = clampProgress(done, total)
 	elapsed := time.Since(p.startedAt).Seconds()
 	speed := 0.0
 	if p.showSpeed && elapsed > 0 {
@@ -625,11 +627,21 @@ func (p *progressBar) renderUnlocked() {
 	}
 	if stderrIsTerm {
 		line := formatFancyBar(p.label, done, total, p.width, speed, p.showSpeed)
-		fmt.Fprintf(os.Stderr, "\r\033[K%s", line)
+		fmt.Fprintf(os.Stderr, "\r"+ansiClear+"%s", line)
 	} else {
 		line := formatProgressBar(p.label, done, total, p.width, speed, p.showSpeed)
 		fmt.Fprintf(os.Stderr, "\r%s", line)
 	}
+}
+
+func clampProgress(done, total int64) (int64, int64) {
+	if done < 0 {
+		done = 0
+	}
+	if done > total {
+		done = total
+	}
+	return done, total
 }
 
 func (p *progressBar) render(done int64) {
@@ -640,12 +652,7 @@ func (p *progressBar) render(done int64) {
 	if total <= 0 {
 		return
 	}
-	if done < 0 {
-		done = 0
-	}
-	if done > total {
-		done = total
-	}
+	done, total = clampProgress(done, total)
 	if p.lastDone.Load() == done && p.lastTotal.Load() == total {
 		return
 	}
@@ -700,17 +707,17 @@ func formatFancyBar(label string, done, total int64, width int, speed float64, s
 	if filled > width {
 		filled = width
 	}
-	bar := "\033[32m" + strings.Repeat("━", filled) + "\033[90m" + strings.Repeat("━", width-filled) + "\033[0m"
-	pctColor := "\033[36m"
+	bar := ansiGreen + strings.Repeat("━", filled) + ansiGray + strings.Repeat("━", width-filled) + ansiReset
+	pctColor := ansiCyan
 	suffix := ""
 	if done == total {
-		pctColor = "\033[32m"
-		suffix = " \033[32m✓\033[0m"
+		pctColor = ansiGreen
+		suffix = " " + ansiGreen + "✓" + ansiReset
 	}
 	if !showSpeed {
-		return fmt.Sprintf("\033[1m%s\033[0m %s %s%3d%%\033[0m (%d/%d)%s", label, bar, pctColor, percent, done, total, suffix)
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d)%s", label, bar, pctColor, percent, done, total, suffix)
 	}
-	return fmt.Sprintf("\033[1m%s\033[0m %s %s%3d%%\033[0m (%d/%d, %s)%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), suffix)
+	return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d, %s)%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), suffix)
 }
 
 func formatByteSpeed(bytesPerSecond float64) string {
