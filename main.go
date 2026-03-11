@@ -1144,7 +1144,9 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		defer cancel()
 
 		var wg sync.WaitGroup
-		taskCh := make(chan cpTask, workers)
+		// Buffer taskCh larger than workers so expanders can push ahead
+		// without blocking while cp workers are busy.
+		taskCh := make(chan cpTask, workers*4)
 		var firstErr error
 		var firstErrMu sync.Mutex
 		var totalPending atomic.Int64
@@ -1195,15 +1197,14 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			}()
 		}
 
-		pairCh := make(chan taskPair, workers)
-		var seenMu sync.Mutex
-		expanders := workers
+		// Dedicated expander pool: at least 1 goroutine, separate from
+		// the cp workers so expansion always makes progress.
+		expanders := max(1, workers/4)
 		if expanders > len(tasks) {
 			expanders = len(tasks)
 		}
-		if expanders < 1 {
-			expanders = 1
-		}
+		pairCh := make(chan taskPair, workers)
+		var seenMu sync.Mutex
 		var expandWG sync.WaitGroup
 		for i := 0; i < expanders; i++ {
 			expandWG.Add(1)
