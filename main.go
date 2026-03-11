@@ -496,16 +496,22 @@ func isTerminal(f *os.File) bool {
 }
 
 type progressBar struct {
-	label       string
-	total       int64
-	width       int
-	showSpeed   bool
-	startedAt   time.Time
-	done        atomic.Int64
-	bytesDone   atomic.Int64
-	lastPercent atomic.Int64
-	finished    atomic.Bool
+	label     string
+	width     int
+	showSpeed bool
+	startedAt time.Time
+	total     atomic.Int64
+	done      atomic.Int64
+	bytesDone atomic.Int64
+	lastDone  atomic.Int64
+	lastTotal atomic.Int64
+	finished  atomic.Bool
 }
+
+const (
+	progressUninitialized = int64(-1)
+	minProgressTotal      = 2
+)
 
 func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progressBar {
 	if quiet || total <= 1 || !isTerminal(os.Stderr) {
@@ -513,11 +519,13 @@ func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progre
 	}
 	bar := &progressBar{
 		label:     label,
-		total:     int64(total),
 		width:     28,
 		showSpeed: showSpeed,
 		startedAt: time.Now(),
 	}
+	bar.total.Store(int64(total))
+	bar.lastDone.Store(progressUninitialized)
+	bar.lastTotal.Store(progressUninitialized)
 	bar.render(0)
 	return bar
 }
@@ -537,51 +545,62 @@ func (p *progressBar) AddBytes(n int64) {
 	p.bytesDone.Add(n)
 }
 
+func (p *progressBar) SetTotal(total int64) {
+	if p == nil {
+		return
+	}
+	if total < 1 {
+		total = 1
+	}
+	p.total.Store(total)
+	if p.done.Load() < total {
+		p.finished.Store(false)
+	}
+	p.render(p.done.Load())
+}
+
 func (p *progressBar) Finish() {
 	if p == nil {
 		return
 	}
-	p.done.Store(p.total)
-	p.render(p.total)
+	if !p.finished.CompareAndSwap(false, true) {
+		return
+	}
+	total := p.total.Load()
+	if total < 1 {
+		total = 1
+	}
+	p.done.Store(total)
+	p.render(total)
+	lockedFprintf(os.Stderr, "\n")
 }
 
 func (p *progressBar) render(done int64) {
 	if p == nil {
 		return
 	}
-	if p.total <= 0 {
+	total := p.total.Load()
+	if total <= 0 {
 		return
 	}
 	if done < 0 {
 		done = 0
 	}
-	if done > p.total {
-		done = p.total
+	if done > total {
+		done = total
 	}
-	percent := done * 100 / p.total
-	if done != p.total {
-		for {
-			prev := p.lastPercent.Load()
-			if percent == prev {
-				return
-			}
-			if p.lastPercent.CompareAndSwap(prev, percent) {
-				break
-			}
-		}
-	} else if !p.finished.CompareAndSwap(false, true) {
+	if p.lastDone.Load() == done && p.lastTotal.Load() == total {
 		return
 	}
+	p.lastDone.Store(done)
+	p.lastTotal.Store(total)
 	elapsed := time.Since(p.startedAt).Seconds()
 	speed := 0.0
 	if p.showSpeed && elapsed > 0 {
 		speed = float64(p.bytesDone.Load()) / elapsed
 	}
-	line := formatProgressBar(p.label, done, p.total, p.width, speed, p.showSpeed)
+	line := formatProgressBar(p.label, done, total, p.width, speed, p.showSpeed)
 	lockedFprintf(os.Stderr, "\r%s", line)
-	if done == p.total {
-		lockedFprintf(os.Stderr, "\n")
-	}
 }
 
 func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
@@ -990,7 +1009,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		taskProgress := newProgressBar(len(tasks), "cp tasks", quiet, false)
+		taskProgress := newProgressBar(max(len(tasks), minProgressTotal), "cp files", quiet, false)
 		defer func() {
 			if taskProgress != nil {
 				taskProgress.Finish()
@@ -1017,6 +1036,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		taskCh := make(chan cpTask, workers)
 		var firstErr error
 		var firstErrMu sync.Mutex
+		var totalPending atomic.Int64
 
 		setErr := func(err error) {
 			firstErrMu.Lock()
@@ -1049,6 +1069,9 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								return
 							}
 						}
+						if taskProgress != nil {
+							taskProgress.Increment()
+						}
 					}
 				}
 			}()
@@ -1072,10 +1095,10 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 					break enqueueLoop
 				case taskCh <- expandedTask:
 					queued = true
+					if taskProgress != nil {
+						taskProgress.SetTotal(totalPending.Add(1))
+					}
 				}
-			}
-			if taskProgress != nil {
-				taskProgress.Increment()
 			}
 		}
 		close(taskCh)
