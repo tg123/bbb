@@ -1072,7 +1072,7 @@ func expandCPTask(ctx context.Context, task taskPair) ([]cpTask, error) {
 			}
 			out = append(out, cpTask{
 				src: entry.Path,
-				dst: dap.Child(entry.Name).String(),
+				dst: dap.Child(filepath.ToSlash(entry.Name)).String(),
 				key: taskStateKey(entry.Path, task.dst),
 			})
 		}
@@ -1251,7 +1251,11 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 									lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
 								}
 								if taskProgress != nil && inState {
-									taskProgress.SetTotal(totalPending.Add(1))
+									newTotal := totalPending.Add(1)
+									if newTotal < int64(minProgressTotal) {
+										newTotal = int64(minProgressTotal)
+									}
+									taskProgress.SetTotal(newTotal)
 									taskProgress.Increment()
 								}
 								continue
@@ -1275,7 +1279,11 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 							case taskCh <- pt:
 								queued.Store(true)
 								if taskProgress != nil {
-									taskProgress.SetTotal(totalPending.Add(1))
+									newTotal := totalPending.Add(1)
+									if newTotal < int64(minProgressTotal) {
+										newTotal = int64(minProgressTotal)
+									}
+									taskProgress.SetTotal(newTotal)
 								}
 							}
 						}
