@@ -540,6 +540,13 @@ const (
 	ansiClear = "\033[K"
 )
 
+func clampProgressTotal(total int64) int64 {
+	if total < int64(minProgressTotal) {
+		return int64(minProgressTotal)
+	}
+	return total
+}
+
 func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progressBar {
 	if quiet || total <= 1 || !isTerminal(os.Stderr) {
 		return nil
@@ -1251,11 +1258,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 									lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
 								}
 								if taskProgress != nil && inState {
-									newTotal := totalPending.Add(1)
-									if newTotal < int64(minProgressTotal) {
-										newTotal = int64(minProgressTotal)
-									}
-									taskProgress.SetTotal(newTotal)
+									taskProgress.SetTotal(clampProgressTotal(totalPending.Add(1)))
 									taskProgress.Increment()
 								}
 								continue
@@ -1279,11 +1282,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 							case taskCh <- pt:
 								queued.Store(true)
 								if taskProgress != nil {
-									newTotal := totalPending.Add(1)
-									if newTotal < int64(minProgressTotal) {
-										newTotal = int64(minProgressTotal)
-									}
-									taskProgress.SetTotal(newTotal)
+									taskProgress.SetTotal(clampProgressTotal(totalPending.Add(1)))
 								}
 							}
 						}
