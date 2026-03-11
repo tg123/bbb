@@ -445,6 +445,126 @@ func TestCmdCPTaskfileStateRecoveryPartialTaskSkipsFinishedFile(t *testing.T) {
 	}
 }
 
+func TestCmdCPTaskfileStateHumanReadable(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	dstDir := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write src a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatalf("write src b: %v", err)
+	}
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(srcDir+" "+dstDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "tasks.state")
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("cp failed: %v", err)
+	}
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read statefile: %v", err)
+	}
+	stateText := string(stateData)
+	// File-level keys should be human-readable src -> dst
+	expectedA := filepath.Join(srcDir, "a.txt") + " -> " + dstDir
+	expectedB := filepath.Join(srcDir, "b.txt") + " -> " + dstDir
+	if !strings.Contains(stateText, expectedA) {
+		t.Fatalf("expected human-readable key for a.txt in statefile, got:\n%s", stateText)
+	}
+	if !strings.Contains(stateText, expectedB) {
+		t.Fatalf("expected human-readable key for b.txt in statefile, got:\n%s", stateText)
+	}
+	// Task checkpoint should be present
+	expectedCheckpoint := "TASK\t" + srcDir + " -> " + dstDir
+	if !strings.Contains(stateText, expectedCheckpoint) {
+		t.Fatalf("expected task checkpoint in statefile, got:\n%s", stateText)
+	}
+}
+
+func TestCmdCPTaskfileStateCheckpointSkipsExpansion(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	dstDir := filepath.Join(dir, "dst")
+	// Source does not exist — if expansion is attempted it would fail or return empty
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(srcDir+" "+dstDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "tasks.state")
+	// Pre-seed task checkpoint
+	checkpoint := "TASK\t" + srcDir + " -> " + dstDir + "\n"
+	if err := os.WriteFile(stateFile, []byte(checkpoint), 0o644); err != nil {
+		t.Fatalf("write statefile: %v", err)
+	}
+
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stderr: %v", err)
+	}
+	os.Stderr = w
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	runErr := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile})
+	if err := w.Close(); err != nil {
+		t.Fatalf("close write pipe: %v", err)
+	}
+	os.Stderr = origStderr
+	stderrOut, readErr := io.ReadAll(r)
+	if err := r.Close(); err != nil {
+		t.Fatalf("close read pipe: %v", err)
+	}
+	if runErr != nil {
+		t.Fatalf("cp failed: %v", runErr)
+	}
+	if readErr != nil {
+		t.Fatalf("read stderr: %v", readErr)
+	}
+	// Should see the task-level skip message, not a listing message
+	if !strings.Contains(string(stderrOut), "cp: skip already completed task") {
+		t.Fatalf("expected task checkpoint skip message, got:\n%s", string(stderrOut))
+	}
+	if strings.Contains(string(stderrOut), "cp: listing") {
+		t.Fatalf("expansion should be skipped for checkpointed task, got:\n%s", string(stderrOut))
+	}
+}
+
 func TestCmdSyncTaskfile(t *testing.T) {
 	dir := t.TempDir()
 	srcA := filepath.Join(dir, "src-a")

@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -46,11 +44,7 @@ func parseMD5Output(out []byte) string {
 }
 
 func taskStateKey(src, dst string) string {
-	hasher := sha256.New()
-	hasher.Write([]byte(src))
-	hasher.Write([]byte{0})
-	hasher.Write([]byte(dst))
-	return hex.EncodeToString(hasher.Sum(nil))
+	return src + " -> " + dst
 }
 
 func waitForEndpointReady(addr string) bool {

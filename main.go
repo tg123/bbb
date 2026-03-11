@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/md5"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -913,18 +911,19 @@ func loadTaskPairs(taskfile string) ([]taskPair, error) {
 	return tasks, nil
 }
 
-func loadTaskState(path string) (map[string]struct{}, error) {
-	state := map[string]struct{}{}
+func loadTaskState(path string) (fileState map[string]struct{}, taskCheckpoints map[string]struct{}, err error) {
+	fileState = map[string]struct{}{}
+	taskCheckpoints = map[string]struct{}{}
 	if path == "" {
-		return state, nil
+		return fileState, taskCheckpoints, nil
 	}
 
-	file, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return state, nil
+	file, ferr := os.Open(path)
+	if ferr != nil {
+		if os.IsNotExist(ferr) {
+			return fileState, taskCheckpoints, nil
 		}
-		return nil, err
+		return nil, nil, ferr
 	}
 	defer func() {
 		_ = file.Close()
@@ -936,12 +935,16 @@ func loadTaskState(path string) (map[string]struct{}, error) {
 		if line == "" {
 			continue
 		}
-		state[line] = struct{}{}
+		if strings.HasPrefix(line, taskCheckpointPrefix) {
+			taskCheckpoints[line] = struct{}{}
+		} else {
+			fileState[line] = struct{}{}
+		}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
+	if serr := scanner.Err(); serr != nil {
+		return nil, nil, serr
 	}
-	return state, nil
+	return fileState, taskCheckpoints, nil
 }
 
 type taskStateAppender struct {
@@ -1002,18 +1005,26 @@ func (a *taskStateAppender) close() error {
 	return err
 }
 
+const taskCheckpointPrefix = "TASK\t"
+
 func taskStateKey(src, dst string) string {
-	h := sha256.New()
-	h.Write([]byte(src))
-	h.Write([]byte{0})
-	h.Write([]byte(dst))
-	return hex.EncodeToString(h.Sum(nil))
+	return src + " -> " + dst
+}
+
+func taskCheckpointKey(src, dst string) string {
+	return taskCheckpointPrefix + src + " -> " + dst
+}
+
+type taskTracker struct {
+	remaining atomic.Int64
+	key       string // task checkpoint key
 }
 
 type cpTask struct {
-	src string
-	dst string
-	key string
+	src     string
+	dst     string
+	key     string
+	tracker *taskTracker // nil when no task-level checkpoint tracking
 }
 
 // expandCPTask expands a taskfile pair into file-level copy tasks when the source
@@ -1097,7 +1108,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		state, err := loadTaskState(taskfileState)
+		state, taskCheckpoints, err := loadTaskState(taskfileState)
 		if err != nil {
 			return err
 		}
@@ -1162,6 +1173,12 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								setErr(err)
 								return
 							}
+							if task.tracker != nil && task.tracker.remaining.Add(-1) == 0 {
+								if err := stateAppender.append(task.tracker.key); err != nil {
+									setErr(err)
+									return
+								}
+							}
 						}
 						if taskProgress != nil {
 							taskProgress.Increment()
@@ -1193,6 +1210,13 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 						if !ok {
 							return
 						}
+						cpKey := taskCheckpointKey(task.src, task.dst)
+						if _, done := taskCheckpoints[cpKey]; done {
+							if !quiet {
+								lockedFprintf(os.Stderr, "cp: skip already completed task %s -> %s\n", task.src, task.dst)
+							}
+							continue
+						}
 						if !quiet {
 							lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
 						}
@@ -1205,6 +1229,11 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 							setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
 							return
 						}
+						var tracker *taskTracker
+						if taskfileState != "" {
+							tracker = &taskTracker{key: cpKey}
+						}
+						pending := int64(0)
 						for _, expandedTask := range expandedTasks {
 							seenMu.Lock()
 							_, alreadySeen := seen[expandedTask.key]
@@ -1219,6 +1248,8 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								}
 								continue
 							}
+							expandedTask.tracker = tracker
+							pending++
 							select {
 							case <-workerCtx.Done():
 								return
@@ -1226,6 +1257,15 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								queued.Store(true)
 								if taskProgress != nil {
 									taskProgress.SetTotal(totalPending.Add(1))
+								}
+							}
+						}
+						if tracker != nil {
+							tracker.remaining.Store(pending)
+							if pending == 0 {
+								if err := stateAppender.append(cpKey); err != nil {
+									setErr(err)
+									return
 								}
 							}
 						}
