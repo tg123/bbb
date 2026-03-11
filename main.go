@@ -466,11 +466,10 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 var (
 	outputMu     sync.Mutex
 	activeBarPtr *progressBar // guarded by outputMu
-	stderrIsTerm = isTerminal(os.Stderr)
 )
 
 func clearActiveBar() {
-	if activeBarPtr != nil && stderrIsTerm {
+	if activeBarPtr != nil && isTerminal(os.Stderr) {
 		fmt.Fprintf(os.Stderr, "\r"+ansiClear)
 	}
 }
@@ -630,7 +629,7 @@ func (p *progressBar) renderUnlocked() {
 	if p.showSpeed && elapsed > 0 {
 		speed = float64(p.bytesDone.Load()) / elapsed
 	}
-	if stderrIsTerm {
+	if isTerminal(os.Stderr) {
 		line := formatFancyBar(p.label, done, total, p.width, speed, p.showSpeed)
 		fmt.Fprintf(os.Stderr, "\r"+ansiClear+"%s", line)
 	} else {
@@ -937,6 +936,7 @@ func loadTaskState(path string) (fileState map[string]struct{}, taskCheckpoints 
 	}()
 
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxTaskfileLineSize)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -982,6 +982,20 @@ func (a *taskStateAppender) append(taskKey string) error {
 		return a.closeOnError(err)
 	}
 
+	return nil
+}
+
+func (a *taskStateAppender) appendCheckpoint(taskKey string) error {
+	if a.file == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
+		return a.closeOnError(err)
+	}
+
 	if err := a.file.Sync(); err != nil {
 		return a.closeOnError(err)
 	}
@@ -1006,6 +1020,11 @@ func (a *taskStateAppender) close() error {
 	defer a.mu.Unlock()
 	if a.file == nil {
 		return nil
+	}
+	if serr := a.file.Sync(); serr != nil {
+		_ = a.file.Close()
+		a.file = nil
+		return serr
 	}
 	err := a.file.Close()
 	a.file = nil
@@ -1190,7 +1209,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								return
 							}
 							if task.tracker != nil && task.tracker.remaining.Add(-1) == 0 {
-								if err := stateAppender.append(task.tracker.key); err != nil {
+								if err := stateAppender.appendCheckpoint(task.tracker.key); err != nil {
 									setErr(err)
 									return
 								}
@@ -1229,7 +1248,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								lockedFprintf(os.Stderr, "cp: skip already completed task %s -> %s\n", task.src, task.dst)
 							}
 							if taskProgress != nil {
-								taskProgress.SetTotal(totalPending.Add(1))
+								taskProgress.SetTotal(clampProgressTotal(totalPending.Add(1)))
 								taskProgress.Increment()
 							}
 							continue
@@ -1275,7 +1294,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 						if tracker != nil {
 							tracker.remaining.Store(int64(len(pendingTasks)))
 							if len(pendingTasks) == 0 {
-								if err := stateAppender.append(cpKey); err != nil {
+								if err := stateAppender.appendCheckpoint(cpKey); err != nil {
 									setErr(err)
 									return
 								}
@@ -2202,13 +2221,11 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		if srcAz {
 			sap, err := azblob.Parse(src)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
+				return fmt.Errorf("sync: %w", err)
 			}
 			list, err := azblob.ListRecursive(ctx, sap)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
+				return fmt.Errorf("sync: list %s: %w", src, err)
 			}
 			for _, bm := range list {
 				if bm.Name == "" || excludeMatch(bm.Name) {
