@@ -22,8 +22,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
 
 // MkContainer creates a new Azure Blob container
@@ -605,12 +605,6 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
 		return errors.New("destination path is directory-like")
 	}
-	if src.Account != dst.Account {
-		return errors.New("server-side copy requires same storage account")
-	}
-	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
-		return bloberror.MissingSharedKeyCredential
-	}
 	client, err := getAzBlobClient(ctx, dst.Account)
 	if err != nil {
 		return err
@@ -671,16 +665,57 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 }
 
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
-	client, err := getAzBlobClient(ctx, ap.Account)
-	if err != nil {
-		return "", err
+	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") != "" {
+		client, err := getAzBlobClient(ctx, ap.Account)
+		if err != nil {
+			return "", err
+		}
+		blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob)
+		sasURL, err := blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(copySASDuration()), nil)
+		if err != nil {
+			return "", fmt.Errorf("generate SAS URL: %w", err)
+		}
+		return sasURL, nil
 	}
-	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob)
-	sasURL, err := blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(copySASDuration()), nil)
+	return blobDelegationSASURL(ctx, ap)
+}
+
+// blobDelegationSASURL generates a SAS URL using a User Delegation Key obtained
+// via OAuth. This enables cross-account server-side copy within the same tenant.
+func blobDelegationSASURL(ctx context.Context, ap AzurePath) (string, error) {
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
-		return "", fmt.Errorf("generate SAS URL: %w", err)
+		return "", fmt.Errorf("default credential: %w", err)
 	}
-	return sasURL, nil
+	endpoint := getEndpoint(ap.Account)
+	svcClient, err := service.NewClient(endpoint, cred, nil)
+	if err != nil {
+		return "", fmt.Errorf("service client: %w", err)
+	}
+	now := time.Now().UTC()
+	expiry := now.Add(copySASDuration())
+	startStr := now.Format(sas.TimeFormat)
+	expiryStr := expiry.Format(sas.TimeFormat)
+	udc, err := svcClient.GetUserDelegationCredential(ctx, service.KeyInfo{
+		Start:  &startStr,
+		Expiry: &expiryStr,
+	}, nil)
+	if err != nil {
+		return "", fmt.Errorf("get user delegation credential: %w", err)
+	}
+	sasValues := sas.BlobSignatureValues{
+		Protocol:      sas.ProtocolHTTPS,
+		ExpiryTime:    expiry,
+		Permissions:   (&sas.BlobPermissions{Read: true}).String(),
+		ContainerName: ap.Container,
+		BlobName:      ap.Blob,
+	}
+	qp, err := sasValues.SignWithUserDelegation(udc)
+	if err != nil {
+		return "", fmt.Errorf("sign user delegation SAS: %w", err)
+	}
+	blobURL := fmt.Sprintf("%s/%s/%s", endpoint, ap.Container, ap.Blob)
+	return fmt.Sprintf("%s?%s", blobURL, qp.Encode()), nil
 }
 
 func nextPollDelay(current time.Duration) time.Duration {

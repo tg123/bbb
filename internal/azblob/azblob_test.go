@@ -79,24 +79,31 @@ func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 	}
 }
 
-func TestCopyBlobServerSideRequiresSameAccount(t *testing.T) {
+func TestCopyBlobServerSideCrossAccountNeedsCredentials(t *testing.T) {
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
 	ctx := context.Background()
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
 	err := CopyBlobServerSide(ctx, src, dst)
 	if err == nil {
-		t.Fatal("expected error for cross-account copy")
+		t.Fatal("expected error for cross-account copy without credentials")
 	}
 }
 
-func TestCopyBlobServerSideRequiresSharedKey(t *testing.T) {
+func TestCopyBlobServerSideFallsBackToUserDelegation(t *testing.T) {
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
 	ctx := context.Background()
 	src := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "other.txt"}
 	err := CopyBlobServerSide(ctx, src, dst)
-	if !errors.Is(err, bloberror.MissingSharedKeyCredential) {
-		t.Fatalf("expected missing shared key error, got %v", err)
+	// Without real Azure credentials the user delegation path will fail,
+	// but it must NOT be a MissingSharedKeyCredential error since we now
+	// attempt the delegation path instead.
+	if errors.Is(err, bloberror.MissingSharedKeyCredential) {
+		t.Fatalf("should not require shared key, got %v", err)
+	}
+	if err == nil {
+		t.Fatal("expected error without real credentials")
 	}
 }
 
