@@ -1138,15 +1138,22 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if workers < 1 {
 			workers = 1
 		}
+		// Split concurrency budget: at least 1 expander, at least 1 cp worker.
+		// When concurrency is high, allocate ~25% to expansion.
+		expanders := max(1, workers/4)
+		cpWorkers := workers - expanders
+		if cpWorkers < 1 {
+			cpWorkers = 1
+		}
 		innerConcurrency := 1
 		innerQuiet := true
 		workerCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
 		var wg sync.WaitGroup
-		// Buffer taskCh larger than workers so expanders can push ahead
+		// Buffer taskCh larger than cpWorkers so expanders can push ahead
 		// without blocking while cp workers are busy.
-		taskCh := make(chan cpTask, workers*4)
+		taskCh := make(chan cpTask, cpWorkers*4)
 		var firstErr error
 		var firstErrMu sync.Mutex
 		var totalPending atomic.Int64
@@ -1161,7 +1168,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			firstErrMu.Unlock()
 		}
 
-		for i := 0; i < workers; i++ {
+		for i := 0; i < cpWorkers; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -1197,13 +1204,11 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			}()
 		}
 
-		// Dedicated expander pool: at least 1 goroutine, separate from
-		// the cp workers so expansion always makes progress.
-		expanders := max(1, workers/4)
+		// Dedicated expander pool uses goroutines from the concurrency budget.
 		if expanders > len(tasks) {
 			expanders = len(tasks)
 		}
-		pairCh := make(chan taskPair, workers)
+		pairCh := make(chan taskPair, expanders*2)
 		var seenMu sync.Mutex
 		var expandWG sync.WaitGroup
 		for i := 0; i < expanders; i++ {
