@@ -1087,6 +1087,11 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			}
 			for _, expandedTask := range expandedTasks {
 				if _, ok := seen[expandedTask.key]; ok {
+					if !quiet {
+						if _, inState := state[expandedTask.key]; inState {
+							lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
+						}
+					}
 					continue
 				}
 				seen[expandedTask.key] = struct{}{}

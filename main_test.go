@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -280,8 +281,30 @@ func TestCmdCPTaskfileStateRecoverySkipsFinishedTask(t *testing.T) {
 			&cli.StringFlag{Name: "taskfile-state"},
 		},
 	}
-	if err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
-		t.Fatalf("cp recovery failed: %v", err)
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stderr: %v", err)
+	}
+	os.Stderr = w
+	runErr := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile})
+	if err := w.Close(); err != nil {
+		t.Fatalf("close write pipe: %v", err)
+	}
+	os.Stderr = origStderr
+	stderrOut, readErr := io.ReadAll(r)
+	if err := r.Close(); err != nil {
+		t.Fatalf("close read pipe: %v", err)
+	}
+	if runErr != nil {
+		t.Fatalf("cp recovery failed: %v", runErr)
+	}
+	if readErr != nil {
+		t.Fatalf("read stderr: %v", readErr)
+	}
+	expectedSkipMsg := "cp: skip already copied " + srcMissing + " -> " + dstDir
+	if !strings.Contains(string(stderrOut), expectedSkipMsg) {
+		t.Fatalf("expected skip message in stderr, got %q", string(stderrOut))
 	}
 	if _, err := os.Stat(filepath.Join(dstDir, filepath.Base(srcOK))); err != nil {
 		t.Fatalf("expected copied file: %v", err)
