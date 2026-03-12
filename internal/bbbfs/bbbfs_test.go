@@ -55,12 +55,11 @@ func TestListRecursiveLocalNestedPaths(t *testing.T) {
 	}
 
 	var got []string
-	err := ListRecursive(context.Background(), root, func(e Entry) error {
-		got = append(got, e.Name)
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("ListRecursive failed: %v", err)
+	for result := range ListRecursive(context.Background(), root) {
+		if result.Err != nil {
+			t.Fatalf("ListRecursive failed: %v", result.Err)
+		}
+		got = append(got, result.Entry.Name)
 	}
 
 	want := []string{"a.txt", filepath.Join("sub", "b.txt")}

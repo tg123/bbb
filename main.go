@@ -347,11 +347,11 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 
 	parentPath, pattern := splitWildcard(root)
 	var list []bbbfs.Entry
-	if err := bbbfs.ListRecursive(ctx, parentPath, func(e bbbfs.Entry) error {
-		list = append(list, e)
-		return nil
-	}); err != nil {
-		return err
+	for result := range bbbfs.ListRecursive(ctx, parentPath) {
+		if result.Err != nil {
+			return result.Err
+		}
+		list = append(list, result.Entry)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	var count int64
@@ -1090,27 +1090,41 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 		if err != nil {
 			return err
 		}
-		return bbbfs.ListRecursive(ctx, task.src, func(entry bbbfs.Entry) error {
-			if entry.IsDir {
-				return nil
+		for result := range bbbfs.ListRecursive(ctx, task.src) {
+			if result.Err != nil {
+				return result.Err
 			}
-			return emit(cpTask{
+			entry := result.Entry
+			if entry.IsDir {
+				continue
+			}
+			if err := emit(cpTask{
 				src: entry.Path,
 				dst: dap.Child(filepath.ToSlash(entry.Name)).String(),
 				key: taskStateKey(entry.Path, task.dst),
-			})
-		})
-	}
-	return bbbfs.ListRecursive(ctx, task.src, func(entry bbbfs.Entry) error {
-		if entry.IsDir {
-			return nil
+			}); err != nil {
+				return err
+			}
 		}
-		return emit(cpTask{
+		return nil
+	}
+	for result := range bbbfs.ListRecursive(ctx, task.src) {
+		if result.Err != nil {
+			return result.Err
+		}
+		entry := result.Entry
+		if entry.IsDir {
+			continue
+		}
+		if err := emit(cpTask{
 			src: entry.Path,
 			dst: filepath.Join(task.dst, entry.Name),
 			key: taskStateKey(entry.Path, task.dst),
-		})
-	})
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cmdCP(ctx context.Context, c *cli.Command) error {

@@ -12,17 +12,40 @@ type recursiveLister interface {
 	ListRecursive(ctx context.Context, root string, emit func(Entry) error) error
 }
 
-// ListRecursive streams all files under the path via the emit callback, using
-// provider-specific recursive listing when available, and falling back to
-// List and Stat-based traversal.
-func ListRecursive(ctx context.Context, root string, emit func(Entry) error) error {
-	fs := Resolve(root)
+// ListRecursive returns a channel that streams all files under the path.
+// Entries are emitted as they are discovered; any listing error is sent as a
+// ListResult with Err set. The channel is closed when listing completes or
+// the context is cancelled. Callers should cancel the context if they stop
+// consuming the channel early.
+func ListRecursive(ctx context.Context, root string) <-chan ListResult {
+	ch := make(chan ListResult)
+	go func() {
+		defer close(ch)
+		emit := func(e Entry) error {
+			select {
+			case ch <- ListResult{Entry: e}:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 
-	if rl, ok := fs.(recursiveLister); ok {
-		return rl.ListRecursive(ctx, root, emit)
-	}
-	isRemote := strings.Contains(root, "://")
-	return listRecursive(ctx, fs, root, root, "", isRemote, emit)
+		fs := Resolve(root)
+		var err error
+		if rl, ok := fs.(recursiveLister); ok {
+			err = rl.ListRecursive(ctx, root, emit)
+		} else {
+			isRemote := strings.Contains(root, "://")
+			err = listRecursive(ctx, fs, root, root, "", isRemote, emit)
+		}
+		if err != nil && err != ctx.Err() {
+			select {
+			case ch <- ListResult{Err: err}:
+			case <-ctx.Done():
+			}
+		}
+	}()
+	return ch
 }
 
 func listRecursive(ctx context.Context, fs FS, root, current, relPrefix string, isRemote bool, emit func(Entry) error) error {
