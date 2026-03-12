@@ -1053,68 +1053,72 @@ type cpTask struct {
 	tracker *taskTracker // nil when no task-level checkpoint tracking
 }
 
-// expandCPTask expands a taskfile pair into file-level copy tasks when the source
-// is directory-like, so resume state can be tracked and skipped per file.
-// For file-like sources it returns one task preserving the original pair.
-func expandCPTask(ctx context.Context, task taskPair) ([]cpTask, error) {
+// expandCPTask streams file-level copy tasks for a taskfile pair via the emit
+// callback. When the source is directory-like it expands recursively and calls
+// emit for each discovered file; for file-like sources it emits a single task.
+// Returning a non-nil error from emit stops expansion early.
+func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) error {
 	if isHF(task.src) {
 		hfPath, err := hf.Parse(task.src)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if hfPath.File != "" {
-			return []cpTask{{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)}}, nil
+			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
 		}
 	}
 
 	if isAz(task.src) {
 		sap, err := azblob.Parse(task.src)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !sap.IsDirLike() {
-			return []cpTask{{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)}}, nil
+			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
 		}
 	} else if !isHF(task.src) {
 		if info, err := os.Stat(task.src); err != nil || !info.IsDir() {
-			return []cpTask{{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)}}, nil
+			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
 		}
 	}
 
 	entries, err := bbbfs.ListRecursive(ctx, task.src)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	var out []cpTask
 	if isAz(task.dst) {
 		dap, err := azblob.Parse(task.dst)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, entry := range entries {
 			if entry.IsDir {
 				continue
 			}
-			out = append(out, cpTask{
+			if err := emit(cpTask{
 				src: entry.Path,
 				dst: dap.Child(filepath.ToSlash(entry.Name)).String(),
 				key: taskStateKey(entry.Path, task.dst),
-			})
+			}); err != nil {
+				return err
+			}
 		}
-		return out, nil
+		return nil
 	}
 	for _, entry := range entries {
 		if entry.IsDir {
 			continue
 		}
-		out = append(out, cpTask{
+		if err := emit(cpTask{
 			src: entry.Path,
 			dst: filepath.Join(task.dst, entry.Name),
 			key: taskStateKey(entry.Path, task.dst),
-		})
+		}); err != nil {
+			return err
+		}
 	}
-	return out, nil
+	return nil
 }
 
 func cmdCP(ctx context.Context, c *cli.Command) error {
@@ -1258,21 +1262,12 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 						if !quiet {
 							lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
 						}
-						var expandedTasks []cpTask
-						if err := retryOp(workerCtx, retryCount, func() error {
-							var expandErr error
-							expandedTasks, expandErr = expandCPTask(workerCtx, task)
-							return expandErr
-						}); err != nil {
-							setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
-							return
-						}
 						var tracker *taskTracker
 						if taskfileState != "" {
 							tracker = &taskTracker{key: cpKey}
 						}
-						var pendingTasks []cpTask
-						for _, expandedTask := range expandedTasks {
+						var pendingCount int64
+						expandEmit := func(expandedTask cpTask) error {
 							seenMu.Lock()
 							_, alreadySeen := seen[expandedTask.key]
 							if !alreadySeen {
@@ -1288,29 +1283,35 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 									taskProgress.SetTotal(clampProgressTotal(totalPending.Add(1)))
 									taskProgress.Increment()
 								}
-								continue
+								return nil
 							}
 							expandedTask.tracker = tracker
-							pendingTasks = append(pendingTasks, expandedTask)
-						}
-						if tracker != nil {
-							tracker.remaining.Store(int64(len(pendingTasks)))
-							if len(pendingTasks) == 0 {
-								if err := stateAppender.appendCheckpoint(cpKey); err != nil {
-									setErr(err)
-									return
-								}
-							}
-						}
-						for _, pt := range pendingTasks {
+							pendingCount++
 							select {
 							case <-workerCtx.Done():
-								return
-							case taskCh <- pt:
-								slog.Debug("cp: queued", "src", pt.src, "dst", pt.dst)
+								return workerCtx.Err()
+							case taskCh <- expandedTask:
+								slog.Debug("cp: queued", "src", expandedTask.src, "dst", expandedTask.dst)
 								queued.Store(true)
 								if taskProgress != nil {
 									taskProgress.SetTotal(clampProgressTotal(totalPending.Add(1)))
+								}
+							}
+							return nil
+						}
+						if err := retryOp(workerCtx, retryCount, func() error {
+							pendingCount = 0
+							return expandCPTask(workerCtx, task, expandEmit)
+						}); err != nil {
+							setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
+							return
+						}
+						if tracker != nil {
+							tracker.remaining.Store(pendingCount)
+							if pendingCount == 0 {
+								if err := stateAppender.appendCheckpoint(cpKey); err != nil {
+									setErr(err)
+									return
 								}
 							}
 						}
