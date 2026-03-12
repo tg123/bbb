@@ -54,15 +54,15 @@ func TestListRecursiveLocalNestedPaths(t *testing.T) {
 		t.Fatalf("write sub/b.txt: %v", err)
 	}
 
-	entries, err := ListRecursive(context.Background(), root)
+	var got []string
+	err := ListRecursive(context.Background(), root, func(e Entry) error {
+		got = append(got, e.Name)
+		return nil
+	})
 	if err != nil {
 		t.Fatalf("ListRecursive failed: %v", err)
 	}
 
-	got := make([]string, 0, len(entries))
-	for _, e := range entries {
-		got = append(got, e.Name)
-	}
 	want := []string{"a.txt", filepath.Join("sub", "b.txt")}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected recursive entries: got %v want %v", got, want)

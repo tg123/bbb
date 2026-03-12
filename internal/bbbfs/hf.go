@@ -84,33 +84,34 @@ func (hfFS) Stat(ctx context.Context, target string) (Entry, error) {
 	}, nil
 }
 
-func (hfFS) ListRecursive(ctx context.Context, target string) ([]Entry, error) {
+func (hfFS) ListRecursive(ctx context.Context, target string, emit func(Entry) error) error {
 	hp, err := hf.Parse(target)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	hp.File = normalizeHFPrefix(hp.File)
 	files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	filtered := hfFilterFiles(files, hp.File)
 	sort.Strings(filtered)
-	out := make([]Entry, 0, len(filtered))
 	for _, file := range filtered {
 		if file == "" {
 			continue
 		}
 		fullFile := path.Join(hp.File, file)
-		out = append(out, Entry{
+		if err := emit(Entry{
 			Name:    file,
 			Path:    hf.Path{Repo: hp.Repo, File: fullFile}.String(),
 			Size:    hfUnknownSize,
 			IsDir:   false,
 			ModTime: time.Time{},
-		})
+		}); err != nil {
+			return err
+		}
 	}
-	return out, nil
+	return nil
 }
 
 func normalizeHFPrefix(prefix string) string {

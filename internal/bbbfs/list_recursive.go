@@ -9,30 +9,30 @@ import (
 
 // recursiveLister is implemented by backends that support efficient recursive listing.
 type recursiveLister interface {
-	ListRecursive(ctx context.Context, root string) ([]Entry, error)
+	ListRecursive(ctx context.Context, root string, emit func(Entry) error) error
 }
 
-// ListRecursive lists all files under the path, using provider-specific recursive
-// listing when available, and falling back to List and Stat-based traversal.
-func ListRecursive(ctx context.Context, root string) ([]Entry, error) {
+// ListRecursive streams all files under the path via the emit callback, using
+// provider-specific recursive listing when available, and falling back to
+// List and Stat-based traversal.
+func ListRecursive(ctx context.Context, root string, emit func(Entry) error) error {
 	fs := Resolve(root)
 
 	if rl, ok := fs.(recursiveLister); ok {
-		return rl.ListRecursive(ctx, root)
+		return rl.ListRecursive(ctx, root, emit)
 	}
 	isRemote := strings.Contains(root, "://")
-	return listRecursive(ctx, fs, root, root, "", isRemote)
+	return listRecursive(ctx, fs, root, root, "", isRemote, emit)
 }
 
-func listRecursive(ctx context.Context, fs FS, root, current, relPrefix string, isRemote bool) ([]Entry, error) {
+func listRecursive(ctx context.Context, fs FS, root, current, relPrefix string, isRemote bool, emit func(Entry) error) error {
 	entries, err := fs.List(ctx, current)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	out := make([]Entry, 0, len(entries))
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		childName := strings.TrimSuffix(entry.Name, "/")
 		if childName == "" {
@@ -51,16 +51,14 @@ func listRecursive(ctx context.Context, fs FS, root, current, relPrefix string, 
 			}
 		}
 		if entry.IsDir {
-			childEntries, err := listRecursive(ctx, fs, root, childPath, childRel, isRemote)
-			if err != nil {
-				return nil, err
+			if err := listRecursive(ctx, fs, root, childPath, childRel, isRemote, emit); err != nil {
+				return err
 			}
-			out = append(out, childEntries...)
 			continue
 		}
 		stat, err := fs.Stat(ctx, childPath)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !isRemote {
 			if relPath, relErr := filepath.Rel(root, stat.Path); relErr == nil {
@@ -72,7 +70,9 @@ func listRecursive(ctx context.Context, fs FS, root, current, relPrefix string, 
 			stat.Name = childRel
 		}
 		stat.Path = childPath
-		out = append(out, stat)
+		if err := emit(stat); err != nil {
+			return err
+		}
 	}
-	return out, nil
+	return nil
 }
