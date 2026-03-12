@@ -1199,10 +1199,12 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 						if !ok {
 							return
 						}
+						slog.Debug("cp: start", "src", task.src, "dst", task.dst)
 						if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst); err != nil {
 							setErr(err)
 							return
 						}
+						slog.Debug("cp: done", "src", task.src, "dst", task.dst)
 						if taskfileState != "" {
 							if err := stateAppender.append(task.key); err != nil {
 								setErr(err)
@@ -1305,6 +1307,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 							case <-workerCtx.Done():
 								return
 							case taskCh <- pt:
+								slog.Debug("cp: queued", "src", pt.src, "dst", pt.dst)
 								queued.Store(true)
 								if taskProgress != nil {
 									taskProgress.SetTotal(clampProgressTotal(totalPending.Add(1)))
