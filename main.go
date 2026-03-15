@@ -570,6 +570,25 @@ func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progre
 	return bar
 }
 
+// newStreamingProgressBar creates a progress bar with total=0 for streaming
+// mode where the total grows dynamically as items are discovered. The bar
+// stays invisible until the first SetTotal call with a positive value.
+func newStreamingProgressBar(label string, quiet bool) *progressBar {
+	if quiet || !isTerminal(os.Stderr) {
+		return nil
+	}
+	bar := &progressBar{
+		label:     label,
+		width:     28,
+		showSpeed: false,
+		startedAt: time.Now(),
+	}
+	bar.lastDone.Store(progressUninitialized)
+	bar.lastTotal.Store(progressUninitialized)
+	// total starts at 0; bar won't render until SetTotal(>0) is called.
+	return bar
+}
+
 func (p *progressBar) Increment() {
 	if p == nil {
 		return
@@ -592,7 +611,16 @@ func (p *progressBar) SetTotal(total int64) {
 	if total < 1 {
 		total = 1
 	}
-	p.total.Store(total)
+	// Monotonically increasing: only allow total to grow, never shrink.
+	for {
+		cur := p.total.Load()
+		if total <= cur {
+			return
+		}
+		if p.total.CompareAndSwap(cur, total) {
+			break
+		}
+	}
 	if p.done.Load() < total {
 		p.finished.Store(false)
 	}
@@ -1169,11 +1197,10 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		// Use len(tasks) as the progress bar floor: each task pair represents
-		// at least 1 unit of work. As directory expansion discovers individual
-		// files, the total grows beyond this floor but never shrinks below it.
-		totalFloor := int64(max(len(tasks), minProgressTotal))
-		taskProgress := newProgressBar(int(totalFloor), "cp files", quiet, false)
+		// Streaming progress bar: total starts at 0 and grows as files are
+		// discovered during expansion. The bar stays invisible until the
+		// first file is found, then updates on every change.
+		taskProgress := newStreamingProgressBar("cp files", quiet)
 		defer func() {
 			if taskProgress != nil {
 				taskProgress.Finish()
@@ -1285,7 +1312,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								lockedFprintf(os.Stderr, "cp: skip already completed task %s -> %s\n", task.src, task.dst)
 							}
 							if taskProgress != nil {
-								taskProgress.SetTotal(max(totalFloor, totalPending.Add(1)))
+								taskProgress.SetTotal(totalPending.Add(1))
 								taskProgress.Increment()
 							}
 							continue
@@ -1311,7 +1338,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 									lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
 								}
 								if taskProgress != nil && inState {
-									taskProgress.SetTotal(max(totalFloor, totalPending.Add(1)))
+									taskProgress.SetTotal(totalPending.Add(1))
 									taskProgress.Increment()
 								}
 								return nil
@@ -1325,7 +1352,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								slog.Debug("cp: queued", "src", expandedTask.src, "dst", expandedTask.dst)
 								queued.Store(true)
 								if taskProgress != nil {
-									taskProgress.SetTotal(max(totalFloor, totalPending.Add(1)))
+									taskProgress.SetTotal(totalPending.Add(1))
 								}
 							}
 							return nil
@@ -1340,7 +1367,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 						// Reconcile progress bar total after expansion completes
 						// so it reflects all discovered files (queued + skipped).
 						if taskProgress != nil {
-							taskProgress.SetTotal(max(totalFloor, totalPending.Load()))
+							taskProgress.SetTotal(totalPending.Load())
 						}
 						if tracker != nil {
 							tracker.remaining.Store(pendingCount)
