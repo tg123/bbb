@@ -553,13 +553,6 @@ const (
 	ansiClear = "\033[K"
 )
 
-func clampProgressTotal(total int64) int64 {
-	if total < int64(minProgressTotal) {
-		return int64(minProgressTotal)
-	}
-	return total
-}
-
 func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progressBar {
 	if quiet || total <= 1 || !isTerminal(os.Stderr) {
 		return nil
@@ -1176,7 +1169,11 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		taskProgress := newProgressBar(minProgressTotal, "cp files", quiet, false)
+		// Use len(tasks) as the progress bar floor: each task pair represents
+		// at least 1 unit of work. As directory expansion discovers individual
+		// files, the total grows beyond this floor but never shrinks below it.
+		totalFloor := int64(max(len(tasks), minProgressTotal))
+		taskProgress := newProgressBar(int(totalFloor), "cp files", quiet, false)
 		defer func() {
 			if taskProgress != nil {
 				taskProgress.Finish()
@@ -1288,7 +1285,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								lockedFprintf(os.Stderr, "cp: skip already completed task %s -> %s\n", task.src, task.dst)
 							}
 							if taskProgress != nil {
-								taskProgress.SetTotal(clampProgressTotal(totalPending.Add(1)))
+								taskProgress.SetTotal(max(totalFloor, totalPending.Add(1)))
 								taskProgress.Increment()
 							}
 							continue
@@ -1314,7 +1311,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 									lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
 								}
 								if taskProgress != nil && inState {
-									taskProgress.SetTotal(clampProgressTotal(totalPending.Add(1)))
+									taskProgress.SetTotal(max(totalFloor, totalPending.Add(1)))
 									taskProgress.Increment()
 								}
 								return nil
@@ -1328,7 +1325,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 								slog.Debug("cp: queued", "src", expandedTask.src, "dst", expandedTask.dst)
 								queued.Store(true)
 								if taskProgress != nil {
-									taskProgress.SetTotal(clampProgressTotal(totalPending.Add(1)))
+									taskProgress.SetTotal(max(totalFloor, totalPending.Add(1)))
 								}
 							}
 							return nil
