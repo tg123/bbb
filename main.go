@@ -283,6 +283,15 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	// If listing returns nothing and no wildcard was used, the target
+	// may be a file rather than a directory. Fall back to Stat so that
+	// single-file paths (e.g. az://account/container/blob) are shown.
+	if len(entries) == 0 && pattern == "" {
+		st, statErr := fs.Stat(ctx, parentPath)
+		if statErr == nil && !st.IsDir {
+			entries = []bbbfs.Entry{st}
+		}
+	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	for _, entry := range entries {
 		name := entry.Name
