@@ -96,7 +96,7 @@ func main() {
 				lvl = slog.LevelInfo
 			}
 			handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
-			slog.SetDefault(slog.New(handler))
+			slog.SetDefault(slog.New(&barAwareHandler{inner: handler}))
 			slog.Debug("Logger initialized", "level", lvlStr)
 			return ctx, nil
 		},
@@ -518,6 +518,34 @@ func lockedFprintf(w io.Writer, format string, args ...any) {
 		fmt.Fprintln(os.Stderr, err)
 	}
 	rerenderActiveBar()
+}
+
+// barAwareHandler wraps an slog.Handler so log output coordinates with the
+// pinned progress bar. It clears the active bar before writing and
+// re-renders it after, preventing log lines from clobbering the bar.
+type barAwareHandler struct {
+	inner slog.Handler
+}
+
+func (h *barAwareHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h *barAwareHandler) Handle(ctx context.Context, r slog.Record) error {
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	clearActiveBar()
+	err := h.inner.Handle(ctx, r)
+	rerenderActiveBar()
+	return err
+}
+
+func (h *barAwareHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &barAwareHandler{inner: h.inner.WithAttrs(attrs)}
+}
+
+func (h *barAwareHandler) WithGroup(name string) slog.Handler {
+	return &barAwareHandler{inner: h.inner.WithGroup(name)}
 }
 
 func isTerminal(f *os.File) bool {
