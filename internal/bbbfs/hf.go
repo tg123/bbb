@@ -2,6 +2,7 @@ package bbbfs
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"path"
 	"sort"
@@ -75,10 +76,26 @@ func (hfFS) Stat(ctx context.Context, target string) (Entry, error) {
 			ModTime: time.Time{},
 		}, nil
 	}
+	// Verify the file actually exists in the repo listing.
+	files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
+	if err != nil {
+		return Entry{}, err
+	}
+	normalized := normalizeHFPrefix(hp.File)
+	found := false
+	for _, f := range files {
+		if f == normalized {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return Entry{}, fmt.Errorf("hf: file not found: %s", target)
+	}
 	return Entry{
 		Name:    path.Base(hp.File),
 		Path:    hp.String(),
-		Size:    hfUnknownSize, // HF API doesn't expose size/modtime for single file metadata.
+		Size:    hfUnknownSize,
 		IsDir:   false,
 		ModTime: time.Time{},
 	}, nil
