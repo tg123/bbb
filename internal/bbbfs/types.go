@@ -26,6 +26,12 @@ type Entry struct {
 	ModTime time.Time
 }
 
+// ListResult wraps an Entry with an optional error from a listing operation.
+type ListResult struct {
+	Entry Entry
+	Err   error
+}
+
 // HFScheme is the scheme prefix for Hugging Face paths.
 const HFScheme = "hf://"
 

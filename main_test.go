@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -165,6 +167,453 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 	}
 }
 
+func TestCmdCPTaskfileStateRecovery(t *testing.T) {
+	dir := t.TempDir()
+	srcOk := filepath.Join(dir, "ok.txt")
+	dstOk := filepath.Join(dir, "out-ok.txt")
+	if err := os.WriteFile(srcOk, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(srcOk+" "+dstOk+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+
+	stateFile := filepath.Join(dir, "tasks.state")
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("cp failed: %v", err)
+	}
+	if _, err := os.Stat(dstOk); err != nil {
+		t.Fatalf("expected copied file: %v", err)
+	}
+	if err := os.Remove(srcOk); err != nil {
+		t.Fatalf("remove src: %v", err)
+	}
+	if err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("cp resume failed: %v", err)
+	}
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read statefile: %v", err)
+	}
+	if strings.TrimSpace(string(stateData)) == "" {
+		t.Fatalf("expected non-empty statefile")
+	}
+}
+
+func TestLoadTaskPairsLongLine(t *testing.T) {
+	dir := t.TempDir()
+	longSrc := strings.Repeat("a", 70*1024)
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(longSrc+" dst\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	tasks, err := loadTaskPairs(taskfile)
+	if err != nil {
+		t.Fatalf("loadTaskPairs failed: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].src != longSrc || tasks[0].dst != "dst" {
+		t.Fatalf("unexpected parsed tasks: %+v", tasks)
+	}
+}
+
+func TestLoadTaskPairsRejectsWhitespacePaths(t *testing.T) {
+	dir := t.TempDir()
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte("a b c\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	_, err := loadTaskPairs(taskfile)
+	if err == nil {
+		t.Fatal("expected parse error")
+	}
+	if !strings.Contains(err.Error(), "paths with spaces are not supported") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCmdCPTaskfileStateRecoverySkipsFinishedTask(t *testing.T) {
+	dir := t.TempDir()
+	srcMissing := filepath.Join(dir, "missing.txt")
+	srcOK := filepath.Join(dir, "ok.txt")
+	dstDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	if err := os.WriteFile(srcOK, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(strings.Join([]string{
+		srcMissing + " " + dstDir,
+		srcOK + " " + dstDir,
+		"",
+	}, "\n")), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+
+	stateFile := filepath.Join(dir, "tasks.state")
+	skippedKey := taskStateKey(srcMissing, dstDir)
+	if err := os.WriteFile(stateFile, []byte(skippedKey+"\n"), 0o644); err != nil {
+		t.Fatalf("write statefile: %v", err)
+	}
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stderr: %v", err)
+	}
+	os.Stderr = w
+	runErr := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile})
+	if err := w.Close(); err != nil {
+		t.Fatalf("close write pipe: %v", err)
+	}
+	os.Stderr = origStderr
+	stderrOut, readErr := io.ReadAll(r)
+	if err := r.Close(); err != nil {
+		t.Fatalf("close read pipe: %v", err)
+	}
+	if runErr != nil {
+		t.Fatalf("cp recovery failed: %v", runErr)
+	}
+	if readErr != nil {
+		t.Fatalf("read stderr: %v", readErr)
+	}
+	expectedSkipMsg := "cp: skip already copied " + srcMissing + " -> " + dstDir
+	if !strings.Contains(string(stderrOut), expectedSkipMsg) {
+		t.Fatalf("expected skip message in stderr, got %q", string(stderrOut))
+	}
+	expectedListingMissing := "cp: listing " + srcMissing + " -> " + dstDir
+	if !strings.Contains(string(stderrOut), expectedListingMissing) {
+		t.Fatalf("expected listing message for first task in stderr, got %q", string(stderrOut))
+	}
+	expectedListingOK := "cp: listing " + srcOK + " -> " + dstDir
+	if !strings.Contains(string(stderrOut), expectedListingOK) {
+		t.Fatalf("expected listing message for second task in stderr, got %q", string(stderrOut))
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, filepath.Base(srcOK))); err != nil {
+		t.Fatalf("expected copied file: %v", err)
+	}
+
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read statefile: %v", err)
+	}
+	stateText := string(stateData)
+	if !strings.Contains(stateText, skippedKey) {
+		t.Fatalf("expected skipped task key in statefile")
+	}
+	if !strings.Contains(stateText, taskStateKey(srcOK, dstDir)) {
+		t.Fatalf("expected completed task key in statefile")
+	}
+}
+
+func TestCmdCPTaskfileStateRecoveryPartialTask(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	dstDir := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write src a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatalf("write src b: %v", err)
+	}
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dstDir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("seed partial dst: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(srcDir+" "+dstDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "tasks.state")
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("cp partial recovery failed: %v", err)
+	}
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if _, err := os.Stat(filepath.Join(dstDir, name)); err != nil {
+			t.Fatalf("expected copied file %s: %v", name, err)
+		}
+	}
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read statefile: %v", err)
+	}
+	stateText := string(stateData)
+	if !strings.Contains(stateText, taskStateKey(filepath.Join(srcDir, "a.txt"), dstDir)) {
+		t.Fatalf("expected a.txt task key in statefile")
+	}
+	if !strings.Contains(stateText, taskStateKey(filepath.Join(srcDir, "b.txt"), dstDir)) {
+		t.Fatalf("expected b.txt task key in statefile")
+	}
+}
+
+func TestCmdCPTaskfileStateRecoveryPartialTaskSkipsFinishedFile(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	dstDir := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "a.txt"), []byte("new-a"), 0o644); err != nil {
+		t.Fatalf("write src a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "b.txt"), []byte("new-b"), 0o644); err != nil {
+		t.Fatalf("write src b: %v", err)
+	}
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dstDir, "a.txt"), []byte("old-a"), 0o644); err != nil {
+		t.Fatalf("seed dst a: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(srcDir+" "+dstDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "tasks.state")
+	skippedKey := taskStateKey(filepath.Join(srcDir, "a.txt"), dstDir)
+	if err := os.WriteFile(stateFile, []byte(skippedKey+"\n"), 0o644); err != nil {
+		t.Fatalf("write statefile: %v", err)
+	}
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("cp partial recovery failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, "b.txt")); err != nil {
+		t.Fatalf("expected copied file b.txt: %v", err)
+	}
+	dstA, err := os.ReadFile(filepath.Join(dstDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("read dst a: %v", err)
+	}
+	if string(dstA) != "old-a" {
+		t.Fatalf("expected a.txt to be skipped, got content %q", string(dstA))
+	}
+}
+
+func TestCmdCPTaskfileStateHumanReadable(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	dstDir := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write src a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatalf("write src b: %v", err)
+	}
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(srcDir+" "+dstDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "tasks.state")
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("cp failed: %v", err)
+	}
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read statefile: %v", err)
+	}
+	stateText := string(stateData)
+	// File-level keys should be human-readable src -> dst
+	expectedA := filepath.Join(srcDir, "a.txt") + " -> " + dstDir
+	expectedB := filepath.Join(srcDir, "b.txt") + " -> " + dstDir
+	if !strings.Contains(stateText, expectedA) {
+		t.Fatalf("expected human-readable key for a.txt in statefile, got:\n%s", stateText)
+	}
+	if !strings.Contains(stateText, expectedB) {
+		t.Fatalf("expected human-readable key for b.txt in statefile, got:\n%s", stateText)
+	}
+	// Task checkpoint should be present
+	expectedCheckpoint := "TASK\t" + srcDir + " -> " + dstDir
+	if !strings.Contains(stateText, expectedCheckpoint) {
+		t.Fatalf("expected task checkpoint in statefile, got:\n%s", stateText)
+	}
+}
+
+func TestCmdCPTaskfileStateCheckpointSkipsExpansion(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	dstDir := filepath.Join(dir, "dst")
+	// Source does not exist — if expansion is attempted it would fail or return empty
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "tasks.txt")
+	if err := os.WriteFile(taskfile, []byte(srcDir+" "+dstDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "tasks.state")
+	// Pre-seed task checkpoint
+	checkpoint := "TASK\t" + srcDir + " -> " + dstDir + "\n"
+	if err := os.WriteFile(stateFile, []byte(checkpoint), 0o644); err != nil {
+		t.Fatalf("write statefile: %v", err)
+	}
+
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stderr: %v", err)
+	}
+	os.Stderr = w
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	runErr := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile})
+	if err := w.Close(); err != nil {
+		t.Fatalf("close write pipe: %v", err)
+	}
+	os.Stderr = origStderr
+	stderrOut, readErr := io.ReadAll(r)
+	if err := r.Close(); err != nil {
+		t.Fatalf("close read pipe: %v", err)
+	}
+	if runErr != nil {
+		t.Fatalf("cp failed: %v", runErr)
+	}
+	if readErr != nil {
+		t.Fatalf("read stderr: %v", readErr)
+	}
+	// Should see the task-level skip message, not a listing message
+	if !strings.Contains(string(stderrOut), "cp: skip already completed task") {
+		t.Fatalf("expected task checkpoint skip message, got:\n%s", string(stderrOut))
+	}
+	if strings.Contains(string(stderrOut), "cp: listing") {
+		t.Fatalf("expansion should be skipped for checkpointed task, got:\n%s", string(stderrOut))
+	}
+}
+
+func TestCmdSyncTaskfile(t *testing.T) {
+	dir := t.TempDir()
+	srcA := filepath.Join(dir, "src-a")
+	dstA := filepath.Join(dir, "dst-a")
+	srcB := filepath.Join(dir, "src-b")
+	dstB := filepath.Join(dir, "dst-b")
+	if err := os.MkdirAll(srcA, 0o755); err != nil {
+		t.Fatalf("mkdir srcA: %v", err)
+	}
+	if err := os.MkdirAll(srcB, 0o755); err != nil {
+		t.Fatalf("mkdir srcB: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcA, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write srcA: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcB, "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatalf("write srcB: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "sync.tasks")
+	content := strings.Join([]string{srcA + " " + dstA, srcB + " " + dstB, ""}, "\n")
+	if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+
+	app := &cli.Command{
+		Action: cmdSync,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "dry-run"},
+			&cli.BoolFlag{Name: "delete"},
+			&cli.StringFlag{Name: "x"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.StringFlag{Name: "taskfile"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"sync", "--taskfile", taskfile}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstA, "a.txt")); err != nil {
+		t.Fatalf("expected synced file A: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstB, "b.txt")); err != nil {
+		t.Fatalf("expected synced file B: %v", err)
+	}
+}
+
 func TestRunOpPoolProcessesAll(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -208,6 +657,51 @@ func TestRetryOpRetries(t *testing.T) {
 	}
 	if attempts != 3 {
 		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+func TestRetryOpFailFast401(t *testing.T) {
+	ctx := context.Background()
+	attempts := 0
+	err := retryOp(ctx, 5, func() error {
+		attempts++
+		return fmt.Errorf("wrapped: %w", &hf.HTTPStatusError{StatusCode: 401, Status: "401 Unauthorized"})
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected 1 attempt (fail fast), got %d", attempts)
+	}
+}
+
+func TestRetryOpFailFast403(t *testing.T) {
+	ctx := context.Background()
+	attempts := 0
+	err := retryOp(ctx, 5, func() error {
+		attempts++
+		return fmt.Errorf("wrapped: %w", &hf.HTTPStatusError{StatusCode: 403, Status: "403 Forbidden"})
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected 1 attempt (fail fast), got %d", attempts)
+	}
+}
+
+func TestRetryOpRetries500(t *testing.T) {
+	ctx := context.Background()
+	attempts := 0
+	err := retryOp(ctx, 2, func() error {
+		attempts++
+		return fmt.Errorf("wrapped: %w", &hf.HTTPStatusError{StatusCode: 500, Status: "500 Internal Server Error"})
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts for 500, got %d", attempts)
 	}
 }
 
