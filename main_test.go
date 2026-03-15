@@ -693,10 +693,13 @@ func TestRetryOpFailFast403(t *testing.T) {
 func TestRetryOpRetries500(t *testing.T) {
 	ctx := context.Background()
 	attempts := 0
-	_ = retryOp(ctx, 2, func() error {
+	err := retryOp(ctx, 2, func() error {
 		attempts++
 		return fmt.Errorf("wrapped: %w", &hf.HTTPStatusError{StatusCode: 500, Status: "500 Internal Server Error"})
 	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
 	if attempts != 3 {
 		t.Fatalf("expected 3 attempts for 500, got %d", attempts)
 	}

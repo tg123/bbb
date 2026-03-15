@@ -824,16 +824,12 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 // indicating an authentication/authorization failure that should not be retried.
 func isNonRetryableHTTPErr(err error) bool {
 	var hfErr *hf.HTTPStatusError
-	if errors.As(err, &hfErr) {
-		if hfErr.StatusCode == 401 || hfErr.StatusCode == 403 {
-			return true
-		}
+	if errors.As(err, &hfErr) && (hfErr.StatusCode == 401 || hfErr.StatusCode == 403) {
+		return true
 	}
 	var azErr *azcore.ResponseError
-	if errors.As(err, &azErr) {
-		if azErr.StatusCode == 401 || azErr.StatusCode == 403 {
-			return true
-		}
+	if errors.As(err, &azErr) && (azErr.StatusCode == 401 || azErr.StatusCode == 403) {
+		return true
 	}
 	return false
 }
