@@ -1311,7 +1311,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 									lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
 								}
 								if taskProgress != nil && inState {
-									taskProgress.SetTotal(max(totalFloor, totalPending.Add(1)))
+									totalPending.Add(1)
 									taskProgress.Increment()
 								}
 								return nil
@@ -1336,6 +1336,11 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 						}); err != nil {
 							setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
 							return
+						}
+						// Reconcile progress bar total after expansion completes
+						// so it reflects all discovered files (queued + skipped).
+						if taskProgress != nil {
+							taskProgress.SetTotal(max(totalFloor, totalPending.Load()))
 						}
 						if tracker != nil {
 							tracker.remaining.Store(pendingCount)
