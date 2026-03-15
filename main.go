@@ -287,6 +287,15 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	// If listing returns nothing and no wildcard was used, the target
+	// may be a file rather than a directory. Fall back to Stat so that
+	// single-file paths (e.g. az://account/container/blob) are shown.
+	if len(entries) == 0 && pattern == "" {
+		st, statErr := fs.Stat(ctx, parentPath)
+		if statErr == nil && !st.IsDir {
+			entries = []bbbfs.Entry{st}
+		}
+	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	for _, entry := range entries {
 		name := entry.Name
@@ -403,20 +412,20 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 }
 
 func splitWildcard(target string) (string, string) {
-	if strings.Contains(target, "*") {
-		starIdx := strings.Index(target, "*")
-		if schemeIdx := strings.Index(target, "://"); schemeIdx >= 0 && schemeIdx < starIdx {
-			pathStart := schemeIdx + len("://")
-			if !strings.Contains(target[pathStart:starIdx], "/") {
-				return target, "*"
-			}
-		}
-		if lastSlash := strings.LastIndex(target[:starIdx], "/"); lastSlash >= 0 {
-			return target[:lastSlash+1], target[lastSlash+1:]
-		}
-		return target, "*"
+	metaIdx := strings.IndexAny(target, "*?[")
+	if metaIdx < 0 {
+		return target, ""
 	}
-	return target, ""
+	if schemeIdx := strings.Index(target, "://"); schemeIdx >= 0 && schemeIdx < metaIdx {
+		pathStart := schemeIdx + len("://")
+		if !strings.Contains(target[pathStart:metaIdx], "/") {
+			return target, "*"
+		}
+	}
+	if lastSlash := strings.LastIndex(target[:metaIdx], "/"); lastSlash >= 0 {
+		return target[:lastSlash+1], target[lastSlash+1:]
+	}
+	return target, "*"
 }
 
 func cmdCat(ctx context.Context, c *cli.Command) error {

@@ -367,6 +367,34 @@ func TestBasic(t *testing.T) {
 
 	}
 
+	// ls single file (stat fallback for exact blob path)
+	{
+		singleFile := "az://" + azuriteAccount + "/test/testfile.txt"
+		files, err := bbbLs(singleFile, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{singleFile}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls single file: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls single file in subdirectory
+	{
+		singleFile := "az://" + azuriteAccount + "/test/dir/testfile.txt"
+		files, err := bbbLs(singleFile, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{singleFile}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls single file in subdir: got %v, want %v", files, expected)
+		}
+	}
+
 	// lsr
 	{
 		files, err := bbbLs("az://"+azuriteAccount+"/test", true)
@@ -404,6 +432,38 @@ func TestBasic(t *testing.T) {
 
 		if !slices.Equal(files, expected) {
 			t.Errorf("unexpected files: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls with ? wildcard
+	{
+		files, err := bbbLs("az://"+azuriteAccount+"/test/testfile?.txt", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls ? wildcard: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls with [char class] wildcard
+	{
+		files, err := bbbLs("az://"+azuriteAccount+"/test/testfile[0-9].txt", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls [char class] wildcard: got %v, want %v", files, expected)
 		}
 	}
 
