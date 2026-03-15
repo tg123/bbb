@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -656,6 +657,48 @@ func TestRetryOpRetries(t *testing.T) {
 	}
 	if attempts != 3 {
 		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+func TestRetryOpFailFast401(t *testing.T) {
+	ctx := context.Background()
+	attempts := 0
+	err := retryOp(ctx, 5, func() error {
+		attempts++
+		return fmt.Errorf("wrapped: %w", &hf.HTTPStatusError{StatusCode: 401, Status: "401 Unauthorized"})
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected 1 attempt (fail fast), got %d", attempts)
+	}
+}
+
+func TestRetryOpFailFast403(t *testing.T) {
+	ctx := context.Background()
+	attempts := 0
+	err := retryOp(ctx, 5, func() error {
+		attempts++
+		return fmt.Errorf("wrapped: %w", &hf.HTTPStatusError{StatusCode: 403, Status: "403 Forbidden"})
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected 1 attempt (fail fast), got %d", attempts)
+	}
+}
+
+func TestRetryOpRetries500(t *testing.T) {
+	ctx := context.Background()
+	attempts := 0
+	_ = retryOp(ctx, 2, func() error {
+		attempts++
+		return fmt.Errorf("wrapped: %w", &hf.HTTPStatusError{StatusCode: 500, Status: "500 Internal Server Error"})
+	})
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts for 500, got %d", attempts)
 	}
 }
 

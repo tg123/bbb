@@ -24,6 +24,8 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+
 	"github.com/tg123/bbb/internal/azblob"
 	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/fsops"
@@ -818,6 +820,24 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 	return errors.Join(collected...)
 }
 
+// isNonRetryableHTTPErr returns true if err contains an HTTP 401 or 403 status,
+// indicating an authentication/authorization failure that should not be retried.
+func isNonRetryableHTTPErr(err error) bool {
+	var hfErr *hf.HTTPStatusError
+	if errors.As(err, &hfErr) {
+		if hfErr.StatusCode == 401 || hfErr.StatusCode == 403 {
+			return true
+		}
+	}
+	var azErr *azcore.ResponseError
+	if errors.As(err, &azErr) {
+		if azErr.StatusCode == 401 || azErr.StatusCode == 403 {
+			return true
+		}
+	}
+	return false
+}
+
 func retryOp(ctx context.Context, retryCount int, op func() error) error {
 	if retryCount < 0 {
 		retryCount = 0
@@ -830,6 +850,9 @@ func retryOp(ctx context.Context, retryCount int, op func() error) error {
 		err = op()
 		if err == nil {
 			return nil
+		}
+		if isNonRetryableHTTPErr(err) {
+			return err
 		}
 	}
 	return err
