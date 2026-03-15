@@ -405,20 +405,20 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 }
 
 func splitWildcard(target string) (string, string) {
-	if strings.Contains(target, "*") {
-		starIdx := strings.Index(target, "*")
-		if schemeIdx := strings.Index(target, "://"); schemeIdx >= 0 && schemeIdx < starIdx {
-			pathStart := schemeIdx + len("://")
-			if !strings.Contains(target[pathStart:starIdx], "/") {
-				return target, "*"
-			}
-		}
-		if lastSlash := strings.LastIndex(target[:starIdx], "/"); lastSlash >= 0 {
-			return target[:lastSlash+1], target[lastSlash+1:]
-		}
-		return target, "*"
+	metaIdx := strings.IndexAny(target, "*?[")
+	if metaIdx < 0 {
+		return target, ""
 	}
-	return target, ""
+	if schemeIdx := strings.Index(target, "://"); schemeIdx >= 0 && schemeIdx < metaIdx {
+		pathStart := schemeIdx + len("://")
+		if !strings.Contains(target[pathStart:metaIdx], "/") {
+			return target, "*"
+		}
+	}
+	if lastSlash := strings.LastIndex(target[:metaIdx], "/"); lastSlash >= 0 {
+		return target[:lastSlash+1], target[lastSlash+1:]
+	}
+	return target, "*"
 }
 
 func cmdCat(ctx context.Context, c *cli.Command) error {

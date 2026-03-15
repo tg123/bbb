@@ -304,6 +304,34 @@ func TestHFSplitWildcard(t *testing.T) {
 	}
 }
 
+func TestSplitWildcardGlobChars(t *testing.T) {
+	tests := []struct {
+		input      string
+		parentPath string
+		pattern    string
+	}{
+		// * wildcard
+		{"az://account/container/blob*", "az://account/container/", "blob*"},
+		{"az://account/container/dir/*.txt", "az://account/container/dir/", "*.txt"},
+		// ? wildcard
+		{"az://account/container/test?.txt", "az://account/container/", "test?.txt"},
+		{"az://account/container/dir/test?.txt", "az://account/container/dir/", "test?.txt"},
+		// [ character class
+		{"az://account/container/test[0-9].txt", "az://account/container/", "test[0-9].txt"},
+		{"az://account/container/dir/test[0-9].txt", "az://account/container/dir/", "test[0-9].txt"},
+		// no wildcard
+		{"az://account/container/blob", "az://account/container/blob", ""},
+		// wildcard in scheme authority
+		{"az://account*", "az://account*", "*"},
+	}
+	for _, tc := range tests {
+		parentPath, pattern := splitWildcard(tc.input)
+		if parentPath != tc.parentPath || pattern != tc.pattern {
+			t.Errorf("splitWildcard(%q) = (%q, %q), want (%q, %q)", tc.input, parentPath, pattern, tc.parentPath, tc.pattern)
+		}
+	}
+}
+
 func TestWriteStreamToFile(t *testing.T) {
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "nested", "file.txt")

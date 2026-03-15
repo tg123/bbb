@@ -356,6 +356,38 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+	// ls with ? wildcard
+	{
+		files, err := bbbLs("az://"+azuriteAccount+"/test/testfile?.txt", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls ? wildcard: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls with [char class] wildcard
+	{
+		files, err := bbbLs("az://"+azuriteAccount+"/test/testfile[0-9].txt", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls [char class] wildcard: got %v, want %v", files, expected)
+		}
+	}
+
 	// cp az az (directory-style destination)
 	{
 		_, err := runBBB("cp", "az://"+azuriteAccount+"/test/testfile.txt", "az://"+azuriteAccount+"/test/dir2/")
