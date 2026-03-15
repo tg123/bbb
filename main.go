@@ -1148,7 +1148,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		taskProgress := newProgressBar(max(len(tasks), minProgressTotal), "cp files", quiet, false)
+		taskProgress := newProgressBar(minProgressTotal, "cp files", quiet, false)
 		defer func() {
 			if taskProgress != nil {
 				taskProgress.Finish()
