@@ -1311,6 +1311,8 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 									lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
 								}
 								if taskProgress != nil && inState {
+									// Track discovered file but don't call SetTotal here;
+									// total is reconciled after expansion completes.
 									totalPending.Add(1)
 									taskProgress.Increment()
 								}
