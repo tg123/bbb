@@ -1298,6 +1298,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 		innerConcurrency := 1
 		innerQuiet := true
+		showCopyBars := !quiet
 		workerCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
@@ -1332,7 +1333,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 							return
 						}
 						slog.Debug("cp: start", "src", task.src, "dst", task.dst)
-						if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, !quiet); err != nil {
+						if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, showCopyBars); err != nil {
 							setErr(err)
 							return
 						}
