@@ -856,3 +856,29 @@ func TestWriteStreamToFile(t *testing.T) {
 		t.Fatalf("unexpected content: %s", data)
 	}
 }
+
+func TestFormatSize(t *testing.T) {
+	tests := []struct {
+		bytes int64
+		want  string
+	}{
+		{0, "0 B"},
+		{1, "1 B"},
+		{512, "512 B"},
+		{1023, "1023 B"},
+		{1024, "1.0 KiB"},
+		{1536, "1.5 KiB"},
+		{1048576, "1.0 MiB"},
+		{1073741824, "1.0 GiB"},
+		{1099511627776, "1.0 TiB"},
+		{-1, "0 B"},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%d", tt.bytes), func(t *testing.T) {
+			got := formatSize(tt.bytes)
+			if got != tt.want {
+				t.Errorf("formatSize(%d) = %q, want %q", tt.bytes, got, tt.want)
+			}
+		})
+	}
+}
