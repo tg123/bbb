@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -972,5 +974,125 @@ func TestWriteStreamToFile(t *testing.T) {
 	}
 	if string(data) != content {
 		t.Fatalf("unexpected content: %s", data)
+	}
+}
+
+func TestFormatSize(t *testing.T) {
+	tests := []struct {
+		bytes int64
+		want  string
+	}{
+		{0, "0 B"},
+		{1, "1 B"},
+		{512, "512 B"},
+		{1023, "1023 B"},
+		{1024, "1.0 KiB"},
+		{1536, "1.5 KiB"},
+		{1048576, "1.0 MiB"},
+		{1073741824, "1.0 GiB"},
+		{1099511627776, "1.0 TiB"},
+		{-1, "0 B"},
+		// boundary: just below 1 MiB must stay in KiB, not round up
+		{1048575, "1023.9 KiB"},
+		// large value beyond float64 exact integer range
+		{1<<53 + 1, "8192.0 TiB"},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%d", tt.bytes), func(t *testing.T) {
+			got := formatSize(tt.bytes)
+			if got != tt.want {
+				t.Errorf("formatSize(%d) = %q, want %q", tt.bytes, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDNSLoggingDialContextPassesThrough(t *testing.T) {
+	var dialedNetwork, dialedAddr string
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialedNetwork = network
+		dialedAddr = addr
+		return nil, errors.New("fake")
+	}
+	dial := dnsLoggingDialContext(baseDial, net.DefaultResolver)
+	_, _ = dial(context.Background(), "tcp", "example.com:443")
+	if dialedNetwork != "tcp" || dialedAddr != "example.com:443" {
+		t.Fatalf("expected baseDial to receive original addr, got %s %s", dialedNetwork, dialedAddr)
+	}
+}
+
+func TestDNSLoggingDialContextLogsOnDebug(t *testing.T) {
+	orig := slog.Default()
+	var buf strings.Builder
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	slog.SetDefault(slog.New(handler))
+	defer slog.SetDefault(orig)
+
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("fake")
+	}
+	dial := dnsLoggingDialContext(baseDial, net.DefaultResolver)
+	_, _ = dial(context.Background(), "tcp", "localhost:80")
+	if !strings.Contains(buf.String(), "DNS lookup") {
+		t.Fatalf("expected DNS lookup log at debug level, got: %s", buf.String())
+	}
+}
+
+func TestDNSLoggingDialContextSilentOnInfo(t *testing.T) {
+	orig := slog.Default()
+	var buf strings.Builder
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
+	slog.SetDefault(slog.New(handler))
+	defer slog.SetDefault(orig)
+
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("fake")
+	}
+	dial := dnsLoggingDialContext(baseDial, net.DefaultResolver)
+	_, _ = dial(context.Background(), "tcp", "localhost:80")
+	if buf.Len() != 0 {
+		t.Fatalf("expected no log at info level, got: %s", buf.String())
+	}
+}
+
+func TestDNSLoggingDialContextBadAddr(t *testing.T) {
+	var called bool
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		called = true
+		return nil, errors.New("fake")
+	}
+	// Enable debug logging so the SplitHostPort error path is exercised.
+	orig := slog.Default()
+	var buf strings.Builder
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	slog.SetDefault(slog.New(handler))
+	defer slog.SetDefault(orig)
+
+	dial := dnsLoggingDialContext(baseDial, net.DefaultResolver)
+	_, _ = dial(context.Background(), "tcp", "no-port")
+	if !called {
+		t.Fatal("expected baseDial to be called on bad addr")
+	}
+	// SplitHostPort fails, so no DNS lookup should be attempted.
+	if strings.Contains(buf.String(), "DNS") {
+		t.Fatalf("expected no DNS log on bad addr, got: %s", buf.String())
+	}
+}
+
+func TestDNSLoggingDialContextResolverError(t *testing.T) {
+	orig := slog.Default()
+	var buf strings.Builder
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	slog.SetDefault(slog.New(handler))
+	defer slog.SetDefault(orig)
+
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("fake")
+	}
+	dial := dnsLoggingDialContext(baseDial, net.DefaultResolver)
+	// Use a hostname that won't resolve
+	_, _ = dial(context.Background(), "tcp", "this-host-does-not-exist-xyzzy.invalid:443")
+	if !strings.Contains(buf.String(), "DNS lookup error") {
+		t.Fatalf("expected DNS lookup error log, got: %s", buf.String())
 	}
 }
