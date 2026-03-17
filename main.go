@@ -68,6 +68,32 @@ func isHF(s string) bool {
 	return strings.HasPrefix(s, hfScheme)
 }
 
+type dialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// dnsLoggingDialContext wraps a base dialer to log DNS resolution results at
+// debug level before each connection. When debug logging is not enabled the
+// wrapper is a no-op and delegates directly to baseDial, so there is no extra
+// overhead in normal operation. The original address is always passed through
+// to baseDial, preserving Go's standard happy-eyeballs dialing behaviour.
+func dnsLoggingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dialContextFunc {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if slog.Default().Enabled(ctx, slog.LevelDebug) {
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil {
+				addrs, dnsErr := resolver.LookupHost(ctx, host)
+				if dnsErr != nil {
+					slog.Debug("DNS lookup error", "host", host, "error", dnsErr)
+				} else if len(addrs) == 0 {
+					slog.Debug("DNS lookup returned no addresses", "host", host)
+				} else {
+					slog.Debug("DNS lookup", "host", host, "addrs", addrs)
+				}
+			}
+		}
+		return baseDial(ctx, network, addr)
+	}
+}
+
 func main() {
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
@@ -103,34 +129,11 @@ func main() {
 
 			if transport, ok := http.DefaultTransport.(*http.Transport); ok {
 				transport = transport.Clone()
-				dialer := &net.Dialer{
+				baseDial := (&net.Dialer{
 					Timeout:   30 * time.Second,
 					KeepAlive: 30 * time.Second,
-				}
-				transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-					host, port, err := net.SplitHostPort(addr)
-					if err != nil {
-						return dialer.DialContext(ctx, network, addr)
-					}
-					addrs, dnsErr := net.DefaultResolver.LookupHost(ctx, host)
-					if dnsErr != nil || len(addrs) == 0 {
-						slog.Debug("DNS lookup failed", "host", host, "error", dnsErr)
-						return dialer.DialContext(ctx, network, addr)
-					}
-					slog.Debug("DNS lookup", "host", host, "addrs", addrs)
-					// Dial resolved addresses directly so the connection uses
-					// exactly the addresses we logged.
-					var lastErr error
-					for _, a := range addrs {
-						conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(a, port))
-						if err == nil {
-							slog.Debug("DNS dial connected", "host", host, "addr", a)
-							return conn, nil
-						}
-						lastErr = err
-					}
-					return nil, lastErr
-				}
+				}).DialContext
+				transport.DialContext = dnsLoggingDialContext(baseDial, net.DefaultResolver)
 				http.DefaultTransport = transport
 			}
 
