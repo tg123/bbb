@@ -2759,6 +2759,24 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		// If listing returns nothing and no wildcard was used, the target
+		// may be a single blob. Fall back to HeadBlob so that single-file
+		// paths (e.g. az://account/container/blob) are shown.
+		if count == 0 && pattern == "" {
+			if size, headErr := azblob.HeadBlob(ctx, ap); headErr == nil {
+				display := target
+				if relFlag {
+					display = path.Base(ap.Blob)
+				}
+				if machine {
+					fmt.Printf("f\t%d\t%s\t%s\n", size, "-", display)
+				} else {
+					fmt.Printf("%10s  %s  %s\n", formatSize(size), "-", display)
+				}
+				totalSize = size
+				count = 1
+			}
+		}
 		if !machine {
 			fmt.Printf("Listed %d files summing to %s (%d bytes)\n", count, formatSize(totalSize), totalSize)
 		}
@@ -2767,6 +2785,15 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 	if listErr != nil {
 		fmt.Fprintln(os.Stderr, listErr)
 		os.Exit(1)
+	}
+	// If listing returns nothing and no wildcard was used, the target
+	// may be a file rather than a directory. Fall back to Stat so that
+	// single-file paths are shown.
+	if len(list) == 0 && pattern == "" {
+		st, statErr := fs.Stat(ctx, parentPath)
+		if statErr == nil && !st.IsDir {
+			list = []bbbfs.Entry{st}
+		}
 	}
 	var totalSize int64
 	var count int
