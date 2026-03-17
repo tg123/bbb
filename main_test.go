@@ -873,6 +873,36 @@ func TestWriteStreamToFile(t *testing.T) {
 	}
 }
 
+func TestFormatSize(t *testing.T) {
+	tests := []struct {
+		bytes int64
+		want  string
+	}{
+		{0, "0 B"},
+		{1, "1 B"},
+		{512, "512 B"},
+		{1023, "1023 B"},
+		{1024, "1.0 KiB"},
+		{1536, "1.5 KiB"},
+		{1048576, "1.0 MiB"},
+		{1073741824, "1.0 GiB"},
+		{1099511627776, "1.0 TiB"},
+		{-1, "0 B"},
+		// boundary: just below 1 MiB must stay in KiB, not round up
+		{1048575, "1023.9 KiB"},
+		// large value beyond float64 exact integer range
+		{1<<53 + 1, "8192.0 TiB"},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%d", tt.bytes), func(t *testing.T) {
+			got := formatSize(tt.bytes)
+			if got != tt.want {
+				t.Errorf("formatSize(%d) = %q, want %q", tt.bytes, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDNSLoggingDialContextPassesThrough(t *testing.T) {
 	var dialedNetwork, dialedAddr string
 	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {

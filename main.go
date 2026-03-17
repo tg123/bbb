@@ -878,6 +878,37 @@ func formatFancyBar(label string, done, total int64, width int, speed float64, s
 	}
 }
 
+func formatSize(bytes int64) string {
+	if bytes < 0 {
+		bytes = 0
+	}
+	const (
+		kib int64 = 1024
+		mib       = 1024 * kib
+		gib       = 1024 * mib
+		tib       = 1024 * gib
+	)
+	// formatUnit formats bytes in terms of the given unit using integer
+	// arithmetic (no float64 conversion) and truncates to 1 decimal place.
+	formatUnit := func(b, unit int64, suffix string) string {
+		whole := b / unit
+		frac := (b % unit) * 10 / unit // truncated tenths
+		return fmt.Sprintf("%d.%d %s", whole, frac, suffix)
+	}
+	switch {
+	case bytes >= tib:
+		return formatUnit(bytes, tib, "TiB")
+	case bytes >= gib:
+		return formatUnit(bytes, gib, "GiB")
+	case bytes >= mib:
+		return formatUnit(bytes, mib, "MiB")
+	case bytes >= kib:
+		return formatUnit(bytes, kib, "KiB")
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
 func formatByteSpeed(bytesPerSecond float64) string {
 	if bytesPerSecond < 0 {
 		bytesPerSecond = 0
@@ -2798,7 +2829,6 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			}
 			fullpath := fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
 			fullpath = strings.TrimSuffix(fullpath, "/")
-			sizeMiB := float64(bm.Size) / (1024 * 1024)
 			mod := "-" // Placeholder, modtime not available
 			display := fullpath
 			if relFlag {
@@ -2807,7 +2837,7 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			if machine {
 				fmt.Printf("f\t%d\t%s\t%s\n", bm.Size, mod, display)
 			} else {
-				fmt.Printf("%10.1f MiB  %s  %s\n", sizeMiB, mod, display)
+				fmt.Printf("%10s  %s  %s\n", formatSize(bm.Size), mod, display)
 			}
 			totalSize += bm.Size
 			count++
@@ -2817,7 +2847,7 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			os.Exit(1)
 		}
 		if !machine {
-			fmt.Printf("Listed %d files summing to %d bytes (%.1f MiB)\n", count, totalSize, float64(totalSize)/(1024*1024))
+			fmt.Printf("Listed %d files summing to %s (%d bytes)\n", count, formatSize(totalSize), totalSize)
 		}
 		return nil
 	}
@@ -2842,7 +2872,6 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 				continue
 			}
 		}
-		sizeMiB := float64(entry.Size) / (1024 * 1024)
 		mod := "-"
 		if !entry.ModTime.IsZero() {
 			mod = entry.ModTime.Format(time.RFC3339)
@@ -2854,13 +2883,13 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 		if machine {
 			fmt.Printf("f\t%d\t%s\t%s\n", entry.Size, mod, display)
 		} else {
-			fmt.Printf("%10.1f MiB  %s  %s\n", sizeMiB, mod, display)
+			fmt.Printf("%10s  %s  %s\n", formatSize(entry.Size), mod, display)
 		}
 		totalSize += entry.Size
 		count++
 	}
 	if !machine {
-		fmt.Printf("Listed %d files summing to %d bytes (%.1f MiB)\n", count, totalSize, float64(totalSize)/(1024*1024))
+		fmt.Printf("Listed %d files summing to %s (%d bytes)\n", count, formatSize(totalSize), totalSize)
 	}
 	return nil
 }
