@@ -869,15 +869,15 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 	return errors.Join(collected...)
 }
 
-// isNonRetryableHTTPErr returns true if err contains an HTTP 401 or 403 status,
-// indicating an authentication/authorization failure that should not be retried.
+// isNonRetryableHTTPErr returns true if err contains an HTTP 401, 403, or 404 status,
+// indicating an authentication/authorization failure or missing resource that should not be retried.
 func isNonRetryableHTTPErr(err error) bool {
 	var hfErr *hf.HTTPStatusError
-	if errors.As(err, &hfErr) && (hfErr.StatusCode == 401 || hfErr.StatusCode == 403) {
+	if errors.As(err, &hfErr) && (hfErr.StatusCode == 401 || hfErr.StatusCode == 403 || hfErr.StatusCode == 404) {
 		return true
 	}
 	var azErr *azcore.ResponseError
-	if errors.As(err, &azErr) && (azErr.StatusCode == 401 || azErr.StatusCode == 403) {
+	if errors.As(err, &azErr) && (azErr.StatusCode == 401 || azErr.StatusCode == 403 || azErr.StatusCode == 404) {
 		return true
 	}
 	return false

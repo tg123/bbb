@@ -690,6 +690,21 @@ func TestRetryOpFailFast403(t *testing.T) {
 	}
 }
 
+func TestRetryOpFailFast404(t *testing.T) {
+	ctx := context.Background()
+	attempts := 0
+	err := retryOp(ctx, 5, func() error {
+		attempts++
+		return fmt.Errorf("wrapped: %w", &hf.HTTPStatusError{StatusCode: 404, Status: "404 Not Found"})
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected 1 attempt (fail fast), got %d", attempts)
+	}
+}
+
 func TestRetryOpRetries500(t *testing.T) {
 	ctx := context.Background()
 	attempts := 0
