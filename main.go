@@ -792,21 +792,27 @@ func formatSize(bytes int64) string {
 		bytes = 0
 	}
 	const (
-		kib = 1024.0
-		mib = 1024.0 * kib
-		gib = 1024.0 * mib
-		tib = 1024.0 * gib
+		kib int64 = 1024
+		mib       = 1024 * kib
+		gib       = 1024 * mib
+		tib       = 1024 * gib
 	)
-	b := float64(bytes)
+	// formatUnit formats bytes in terms of the given unit using integer
+	// arithmetic (no float64 conversion) and truncates to 1 decimal place.
+	formatUnit := func(b, unit int64, suffix string) string {
+		whole := b / unit
+		frac := (b % unit) * 10 / unit // truncated tenths
+		return fmt.Sprintf("%d.%d %s", whole, frac, suffix)
+	}
 	switch {
-	case b >= tib:
-		return fmt.Sprintf("%.1f TiB", b/tib)
-	case b >= gib:
-		return fmt.Sprintf("%.1f GiB", b/gib)
-	case b >= mib:
-		return fmt.Sprintf("%.1f MiB", b/mib)
-	case b >= kib:
-		return fmt.Sprintf("%.1f KiB", b/kib)
+	case bytes >= tib:
+		return formatUnit(bytes, tib, "TiB")
+	case bytes >= gib:
+		return formatUnit(bytes, gib, "GiB")
+	case bytes >= mib:
+		return formatUnit(bytes, mib, "MiB")
+	case bytes >= kib:
+		return formatUnit(bytes, kib, "KiB")
 	default:
 		return fmt.Sprintf("%d B", bytes)
 	}
