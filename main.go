@@ -533,8 +533,14 @@ func clearActiveBars() {
 }
 
 func rerenderActiveBars() {
+	maxLabel := 0
+	for _, bar := range activeBars {
+		if n := len(bar.label); n > maxLabel {
+			maxLabel = n
+		}
+	}
 	for i, bar := range activeBars {
-		bar.renderUnlocked()
+		bar.renderAligned(maxLabel)
 		if i < len(activeBars)-1 {
 			fmt.Fprintf(os.Stderr, "\n")
 		}
@@ -756,6 +762,13 @@ func (p *progressBar) Finish() {
 
 // renderUnlocked writes the progress bar to stderr. outputMu must be held.
 func (p *progressBar) renderUnlocked() {
+	p.renderAligned(0)
+}
+
+// renderAligned writes the progress bar to stderr with the label padded to
+// labelWidth characters. This aligns bars with different-length labels.
+// outputMu must be held.
+func (p *progressBar) renderAligned(labelWidth int) {
 	if p == nil {
 		return
 	}
@@ -770,11 +783,15 @@ func (p *progressBar) renderUnlocked() {
 	if p.showSpeed && elapsed > 0 {
 		speed = float64(p.bytesDone.Load()) / elapsed
 	}
+	label := p.label
+	if labelWidth > len(label) {
+		label = label + strings.Repeat(" ", labelWidth-len(label))
+	}
 	if isTerminal(os.Stderr) {
-		line := formatFancyBar(p.label, done, total, p.width, speed, p.showSpeed, p.byteSized)
+		line := formatFancyBar(label, done, total, p.width, speed, p.showSpeed, p.byteSized)
 		fmt.Fprintf(os.Stderr, "\r"+ansiClear+"%s", line)
 	} else {
-		line := formatProgressBar(p.label, done, total, p.width, speed, p.showSpeed, p.byteSized)
+		line := formatProgressBar(label, done, total, p.width, speed, p.showSpeed, p.byteSized)
 		fmt.Fprintf(os.Stderr, "\r%s", line)
 	}
 }
