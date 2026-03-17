@@ -1754,17 +1754,23 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 					copyBar.byteSized = true
 				}
 			}
-			var lastReported int64
+			var lastReported atomic.Int64
 			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, func(copied, total int64) {
 				if total <= 0 {
 					return
 				}
 				// Report incremental bytes to the overall taskbar.
+				// Use CAS loop because callbacks arrive from parallel goroutines.
 				if onBytes != nil {
-					delta := copied - lastReported
-					if delta > 0 {
-						onBytes(delta)
-						lastReported = copied
+					for {
+						prev := lastReported.Load()
+						if copied <= prev {
+							break
+						}
+						if lastReported.CompareAndSwap(prev, copied) {
+							onBytes(copied - prev)
+							break
+						}
 					}
 				}
 				if copyBar == nil {
