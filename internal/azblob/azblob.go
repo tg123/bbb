@@ -690,7 +690,12 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, onPro
 		blkSize = (totalSize + blockblob.MaxBlocks - 1) / blockblob.MaxBlocks
 		numBlocks = (totalSize + blkSize - 1) / blkSize
 	}
+	if numBlocks > blockblob.MaxBlocks {
+		return fmt.Errorf("blob too large: %d bytes requires more than %d blocks", totalSize, blockblob.MaxBlocks)
+	}
 
+	// Block IDs must all be the same length; 6-digit format supports up to
+	// 999,999 which exceeds MaxBlocks (50,000).
 	blockIDs := make([]string, numBlocks)
 	for i := int64(0); i < numBlocks; i++ {
 		blockIDs[i] = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%06d", i)))
@@ -717,7 +722,7 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, onPro
 
 		sem <- struct{}{}
 		wg.Add(1)
-		go func() {
+		go func(blockID string, offset, count int64) {
 			defer func() {
 				<-sem
 				wg.Done()
@@ -740,7 +745,7 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, onPro
 			if onProgress != nil {
 				onProgress(copied, totalSize)
 			}
-		}()
+		}(blockID, offset, count)
 	}
 
 	wg.Wait()
