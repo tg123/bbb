@@ -689,6 +689,49 @@ func TestCmdSyncTaskfileStateRecovery(t *testing.T) {
 	}
 }
 
+func TestCmdSyncTaskfileDryRunNoState(t *testing.T) {
+	dir := t.TempDir()
+	srcA := filepath.Join(dir, "src-a")
+	dstA := filepath.Join(dir, "dst-a")
+	if err := os.MkdirAll(srcA, 0o755); err != nil {
+		t.Fatalf("mkdir srcA: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcA, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write srcA: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "sync.tasks")
+	if err := os.WriteFile(taskfile, []byte(srcA+" "+dstA+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "sync.state")
+
+	app := &cli.Command{
+		Action: cmdSync,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "dry-run"},
+			&cli.BoolFlag{Name: "delete"},
+			&cli.StringFlag{Name: "x"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"sync", "--dry-run", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("sync dry-run failed: %v", err)
+	}
+	// State file should not be created in dry-run mode
+	if _, err := os.Stat(stateFile); err == nil {
+		t.Fatalf("state file should not exist after dry-run")
+	}
+	// Destination should not be created in dry-run mode
+	if _, err := os.Stat(dstA); err == nil {
+		t.Fatalf("destination should not exist after dry-run")
+	}
+}
+
 func TestRunOpPoolProcessesAll(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

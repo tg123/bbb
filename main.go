@@ -2263,9 +2263,12 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		stateAppender, err := newTaskStateAppender(taskfileState)
-		if err != nil {
-			return err
+		var stateAppender *taskStateAppender
+		if !dry {
+			stateAppender, err = newTaskStateAppender(taskfileState)
+			if err != nil {
+				return err
+			}
 		}
 		for _, task := range tasks {
 			cpKey := taskCheckpointKey(task.src, task.dst)
@@ -2276,15 +2279,21 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				continue
 			}
 			if err := cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, task.src, task.dst); err != nil {
-				_ = stateAppender.close()
+				if stateAppender != nil {
+					_ = stateAppender.close()
+				}
 				return err
 			}
-			if err := stateAppender.appendCheckpoint(cpKey); err != nil {
-				return err
+			if stateAppender != nil {
+				if err := stateAppender.appendCheckpoint(cpKey); err != nil {
+					return err
+				}
 			}
 		}
-		if err := stateAppender.close(); err != nil {
-			return err
+		if stateAppender != nil {
+			if err := stateAppender.close(); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
