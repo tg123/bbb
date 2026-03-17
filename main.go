@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/md5"
 	"errors"
@@ -22,6 +23,8 @@ import (
 	"log/slog"
 
 	"github.com/urfave/cli/v3"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 
 	"github.com/tg123/bbb/internal/azblob"
 	"github.com/tg123/bbb/internal/bbbfs"
@@ -93,7 +96,7 @@ func main() {
 				lvl = slog.LevelInfo
 			}
 			handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
-			slog.SetDefault(slog.New(handler))
+			slog.SetDefault(slog.New(&barAwareHandler{inner: handler}))
 			slog.Debug("Logger initialized", "level", lvlStr)
 			return ctx, nil
 		},
@@ -192,13 +195,15 @@ func main() {
 			{
 				Name:      "cp",
 				Usage:     "Copy files or directories",
-				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
+				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] [--taskfile FILE|--taskfile -] [--taskfile-state FILE]\n   or: bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
 				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
+					&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
+					&cli.StringFlag{Name: "taskfile-state", Usage: "State file for `cp --taskfile` crash recovery"},
 				},
 				Action: cmdCP,
 			},
@@ -240,7 +245,7 @@ func main() {
 			{
 				Name:      "sync",
 				Usage:     "Synchronise two directory trees",
-				UsageText: "bbb sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] src dst",
+				UsageText: "bbb sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] [--taskfile FILE|--taskfile -] src dst",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "dry-run", Usage: "show actions without applying"},
 					&cli.BoolFlag{Name: "delete", Usage: "Delete destination files that don't exist in source"},
@@ -248,6 +253,7 @@ func main() {
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
 					&cli.StringFlag{Name: "x", Aliases: []string{"exclude"}, Usage: "Exclude files matching this regex"},
+					&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
 				},
 				Action: cmdSync,
 			},
@@ -351,9 +357,12 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	relFlag := c.Bool("s") || c.Bool("relative")
 
 	parentPath, pattern := splitWildcard(root)
-	list, err := bbbfs.ListRecursive(ctx, parentPath)
-	if err != nil {
-		return err
+	var list []bbbfs.Entry
+	for result := range bbbfs.ListRecursive(ctx, parentPath) {
+		if result.Err != nil {
+			return result.Err
+		}
+		list = append(list, result.Entry)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	var count int64
@@ -468,26 +477,75 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
-var outputMu sync.Mutex
+var (
+	outputMu     sync.Mutex
+	activeBarPtr *progressBar // guarded by outputMu
+)
+
+func clearActiveBar() {
+	if activeBarPtr != nil && isTerminal(os.Stderr) {
+		fmt.Fprintf(os.Stderr, "\r"+ansiClear)
+	}
+}
+
+func rerenderActiveBar() {
+	if activeBarPtr != nil {
+		activeBarPtr.renderUnlocked()
+	}
+}
 
 func lockedPrintf(format string, args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
+	clearActiveBar()
 	fmt.Printf(format, args...)
+	rerenderActiveBar()
 }
 
 func lockedPrintln(args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
+	clearActiveBar()
 	fmt.Println(args...)
+	rerenderActiveBar()
 }
 
 func lockedFprintf(w io.Writer, format string, args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
+	clearActiveBar()
 	if _, err := fmt.Fprintf(w, format, args...); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
+	rerenderActiveBar()
+}
+
+// barAwareHandler wraps an slog.Handler so log output coordinates with the
+// pinned progress bar. It clears the active bar before writing and
+// re-renders it after, preventing log lines from clobbering the bar.
+type barAwareHandler struct {
+	inner slog.Handler
+}
+
+func (h *barAwareHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h *barAwareHandler) Handle(ctx context.Context, r slog.Record) error {
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	clearActiveBar()
+	err := h.inner.Handle(ctx, r)
+	rerenderActiveBar()
+	return err
+}
+
+func (h *barAwareHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &barAwareHandler{inner: h.inner.WithAttrs(attrs)}
+}
+
+func (h *barAwareHandler) WithGroup(name string) slog.Handler {
+	return &barAwareHandler{inner: h.inner.WithGroup(name)}
 }
 
 func isTerminal(f *os.File) bool {
@@ -499,16 +557,29 @@ func isTerminal(f *os.File) bool {
 }
 
 type progressBar struct {
-	label       string
-	total       int64
-	width       int
-	showSpeed   bool
-	startedAt   time.Time
-	done        atomic.Int64
-	bytesDone   atomic.Int64
-	lastPercent atomic.Int64
-	finished    atomic.Bool
+	label     string
+	width     int
+	showSpeed bool
+	startedAt time.Time
+	total     atomic.Int64
+	done      atomic.Int64
+	bytesDone atomic.Int64
+	lastDone  atomic.Int64
+	lastTotal atomic.Int64
+	finished  atomic.Bool
 }
+
+const (
+	progressUninitialized = int64(-1)
+	minProgressTotal      = 2
+
+	ansiReset = "\033[0m"
+	ansiBold  = "\033[1m"
+	ansiGreen = "\033[32m"
+	ansiCyan  = "\033[36m"
+	ansiGray  = "\033[90m"
+	ansiClear = "\033[K"
+)
 
 func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progressBar {
 	if quiet || total <= 1 || !isTerminal(os.Stderr) {
@@ -516,12 +587,33 @@ func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progre
 	}
 	bar := &progressBar{
 		label:     label,
-		total:     int64(total),
 		width:     28,
 		showSpeed: showSpeed,
 		startedAt: time.Now(),
 	}
+	bar.total.Store(int64(total))
+	bar.lastDone.Store(progressUninitialized)
+	bar.lastTotal.Store(progressUninitialized)
 	bar.render(0)
+	return bar
+}
+
+// newStreamingProgressBar creates a progress bar with total=0 for streaming
+// mode where the total grows dynamically as items are discovered. The bar
+// stays invisible until the first SetTotal call with a positive value.
+func newStreamingProgressBar(label string, quiet bool) *progressBar {
+	if quiet || !isTerminal(os.Stderr) {
+		return nil
+	}
+	bar := &progressBar{
+		label:     label,
+		width:     28,
+		showSpeed: false,
+		startedAt: time.Now(),
+	}
+	bar.lastDone.Store(progressUninitialized)
+	bar.lastTotal.Store(progressUninitialized)
+	// total starts at 0; bar won't render until SetTotal(>0) is called.
 	return bar
 }
 
@@ -540,51 +632,103 @@ func (p *progressBar) AddBytes(n int64) {
 	p.bytesDone.Add(n)
 }
 
+func (p *progressBar) SetTotal(total int64) {
+	if p == nil {
+		return
+	}
+	if total < 1 {
+		total = 1
+	}
+	// Monotonically increasing: only allow total to grow, never shrink.
+	for {
+		cur := p.total.Load()
+		if total <= cur {
+			return
+		}
+		if p.total.CompareAndSwap(cur, total) {
+			break
+		}
+	}
+	if p.done.Load() < total {
+		p.finished.Store(false)
+	}
+	p.render(p.done.Load())
+}
+
 func (p *progressBar) Finish() {
 	if p == nil {
 		return
 	}
-	p.done.Store(p.total)
-	p.render(p.total)
+	if !p.finished.CompareAndSwap(false, true) {
+		return
+	}
+	total := p.total.Load()
+	if total < 1 {
+		total = 1
+	}
+	p.done.Store(total)
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	p.renderUnlocked()
+	fmt.Fprintf(os.Stderr, "\n")
+	if activeBarPtr == p {
+		activeBarPtr = nil
+	}
+}
+
+// renderUnlocked writes the progress bar to stderr. outputMu must be held.
+func (p *progressBar) renderUnlocked() {
+	if p == nil {
+		return
+	}
+	done := p.done.Load()
+	total := p.total.Load()
+	if total <= 0 {
+		return
+	}
+	done, total = clampProgress(done, total)
+	elapsed := time.Since(p.startedAt).Seconds()
+	speed := 0.0
+	if p.showSpeed && elapsed > 0 {
+		speed = float64(p.bytesDone.Load()) / elapsed
+	}
+	if isTerminal(os.Stderr) {
+		line := formatFancyBar(p.label, done, total, p.width, speed, p.showSpeed)
+		fmt.Fprintf(os.Stderr, "\r"+ansiClear+"%s", line)
+	} else {
+		line := formatProgressBar(p.label, done, total, p.width, speed, p.showSpeed)
+		fmt.Fprintf(os.Stderr, "\r%s", line)
+	}
+}
+
+func clampProgress(done, total int64) (int64, int64) {
+	if done < 0 {
+		done = 0
+	}
+	if done > total {
+		done = total
+	}
+	return done, total
 }
 
 func (p *progressBar) render(done int64) {
 	if p == nil {
 		return
 	}
-	if p.total <= 0 {
+	total := p.total.Load()
+	if total <= 0 {
 		return
 	}
-	if done < 0 {
-		done = 0
-	}
-	if done > p.total {
-		done = p.total
-	}
-	percent := done * 100 / p.total
-	if done != p.total {
-		for {
-			prev := p.lastPercent.Load()
-			if percent == prev {
-				return
-			}
-			if p.lastPercent.CompareAndSwap(prev, percent) {
-				break
-			}
-		}
-	} else if !p.finished.CompareAndSwap(false, true) {
+	done, total = clampProgress(done, total)
+	if p.lastDone.Load() == done && p.lastTotal.Load() == total {
 		return
 	}
-	elapsed := time.Since(p.startedAt).Seconds()
-	speed := 0.0
-	if p.showSpeed && elapsed > 0 {
-		speed = float64(p.bytesDone.Load()) / elapsed
-	}
-	line := formatProgressBar(p.label, done, p.total, p.width, speed, p.showSpeed)
-	lockedFprintf(os.Stderr, "\r%s", line)
-	if done == p.total {
-		lockedFprintf(os.Stderr, "\n")
-	}
+	p.lastDone.Store(done)
+	p.lastTotal.Store(total)
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	activeBarPtr = p
+	p.renderUnlocked()
 }
 
 func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
@@ -610,6 +754,37 @@ func formatProgressBar(label string, done, total int64, width int, speed float64
 		return fmt.Sprintf("%s [%s] %3d%% (%d/%d)", label, bar, percent, done, total)
 	}
 	return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s)", label, bar, percent, done, total, formatByteSpeed(speed))
+}
+
+func formatFancyBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
+	if width < 1 {
+		width = 1
+	}
+	if total < 1 {
+		total = 1
+	}
+	if done < 0 {
+		done = 0
+	}
+	if done > total {
+		done = total
+	}
+	percent := done * 100 / total
+	filled := int(done * int64(width) / total)
+	if filled > width {
+		filled = width
+	}
+	bar := ansiGreen + strings.Repeat("━", filled) + ansiGray + strings.Repeat("━", width-filled) + ansiReset
+	pctColor := ansiCyan
+	suffix := ""
+	if done == total {
+		pctColor = ansiGreen
+		suffix = " " + ansiGreen + "✓" + ansiReset
+	}
+	if !showSpeed {
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d)%s", label, bar, pctColor, percent, done, total, suffix)
+	}
+	return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d, %s)%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), suffix)
 }
 
 func formatByteSpeed(bytesPerSecond float64) string {
@@ -694,6 +869,20 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 	return errors.Join(collected...)
 }
 
+// isNonRetryableHTTPErr returns true if err contains an HTTP 401, 403, or 404 status,
+// indicating an authentication/authorization failure or missing resource that should not be retried.
+func isNonRetryableHTTPErr(err error) bool {
+	var hfErr *hf.HTTPStatusError
+	if errors.As(err, &hfErr) && (hfErr.StatusCode == 401 || hfErr.StatusCode == 403 || hfErr.StatusCode == 404) {
+		return true
+	}
+	var azErr *azcore.ResponseError
+	if errors.As(err, &azErr) && (azErr.StatusCode == 401 || azErr.StatusCode == 403 || azErr.StatusCode == 404) {
+		return true
+	}
+	return false
+}
+
 func retryOp(ctx context.Context, retryCount int, op func() error) error {
 	if retryCount < 0 {
 		retryCount = 0
@@ -706,6 +895,9 @@ func retryOp(ctx context.Context, retryCount int, op func() error) error {
 		err = op()
 		if err == nil {
 			return nil
+		}
+		if isNonRetryableHTTPErr(err) {
+			return err
 		}
 	}
 	return err
@@ -751,20 +943,514 @@ func runOpPoolWithRetryProgressBytes[T any](ctx context.Context, concurrency int
 	return err
 }
 
+type taskPair struct {
+	src string
+	dst string
+}
+
+const maxTaskfileLineSize = 4 * 1024 * 1024
+
+func parseTaskPairLine(line string, lineNo int) (taskPair, error) {
+	parts := strings.Fields(line)
+	if len(parts) != 2 {
+		return taskPair{}, fmt.Errorf("taskfile: line %d: expected exactly two whitespace-separated fields `src dst` (paths with spaces are not supported)", lineNo)
+	}
+	return taskPair{src: parts[0], dst: parts[1]}, nil
+}
+
+func loadTaskPairs(taskfile string) ([]taskPair, error) {
+	var (
+		reader io.Reader
+		file   *os.File
+		err    error
+	)
+	if taskfile == "-" {
+		reader = os.Stdin
+	} else {
+		file, err = os.Open(taskfile)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			_ = file.Close()
+		}()
+		reader = file
+	}
+
+	var tasks []taskPair
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxTaskfileLineSize)
+	for lineNo := 1; scanner.Scan(); lineNo++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		task, err := parseTaskPairLine(line, lineNo)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
+func loadTaskState(path string) (fileState map[string]struct{}, taskCheckpoints map[string]struct{}, err error) {
+	fileState = map[string]struct{}{}
+	taskCheckpoints = map[string]struct{}{}
+	if path == "" {
+		return fileState, taskCheckpoints, nil
+	}
+
+	file, ferr := os.Open(path)
+	if ferr != nil {
+		if os.IsNotExist(ferr) {
+			return fileState, taskCheckpoints, nil
+		}
+		return nil, nil, ferr
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxTaskfileLineSize)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, taskCheckpointPrefix) {
+			taskCheckpoints[line] = struct{}{}
+		} else {
+			fileState[line] = struct{}{}
+		}
+	}
+	if serr := scanner.Err(); serr != nil {
+		return nil, nil, serr
+	}
+	return fileState, taskCheckpoints, nil
+}
+
+type taskStateAppender struct {
+	mu   sync.Mutex
+	file *os.File
+}
+
+func newTaskStateAppender(path string) (*taskStateAppender, error) {
+	if path == "" {
+		return &taskStateAppender{}, nil
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return &taskStateAppender{file: file}, nil
+}
+
+func (a *taskStateAppender) append(taskKey string) error {
+	if a.file == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
+		return a.closeOnError(err)
+	}
+
+	return nil
+}
+
+func (a *taskStateAppender) appendCheckpoint(taskKey string) error {
+	if a.file == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
+		return a.closeOnError(err)
+	}
+
+	if err := a.file.Sync(); err != nil {
+		return a.closeOnError(err)
+	}
+
+	return nil
+}
+
+func (a *taskStateAppender) closeOnError(err error) error {
+	if a.file == nil {
+		return err
+	}
+	if cerr := a.file.Close(); cerr != nil {
+		a.file = nil
+		return errors.Join(err, cerr)
+	}
+	a.file = nil
+	return err
+}
+
+func (a *taskStateAppender) close() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.file == nil {
+		return nil
+	}
+	if serr := a.file.Sync(); serr != nil {
+		_ = a.file.Close()
+		a.file = nil
+		return serr
+	}
+	err := a.file.Close()
+	a.file = nil
+	return err
+}
+
+const taskCheckpointPrefix = "TASK\t"
+
+func taskStateKey(src, dst string) string {
+	return src + " -> " + dst
+}
+
+func taskCheckpointKey(src, dst string) string {
+	return taskCheckpointPrefix + src + " -> " + dst
+}
+
+type taskTracker struct {
+	remaining atomic.Int64
+	key       string // task checkpoint key
+}
+
+type cpTask struct {
+	src     string
+	dst     string
+	key     string
+	tracker *taskTracker // nil when no task-level checkpoint tracking
+}
+
+// expandCPTask streams file-level copy tasks for a taskfile pair via the emit
+// callback. When the source is directory-like it expands recursively and calls
+// emit for each discovered file; for file-like sources it emits a single task.
+// Returning a non-nil error from emit stops expansion early.
+func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) error {
+	if isHF(task.src) {
+		hfPath, err := hf.Parse(task.src)
+		if err != nil {
+			return err
+		}
+		if hfPath.File != "" {
+			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+		}
+	}
+
+	if isAz(task.src) {
+		sap, err := azblob.Parse(task.src)
+		if err != nil {
+			return err
+		}
+		if !sap.IsDirLike() {
+			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+		}
+	} else if !isHF(task.src) {
+		if info, err := os.Stat(task.src); err != nil || !info.IsDir() {
+			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+		}
+	}
+
+	if isAz(task.dst) {
+		dap, err := azblob.Parse(task.dst)
+		if err != nil {
+			return err
+		}
+		for result := range bbbfs.ListRecursive(ctx, task.src) {
+			if result.Err != nil {
+				return result.Err
+			}
+			entry := result.Entry
+			if entry.IsDir {
+				continue
+			}
+			if err := emit(cpTask{
+				src: entry.Path,
+				dst: dap.Child(filepath.ToSlash(entry.Name)).String(),
+				key: taskStateKey(entry.Path, task.dst),
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for result := range bbbfs.ListRecursive(ctx, task.src) {
+		if result.Err != nil {
+			return result.Err
+		}
+		entry := result.Entry
+		if entry.IsDir {
+			continue
+		}
+		if err := emit(cpTask{
+			src: entry.Path,
+			dst: filepath.Join(task.dst, entry.Name),
+			key: taskStateKey(entry.Path, task.dst),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func cmdCP(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdCP called", "args", c.Args().Slice())
-	if c.Args().Len() < 2 {
-		return fmt.Errorf("cp: need srcs dst")
-	}
 	overwrite := c.Bool("f")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
+	taskfile := c.String("taskfile")
+	taskfileState := c.String("taskfile-state")
+
+	if taskfile != "" {
+		if c.Args().Len() != 0 {
+			return fmt.Errorf("cp: cannot use positional args with --taskfile")
+		}
+		tasks, err := loadTaskPairs(taskfile)
+		if err != nil {
+			return err
+		}
+		state, taskCheckpoints, err := loadTaskState(taskfileState)
+		if err != nil {
+			return err
+		}
+		// Streaming progress bar: total starts at 0 and grows as files are
+		// discovered during expansion. The bar stays invisible until the
+		// first file is found, then updates on every change.
+		taskProgress := newStreamingProgressBar("cp files", quiet)
+		defer func() {
+			if taskProgress != nil {
+				taskProgress.Finish()
+			}
+		}()
+		seen := make(map[string]struct{}, len(state)+len(tasks))
+		for key := range state {
+			seen[key] = struct{}{}
+		}
+		stateAppender, err := newTaskStateAppender(taskfileState)
+		if err != nil {
+			return err
+		}
+
+		workers := concurrency
+		if workers < 1 {
+			workers = 1
+		}
+		// Split concurrency budget: at least 1 expander, at least 1 cp worker.
+		// When concurrency is high, allocate ~25% to expansion.
+		expanders := max(1, workers/4)
+		cpWorkers := workers - expanders
+		if cpWorkers < 1 {
+			cpWorkers = 1
+		}
+		innerConcurrency := 1
+		innerQuiet := true
+		workerCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		var wg sync.WaitGroup
+		// Buffer taskCh larger than cpWorkers so expanders can push ahead
+		// without blocking while cp workers are busy.
+		taskCh := make(chan cpTask, cpWorkers*4)
+		var firstErr error
+		var firstErrMu sync.Mutex
+		var totalPending atomic.Int64
+		var queued atomic.Bool
+
+		setErr := func(err error) {
+			firstErrMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+				cancel()
+			}
+			firstErrMu.Unlock()
+		}
+
+		for i := 0; i < cpWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-workerCtx.Done():
+						return
+					case task, ok := <-taskCh:
+						if !ok {
+							return
+						}
+						slog.Debug("cp: start", "src", task.src, "dst", task.dst)
+						if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst); err != nil {
+							setErr(err)
+							return
+						}
+						slog.Debug("cp: done", "src", task.src, "dst", task.dst)
+						if taskfileState != "" {
+							if err := stateAppender.append(task.key); err != nil {
+								setErr(err)
+								return
+							}
+							if task.tracker != nil && task.tracker.remaining.Add(-1) == 0 {
+								if err := stateAppender.appendCheckpoint(task.tracker.key); err != nil {
+									setErr(err)
+									return
+								}
+							}
+						}
+						if taskProgress != nil {
+							taskProgress.Increment()
+						}
+					}
+				}
+			}()
+		}
+
+		// Dedicated expander pool uses goroutines from the concurrency budget.
+		if expanders > len(tasks) {
+			expanders = len(tasks)
+		}
+		pairCh := make(chan taskPair, expanders*2)
+		var seenMu sync.Mutex
+		var expandWG sync.WaitGroup
+		for i := 0; i < expanders; i++ {
+			expandWG.Add(1)
+			go func() {
+				defer expandWG.Done()
+				for {
+					select {
+					case <-workerCtx.Done():
+						return
+					case task, ok := <-pairCh:
+						if !ok {
+							return
+						}
+						cpKey := taskCheckpointKey(task.src, task.dst)
+						if _, done := taskCheckpoints[cpKey]; done {
+							if !quiet {
+								lockedFprintf(os.Stderr, "cp: skip already completed task %s -> %s\n", task.src, task.dst)
+							}
+							if taskProgress != nil {
+								taskProgress.SetTotal(totalPending.Add(1))
+								taskProgress.Increment()
+							}
+							continue
+						}
+						if !quiet {
+							lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
+						}
+						var tracker *taskTracker
+						if taskfileState != "" {
+							tracker = &taskTracker{key: cpKey}
+						}
+						var pendingCount int64
+						expandEmit := func(expandedTask cpTask) error {
+							seenMu.Lock()
+							_, alreadySeen := seen[expandedTask.key]
+							if !alreadySeen {
+								seen[expandedTask.key] = struct{}{}
+							}
+							seenMu.Unlock()
+							if alreadySeen {
+								_, inState := state[expandedTask.key]
+								if !quiet && inState {
+									lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
+								}
+								if taskProgress != nil && inState {
+									taskProgress.SetTotal(totalPending.Add(1))
+									taskProgress.Increment()
+								}
+								return nil
+							}
+							expandedTask.tracker = tracker
+							pendingCount++
+							select {
+							case <-workerCtx.Done():
+								return workerCtx.Err()
+							case taskCh <- expandedTask:
+								slog.Debug("cp: queued", "src", expandedTask.src, "dst", expandedTask.dst)
+								queued.Store(true)
+								if taskProgress != nil {
+									taskProgress.SetTotal(totalPending.Add(1))
+								}
+							}
+							return nil
+						}
+						if err := retryOp(workerCtx, retryCount, func() error {
+							pendingCount = 0
+							return expandCPTask(workerCtx, task, expandEmit)
+						}); err != nil {
+							setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
+							return
+						}
+						// Reconcile progress bar total after expansion completes
+						// so it reflects all discovered files (queued + skipped).
+						if taskProgress != nil {
+							taskProgress.SetTotal(totalPending.Load())
+						}
+						if tracker != nil {
+							tracker.remaining.Store(pendingCount)
+							if pendingCount == 0 {
+								if err := stateAppender.appendCheckpoint(cpKey); err != nil {
+									setErr(err)
+									return
+								}
+							}
+						}
+					}
+				}
+			}()
+		}
+	enqueueTasks:
+		for _, task := range tasks {
+			select {
+			case <-workerCtx.Done():
+				break enqueueTasks
+			case pairCh <- task:
+			}
+		}
+		close(pairCh)
+		expandWG.Wait()
+		close(taskCh)
+		wg.Wait()
+		if !queued.Load() && firstErr == nil {
+			if err := stateAppender.close(); err != nil {
+				return err
+			}
+			return nil
+		}
+
+		if firstErr != nil {
+			_ = stateAppender.close()
+			return firstErr
+		}
+		if err := stateAppender.close(); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if c.Args().Len() < 2 {
+		return fmt.Errorf("cp: need srcs dst")
+	}
 	srcs := make([]string, c.Args().Len()-1)
 	for i := 0; i < len(srcs); i++ {
 		srcs[i] = c.Args().Get(i)
 	}
 	dst := c.Args().Get(c.Args().Len() - 1)
+	return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, srcs, dst)
+}
+
+func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string) error {
 	if isHF(dst) {
 		return fmt.Errorf("cp: hf:// only supported as source")
 	}
@@ -774,8 +1460,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	if dstAz {
 		dap, err := azblob.Parse(dst)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return fmt.Errorf("cp: parse destination %q: %w", dst, err)
 		}
 		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
 			isDstDir = true
@@ -881,8 +1566,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			err = copyTree(ctx, op.src, op.dst, overwrite, quiet, "cp", concurrency, retryCount)
 		}
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return fmt.Errorf("cp: %s -> %s: %w", op.src, op.dst, err)
 		}
 	}
 	if err := runOpPoolWithRetryProgressBytes(ctx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
@@ -915,14 +1599,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			}
 			var copyBar *progressBar
 			if !quiet && isTerminal(os.Stderr) {
-				copyBar = &progressBar{
-					label:     path.Base(op.src),
-					total:     100,
-					width:     28,
-					showSpeed: true,
-					startedAt: time.Now(),
-				}
-				copyBar.render(0)
+				copyBar = newProgressBar(100, path.Base(op.src), false, true)
 			}
 			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, func(copied, total int64) {
 				if copyBar == nil || total <= 0 {
@@ -932,7 +1609,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 				copyBar.render(copied * 100 / total)
 			}); err != nil {
 				if copyBar != nil {
-					lockedFprintf(os.Stderr, "\n")
+					copyBar.Finish()
 				}
 				return 0, err
 			}
@@ -999,8 +1676,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 		return size, nil
 	}); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return fmt.Errorf("cp: file operations: %w", err)
 	}
 	return nil
 }
@@ -1567,16 +2243,37 @@ func syncHFFilesFromList(files []string, excludeMatch func(string) bool) []strin
 
 func cmdSync(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdSync called", "args", c.Args().Slice())
-	if c.Args().Len() != 2 {
-		return fmt.Errorf("sync: need src dst")
-	}
 	dry := c.Bool("dry-run")
 	del := c.Bool("delete")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	exclude := c.String("x")
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
+	taskfile := c.String("taskfile")
+
+	if taskfile != "" {
+		if c.Args().Len() != 0 {
+			return fmt.Errorf("sync: cannot use positional args with --taskfile")
+		}
+		tasks, err := loadTaskPairs(taskfile)
+		if err != nil {
+			return err
+		}
+		for _, task := range tasks {
+			if err := cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, task.src, task.dst); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if c.Args().Len() != 2 {
+		return fmt.Errorf("sync: need src dst")
+	}
 	src, dst := c.Args().Get(0), c.Args().Get(1)
+	return cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, src, dst)
+}
+
+func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, concurrency, retryCount int, src, dst string) error {
 	if isHF(dst) {
 		return fmt.Errorf("sync: hf:// only supported as source")
 	}
@@ -1619,13 +2316,11 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		if srcAz {
 			sap, err := azblob.Parse(src)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
+				return fmt.Errorf("sync: %w", err)
 			}
 			list, err := azblob.ListRecursive(ctx, sap)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
+				return fmt.Errorf("sync: list %s: %w", src, err)
 			}
 			for _, bm := range list {
 				if bm.Name == "" || excludeMatch(bm.Name) {

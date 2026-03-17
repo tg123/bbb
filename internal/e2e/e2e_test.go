@@ -43,6 +43,10 @@ func parseMD5Output(out []byte) string {
 	return fields[0]
 }
 
+func taskStateKey(src, dst string) string {
+	return src + " -> " + dst
+}
+
 func waitForEndpointReady(addr string) bool {
 	return waitForEndpointReadyWithTimeout(addr, waitTimeout)
 }
@@ -268,6 +272,81 @@ func TestBasic(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
+	t.Run("cp taskfile parallel", func(t *testing.T) {
+		taskDir := t.TempDir()
+		srcA := filepath.Join(taskDir, "task-a.txt")
+		srcB := filepath.Join(taskDir, "task-b.txt")
+		if err := os.WriteFile(srcA, []byte("task-a"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(srcB, []byte("task-b"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		taskfile := filepath.Join(taskDir, "cp.tasks")
+		dstPrefix := fmt.Sprintf("az://%s/test/taskfile-%d/", azuriteAccount, time.Now().UnixNano())
+		t.Cleanup(func() {
+			cleanFolder(t, dstPrefix)
+		})
+		content := strings.Join([]string{
+			srcA + " " + dstPrefix,
+			srcB + " " + dstPrefix,
+		}, "\n") + "\n"
+		if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runBBB("cp", "--taskfile", taskfile, "--concurrency", "2"); err != nil {
+			t.Fatal(err)
+		}
+		files, err := bbbLs(dstPrefix, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{
+			strings.TrimSuffix(dstPrefix, "/") + "/task-a.txt",
+			strings.TrimSuffix(dstPrefix, "/") + "/task-b.txt",
+		}
+		if !slices.Equal(files, expected) {
+			t.Fatalf("unexpected taskfile cp files: got %v, want %v", files, expected)
+		}
+	})
+
+	t.Run("cp taskfile state recovery skip finished", func(t *testing.T) {
+		taskDir := t.TempDir()
+		srcMissing := filepath.Join(taskDir, "missing.txt")
+		srcOK := filepath.Join(taskDir, "task-ok.txt")
+		if err := os.WriteFile(srcOK, []byte("task-ok"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		taskfile := filepath.Join(taskDir, "cp-recovery.tasks")
+		dstPrefix := fmt.Sprintf("az://%s/test/taskfile-recovery-%d/", azuriteAccount, time.Now().UnixNano())
+		t.Cleanup(func() {
+			cleanFolder(t, dstPrefix)
+		})
+		content := strings.Join([]string{
+			srcMissing + " " + dstPrefix,
+			srcOK + " " + dstPrefix,
+		}, "\n") + "\n"
+		if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		stateFile := filepath.Join(taskDir, "cp-recovery.state")
+		skippedKey := taskStateKey(srcMissing, dstPrefix)
+		if err := os.WriteFile(stateFile, []byte(skippedKey+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runBBB("cp", "--taskfile", taskfile, "--taskfile-state", stateFile, "--concurrency", "2"); err != nil {
+			t.Fatal(err)
+		}
+		files, err := bbbLs(dstPrefix, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{strings.TrimSuffix(dstPrefix, "/") + "/task-ok.txt"}
+		if !slices.Equal(files, expected) {
+			t.Fatalf("unexpected taskfile recovery files: got %v, want %v", files, expected)
+		}
+	})
 
 	// ls
 	{
