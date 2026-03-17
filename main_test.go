@@ -756,44 +756,58 @@ func TestRunOpPoolWithRetry(t *testing.T) {
 }
 
 func TestFormatProgressBarIncludesSpeed(t *testing.T) {
-	line := formatProgressBar("cp", 5, 10, 10, 2.5*1024*1024, true)
+	line := formatProgressBar("cp", 5, 10, 10, 2.5*1024*1024, true, false)
 	if line != "cp [=====     ]  50% (5/10, 2.5 MB/s)" {
 		t.Fatalf("unexpected progress bar output: %s", line)
 	}
 }
 
 func TestFormatProgressBarClampsDoneToTotal(t *testing.T) {
-	line := formatProgressBar("cp", 7, 5, 10, 1*1024*1024, true)
+	line := formatProgressBar("cp", 7, 5, 10, 1*1024*1024, true, false)
 	if line != "cp [==========] 100% (5/5, 1.0 MB/s)" {
 		t.Fatalf("unexpected clamped output: %s", line)
 	}
 }
 
 func TestFormatProgressBarNormalizesWidth(t *testing.T) {
-	line := formatProgressBar("cp", 1, 5, 0, 1*1024*1024, true)
+	line := formatProgressBar("cp", 1, 5, 0, 1*1024*1024, true, false)
 	if line != "cp [ ]  20% (1/5, 1.0 MB/s)" {
 		t.Fatalf("unexpected normalized width output: %s", line)
 	}
 }
 
 func TestFormatProgressBarNormalizesNegativeSpeed(t *testing.T) {
-	line := formatProgressBar("cp", 1, 5, 10, -2, true)
+	line := formatProgressBar("cp", 1, 5, 10, -2, true, false)
 	if line != "cp [==        ]  20% (1/5, 0.0 MB/s)" {
 		t.Fatalf("unexpected normalized speed output: %s", line)
 	}
 }
 
 func TestFormatProgressBarUsesGBSpeedForLargeValues(t *testing.T) {
-	line := formatProgressBar("cp", 5, 10, 10, 1.5*1024*1024*1024, true)
+	line := formatProgressBar("cp", 5, 10, 10, 1.5*1024*1024*1024, true, false)
 	if line != "cp [=====     ]  50% (5/10, 1.5 GB/s)" {
 		t.Fatalf("unexpected GB speed output: %s", line)
 	}
 }
 
 func TestFormatProgressBarWithoutSpeed(t *testing.T) {
-	line := formatProgressBar("sync", 3, 10, 10, 10*1024*1024, false)
+	line := formatProgressBar("sync", 3, 10, 10, 10*1024*1024, false, false)
 	if line != "sync [===       ]  30% (3/10)" {
 		t.Fatalf("unexpected output without speed: %s", line)
+	}
+}
+
+func TestFormatProgressBarHideCount(t *testing.T) {
+	line := formatProgressBar("file.dat", 50, 100, 10, 5*1024*1024, true, true)
+	if line != "file.dat [=====     ]  50% (5.0 MB/s)" {
+		t.Fatalf("unexpected hidden count output: %s", line)
+	}
+}
+
+func TestFormatProgressBarHideCountNoSpeed(t *testing.T) {
+	line := formatProgressBar("file.dat", 50, 100, 10, 0, false, true)
+	if line != "file.dat [=====     ]  50%" {
+		t.Fatalf("unexpected hidden count no speed output: %s", line)
 	}
 }
 

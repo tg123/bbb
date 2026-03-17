@@ -636,6 +636,7 @@ type progressBar struct {
 	label     string
 	width     int
 	showSpeed bool
+	hideCount bool // if true, omit (done/total) from the display
 	startedAt time.Time
 	total     atomic.Int64
 	done      atomic.Int64
@@ -678,14 +679,14 @@ func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progre
 // newStreamingProgressBar creates a progress bar with total=0 for streaming
 // mode where the total grows dynamically as items are discovered. The bar
 // stays invisible until the first SetTotal call with a positive value.
-func newStreamingProgressBar(label string, quiet bool) *progressBar {
+func newStreamingProgressBar(label string, quiet bool, showSpeed bool) *progressBar {
 	if quiet || !isTerminal(os.Stderr) {
 		return nil
 	}
 	bar := &progressBar{
 		label:     label,
 		width:     28,
-		showSpeed: false,
+		showSpeed: showSpeed,
 		startedAt: time.Now(),
 	}
 	bar.lastDone.Store(progressUninitialized)
@@ -770,10 +771,10 @@ func (p *progressBar) renderUnlocked() {
 		speed = float64(p.bytesDone.Load()) / elapsed
 	}
 	if isTerminal(os.Stderr) {
-		line := formatFancyBar(p.label, done, total, p.width, speed, p.showSpeed)
+		line := formatFancyBar(p.label, done, total, p.width, speed, p.showSpeed, p.hideCount)
 		fmt.Fprintf(os.Stderr, "\r"+ansiClear+"%s", line)
 	} else {
-		line := formatProgressBar(p.label, done, total, p.width, speed, p.showSpeed)
+		line := formatProgressBar(p.label, done, total, p.width, speed, p.showSpeed, p.hideCount)
 		fmt.Fprintf(os.Stderr, "\r%s", line)
 	}
 }
@@ -809,7 +810,7 @@ func (p *progressBar) render(done int64) {
 	rerenderActiveBars()
 }
 
-func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
+func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool, hideCount bool) string {
 	if width < 1 {
 		width = 1
 	}
@@ -828,13 +829,19 @@ func formatProgressBar(label string, done, total int64, width int, speed float64
 		filled = width
 	}
 	bar := strings.Repeat("=", filled) + strings.Repeat(" ", width-filled)
-	if !showSpeed {
+	switch {
+	case hideCount && showSpeed:
+		return fmt.Sprintf("%s [%s] %3d%% (%s)", label, bar, percent, formatByteSpeed(speed))
+	case hideCount:
+		return fmt.Sprintf("%s [%s] %3d%%", label, bar, percent)
+	case showSpeed:
+		return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s)", label, bar, percent, done, total, formatByteSpeed(speed))
+	default:
 		return fmt.Sprintf("%s [%s] %3d%% (%d/%d)", label, bar, percent, done, total)
 	}
-	return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s)", label, bar, percent, done, total, formatByteSpeed(speed))
 }
 
-func formatFancyBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
+func formatFancyBar(label string, done, total int64, width int, speed float64, showSpeed bool, hideCount bool) string {
 	if width < 1 {
 		width = 1
 	}
@@ -859,10 +866,16 @@ func formatFancyBar(label string, done, total int64, width int, speed float64, s
 		pctColor = ansiGreen
 		suffix = " " + ansiGreen + "✓" + ansiReset
 	}
-	if !showSpeed {
+	switch {
+	case hideCount && showSpeed:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s)%s", label, bar, pctColor, percent, formatByteSpeed(speed), suffix)
+	case hideCount:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+"%s", label, bar, pctColor, percent, suffix)
+	case showSpeed:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d, %s)%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), suffix)
+	default:
 		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d)%s", label, bar, pctColor, percent, done, total, suffix)
 	}
-	return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d, %s)%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), suffix)
 }
 
 func formatByteSpeed(bytesPerSecond float64) string {
@@ -1306,7 +1319,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		// Streaming progress bar: total starts at 0 and grows as files are
 		// discovered during expansion. The bar stays invisible until the
 		// first file is found, then updates on every change.
-		taskProgress := newStreamingProgressBar("cp files", quiet)
+		taskProgress := newStreamingProgressBar("cp files", quiet, true)
 		if taskProgress != nil {
 			taskProgress.pinBottom = true
 		}
@@ -1372,7 +1385,11 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 							return
 						}
 						slog.Debug("cp: start", "src", task.src, "dst", task.dst)
-						if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, showCopyBars); err != nil {
+						var bytesCb func(int64)
+						if taskProgress != nil {
+							bytesCb = taskProgress.AddBytes
+						}
+						if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, showCopyBars, bytesCb); err != nil {
 							setErr(err)
 							return
 						}
@@ -1529,10 +1546,10 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		srcs[i] = c.Args().Get(i)
 	}
 	dst := c.Args().Get(c.Args().Len() - 1)
-	return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, srcs, dst, !quiet)
+	return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, srcs, dst, !quiet, nil)
 }
 
-func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, showCopyBar bool) error {
+func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, showCopyBar bool, onBytes func(int64)) error {
 	if isHF(dst) {
 		return fmt.Errorf("cp: hf:// only supported as source")
 	}
@@ -1660,7 +1677,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		return nil
 	}, func(op cpFileOp, trackBytes bool) (int64, error) {
 		size := op.size
-		if trackBytes && size <= 0 {
+		if (trackBytes || onBytes != nil) && size <= 0 {
 			info, err := bbbfs.Resolve(op.src).Stat(ctx, op.src)
 			if err != nil {
 				slog.Debug("unable to stat source size for progress speed", "src", op.src, "error", err)
@@ -1670,6 +1687,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		}
 		if op.srcHF {
 			err := copyHFFile(ctx, op.hf, op.base, op.dst, op.dstAz, overwrite, quiet, isDstDir)
+			if err == nil && onBytes != nil {
+				onBytes(size)
+			}
 			return size, err
 		}
 		if op.srcAz && op.dstAz {
@@ -1682,6 +1702,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			var copyBar *progressBar
 			if showCopyBar && isTerminal(os.Stderr) {
 				copyBar = newProgressBar(100, path.Base(op.src), false, true)
+				copyBar.hideCount = true
 			}
 			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, func(copied, total int64) {
 				if copyBar == nil || total <= 0 {
@@ -1702,6 +1723,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
+			}
+			if onBytes != nil {
+				onBytes(size)
 			}
 			return size, nil
 		}
@@ -1725,6 +1749,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
+			}
+			if onBytes != nil {
+				onBytes(size)
 			}
 			return size, nil
 		}
@@ -1750,6 +1777,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
+			if onBytes != nil {
+				onBytes(size)
+			}
 			return size, nil
 		}
 		if err := fsops.CopyFile(op.src, op.dst, overwrite); err != nil {
@@ -1757,6 +1787,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		}
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
+		}
+		if onBytes != nil {
+			onBytes(size)
 		}
 		return size, nil
 	}); err != nil {
