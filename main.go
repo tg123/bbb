@@ -636,7 +636,7 @@ type progressBar struct {
 	label     string
 	width     int
 	showSpeed bool
-	hideCount bool // if true, omit (done/total) from the display
+	byteSized bool // if true, show done/total as formatted byte sizes
 	startedAt time.Time
 	total     atomic.Int64
 	done      atomic.Int64
@@ -771,10 +771,10 @@ func (p *progressBar) renderUnlocked() {
 		speed = float64(p.bytesDone.Load()) / elapsed
 	}
 	if isTerminal(os.Stderr) {
-		line := formatFancyBar(p.label, done, total, p.width, speed, p.showSpeed, p.hideCount)
+		line := formatFancyBar(p.label, done, total, p.width, speed, p.showSpeed, p.byteSized)
 		fmt.Fprintf(os.Stderr, "\r"+ansiClear+"%s", line)
 	} else {
-		line := formatProgressBar(p.label, done, total, p.width, speed, p.showSpeed, p.hideCount)
+		line := formatProgressBar(p.label, done, total, p.width, speed, p.showSpeed, p.byteSized)
 		fmt.Fprintf(os.Stderr, "\r%s", line)
 	}
 }
@@ -810,7 +810,7 @@ func (p *progressBar) render(done int64) {
 	rerenderActiveBars()
 }
 
-func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool, hideCount bool) string {
+func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool) string {
 	if width < 1 {
 		width = 1
 	}
@@ -830,10 +830,10 @@ func formatProgressBar(label string, done, total int64, width int, speed float64
 	}
 	bar := strings.Repeat("=", filled) + strings.Repeat(" ", width-filled)
 	switch {
-	case hideCount && showSpeed:
-		return fmt.Sprintf("%s [%s] %3d%% (%s)", label, bar, percent, formatByteSpeed(speed))
-	case hideCount:
-		return fmt.Sprintf("%s [%s] %3d%%", label, bar, percent)
+	case byteSized && showSpeed:
+		return fmt.Sprintf("%s [%s] %3d%% (%s/%s, %s)", label, bar, percent, formatSize(done), formatSize(total), formatByteSpeed(speed))
+	case byteSized:
+		return fmt.Sprintf("%s [%s] %3d%% (%s/%s)", label, bar, percent, formatSize(done), formatSize(total))
 	case showSpeed:
 		return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s)", label, bar, percent, done, total, formatByteSpeed(speed))
 	default:
@@ -841,7 +841,7 @@ func formatProgressBar(label string, done, total int64, width int, speed float64
 	}
 }
 
-func formatFancyBar(label string, done, total int64, width int, speed float64, showSpeed bool, hideCount bool) string {
+func formatFancyBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool) string {
 	if width < 1 {
 		width = 1
 	}
@@ -867,10 +867,10 @@ func formatFancyBar(label string, done, total int64, width int, speed float64, s
 		suffix = " " + ansiGreen + "✓" + ansiReset
 	}
 	switch {
-	case hideCount && showSpeed:
-		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s)%s", label, bar, pctColor, percent, formatByteSpeed(speed), suffix)
-	case hideCount:
-		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+"%s", label, bar, pctColor, percent, suffix)
+	case byteSized && showSpeed:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s/%s, %s)%s", label, bar, pctColor, percent, formatSize(done), formatSize(total), formatByteSpeed(speed), suffix)
+	case byteSized:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s/%s)%s", label, bar, pctColor, percent, formatSize(done), formatSize(total), suffix)
 	case showSpeed:
 		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d, %s)%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), suffix)
 	default:
@@ -1731,9 +1731,11 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				}
 			}
 			var copyBar *progressBar
-			if showCopyBar && isTerminal(os.Stderr) {
-				copyBar = newProgressBar(100, path.Base(op.src), false, true)
-				copyBar.hideCount = true
+			if showCopyBar {
+				copyBar = newStreamingProgressBar(path.Base(op.src), false, true)
+				if copyBar != nil {
+					copyBar.byteSized = true
+				}
 			}
 			var lastReported int64
 			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, func(copied, total int64) {
@@ -1751,10 +1753,10 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				if copyBar == nil {
 					return
 				}
+				copyBar.SetTotal(total)
 				copyBar.bytesDone.Store(copied)
-				pct := copied * 100 / total
-				copyBar.done.Store(pct)
-				copyBar.render(pct)
+				copyBar.done.Store(copied)
+				copyBar.render(copied)
 			}); err != nil {
 				if copyBar != nil {
 					copyBar.Finish()

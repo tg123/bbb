@@ -65,7 +65,7 @@ var validBlobSuffixes = []string{
 const (
 	defaultCopySASExpiry     = time.Hour
 	copyPollInitialDelay     = time.Second
-	copyPollMaxDelay         = 30 * time.Second
+	copyPollMaxDelay         = 2 * time.Second
 	copyPollBackoffFactor    = 2
 	uploadStreamMiB          = 1 << 20
 	uploadStreamBlockMin     = 256 * uploadStreamMiB  // Default UploadStream minimum block size.
