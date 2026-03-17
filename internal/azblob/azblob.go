@@ -306,6 +306,8 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 	opts := &azblob.ListBlobsFlatOptions{
 		Include: azblob.ListBlobsInclude{Metadata: true},
 	}
+	// Use nil Prefix (omit query param) for container root instead of &""
+	// to avoid potential Azure SDK/API differences with empty string prefix.
 	if prefix != "" {
 		opts.Prefix = &prefix
 	}
@@ -407,6 +409,7 @@ func ListRecursive(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 	opts := &azblob.ListBlobsFlatOptions{
 		Include: azblob.ListBlobsInclude{Metadata: true},
 	}
+	// Use nil Prefix for container root; see ListStream comment.
 	if prefix != "" {
 		opts.Prefix = &prefix
 	}
