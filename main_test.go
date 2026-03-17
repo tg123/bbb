@@ -886,6 +886,9 @@ func TestFormatSize(t *testing.T) {
 				t.Errorf("formatSize(%d) = %q, want %q", tt.bytes, got, tt.want)
 			}
 		})
+	}
+}
+
 func TestDNSLoggingDialContextPassesThrough(t *testing.T) {
 	var dialedNetwork, dialedAddr string
 	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
