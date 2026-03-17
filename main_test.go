@@ -874,10 +874,11 @@ func TestDNSLoggingDialContextPassesThrough(t *testing.T) {
 }
 
 func TestDNSLoggingDialContextLogsOnDebug(t *testing.T) {
+	orig := slog.Default()
 	var buf strings.Builder
 	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
 	slog.SetDefault(slog.New(handler))
-	defer slog.SetDefault(slog.Default())
+	defer slog.SetDefault(orig)
 
 	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return nil, errors.New("fake")
@@ -890,10 +891,11 @@ func TestDNSLoggingDialContextLogsOnDebug(t *testing.T) {
 }
 
 func TestDNSLoggingDialContextSilentOnInfo(t *testing.T) {
+	orig := slog.Default()
 	var buf strings.Builder
 	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
 	slog.SetDefault(slog.New(handler))
-	defer slog.SetDefault(slog.Default())
+	defer slog.SetDefault(orig)
 
 	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return nil, errors.New("fake")
@@ -912,10 +914,11 @@ func TestDNSLoggingDialContextBadAddr(t *testing.T) {
 		return nil, errors.New("fake")
 	}
 	// Enable debug logging so the SplitHostPort error path is exercised.
+	orig := slog.Default()
 	var buf strings.Builder
 	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
 	slog.SetDefault(slog.New(handler))
-	defer slog.SetDefault(slog.Default())
+	defer slog.SetDefault(orig)
 
 	dial := dnsLoggingDialContext(baseDial, net.DefaultResolver)
 	_, _ = dial(context.Background(), "tcp", "no-port")
@@ -929,10 +932,11 @@ func TestDNSLoggingDialContextBadAddr(t *testing.T) {
 }
 
 func TestDNSLoggingDialContextResolverError(t *testing.T) {
+	orig := slog.Default()
 	var buf strings.Builder
 	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
 	slog.SetDefault(slog.New(handler))
-	defer slog.SetDefault(slog.Default())
+	defer slog.SetDefault(orig)
 
 	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return nil, errors.New("fake")
