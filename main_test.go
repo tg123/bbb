@@ -601,6 +601,7 @@ func TestCmdSyncTaskfile(t *testing.T) {
 			&cli.IntFlag{Name: "retry-count"},
 			&cli.BoolFlag{Name: "q"},
 			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
 		},
 	}
 	if err := app.Run(context.Background(), []string{"sync", "--taskfile", taskfile}); err != nil {
@@ -611,6 +612,80 @@ func TestCmdSyncTaskfile(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dstB, "b.txt")); err != nil {
 		t.Fatalf("expected synced file B: %v", err)
+	}
+}
+
+func TestCmdSyncTaskfileStateRecovery(t *testing.T) {
+	dir := t.TempDir()
+	srcA := filepath.Join(dir, "src-a")
+	dstA := filepath.Join(dir, "dst-a")
+	srcB := filepath.Join(dir, "src-b")
+	dstB := filepath.Join(dir, "dst-b")
+	if err := os.MkdirAll(srcA, 0o755); err != nil {
+		t.Fatalf("mkdir srcA: %v", err)
+	}
+	if err := os.MkdirAll(srcB, 0o755); err != nil {
+		t.Fatalf("mkdir srcB: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcA, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write srcA: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcB, "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatalf("write srcB: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "sync.tasks")
+	content := strings.Join([]string{srcA + " " + dstA, srcB + " " + dstB, ""}, "\n")
+	if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "sync.state")
+
+	app := &cli.Command{
+		Action: cmdSync,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "dry-run"},
+			&cli.BoolFlag{Name: "delete"},
+			&cli.StringFlag{Name: "x"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "taskfile-state"},
+		},
+	}
+
+	// First run: sync both task pairs
+	if err := app.Run(context.Background(), []string{"sync", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstA, "a.txt")); err != nil {
+		t.Fatalf("expected synced file A: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstB, "b.txt")); err != nil {
+		t.Fatalf("expected synced file B: %v", err)
+	}
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read statefile: %v", err)
+	}
+	stateText := string(stateData)
+	cpKeyA := taskCheckpointKey(srcA, dstA)
+	cpKeyB := taskCheckpointKey(srcB, dstB)
+	if !strings.Contains(stateText, cpKeyA) {
+		t.Fatalf("expected checkpoint for task A in statefile, got:\n%s", stateText)
+	}
+	if !strings.Contains(stateText, cpKeyB) {
+		t.Fatalf("expected checkpoint for task B in statefile, got:\n%s", stateText)
+	}
+
+	// Remove source A so a re-run would fail if it tried to sync it again
+	if err := os.RemoveAll(srcA); err != nil {
+		t.Fatalf("remove srcA: %v", err)
+	}
+	// Second run: both tasks are already checkpointed, so should be skipped
+	if err := app.Run(context.Background(), []string{"sync", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+		t.Fatalf("sync resume failed: %v", err)
 	}
 }
 

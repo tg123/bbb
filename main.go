@@ -79,6 +79,8 @@ func main() {
 				Value:   "info",
 				Sources: cli.EnvVars("BBB_LOG_LEVEL"),
 			},
+			&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
+			&cli.StringFlag{Name: "taskfile-state", Usage: "State file for taskfile crash recovery"},
 		},
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
 			lvlStr := cmd.String("loglevel")
@@ -195,15 +197,13 @@ func main() {
 			{
 				Name:      "cp",
 				Usage:     "Copy files or directories",
-				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] [--taskfile FILE|--taskfile -] [--taskfile-state FILE]\n   or: bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
+				UsageText: "bbb [--taskfile FILE|--taskfile -] [--taskfile-state FILE] cp [-q|--quiet] [--concurrency N] [--retry-count N]\n   or: bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
 				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
-					&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
-					&cli.StringFlag{Name: "taskfile-state", Usage: "State file for `cp --taskfile` crash recovery"},
 				},
 				Action: cmdCP,
 			},
@@ -245,7 +245,7 @@ func main() {
 			{
 				Name:      "sync",
 				Usage:     "Synchronise two directory trees",
-				UsageText: "bbb sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] [--taskfile FILE|--taskfile -] src dst",
+				UsageText: "bbb [--taskfile FILE|--taskfile -] [--taskfile-state FILE] sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N]\n   or: bbb sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] src dst",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "dry-run", Usage: "show actions without applying"},
 					&cli.BoolFlag{Name: "delete", Usage: "Delete destination files that don't exist in source"},
@@ -253,7 +253,6 @@ func main() {
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
 					&cli.StringFlag{Name: "x", Aliases: []string{"exclude"}, Usage: "Exclude files matching this regex"},
-					&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
 				},
 				Action: cmdSync,
 			},
@@ -2250,6 +2249,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
 	taskfile := c.String("taskfile")
+	taskfileState := c.String("taskfile-state")
 
 	if taskfile != "" {
 		if c.Args().Len() != 0 {
@@ -2259,12 +2259,32 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
+		_, taskCheckpoints, err := loadTaskState(taskfileState)
+		if err != nil {
+			return err
+		}
+		stateAppender, err := newTaskStateAppender(taskfileState)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = stateAppender.close() }()
 		for _, task := range tasks {
+			cpKey := taskCheckpointKey(task.src, task.dst)
+			if _, done := taskCheckpoints[cpKey]; done {
+				if !quiet {
+					lockedFprintf(os.Stderr, "sync: skip already completed task %s -> %s\n", task.src, task.dst)
+				}
+				continue
+			}
 			if err := cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, task.src, task.dst); err != nil {
+				_ = stateAppender.close()
+				return err
+			}
+			if err := stateAppender.appendCheckpoint(cpKey); err != nil {
 				return err
 			}
 		}
-		return nil
+		return stateAppender.close()
 	}
 	if c.Args().Len() != 2 {
 		return fmt.Errorf("sync: need src dst")
