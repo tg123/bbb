@@ -1649,7 +1649,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 					return
 				}
 				copyBar.bytesDone.Store(copied)
-				copyBar.render(copied * 100 / total)
+				pct := copied * 100 / total
+				copyBar.done.Store(pct)
+				copyBar.render(pct)
 			}); err != nil {
 				if copyBar != nil {
 					copyBar.Finish()
