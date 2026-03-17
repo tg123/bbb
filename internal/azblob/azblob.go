@@ -229,6 +229,52 @@ type BlobMeta struct {
 	Size int64
 }
 
+// flatBlobEntry represents a blob item from a flat listing suitable for
+// first-level child extraction. Size is nil when the blob is a
+// directory-marker or otherwise lacks a content-length.
+type flatBlobEntry struct {
+	Name string
+	Size *int64
+}
+
+// extractFirstLevel derives immediate children (files and virtual dirs)
+// from flat blob entries under the given prefix. Directories are emitted
+// with a trailing "/" and size 0. Files require a non-nil Size.
+func extractFirstLevel(entries []flatBlobEntry, prefix string, cb func(BlobMeta) error) error {
+	seen := make(map[string]struct{})
+	for _, e := range entries {
+		rel := strings.TrimPrefix(e.Name, prefix)
+		if rel == "" {
+			continue
+		}
+		parts := strings.SplitN(rel, "/", 2)
+		if len(parts) == 1 {
+			// file at first level — require valid size
+			if e.Size == nil {
+				continue
+			}
+			if _, exists := seen[parts[0]]; exists {
+				continue
+			}
+			seen[parts[0]] = struct{}{}
+			if err := cb(BlobMeta{Name: parts[0], Size: *e.Size}); err != nil {
+				return err
+			}
+		} else if len(parts) == 2 {
+			// directory — no size needed
+			dirName := parts[0] + "/"
+			if _, exists := seen[dirName]; exists {
+				continue
+			}
+			seen[dirName] = struct{}{}
+			if err := cb(BlobMeta{Name: dirName, Size: 0}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // ListStream streams immediate children (non-recursive). If dir-like path provided, lists under it.
 func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) error {
 	if ap.Container == "" { // account root: list containers
@@ -257,11 +303,14 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 		return err
 	}
 	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
-	pager := containerClient.NewListBlobsFlatPager(&azblob.ListBlobsFlatOptions{
-		Prefix:  &prefix,
+	opts := &azblob.ListBlobsFlatOptions{
 		Include: azblob.ListBlobsInclude{Metadata: true},
-	})
-	firstLevel := make(map[string]*BlobMeta)
+	}
+	if prefix != "" {
+		opts.Prefix = &prefix
+	}
+	pager := containerClient.NewListBlobsFlatPager(opts)
+	seen := make(map[string]struct{})
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
@@ -270,37 +319,25 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 		if resp.Segment == nil {
 			return nil
 		}
+		var batch []flatBlobEntry
 		for _, blob := range resp.Segment.BlobItems {
-			if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
+			if blob == nil || blob.Name == nil {
 				continue
 			}
-			rel := strings.TrimPrefix(*blob.Name, prefix)
-			if rel == "" {
-				continue
+			var size *int64
+			if blob.Properties != nil {
+				size = blob.Properties.ContentLength
 			}
-			parts := strings.SplitN(rel, "/", 2)
-			if len(parts) == 1 {
-				// file at first level
-				if _, exists := firstLevel[parts[0]]; exists {
-					continue
-				}
-				bm := &BlobMeta{Name: parts[0], Size: *blob.Properties.ContentLength}
-				firstLevel[parts[0]] = bm
-				if err := cb(*bm); err != nil {
-					return err
-				}
-			} else if len(parts) == 2 {
-				// directory
-				dirName := parts[0] + "/"
-				if _, exists := firstLevel[dirName]; exists {
-					continue
-				}
-				bm := &BlobMeta{Name: dirName, Size: 0}
-				firstLevel[dirName] = bm
-				if err := cb(*bm); err != nil {
-					return err
-				}
+			batch = append(batch, flatBlobEntry{Name: *blob.Name, Size: size})
+		}
+		if err := extractFirstLevel(batch, prefix, func(bm BlobMeta) error {
+			if _, exists := seen[bm.Name]; exists {
+				return nil
 			}
+			seen[bm.Name] = struct{}{}
+			return cb(bm)
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -367,10 +404,13 @@ func ListRecursive(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 		return nil, err
 	}
 	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
-	pager := containerClient.NewListBlobsFlatPager(&azblob.ListBlobsFlatOptions{
-		Prefix:  &prefix,
+	opts := &azblob.ListBlobsFlatOptions{
 		Include: azblob.ListBlobsInclude{Metadata: true},
-	})
+	}
+	if prefix != "" {
+		opts.Prefix = &prefix
+	}
+	pager := containerClient.NewListBlobsFlatPager(opts)
 	var out []BlobMeta
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
