@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -98,6 +100,30 @@ func main() {
 			handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
 			slog.SetDefault(slog.New(&barAwareHandler{inner: handler}))
 			slog.Debug("Logger initialized", "level", lvlStr)
+
+			if lvl <= slog.LevelDebug {
+				if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+					transport = transport.Clone()
+					dialer := &net.Dialer{
+						Timeout:   30 * time.Second,
+						KeepAlive: 30 * time.Second,
+					}
+					transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+						host, _, err := net.SplitHostPort(addr)
+						if err == nil {
+							addrs, dnsErr := net.DefaultResolver.LookupHost(ctx, host)
+							if dnsErr == nil {
+								slog.Debug("DNS lookup", "host", host, "addrs", addrs)
+							} else {
+								slog.Debug("DNS lookup failed", "host", host, "error", dnsErr)
+							}
+						}
+						return dialer.DialContext(ctx, network, addr)
+					}
+					http.DefaultTransport = transport
+				}
+			}
+
 			return ctx, nil
 		},
 		Commands: []*cli.Command{
