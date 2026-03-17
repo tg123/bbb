@@ -478,46 +478,83 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 }
 
 var (
-	outputMu     sync.Mutex
-	activeBarPtr *progressBar // guarded by outputMu
+	outputMu   sync.Mutex
+	activeBars []*progressBar // guarded by outputMu; rendered in order
 )
 
-func clearActiveBar() {
-	if activeBarPtr != nil && isTerminal(os.Stderr) {
-		fmt.Fprintf(os.Stderr, "\r"+ansiClear)
+func clearActiveBars() {
+	n := len(activeBars)
+	if n == 0 || !isTerminal(os.Stderr) {
+		return
+	}
+	if n > 1 {
+		fmt.Fprintf(os.Stderr, "\033[%dA", n-1) // move cursor up to first bar line
+	}
+	fmt.Fprintf(os.Stderr, "\r\033[J") // clear from cursor to end of screen
+}
+
+func rerenderActiveBars() {
+	for i, bar := range activeBars {
+		bar.renderUnlocked()
+		if i < len(activeBars)-1 {
+			fmt.Fprintf(os.Stderr, "\n")
+		}
 	}
 }
 
-func rerenderActiveBar() {
-	if activeBarPtr != nil {
-		activeBarPtr.renderUnlocked()
+func addActiveBar(p *progressBar) {
+	for _, b := range activeBars {
+		if b == p {
+			return
+		}
+	}
+	if p.pinBottom {
+		activeBars = append(activeBars, p)
+		return
+	}
+	// Insert before any pinBottom bars so they stay at the bottom.
+	insertAt := len(activeBars)
+	for insertAt > 0 && activeBars[insertAt-1].pinBottom {
+		insertAt--
+	}
+	activeBars = append(activeBars, nil)
+	copy(activeBars[insertAt+1:], activeBars[insertAt:])
+	activeBars[insertAt] = p
+}
+
+func removeActiveBar(p *progressBar) {
+	for i, b := range activeBars {
+		if b == p {
+			activeBars = append(activeBars[:i], activeBars[i+1:]...)
+			return
+		}
 	}
 }
 
 func lockedPrintf(format string, args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	clearActiveBar()
+	clearActiveBars()
 	fmt.Printf(format, args...)
-	rerenderActiveBar()
+	rerenderActiveBars()
 }
 
 func lockedPrintln(args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	clearActiveBar()
+	clearActiveBars()
 	fmt.Println(args...)
-	rerenderActiveBar()
+	rerenderActiveBars()
 }
 
 func lockedFprintf(w io.Writer, format string, args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	clearActiveBar()
+	clearActiveBars()
 	if _, err := fmt.Fprintf(w, format, args...); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
-	rerenderActiveBar()
+	rerenderActiveBars()
 }
 
 // barAwareHandler wraps an slog.Handler so log output coordinates with the
@@ -534,9 +571,9 @@ func (h *barAwareHandler) Enabled(ctx context.Context, level slog.Level) bool {
 func (h *barAwareHandler) Handle(ctx context.Context, r slog.Record) error {
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	clearActiveBar()
+	clearActiveBars()
 	err := h.inner.Handle(ctx, r)
-	rerenderActiveBar()
+	rerenderActiveBars()
 	return err
 }
 
@@ -567,6 +604,7 @@ type progressBar struct {
 	lastDone  atomic.Int64
 	lastTotal atomic.Int64
 	finished  atomic.Bool
+	pinBottom bool // if true, renders at the bottom of the bar stack
 }
 
 const (
@@ -669,11 +707,11 @@ func (p *progressBar) Finish() {
 	p.done.Store(total)
 	outputMu.Lock()
 	defer outputMu.Unlock()
+	clearActiveBars()
+	removeActiveBar(p)
 	p.renderUnlocked()
 	fmt.Fprintf(os.Stderr, "\n")
-	if activeBarPtr == p {
-		activeBarPtr = nil
-	}
+	rerenderActiveBars()
 }
 
 // renderUnlocked writes the progress bar to stderr. outputMu must be held.
@@ -727,8 +765,9 @@ func (p *progressBar) render(done int64) {
 	p.lastTotal.Store(total)
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	activeBarPtr = p
-	p.renderUnlocked()
+	clearActiveBars()
+	addActiveBar(p)
+	rerenderActiveBars()
 }
 
 func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
@@ -1229,6 +1268,9 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		// discovered during expansion. The bar stays invisible until the
 		// first file is found, then updates on every change.
 		taskProgress := newStreamingProgressBar("cp files", quiet)
+		if taskProgress != nil {
+			taskProgress.pinBottom = true
+		}
 		defer func() {
 			if taskProgress != nil {
 				taskProgress.Finish()
@@ -1290,7 +1332,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 							return
 						}
 						slog.Debug("cp: start", "src", task.src, "dst", task.dst)
-						if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst); err != nil {
+						if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, !quiet); err != nil {
 							setErr(err)
 							return
 						}
@@ -1447,10 +1489,10 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		srcs[i] = c.Args().Get(i)
 	}
 	dst := c.Args().Get(c.Args().Len() - 1)
-	return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, srcs, dst)
+	return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, srcs, dst, !quiet)
 }
 
-func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string) error {
+func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, showCopyBar bool) error {
 	if isHF(dst) {
 		return fmt.Errorf("cp: hf:// only supported as source")
 	}
@@ -1598,7 +1640,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				}
 			}
 			var copyBar *progressBar
-			if !quiet && isTerminal(os.Stderr) {
+			if showCopyBar && isTerminal(os.Stderr) {
 				copyBar = newProgressBar(100, path.Base(op.src), false, true)
 			}
 			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, func(copied, total int64) {
