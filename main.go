@@ -1704,8 +1704,20 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				copyBar = newProgressBar(100, path.Base(op.src), false, true)
 				copyBar.hideCount = true
 			}
+			var lastReported int64
 			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, func(copied, total int64) {
-				if copyBar == nil || total <= 0 {
+				if total <= 0 {
+					return
+				}
+				// Report incremental bytes to the overall taskbar.
+				if onBytes != nil {
+					delta := copied - lastReported
+					if delta > 0 {
+						onBytes(delta)
+						lastReported = copied
+					}
+				}
+				if copyBar == nil {
 					return
 				}
 				copyBar.bytesDone.Store(copied)
@@ -1723,9 +1735,6 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
-			}
-			if onBytes != nil {
-				onBytes(size)
 			}
 			return size, nil
 		}
