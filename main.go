@@ -2267,7 +2267,6 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		defer func() { _ = stateAppender.close() }()
 		for _, task := range tasks {
 			cpKey := taskCheckpointKey(task.src, task.dst)
 			if _, done := taskCheckpoints[cpKey]; done {
@@ -2284,7 +2283,10 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				return err
 			}
 		}
-		return stateAppender.close()
+		if err := stateAppender.close(); err != nil {
+			return err
+		}
+		return nil
 	}
 	if c.Args().Len() != 2 {
 		return fmt.Errorf("sync: need src dst")
