@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -66,6 +68,32 @@ func isHF(s string) bool {
 	return strings.HasPrefix(s, hfScheme)
 }
 
+type dialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// dnsLoggingDialContext wraps a base dialer to log DNS resolution results at
+// debug level before each connection. When debug logging is not enabled the
+// wrapper is a no-op and delegates directly to baseDial, so there is no extra
+// overhead in normal operation. The original address is always passed through
+// to baseDial, preserving Go's standard happy-eyeballs dialing behaviour.
+func dnsLoggingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dialContextFunc {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if slog.Default().Enabled(ctx, slog.LevelDebug) {
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil {
+				addrs, dnsErr := resolver.LookupHost(ctx, host)
+				if dnsErr != nil {
+					slog.Debug("DNS lookup error", "host", host, "error", dnsErr)
+				} else if len(addrs) == 0 {
+					slog.Debug("DNS lookup returned no addresses", "host", host)
+				} else {
+					slog.Debug("DNS lookup", "host", host, "addrs", addrs)
+				}
+			}
+		}
+		return baseDial(ctx, network, addr)
+	}
+}
+
 func main() {
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
@@ -98,6 +126,17 @@ func main() {
 			handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
 			slog.SetDefault(slog.New(&barAwareHandler{inner: handler}))
 			slog.Debug("Logger initialized", "level", lvlStr)
+
+			if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+				transport = transport.Clone()
+				baseDial := (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext
+				transport.DialContext = dnsLoggingDialContext(baseDial, net.DefaultResolver)
+				http.DefaultTransport = transport
+			}
+
 			return ctx, nil
 		},
 		Commands: []*cli.Command{
