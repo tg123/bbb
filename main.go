@@ -114,7 +114,7 @@ func main() {
 							return dialer.DialContext(ctx, network, addr)
 						}
 						addrs, dnsErr := net.DefaultResolver.LookupHost(ctx, host)
-						if dnsErr != nil {
+						if dnsErr != nil || len(addrs) == 0 {
 							slog.Debug("DNS lookup failed", "host", host, "error", dnsErr)
 							return dialer.DialContext(ctx, network, addr)
 						}
