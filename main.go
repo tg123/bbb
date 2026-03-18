@@ -830,10 +830,7 @@ func clampProgress(done, total int64) (int64, int64) {
 }
 
 func (p *progressBar) render(done int64) {
-	if p == nil {
-		return
-	}
-	if p.finished.Load() {
+	if p == nil || p.finished.Load() {
 		return
 	}
 	total := p.total.Load()
