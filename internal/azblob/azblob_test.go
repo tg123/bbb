@@ -129,6 +129,90 @@ func TestParseCopyProgress(t *testing.T) {
 	}
 }
 
+func TestPlanBlocksEmpty(t *testing.T) {
+	blkSize, ids, err := planBlocks(0, 256*1024*1024, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize != 256*1024*1024 {
+		t.Fatalf("expected default block size, got %d", blkSize)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected 0 block IDs for empty blob, got %d", len(ids))
+	}
+}
+
+func TestPlanBlocksSingleBlock(t *testing.T) {
+	blkSize, ids, err := planBlocks(100, 256*1024*1024, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize != 256*1024*1024 {
+		t.Fatalf("expected default block size, got %d", blkSize)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("expected 1 block ID, got %d", len(ids))
+	}
+}
+
+func TestPlanBlocksMultipleBlocks(t *testing.T) {
+	// 512 MiB at 256 MiB block size = 2 blocks
+	blkSize, ids, err := planBlocks(512*1024*1024, 256*1024*1024, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize != 256*1024*1024 {
+		t.Fatalf("expected default block size, got %d", blkSize)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 block IDs, got %d", len(ids))
+	}
+	// All IDs must have the same length.
+	if len(ids[0]) != len(ids[1]) {
+		t.Fatalf("block IDs have different lengths: %q vs %q", ids[0], ids[1])
+	}
+}
+
+func TestPlanBlocksAdjustsBlockSizeWhenExceedsMax(t *testing.T) {
+	// maxBlocks=2, 300 bytes at default 100 = 3 blocks → must adjust.
+	blkSize, ids, err := planBlocks(300, 100, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize <= 100 {
+		t.Fatalf("expected increased block size, got %d", blkSize)
+	}
+	if len(ids) > 2 {
+		t.Fatalf("expected at most 2 blocks, got %d", len(ids))
+	}
+	// Verify blocks cover entire size.
+	covered := int64(len(ids)) * blkSize
+	if covered < 300 {
+		t.Fatalf("blocks do not cover total size: %d * %d = %d < 300", len(ids), blkSize, covered)
+	}
+}
+
+func TestPlanBlocksUniqueIDs(t *testing.T) {
+	_, ids, err := planBlocks(1024, 100, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	seen := make(map[string]bool)
+	for _, id := range ids {
+		if seen[id] {
+			t.Fatalf("duplicate block ID: %s", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestPlanBlocksNegativeSize(t *testing.T) {
+	_, _, err := planBlocks(-1, 256*1024*1024, 50000)
+	if err == nil {
+		t.Fatal("expected error for negative total size")
+	}
+}
+
 func TestUploadStreamBlockSizeWithinLimit(t *testing.T) {
 	blockSize := uploadStreamBlockSize(100000 * uploadStreamBlockMin)
 	if blockSize != uploadStreamBlockMin {

@@ -642,6 +642,47 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 	return nil
 }
 
+// planBlocks computes the block size and generates base64-encoded block IDs for
+// a server-side copy of totalSize bytes. defaultBlockSize is the preferred block
+// size; maxBlocks is the maximum number of blocks allowed by Azure. For empty
+// blobs (totalSize == 0) it returns blockSize == defaultBlockSize and an empty
+// ID slice. The returned blockSize may exceed defaultBlockSize when totalSize is
+// large enough to require more than maxBlocks blocks at the default size.
+func planBlocks(totalSize int64, defaultBlockSize int64, maxBlocks int64) (blockSize int64, blockIDs []string, err error) {
+	if totalSize < 0 {
+		return 0, nil, fmt.Errorf("negative total size: %d", totalSize)
+	}
+	blockSize = defaultBlockSize
+	if blockSize < 1 {
+		blockSize = 1
+	}
+
+	// For empty blobs, CommitBlockList with an empty list creates a 0-byte blob.
+	if totalSize == 0 {
+		return blockSize, nil, nil
+	}
+
+	numBlocks := (totalSize + blockSize - 1) / blockSize
+	if numBlocks > maxBlocks {
+		blockSize = (totalSize + maxBlocks - 1) / maxBlocks
+		numBlocks = (totalSize + blockSize - 1) / blockSize
+	}
+	if numBlocks > maxBlocks {
+		return 0, nil, fmt.Errorf("blob too large: %d bytes requires more than %d blocks", totalSize, maxBlocks)
+	}
+	if numBlocks > math.MaxInt {
+		return 0, nil, fmt.Errorf("block count %d exceeds platform int limit", numBlocks)
+	}
+
+	// Block IDs must all be the same length; 6-digit format supports up to
+	// 999,999 which exceeds MaxBlocks (50,000).
+	ids := make([]string, int(numBlocks))
+	for i := range ids {
+		ids[i] = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%06d", i)))
+	}
+	return blockSize, ids, nil
+}
+
 // CopyProgress is called during server-side copy with the number of
 // bytes copied so far and the total size in bytes.
 type CopyProgress func(copied, total int64)
@@ -673,23 +714,10 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 
 	blockBlobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
 
-	// Use parallel StageBlockFromURL + CommitBlockList.
-	// For empty files (0 blocks), CommitBlockList with an empty list creates a 0-byte blob.
-	blkSize := int64(copyBlockSize)
-	numBlocks := (totalSize + blkSize - 1) / blkSize
-	if numBlocks > blockblob.MaxBlocks {
-		blkSize = (totalSize + blockblob.MaxBlocks - 1) / blockblob.MaxBlocks
-		numBlocks = (totalSize + blkSize - 1) / blkSize
-	}
-	if numBlocks > blockblob.MaxBlocks {
-		return fmt.Errorf("blob too large: %d bytes requires more than %d blocks", totalSize, blockblob.MaxBlocks)
-	}
-
-	// Block IDs must all be the same length; 6-digit format supports up to
-	// 999,999 which exceeds MaxBlocks (50,000).
-	blockIDs := make([]string, numBlocks)
-	for i := int64(0); i < numBlocks; i++ {
-		blockIDs[i] = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%06d", i)))
+	// Plan blocks and generate IDs.
+	blkSize, blockIDs, err := planBlocks(totalSize, copyBlockSize, blockblob.MaxBlocks)
+	if err != nil {
+		return err
 	}
 
 	var copiedBytes atomic.Int64
@@ -702,14 +730,13 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	var errMu sync.Mutex
 	var firstErr error
 
-	for i := int64(0); i < numBlocks; i++ {
+	for i, blockID := range blockIDs {
 		if ctx.Err() != nil {
 			break
 		}
 
-		offset := i * blkSize
+		offset := int64(i) * blkSize
 		count := min(blkSize, totalSize-offset)
-		blockID := blockIDs[i]
 
 		// Acquire semaphore slot, respecting context cancellation so the
 		// loop doesn't block forever when a peer goroutine cancels ctx.

@@ -768,6 +768,11 @@ func (p *progressBar) Finish() {
 	if !p.finished.CompareAndSwap(false, true) {
 		return
 	}
+	// If the bar was never actually rendered (e.g. a 0-byte copy where
+	// total was never set, or a streaming bar that never received
+	// SetTotal), skip the final render and trailing newline to avoid
+	// printing a misleading "1 B/1 B" line.
+	neverShown := p.lastTotal.Load() == progressUninitialized
 	total := p.total.Load()
 	if total < 1 {
 		total = 1
@@ -778,8 +783,10 @@ func (p *progressBar) Finish() {
 	defer outputMu.Unlock()
 	clearActiveBars()
 	removeActiveBar(p)
-	p.renderUnlocked()
-	fmt.Fprintf(os.Stderr, "\n")
+	if !neverShown {
+		p.renderUnlocked()
+		fmt.Fprintf(os.Stderr, "\n")
+	}
 	rerenderActiveBars()
 }
 
