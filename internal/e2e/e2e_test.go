@@ -334,7 +334,7 @@ func TestBasic(t *testing.T) {
 		if err := os.WriteFile(stateFile, []byte(skippedKey+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := runBBB("cp", "--taskfile", taskfile, "--taskfile-state", stateFile, "--concurrency", "2"); err != nil {
+		if _, err := runBBB("cp", "--taskfile", taskfile, "--state", stateFile, "--concurrency", "2"); err != nil {
 			t.Fatal(err)
 		}
 		files, err := bbbLs(dstPrefix, true)
