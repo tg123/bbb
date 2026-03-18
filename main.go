@@ -818,7 +818,8 @@ func (p *progressBar) renderAligned(labelWidth int) {
 		return
 	}
 	done, total = clampProgress(done, total)
-	elapsed := time.Since(p.startedAt).Seconds()
+	elapsedDur := time.Since(p.startedAt)
+	elapsed := elapsedDur.Seconds()
 	speed := 0.0
 	if p.showSpeed && elapsed > 0 {
 		speed = float64(p.bytesDone.Load()) / elapsed
@@ -828,10 +829,10 @@ func (p *progressBar) renderAligned(labelWidth int) {
 		label = label + strings.Repeat(" ", labelWidth-len(label))
 	}
 	if isTerminal(os.Stderr) {
-		line := formatFancyBar(label, done, total, p.width, speed, p.showSpeed, p.byteSized)
+		line := formatFancyBar(label, done, total, p.width, speed, p.showSpeed, p.byteSized, elapsedDur)
 		fmt.Fprintf(os.Stderr, "\r"+ansiClear+"%s", line)
 	} else {
-		line := formatProgressBar(label, done, total, p.width, speed, p.showSpeed, p.byteSized)
+		line := formatProgressBar(label, done, total, p.width, speed, p.showSpeed, p.byteSized, elapsedDur)
 		fmt.Fprintf(os.Stderr, "\r%s", line)
 	}
 }
@@ -877,7 +878,7 @@ func (p *progressBar) render(done int64) {
 	rerenderActiveBars()
 }
 
-func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool) string {
+func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool, elapsed time.Duration) string {
 	if width < 1 {
 		width = 1
 	}
@@ -896,19 +897,20 @@ func formatProgressBar(label string, done, total int64, width int, speed float64
 		filled = width
 	}
 	bar := strings.Repeat("=", filled) + strings.Repeat(" ", width-filled)
+	elapsedStr := formatElapsed(elapsed)
 	switch {
 	case byteSized && showSpeed:
-		return fmt.Sprintf("%s [%s] %3d%% (%s/%s, %s)", label, bar, percent, formatSize(done), formatSize(total), formatByteSpeed(speed))
+		return fmt.Sprintf("%s [%s] %3d%% (%s/%s, %s) %s", label, bar, percent, formatSize(done), formatSize(total), formatByteSpeed(speed), elapsedStr)
 	case byteSized:
-		return fmt.Sprintf("%s [%s] %3d%% (%s/%s)", label, bar, percent, formatSize(done), formatSize(total))
+		return fmt.Sprintf("%s [%s] %3d%% (%s/%s) %s", label, bar, percent, formatSize(done), formatSize(total), elapsedStr)
 	case showSpeed:
-		return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s)", label, bar, percent, done, total, formatByteSpeed(speed))
+		return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s) %s", label, bar, percent, done, total, formatByteSpeed(speed), elapsedStr)
 	default:
-		return fmt.Sprintf("%s [%s] %3d%% (%d/%d)", label, bar, percent, done, total)
+		return fmt.Sprintf("%s [%s] %3d%% (%d/%d) %s", label, bar, percent, done, total, elapsedStr)
 	}
 }
 
-func formatFancyBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool) string {
+func formatFancyBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool, elapsed time.Duration) string {
 	if width < 1 {
 		width = 1
 	}
@@ -933,15 +935,16 @@ func formatFancyBar(label string, done, total int64, width int, speed float64, s
 		pctColor = ansiGreen
 		suffix = " " + ansiGreen + "✓" + ansiReset
 	}
+	elapsedStr := formatElapsed(elapsed)
 	switch {
 	case byteSized && showSpeed:
-		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s/%s, %s)%s", label, bar, pctColor, percent, formatSize(done), formatSize(total), formatByteSpeed(speed), suffix)
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s/%s, %s) %s%s", label, bar, pctColor, percent, formatSize(done), formatSize(total), formatByteSpeed(speed), elapsedStr, suffix)
 	case byteSized:
-		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s/%s)%s", label, bar, pctColor, percent, formatSize(done), formatSize(total), suffix)
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s/%s) %s%s", label, bar, pctColor, percent, formatSize(done), formatSize(total), elapsedStr, suffix)
 	case showSpeed:
-		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d, %s)%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), suffix)
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d, %s) %s%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), elapsedStr, suffix)
 	default:
-		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d)%s", label, bar, pctColor, percent, done, total, suffix)
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d) %s%s", label, bar, pctColor, percent, done, total, elapsedStr, suffix)
 	}
 }
 
@@ -988,6 +991,20 @@ func formatByteSpeed(bytesPerSecond float64) string {
 		return fmt.Sprintf("%.1f GB/s", bytesPerSecond/gb)
 	}
 	return fmt.Sprintf("%.1f MB/s", bytesPerSecond/mb)
+}
+
+func formatElapsed(d time.Duration) string {
+	d = d.Truncate(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm%02ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
 }
 
 func sizeOfReader(reader io.Reader) int64 {
