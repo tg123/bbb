@@ -2049,24 +2049,35 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				return nil
 			}, func(work azToAzOp) error {
-				reader, err := azblob.DownloadStream(ctx, sap.Child(work.name))
-				if err != nil {
-					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
-					return err
-				}
 				if !overwrite {
 					if _, err := azblob.HeadBlob(ctx, dap.Child(work.name)); err == nil {
-						if cerr := reader.Close(); cerr != nil {
-							return cerr
-						}
 						return nil
 					}
 				}
-				if err := withReadCloser(reader, func(r io.Reader) error {
-					return azblob.UploadStream(ctx, dap.Child(work.name), r)
+				var copyBar *progressBar
+				if !quiet {
+					copyBar = newStreamingProgressBar(path.Base(work.name), false, true)
+					if copyBar != nil {
+						copyBar.byteSized = true
+					}
+				}
+				if err := azblob.CopyBlobServerSide(ctx, sap.Child(work.name), dap.Child(work.name), concurrency, func(copied, total int64) {
+					if total <= 0 || copyBar == nil {
+						return
+					}
+					atomicMax(&copyBar.bytesDone, copied)
+					atomicMax(&copyBar.done, copied)
+					copyBar.SetTotal(total)
+					copyBar.render(copied)
 				}); err != nil {
-					lockedFprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, work.name, err)
+					if copyBar != nil {
+						copyBar.Finish()
+					}
+					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 					return err
+				}
+				if copyBar != nil {
+					copyBar.Finish()
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", sap.Child(work.name).String(), dap.Child(work.name).String())
@@ -2783,25 +2794,36 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		}, func(f item) error {
 			sPath := f.rel
 			if srcAz && dstAz {
-				reader, err := azblob.DownloadStream(ctx, sap.Child(sPath))
-				if err != nil {
-					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync: %s: %w", sPath, err)
-				}
 				if dry {
 					if !quiet {
 						lockedPrintln("COPY", sap.Child(sPath).String(), "->", dap.Child(sPath).String())
 					}
-					if cerr := reader.Close(); cerr != nil {
-						return cerr
-					}
 					return nil
 				}
-				if err := withReadCloser(reader, func(r io.Reader) error {
-					return azblob.UploadStream(ctx, dap.Child(sPath), r)
+				var copyBar *progressBar
+				if !quiet {
+					copyBar = newStreamingProgressBar(path.Base(sPath), false, true)
+					if copyBar != nil {
+						copyBar.byteSized = true
+					}
+				}
+				if err := azblob.CopyBlobServerSide(ctx, sap.Child(sPath), dap.Child(sPath), concurrency, func(copied, total int64) {
+					if total <= 0 || copyBar == nil {
+						return
+					}
+					atomicMax(&copyBar.bytesDone, copied)
+					atomicMax(&copyBar.done, copied)
+					copyBar.SetTotal(total)
+					copyBar.render(copied)
 				}); err != nil {
-					lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync upload: %s: %w", sPath, err)
+					if copyBar != nil {
+						copyBar.Finish()
+					}
+					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
+					return fmt.Errorf("sync: %s: %w", sPath, err)
+				}
+				if copyBar != nil {
+					copyBar.Finish()
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", sap.Child(sPath).String(), dap.Child(sPath).String())
