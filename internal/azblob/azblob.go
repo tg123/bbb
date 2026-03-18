@@ -718,6 +718,9 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	if err != nil {
 		// StageBlockFromURL (Put Block From URL) returns 501 in emulators
 		// like Azurite. Fall back to the async StartCopyFromURL approach.
+		// The 501 occurs on the very first block attempt (the API is either
+		// supported or not), so no partial staged blocks need cleanup —
+		// uncommitted blocks are garbage-collected by Azure automatically.
 		var respErr *azcore.ResponseError
 		if errors.As(err, &respErr) && respErr.StatusCode == 501 {
 			slog.Debug("StageBlockFromURL not supported, falling back to StartCopyFromURL", "dst", dst.String())
@@ -847,13 +850,16 @@ func copyBlobAsync(ctx context.Context, client *azblob.Client, dst AzurePath, co
 		}
 	}
 	pollDelay := copyPollInitialDelay
+	pollTimer := time.NewTimer(pollDelay)
+	defer pollTimer.Stop()
 	for copyStatus == blob.CopyStatusTypePending {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(pollDelay):
+		case <-pollTimer.C:
 		}
 		pollDelay = nextPollDelay(pollDelay)
+		pollTimer.Reset(pollDelay)
 		props, err := blobClient.GetProperties(ctx, nil)
 		if err != nil {
 			return err

@@ -538,6 +538,7 @@ var (
 	elapsedTickerMu sync.Mutex
 	elapsedTicker   *time.Ticker
 	elapsedDone     chan struct{}
+	elapsedWg       sync.WaitGroup
 )
 
 // startElapsedTicker starts a 1-second background ticker that re-renders
@@ -552,12 +553,17 @@ func startElapsedTicker() {
 	}
 	elapsedTicker = time.NewTicker(1 * time.Second)
 	elapsedDone = make(chan struct{})
+	elapsedWg.Add(1)
 	go func() {
+		defer elapsedWg.Done()
 		for {
 			select {
 			case <-elapsedDone:
 				return
-			case <-elapsedTicker.C:
+			case _, ok := <-elapsedTicker.C:
+				if !ok {
+					return
+				}
 				outputMu.Lock()
 				if len(activeBars) > 0 {
 					clearActiveBars()
@@ -569,18 +575,20 @@ func startElapsedTicker() {
 	}()
 }
 
-// stopElapsedTicker stops the background ticker. Safe to call when no
-// ticker is running.
+// stopElapsedTicker stops the background ticker and waits for the
+// goroutine to exit. Safe to call when no ticker is running.
 func stopElapsedTicker() {
 	elapsedTickerMu.Lock()
-	defer elapsedTickerMu.Unlock()
 	if elapsedTicker == nil {
+		elapsedTickerMu.Unlock()
 		return
 	}
 	elapsedTicker.Stop()
 	close(elapsedDone)
 	elapsedTicker = nil
 	elapsedDone = nil
+	elapsedTickerMu.Unlock()
+	elapsedWg.Wait()
 }
 
 func clearActiveBars() {
