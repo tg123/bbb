@@ -468,6 +468,32 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+	// ls local single file (List returns ENOTDIR, falls back to Stat)
+	{
+		files, err := bbbLs(tmpFile.Name(), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{tmpFile.Name()}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls local single file: got %v, want %v", files, expected)
+		}
+	}
+
+	// ll local single file (List returns ENOTDIR, falls back to Stat)
+	{
+		files, err := bbbLL(tmpFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{tmpFile.Name()}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll local single file: got %v, want %v", files, expected)
+		}
+	}
+
 	// ls subdirectory-only prefix: files exist only in nested paths
 	t.Run("ls returns subdirectory when only nested files exist", func(t *testing.T) {
 		prefix := fmt.Sprintf("az://%s/test/lsonly-%d", azuriteAccount, time.Now().UnixNano())
