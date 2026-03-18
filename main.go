@@ -1422,6 +1422,13 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if cpWorkers < 1 {
 			cpWorkers = 1
 		}
+		// Limit concurrent file copies so block-level parallelism (StageBlockFromURL)
+		// focuses on finishing each file ASAP rather than spreading across many files.
+		// Two workers allow the next file's setup (HeadBlob, SAS) to overlap with the
+		// current file's final blocks, hiding latency between files.
+		if cpWorkers > 2 {
+			cpWorkers = 2
+		}
 		innerConcurrency := concurrency
 		innerQuiet := true
 		showCopyBars := !quiet

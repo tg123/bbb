@@ -722,7 +722,15 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 		count := min(blkSize, totalSize-offset)
 		blockID := blockIDs[i]
 
-		sem <- struct{}{}
+		// Acquire semaphore slot, respecting context cancellation so the
+		// loop doesn't block forever when a peer goroutine cancels ctx.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			break
+		}
 		wg.Add(1)
 		go func(blockID string, offset, count int64) {
 			defer func() {
