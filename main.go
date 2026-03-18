@@ -1647,13 +1647,12 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("cp: need srcs dst")
 	}
 	dst := c.Args().Get(c.Args().Len() - 1)
-	return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, srcs, dst, !quiet, nil)
 	allSrcs := make([]string, c.Args().Len()-1)
 	for i := 0; i < len(allSrcs); i++ {
 		allSrcs[i] = c.Args().Get(i)
 	}
 	if stateFile == "" {
-		return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, allSrcs, dst)
+		return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, allSrcs, dst, !quiet, nil)
 	}
 	state, _, err := loadTaskState(stateFile)
 	if err != nil {
@@ -1671,7 +1670,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			}
 			continue
 		}
-		if err := cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, []string{src}, dst); err != nil {
+		if err := cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, []string{src}, dst, !quiet, nil); err != nil {
 			_ = stateAppender.close()
 			return err
 		}
