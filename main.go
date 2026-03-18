@@ -1861,7 +1861,17 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			return fmt.Errorf("cp: %s -> %s: %w", op.src, op.dst, err)
 		}
 	}
-	if err := runOpPoolWithRetryProgressBytes(ctx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
+	// When any file ops involve az→az server-side copy, limit file-level
+	// parallelism to 2 so the block-level goroutines (concurrency per file)
+	// don't cause N² total goroutines and TLS handshake starvation.
+	cpPoolSize := concurrency
+	for _, op := range fileOps {
+		if op.srcAz && op.dstAz {
+			cpPoolSize = min(2, concurrency)
+			break
+		}
+	}
+	if err := runOpPoolWithRetryProgressBytes(ctx, cpPoolSize, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
 			if err := sendOp(ctx, pending, op); err != nil {
 				return err
@@ -2025,7 +2035,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			type azToAzOp struct {
 				name string
 			}
-			return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(list), quiet, errPrefix, func(pending chan<- azToAzOp) error {
+			// Limit file-level parallelism to avoid N² goroutines: each
+			// CopyBlobServerSide spawns `concurrency` block goroutines, so
+			// fileWorkers × concurrency must stay bounded.
+			fileWorkers := min(2, concurrency)
+			return runOpPoolWithRetryProgress(ctx, fileWorkers, retryCount, len(list), quiet, errPrefix, func(pending chan<- azToAzOp) error {
 				for _, bm := range list {
 					if err := sendOp(ctx, pending, azToAzOp{name: bm.Name}); err != nil {
 						return err
@@ -2768,7 +2782,15 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				return err
 			}
 		}
-		workerErr := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(files), quiet, "sync", func(pending chan<- item) error {
+		// When both src and dst are Azure, CopyBlobServerSide spawns
+		// `concurrency` block goroutines per file. Limit file-level
+		// parallelism to 2 so total goroutines stay bounded at
+		// 2 × concurrency instead of concurrency².
+		syncWorkers := concurrency
+		if srcAz && dstAz {
+			syncWorkers = min(2, concurrency)
+		}
+		workerErr := runOpPoolWithRetryProgress(ctx, syncWorkers, retryCount, len(files), quiet, "sync", func(pending chan<- item) error {
 			for _, f := range files {
 				if err := sendOp(ctx, pending, f); err != nil {
 					return err
