@@ -724,11 +724,13 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 
 		// Acquire semaphore slot, respecting context cancellation so the
 		// loop doesn't block forever when a peer goroutine cancels ctx.
+		gotSlot := false
 		select {
 		case sem <- struct{}{}:
+			gotSlot = true
 		case <-ctx.Done():
 		}
-		if ctx.Err() != nil {
+		if !gotSlot {
 			break
 		}
 		wg.Add(1)
