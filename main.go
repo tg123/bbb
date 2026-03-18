@@ -718,6 +718,20 @@ func (p *progressBar) AddBytes(n int64) {
 	p.bytesDone.Add(n)
 }
 
+// atomicMax updates an atomic.Int64 to val if val is greater than the current
+// value. It is safe for concurrent use.
+func atomicMax(a *atomic.Int64, val int64) {
+	for {
+		cur := a.Load()
+		if val <= cur {
+			return
+		}
+		if a.CompareAndSwap(cur, val) {
+			return
+		}
+	}
+}
+
 func (p *progressBar) SetTotal(total int64) {
 	if p == nil {
 		return
@@ -1789,8 +1803,10 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 					return
 				}
 				copyBar.SetTotal(total)
-				copyBar.bytesDone.Store(copied)
-				copyBar.done.Store(copied)
+				// Use monotonic update — callbacks from parallel
+				// StageBlockFromURL goroutines can arrive out of order.
+				atomicMax(&copyBar.bytesDone, copied)
+				atomicMax(&copyBar.done, copied)
 				copyBar.render(copied)
 			}); err != nil {
 				if copyBar != nil {
