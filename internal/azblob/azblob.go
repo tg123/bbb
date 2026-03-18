@@ -15,8 +15,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -24,7 +22,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
@@ -67,9 +64,9 @@ var validBlobSuffixes = []string{
 
 const (
 	defaultCopySASExpiry     = time.Hour
-	copyBlockSize            = 256 * 1024 * 1024 // 256 MiB per block for StageBlockFromURL
-	copyBlockConcurrency     = 64                // parallel StageBlockFromURL calls
-	syncCopyMaxSize          = 256 * 1024 * 1024 // use UploadBlobFromURL below this
+	copyPollInitialDelay     = time.Second
+	copyPollMaxDelay         = 2 * time.Second
+	copyPollBackoffFactor    = 2
 	uploadStreamMiB          = 1 << 20
 	uploadStreamBlockMin     = 256 * uploadStreamMiB  // Default UploadStream minimum block size.
 	uploadStreamBlockMax     = 4000 * uploadStreamMiB // Azure UploadStream maximum block size.
@@ -644,8 +641,9 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 	return nil
 }
 
-// CopyProgress is called during server-side copy with the number of
-// bytes copied so far and the total size in bytes.
+// CopyProgress is called during server-side copy polling with the number of
+// bytes copied so far and the total size in bytes. Either value may be zero
+// when progress information is unavailable.
 type CopyProgress func(copied, total int64)
 
 func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, onProgress CopyProgress) error {
@@ -659,110 +657,82 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, onPro
 	if err != nil {
 		return err
 	}
+	blobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlobClient(dst.Blob)
 	copySource, err := blobSASURL(ctx, src)
 	if err != nil {
 		return err
 	}
-
-	// Get source size for block splitting.
-	totalSize, err := HeadBlob(ctx, src)
+	startCopy, err := blobClient.StartCopyFromURL(ctx, copySource, nil)
 	if err != nil {
-		return fmt.Errorf("failed to get source properties: %w", err)
-	}
-
-	blockBlobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
-
-	// For small or empty files, use synchronous UploadBlobFromURL.
-	if totalSize <= syncCopyMaxSize {
-		if _, err := blockBlobClient.UploadBlobFromURL(ctx, copySource, nil); err != nil {
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.ErrorCode == "PendingCopyOperation" {
+			slog.Info("pending copy operation detected, polling progress", "dst", dst.String())
+			// handled; fall through to polling
+		} else {
 			return err
 		}
-		if onProgress != nil {
-			onProgress(totalSize, totalSize)
+	}
+	var lastProps blob.GetPropertiesResponse
+	hasProps := false
+	copyStatus := blob.CopyStatusTypePending
+	if startCopy.CopyStatus != nil {
+		copyStatus = *startCopy.CopyStatus
+	}
+	if copyStatus != blob.CopyStatusTypePending {
+		props, err := blobClient.GetProperties(ctx, nil)
+		if err == nil && props.CopyStatus != nil {
+			lastProps = props
+			hasProps = true
+			copyStatus = *props.CopyStatus
+			reportCopyProgress(props.CopyProgress, onProgress)
 		}
-		return nil
 	}
-
-	// For large files, use parallel StageBlockFromURL + CommitBlockList.
-	blkSize := int64(copyBlockSize)
-	numBlocks := (totalSize + blkSize - 1) / blkSize
-	if numBlocks > blockblob.MaxBlocks {
-		blkSize = (totalSize + blockblob.MaxBlocks - 1) / blockblob.MaxBlocks
-		numBlocks = (totalSize + blkSize - 1) / blkSize
-	}
-	if numBlocks > blockblob.MaxBlocks {
-		return fmt.Errorf("blob too large: %d bytes requires more than %d blocks", totalSize, blockblob.MaxBlocks)
-	}
-
-	// Block IDs must all be the same length; 6-digit format supports up to
-	// 999,999 which exceeds MaxBlocks (50,000).
-	blockIDs := make([]string, numBlocks)
-	for i := int64(0); i < numBlocks; i++ {
-		blockIDs[i] = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%06d", i)))
-	}
-
-	var copiedBytes atomic.Int64
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sem := make(chan struct{}, copyBlockConcurrency)
-	var wg sync.WaitGroup
-	var errMu sync.Mutex
-	var firstErr error
-
-	for i := int64(0); i < numBlocks; i++ {
-		if ctx.Err() != nil {
-			break
+	pollDelay := copyPollInitialDelay
+	for copyStatus == blob.CopyStatusTypePending {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollDelay):
 		}
-
-		offset := i * blkSize
-		count := min(blkSize, totalSize-offset)
-		blockID := blockIDs[i]
-
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(blockID string, offset, count int64) {
-			defer func() {
-				<-sem
-				wg.Done()
-			}()
-
-			_, err := blockBlobClient.StageBlockFromURL(ctx, blockID, copySource, &blockblob.StageBlockFromURLOptions{
-				Range: blob.HTTPRange{Offset: offset, Count: count},
-			})
-			if err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
-				cancel()
-				return
-			}
-
-			copied := copiedBytes.Add(count)
-			if onProgress != nil {
-				onProgress(copied, totalSize)
-			}
-		}(blockID, offset, count)
+		pollDelay = nextPollDelay(pollDelay)
+		props, err := blobClient.GetProperties(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if props.CopyStatus == nil {
+			return errors.New("copy status missing")
+		}
+		lastProps = props
+		hasProps = true
+		copyStatus = *props.CopyStatus
+		reportCopyProgress(props.CopyProgress, onProgress)
 	}
-
-	wg.Wait()
-
-	if firstErr != nil {
-		return firstErr
+	if copyStatus != blob.CopyStatusTypeSuccess {
+		statusDescription := ""
+		if hasProps && lastProps.CopyStatusDescription != nil {
+			statusDescription = *lastProps.CopyStatusDescription
+		}
+		if statusDescription != "" {
+			return fmt.Errorf("copy failed with status %s: %s", copyStatus, statusDescription)
+		}
+		return fmt.Errorf("copy failed with status %s", copyStatus)
 	}
-
-	// Commit all staged blocks.
-	if _, err := blockBlobClient.CommitBlockList(ctx, blockIDs, nil); err != nil {
-		return fmt.Errorf("commit block list failed: %w", err)
-	}
-
-	if onProgress != nil {
-		onProgress(totalSize, totalSize)
+	if onProgress != nil && hasProps && lastProps.ContentLength != nil {
+		onProgress(*lastProps.ContentLength, *lastProps.ContentLength)
 	}
 	return nil
+}
+
+// reportCopyProgress parses the "bytes_copied/total_bytes" progress string
+// from Azure Blob CopyProgress and invokes the callback.
+func reportCopyProgress(progress *string, onProgress CopyProgress) {
+	if onProgress == nil || progress == nil {
+		return
+	}
+	copied, total, ok := parseCopyProgress(*progress)
+	if ok {
+		onProgress(copied, total)
+	}
 }
 
 // parseCopyProgress parses the Azure "bytes_copied/total_bytes" format.
@@ -837,6 +807,17 @@ func blobDelegationSASURL(ctx context.Context, ap AzurePath) (string, error) {
 	blobClient := containerClient.NewBlobClient(ap.Blob)
 	blobURL := blobClient.URL()
 	return fmt.Sprintf("%s?%s", blobURL, qp.Encode()), nil
+}
+
+func nextPollDelay(current time.Duration) time.Duration {
+	if current >= copyPollMaxDelay {
+		return copyPollMaxDelay
+	}
+	next := current * copyPollBackoffFactor
+	if next > copyPollMaxDelay {
+		return copyPollMaxDelay
+	}
+	return next
 }
 
 func copySASDuration() time.Duration {
