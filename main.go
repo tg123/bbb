@@ -639,23 +639,25 @@ func isTerminal(f *os.File) bool {
 }
 
 type progressBar struct {
-	label     string
-	width     int
-	showSpeed bool
-	byteSized bool // if true, show done/total as formatted byte sizes
-	startedAt time.Time
-	total     atomic.Int64
-	done      atomic.Int64
-	bytesDone atomic.Int64
-	lastDone  atomic.Int64
-	lastTotal atomic.Int64
-	finished  atomic.Bool
-	pinBottom bool // if true, renders at the bottom of the bar stack
+	label      string
+	width      int
+	showSpeed  bool
+	byteSized  bool // if true, show done/total as formatted byte sizes
+	startedAt  time.Time
+	total      atomic.Int64
+	done       atomic.Int64
+	bytesDone  atomic.Int64
+	lastDone   atomic.Int64
+	lastTotal  atomic.Int64
+	finished   atomic.Bool
+	pinBottom  bool         // if true, renders at the bottom of the bar stack
+	lastRender atomic.Int64 // unix nanos of last actual render; for throttling
 }
 
 const (
 	progressUninitialized = int64(-1)
 	minProgressTotal      = 2
+	renderMinInterval     = 50 * time.Millisecond // throttle renders from parallel goroutines
 
 	ansiReset = "\033[0m"
 	ansiBold  = "\033[1m"
@@ -820,6 +822,16 @@ func (p *progressBar) render(done int64) {
 	}
 	p.lastDone.Store(done)
 	p.lastTotal.Store(total)
+	// Throttle: skip rendering if another render happened within renderMinInterval.
+	// This prevents parallel goroutines from flooding the terminal with ANSI escapes.
+	now := time.Now().UnixNano()
+	last := p.lastRender.Load()
+	if now-last < int64(renderMinInterval) {
+		return
+	}
+	if !p.lastRender.CompareAndSwap(last, now) {
+		return // another goroutine won the race
+	}
 	outputMu.Lock()
 	defer outputMu.Unlock()
 	clearActiveBars()
@@ -1396,7 +1408,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if cpWorkers < 1 {
 			cpWorkers = 1
 		}
-		innerConcurrency := 1
+		innerConcurrency := concurrency
 		innerQuiet := true
 		showCopyBars := !quiet
 		workerCtx, cancel := context.WithCancel(ctx)
@@ -1754,17 +1766,23 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 					copyBar.byteSized = true
 				}
 			}
-			var lastReported int64
-			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, func(copied, total int64) {
+			var lastReported atomic.Int64
+			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, concurrency, func(copied, total int64) {
 				if total <= 0 {
 					return
 				}
 				// Report incremental bytes to the overall taskbar.
+				// Use CAS loop because callbacks arrive from parallel goroutines.
 				if onBytes != nil {
-					delta := copied - lastReported
-					if delta > 0 {
-						onBytes(delta)
-						lastReported = copied
+					for {
+						prev := lastReported.Load()
+						if copied <= prev {
+							break
+						}
+						if lastReported.CompareAndSwap(prev, copied) {
+							onBytes(copied - prev)
+							break
+						}
 					}
 				}
 				if copyBar == nil {

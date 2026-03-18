@@ -61,20 +61,20 @@ func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 	ctx := context.Background()
 	src := AzurePath{Account: "acct", Container: "container"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
-	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for dir-like source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for trailing slash source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst = AzurePath{Account: "acct", Container: "container"}
-	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for dir-like destination")
 	}
 	dst = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for trailing slash destination")
 	}
 }
@@ -85,7 +85,7 @@ func TestCopyBlobServerSideCrossAccountRequiresCredentials(t *testing.T) {
 	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
-	err := CopyBlobServerSide(ctx, src, dst, nil)
+	err := CopyBlobServerSide(ctx, src, dst, 4, nil)
 	if err == nil {
 		t.Fatal("expected error for cross-account copy without credentials")
 	}
@@ -97,7 +97,7 @@ func TestCopyBlobServerSideFallsBackToUserDelegation(t *testing.T) {
 	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "other.txt"}
-	err := CopyBlobServerSide(ctx, src, dst, nil)
+	err := CopyBlobServerSide(ctx, src, dst, 4, nil)
 	// Without real Azure credentials the user delegation path will fail,
 	// but it must NOT be a MissingSharedKeyCredential error since we now
 	// attempt the delegation path instead.
