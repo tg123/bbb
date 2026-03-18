@@ -729,6 +729,13 @@ const (
 	minProgressTotal      = 2
 	renderMinInterval     = 50 * time.Millisecond // throttle renders from parallel goroutines
 
+	// maxServerSideCopyFiles limits the number of files being server-side
+	// copied in parallel. Each CopyBlobServerSide call spawns `concurrency`
+	// block goroutines, so without this cap the total goroutines would be
+	// poolSize × concurrency (N²). Two concurrent files allow overlap
+	// (next file's HeadBlob/SAS while current file finishes its last blocks).
+	maxServerSideCopyFiles = 2
+
 	ansiReset = "\033[0m"
 	ansiBold  = "\033[1m"
 	ansiGreen = "\033[32m"
@@ -1549,8 +1556,8 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	// focuses on finishing each file ASAP rather than spreading across many files.
 	// Two workers allow the next file's setup (HeadBlob, SAS) to overlap with the
 	// current file's final blocks, hiding latency between files.
-	if cpWorkers > 2 {
-		cpWorkers = 2
+	if cpWorkers > maxServerSideCopyFiles {
+		cpWorkers = maxServerSideCopyFiles
 	}
 	innerConcurrency := concurrency
 	innerQuiet := true
@@ -1867,7 +1874,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	cpPoolSize := concurrency
 	for _, op := range fileOps {
 		if op.srcAz && op.dstAz {
-			cpPoolSize = min(2, concurrency)
+			cpPoolSize = min(maxServerSideCopyFiles, concurrency)
 			break
 		}
 	}
@@ -2038,7 +2045,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			// Limit file-level parallelism to avoid N² goroutines: each
 			// CopyBlobServerSide spawns `concurrency` block goroutines, so
 			// fileWorkers × concurrency must stay bounded.
-			fileWorkers := min(2, concurrency)
+			fileWorkers := min(maxServerSideCopyFiles, concurrency)
 			return runOpPoolWithRetryProgress(ctx, fileWorkers, retryCount, len(list), quiet, errPrefix, func(pending chan<- azToAzOp) error {
 				for _, bm := range list {
 					if err := sendOp(ctx, pending, azToAzOp{name: bm.Name}); err != nil {
@@ -2788,7 +2795,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		// 2 × concurrency instead of concurrency².
 		syncWorkers := concurrency
 		if srcAz && dstAz {
-			syncWorkers = min(2, concurrency)
+			syncWorkers = min(maxServerSideCopyFiles, concurrency)
 		}
 		workerErr := runOpPoolWithRetryProgress(ctx, syncWorkers, retryCount, len(files), quiet, "sync", func(pending chan<- item) error {
 			for _, f := range files {
