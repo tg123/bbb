@@ -1479,283 +1479,267 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	taskfile := c.String("taskfile")
 	stateFile := c.String("state")
 
+	var tasks []taskPair
 	if taskfile != "" {
 		if c.Args().Len() != 0 {
 			return fmt.Errorf("cp: cannot use positional args with --taskfile")
 		}
-		tasks, err := loadTaskPairs(taskfile)
+		var err error
+		tasks, err = loadTaskPairs(taskfile)
 		if err != nil {
 			return err
 		}
-		state, taskCheckpoints, err := loadTaskState(stateFile)
-		if err != nil {
-			return err
+	} else {
+		// Convert positional args into task pairs so both modes share the
+		// same execution path (expansion, state tracking, progress bars).
+		if c.Args().Len() < 2 {
+			return fmt.Errorf("cp: need srcs dst")
 		}
-		// Streaming progress bar: total starts at 0 and grows as files are
-		// discovered during expansion. The bar stays invisible until the
-		// first file is found, then updates on every change.
-		taskProgress := newStreamingProgressBar("cp files", quiet, true)
+		dst := c.Args().Get(c.Args().Len() - 1)
+		for i := 0; i < c.Args().Len()-1; i++ {
+			tasks = append(tasks, taskPair{src: c.Args().Get(i), dst: dst})
+		}
+	}
+
+	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
+}
+
+// runCPTasks executes a list of task pairs through the unified expansion +
+// parallel copy pipeline. Both taskfile mode and positional-arg mode convert
+// their inputs to []taskPair and call this function, ensuring a single code
+// path for state tracking, progress bars, and concurrency control.
+func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, concurrency, retryCount int, stateFile string) error {
+	state, taskCheckpoints, err := loadTaskState(stateFile)
+	if err != nil {
+		return err
+	}
+	// Streaming progress bar: total starts at 0 and grows as files are
+	// discovered during expansion. The bar stays invisible until the
+	// first file is found, then updates on every change.
+	taskProgress := newStreamingProgressBar("cp files", quiet, true)
+	if taskProgress != nil {
+		taskProgress.pinBottom = true
+	}
+	defer func() {
 		if taskProgress != nil {
-			taskProgress.pinBottom = true
+			taskProgress.Finish()
 		}
-		defer func() {
-			if taskProgress != nil {
-				taskProgress.Finish()
-			}
-		}()
-		seen := make(map[string]struct{}, len(state)+len(tasks))
-		for key := range state {
-			seen[key] = struct{}{}
-		}
-		stateAppender, err := newTaskStateAppender(stateFile)
-		if err != nil {
-			return err
-		}
+	}()
+	seen := make(map[string]struct{}, len(state)+len(tasks))
+	for key := range state {
+		seen[key] = struct{}{}
+	}
+	stateAppender, err := newTaskStateAppender(stateFile)
+	if err != nil {
+		return err
+	}
 
-		workers := concurrency
-		if workers < 1 {
-			workers = 1
-		}
-		// Split concurrency budget: at least 1 expander, at least 1 cp worker.
-		// When concurrency is high, allocate ~25% to expansion.
-		expanders := max(1, workers/4)
-		cpWorkers := workers - expanders
-		if cpWorkers < 1 {
-			cpWorkers = 1
-		}
-		// Limit concurrent file copies so block-level parallelism (StageBlockFromURL)
-		// focuses on finishing each file ASAP rather than spreading across many files.
-		// Two workers allow the next file's setup (HeadBlob, SAS) to overlap with the
-		// current file's final blocks, hiding latency between files.
-		if cpWorkers > 2 {
-			cpWorkers = 2
-		}
-		innerConcurrency := concurrency
-		innerQuiet := true
-		showCopyBars := !quiet
-		workerCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
+	workers := concurrency
+	if workers < 1 {
+		workers = 1
+	}
+	// Split concurrency budget: at least 1 expander, at least 1 cp worker.
+	// When concurrency is high, allocate ~25% to expansion.
+	expanders := max(1, workers/4)
+	cpWorkers := workers - expanders
+	if cpWorkers < 1 {
+		cpWorkers = 1
+	}
+	// Limit concurrent file copies so block-level parallelism (StageBlockFromURL)
+	// focuses on finishing each file ASAP rather than spreading across many files.
+	// Two workers allow the next file's setup (HeadBlob, SAS) to overlap with the
+	// current file's final blocks, hiding latency between files.
+	if cpWorkers > 2 {
+		cpWorkers = 2
+	}
+	innerConcurrency := concurrency
+	innerQuiet := true
+	showCopyBars := !quiet
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-		var wg sync.WaitGroup
-		// Buffer taskCh larger than cpWorkers so expanders can push ahead
-		// without blocking while cp workers are busy.
-		taskCh := make(chan cpTask, cpWorkers*4)
-		var firstErr error
-		var firstErrMu sync.Mutex
-		var totalPending atomic.Int64
-		var queued atomic.Bool
+	var wg sync.WaitGroup
+	// Buffer taskCh larger than cpWorkers so expanders can push ahead
+	// without blocking while cp workers are busy.
+	taskCh := make(chan cpTask, cpWorkers*4)
+	var firstErr error
+	var firstErrMu sync.Mutex
+	var totalPending atomic.Int64
+	var queued atomic.Bool
 
-		setErr := func(err error) {
-			firstErrMu.Lock()
-			if firstErr == nil {
-				firstErr = err
-				cancel()
-			}
-			firstErrMu.Unlock()
+	setErr := func(err error) {
+		firstErrMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
 		}
+		firstErrMu.Unlock()
+	}
 
-		for i := 0; i < cpWorkers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					select {
-					case <-workerCtx.Done():
+	for i := 0; i < cpWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case task, ok := <-taskCh:
+					if !ok {
 						return
-					case task, ok := <-taskCh:
-						if !ok {
-							return
-						}
-						slog.Debug("cp: start", "src", task.src, "dst", task.dst)
-						var bytesCb func(int64)
-						if taskProgress != nil {
-							bytesCb = taskProgress.AddBytes
-						}
-						if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, showCopyBars, bytesCb); err != nil {
+					}
+					slog.Debug("cp: start", "src", task.src, "dst", task.dst)
+					var bytesCb func(int64)
+					if taskProgress != nil {
+						bytesCb = taskProgress.AddBytes
+					}
+					if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, showCopyBars, bytesCb); err != nil {
+						setErr(err)
+						return
+					}
+					slog.Debug("cp: done", "src", task.src, "dst", task.dst)
+					if stateFile != "" {
+						if err := stateAppender.append(task.key); err != nil {
 							setErr(err)
 							return
 						}
-						slog.Debug("cp: done", "src", task.src, "dst", task.dst)
-						if stateFile != "" {
-							if err := stateAppender.append(task.key); err != nil {
+						if task.tracker != nil && task.tracker.remaining.Add(-1) == 0 {
+							if err := stateAppender.appendCheckpoint(task.tracker.key); err != nil {
 								setErr(err)
 								return
 							}
-							if task.tracker != nil && task.tracker.remaining.Add(-1) == 0 {
-								if err := stateAppender.appendCheckpoint(task.tracker.key); err != nil {
-									setErr(err)
-									return
-								}
-							}
-						}
-						if taskProgress != nil {
-							taskProgress.Increment()
 						}
 					}
+					if taskProgress != nil {
+						taskProgress.Increment()
+					}
 				}
-			}()
-		}
+			}
+		}()
+	}
 
-		// Dedicated expander pool uses goroutines from the concurrency budget.
-		if expanders > len(tasks) {
-			expanders = len(tasks)
-		}
-		pairCh := make(chan taskPair, expanders*2)
-		var seenMu sync.Mutex
-		var expandWG sync.WaitGroup
-		for i := 0; i < expanders; i++ {
-			expandWG.Add(1)
-			go func() {
-				defer expandWG.Done()
-				for {
-					select {
-					case <-workerCtx.Done():
+	// Dedicated expander pool uses goroutines from the concurrency budget.
+	if expanders > len(tasks) {
+		expanders = len(tasks)
+	}
+	pairCh := make(chan taskPair, expanders*2)
+	var seenMu sync.Mutex
+	var expandWG sync.WaitGroup
+	for i := 0; i < expanders; i++ {
+		expandWG.Add(1)
+		go func() {
+			defer expandWG.Done()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case task, ok := <-pairCh:
+					if !ok {
 						return
-					case task, ok := <-pairCh:
-						if !ok {
-							return
+					}
+					cpKey := taskCheckpointKey(task.src, task.dst)
+					if _, done := taskCheckpoints[cpKey]; done {
+						if !quiet {
+							lockedFprintf(os.Stderr, "cp: skip already completed task %s -> %s\n", task.src, task.dst)
 						}
-						cpKey := taskCheckpointKey(task.src, task.dst)
-						if _, done := taskCheckpoints[cpKey]; done {
-							if !quiet {
-								lockedFprintf(os.Stderr, "cp: skip already completed task %s -> %s\n", task.src, task.dst)
+						if taskProgress != nil {
+							taskProgress.SetTotal(totalPending.Add(1))
+							taskProgress.Increment()
+						}
+						continue
+					}
+					if !quiet {
+						lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
+					}
+					var tracker *taskTracker
+					if stateFile != "" {
+						tracker = &taskTracker{key: cpKey}
+					}
+					var pendingCount int64
+					expandEmit := func(expandedTask cpTask) error {
+						seenMu.Lock()
+						_, alreadySeen := seen[expandedTask.key]
+						if !alreadySeen {
+							seen[expandedTask.key] = struct{}{}
+						}
+						seenMu.Unlock()
+						if alreadySeen {
+							_, inState := state[expandedTask.key]
+							if !quiet && inState {
+								lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
 							}
-							if taskProgress != nil {
+							if taskProgress != nil && inState {
 								taskProgress.SetTotal(totalPending.Add(1))
 								taskProgress.Increment()
 							}
-							continue
-						}
-						if !quiet {
-							lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
-						}
-						var tracker *taskTracker
-						if stateFile != "" {
-							tracker = &taskTracker{key: cpKey}
-						}
-						var pendingCount int64
-						expandEmit := func(expandedTask cpTask) error {
-							seenMu.Lock()
-							_, alreadySeen := seen[expandedTask.key]
-							if !alreadySeen {
-								seen[expandedTask.key] = struct{}{}
-							}
-							seenMu.Unlock()
-							if alreadySeen {
-								_, inState := state[expandedTask.key]
-								if !quiet && inState {
-									lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
-								}
-								if taskProgress != nil && inState {
-									taskProgress.SetTotal(totalPending.Add(1))
-									taskProgress.Increment()
-								}
-								return nil
-							}
-							expandedTask.tracker = tracker
-							pendingCount++
-							select {
-							case <-workerCtx.Done():
-								return workerCtx.Err()
-							case taskCh <- expandedTask:
-								slog.Debug("cp: queued", "src", expandedTask.src, "dst", expandedTask.dst)
-								queued.Store(true)
-								if taskProgress != nil {
-									taskProgress.SetTotal(totalPending.Add(1))
-								}
-							}
 							return nil
 						}
-						if err := retryOp(workerCtx, retryCount, func() error {
-							pendingCount = 0
-							return expandCPTask(workerCtx, task, expandEmit)
-						}); err != nil {
-							setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
-							return
+						expandedTask.tracker = tracker
+						pendingCount++
+						select {
+						case <-workerCtx.Done():
+							return workerCtx.Err()
+						case taskCh <- expandedTask:
+							slog.Debug("cp: queued", "src", expandedTask.src, "dst", expandedTask.dst)
+							queued.Store(true)
+							if taskProgress != nil {
+								taskProgress.SetTotal(totalPending.Add(1))
+							}
 						}
-						// Reconcile progress bar total after expansion completes
-						// so it reflects all discovered files (queued + skipped).
-						if taskProgress != nil {
-							taskProgress.SetTotal(totalPending.Load())
-						}
-						if tracker != nil {
-							tracker.remaining.Store(pendingCount)
-							if pendingCount == 0 {
-								if err := stateAppender.appendCheckpoint(cpKey); err != nil {
-									setErr(err)
-									return
-								}
+						return nil
+					}
+					if err := retryOp(workerCtx, retryCount, func() error {
+						pendingCount = 0
+						return expandCPTask(workerCtx, task, expandEmit)
+					}); err != nil {
+						setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
+						return
+					}
+					// Reconcile progress bar total after expansion completes
+					// so it reflects all discovered files (queued + skipped).
+					if taskProgress != nil {
+						taskProgress.SetTotal(totalPending.Load())
+					}
+					if tracker != nil {
+						tracker.remaining.Store(pendingCount)
+						if pendingCount == 0 {
+							if err := stateAppender.appendCheckpoint(cpKey); err != nil {
+								setErr(err)
+								return
 							}
 						}
 					}
 				}
-			}()
-		}
-	enqueueTasks:
-		for _, task := range tasks {
-			select {
-			case <-workerCtx.Done():
-				break enqueueTasks
-			case pairCh <- task:
 			}
+		}()
+	}
+enqueueLoop:
+	for _, task := range tasks {
+		select {
+		case <-workerCtx.Done():
+			break enqueueLoop
+		case pairCh <- task:
 		}
-		close(pairCh)
-		expandWG.Wait()
-		close(taskCh)
-		wg.Wait()
-		if !queued.Load() && firstErr == nil {
-			if err := stateAppender.close(); err != nil {
-				return err
-			}
-			return nil
-		}
-
-		if firstErr != nil {
-			_ = stateAppender.close()
-			return firstErr
-		}
+	}
+	close(pairCh)
+	expandWG.Wait()
+	close(taskCh)
+	wg.Wait()
+	if !queued.Load() && firstErr == nil {
 		if err := stateAppender.close(); err != nil {
 			return err
 		}
 		return nil
 	}
 
-	if c.Args().Len() < 2 {
-		return fmt.Errorf("cp: need srcs dst")
+	if firstErr != nil {
+		_ = stateAppender.close()
+		return firstErr
 	}
-	dst := c.Args().Get(c.Args().Len() - 1)
-	allSrcs := make([]string, c.Args().Len()-1)
-	for i := 0; i < len(allSrcs); i++ {
-		allSrcs[i] = c.Args().Get(i)
-	}
-	if stateFile == "" {
-		return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, allSrcs, dst, !quiet, nil)
-	}
-	state, _, err := loadTaskState(stateFile)
-	if err != nil {
+	if err := stateAppender.close(); err != nil {
 		return err
 	}
-	stateAppender, err := newTaskStateAppender(stateFile)
-	if err != nil {
-		return err
-	}
-	for _, src := range allSrcs {
-		key := taskStateKey(src, dst)
-		if _, done := state[key]; done {
-			if !quiet {
-				lockedFprintf(os.Stderr, "cp: skip already completed %s -> %s\n", src, dst)
-			}
-			continue
-		}
-		if err := cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, []string{src}, dst, !quiet, nil); err != nil {
-			_ = stateAppender.close()
-			return err
-		}
-		if err := stateAppender.append(key); err != nil {
-			return err
-		}
-	}
-	return stateAppender.close()
+	return nil
 }
 
 func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, showCopyBar bool, onBytes func(int64)) error {
