@@ -325,7 +325,18 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 	fs := bbbfs.Resolve(parentPath)
 	entries, err := fs.List(ctx, parentPath)
 	if err != nil {
-		return err
+		// List may fail on file targets (e.g. ENOTDIR for local paths).
+		// Fall back to Stat when no wildcard was used.
+		if pattern == "" {
+			st, statErr := fs.Stat(ctx, parentPath)
+			if statErr == nil && !st.IsDir {
+				entries = []bbbfs.Entry{st}
+			} else {
+				return err
+			}
+		} else {
+			return err
+		}
 	}
 	// If listing returns nothing and no wildcard was used, the target
 	// may be a file rather than a directory. Fall back to Stat so that
@@ -2826,7 +2837,9 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 		}
 		var totalSize int64
 		var count int
+		var anyListed bool
 		if err := azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
+			anyListed = true
 			name := bm.Name
 			if name == "" || strings.HasSuffix(name, "/") {
 				return nil // skip directories
@@ -2850,6 +2863,24 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		// If listing returned no entries at all and no wildcard was used, the target
+		// may be a single blob. Fall back to HeadBlob so that single-file
+		// paths (e.g. az://account/container/blob) are shown.
+		if !anyListed && pattern == "" {
+			if size, headErr := azblob.HeadBlob(ctx, ap); headErr == nil {
+				display := target
+				if relFlag {
+					display = path.Base(ap.Blob)
+				}
+				if machine {
+					fmt.Printf("f\t%d\t%s\t%s\n", size, "-", display)
+				} else {
+					fmt.Printf("%10s  %s  %s\n", formatSize(size), "-", display)
+				}
+				totalSize = size
+				count = 1
+			}
+		}
 		if !machine {
 			noun := "files"
 			if count == 1 {
@@ -2860,8 +2891,29 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 		return nil
 	}
 	if listErr != nil {
-		fmt.Fprintln(os.Stderr, listErr)
-		os.Exit(1)
+		// List may fail on file targets (e.g. ENOTDIR for local paths).
+		// Fall back to Stat when no wildcard was used.
+		if pattern == "" {
+			st, statErr := fs.Stat(ctx, parentPath)
+			if statErr == nil && !st.IsDir {
+				list = []bbbfs.Entry{st}
+			} else {
+				fmt.Fprintln(os.Stderr, listErr)
+				os.Exit(1)
+			}
+		} else {
+			fmt.Fprintln(os.Stderr, listErr)
+			os.Exit(1)
+		}
+	}
+	// If listing returns nothing and no wildcard was used, the target
+	// may be a file rather than a directory. Fall back to Stat so that
+	// single-file paths are shown.
+	if len(list) == 0 && pattern == "" {
+		st, statErr := fs.Stat(ctx, parentPath)
+		if statErr == nil && !st.IsDir {
+			list = []bbbfs.Entry{st}
+		}
 	}
 	var totalSize int64
 	var count int
