@@ -131,8 +131,7 @@ func bbbLs(path string, recursive bool) ([]string, error) {
 	if recursive {
 		if len(lines) > 0 {
 			last := strings.TrimSpace(lines[len(lines)-1])
-			fields := strings.Fields(last)
-			if len(fields) == 2 && fields[1] == "files" {
+			if strings.HasPrefix(last, "Listed ") {
 				lines = lines[:len(lines)-1]
 			}
 		}
@@ -394,6 +393,37 @@ func TestBasic(t *testing.T) {
 			t.Errorf("ls single file in subdir: got %v, want %v", files, expected)
 		}
 	}
+
+	// ls subdirectory-only prefix: files exist only in nested paths
+	t.Run("ls returns subdirectory when only nested files exist", func(t *testing.T) {
+		prefix := fmt.Sprintf("az://%s/test/lsonly-%d", azuriteAccount, time.Now().UnixNano())
+		t.Cleanup(func() {
+			cleanFolder(t, prefix)
+		})
+
+		// Upload files only into nested subdirectories — no direct children.
+		nestedFile := prefix + "/subdir/nested.txt"
+		if _, err := runBBB("cp", tmpFile.Name(), nestedFile); err != nil {
+			t.Fatal(err)
+		}
+		deepFile := prefix + "/another/deep/file.txt"
+		if _, err := runBBB("cp", tmpFile.Name(), deepFile); err != nil {
+			t.Fatal(err)
+		}
+
+		// ls on the prefix should return the two subdirectories.
+		files, err := bbbLs(prefix, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{
+			prefix + "/another",
+			prefix + "/subdir",
+		}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls subdirectory-only: got %v, want %v", files, expected)
+		}
+	})
 
 	// lsr
 	{
