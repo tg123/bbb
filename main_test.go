@@ -191,10 +191,10 @@ func TestCmdCPTaskfileStateRecovery(t *testing.T) {
 			&cli.IntFlag{Name: "concurrency", Value: 2},
 			&cli.IntFlag{Name: "retry-count"},
 			&cli.StringFlag{Name: "taskfile"},
-			&cli.StringFlag{Name: "taskfile-state"},
+			&cli.StringFlag{Name: "state"},
 		},
 	}
-	if err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+	if err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--state", stateFile}); err != nil {
 		t.Fatalf("cp failed: %v", err)
 	}
 	if _, err := os.Stat(dstOk); err != nil {
@@ -203,7 +203,7 @@ func TestCmdCPTaskfileStateRecovery(t *testing.T) {
 	if err := os.Remove(srcOk); err != nil {
 		t.Fatalf("remove src: %v", err)
 	}
-	if err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+	if err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--state", stateFile}); err != nil {
 		t.Fatalf("cp resume failed: %v", err)
 	}
 	stateData, err := os.ReadFile(stateFile)
@@ -281,7 +281,7 @@ func TestCmdCPTaskfileStateRecoverySkipsFinishedTask(t *testing.T) {
 			&cli.IntFlag{Name: "concurrency", Value: 2},
 			&cli.IntFlag{Name: "retry-count"},
 			&cli.StringFlag{Name: "taskfile"},
-			&cli.StringFlag{Name: "taskfile-state"},
+			&cli.StringFlag{Name: "state"},
 		},
 	}
 	origStderr := os.Stderr
@@ -290,7 +290,7 @@ func TestCmdCPTaskfileStateRecoverySkipsFinishedTask(t *testing.T) {
 		t.Fatalf("pipe stderr: %v", err)
 	}
 	os.Stderr = w
-	runErr := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile})
+	runErr := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--state", stateFile})
 	if err := w.Close(); err != nil {
 		t.Fatalf("close write pipe: %v", err)
 	}
@@ -368,10 +368,10 @@ func TestCmdCPTaskfileStateRecoveryPartialTask(t *testing.T) {
 			&cli.IntFlag{Name: "concurrency", Value: 2},
 			&cli.IntFlag{Name: "retry-count"},
 			&cli.StringFlag{Name: "taskfile"},
-			&cli.StringFlag{Name: "taskfile-state"},
+			&cli.StringFlag{Name: "state"},
 		},
 	}
-	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--state", stateFile}); err != nil {
 		t.Fatalf("cp partial recovery failed: %v", err)
 	}
 	for _, name := range []string{"a.txt", "b.txt"} {
@@ -430,10 +430,10 @@ func TestCmdCPTaskfileStateRecoveryPartialTaskSkipsFinishedFile(t *testing.T) {
 			&cli.IntFlag{Name: "concurrency", Value: 2},
 			&cli.IntFlag{Name: "retry-count"},
 			&cli.StringFlag{Name: "taskfile"},
-			&cli.StringFlag{Name: "taskfile-state"},
+			&cli.StringFlag{Name: "state"},
 		},
 	}
-	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--state", stateFile}); err != nil {
 		t.Fatalf("cp partial recovery failed: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dstDir, "b.txt")); err != nil {
@@ -479,10 +479,10 @@ func TestCmdCPTaskfileStateHumanReadable(t *testing.T) {
 			&cli.IntFlag{Name: "concurrency", Value: 2},
 			&cli.IntFlag{Name: "retry-count"},
 			&cli.StringFlag{Name: "taskfile"},
-			&cli.StringFlag{Name: "taskfile-state"},
+			&cli.StringFlag{Name: "state"},
 		},
 	}
-	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--taskfile-state", stateFile}); err != nil {
+	if err := app.Run(context.Background(), []string{"cp", "-f", "--taskfile", taskfile, "--state", stateFile}); err != nil {
 		t.Fatalf("cp failed: %v", err)
 	}
 	stateData, err := os.ReadFile(stateFile)
@@ -541,10 +541,10 @@ func TestCmdCPTaskfileStateCheckpointSkipsExpansion(t *testing.T) {
 			&cli.IntFlag{Name: "concurrency", Value: 2},
 			&cli.IntFlag{Name: "retry-count"},
 			&cli.StringFlag{Name: "taskfile"},
-			&cli.StringFlag{Name: "taskfile-state"},
+			&cli.StringFlag{Name: "state"},
 		},
 	}
-	runErr := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--taskfile-state", stateFile})
+	runErr := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile, "--state", stateFile})
 	if err := w.Close(); err != nil {
 		t.Fatalf("close write pipe: %v", err)
 	}
@@ -603,6 +603,7 @@ func TestCmdSyncTaskfile(t *testing.T) {
 			&cli.IntFlag{Name: "retry-count"},
 			&cli.BoolFlag{Name: "q"},
 			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "state"},
 		},
 	}
 	if err := app.Run(context.Background(), []string{"sync", "--taskfile", taskfile}); err != nil {
@@ -613,6 +614,230 @@ func TestCmdSyncTaskfile(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dstB, "b.txt")); err != nil {
 		t.Fatalf("expected synced file B: %v", err)
+	}
+}
+
+func TestCmdSyncTaskfileStateRecovery(t *testing.T) {
+	dir := t.TempDir()
+	srcA := filepath.Join(dir, "src-a")
+	dstA := filepath.Join(dir, "dst-a")
+	srcB := filepath.Join(dir, "src-b")
+	dstB := filepath.Join(dir, "dst-b")
+	if err := os.MkdirAll(srcA, 0o755); err != nil {
+		t.Fatalf("mkdir srcA: %v", err)
+	}
+	if err := os.MkdirAll(srcB, 0o755); err != nil {
+		t.Fatalf("mkdir srcB: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcA, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write srcA: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcB, "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatalf("write srcB: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "sync.tasks")
+	content := strings.Join([]string{srcA + " " + dstA, srcB + " " + dstB, ""}, "\n")
+	if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "sync.state")
+
+	app := &cli.Command{
+		Action: cmdSync,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "dry-run"},
+			&cli.BoolFlag{Name: "delete"},
+			&cli.StringFlag{Name: "x"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "state"},
+		},
+	}
+
+	// First run: sync both task pairs
+	if err := app.Run(context.Background(), []string{"sync", "--taskfile", taskfile, "--state", stateFile}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstA, "a.txt")); err != nil {
+		t.Fatalf("expected synced file A: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstB, "b.txt")); err != nil {
+		t.Fatalf("expected synced file B: %v", err)
+	}
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read statefile: %v", err)
+	}
+	stateText := string(stateData)
+	cpKeyA := taskCheckpointKey(srcA, dstA)
+	cpKeyB := taskCheckpointKey(srcB, dstB)
+	if !strings.Contains(stateText, cpKeyA) {
+		t.Fatalf("expected checkpoint for task A in statefile, got:\n%s", stateText)
+	}
+	if !strings.Contains(stateText, cpKeyB) {
+		t.Fatalf("expected checkpoint for task B in statefile, got:\n%s", stateText)
+	}
+
+	// Remove source A so a re-run would fail if it tried to sync it again
+	if err := os.RemoveAll(srcA); err != nil {
+		t.Fatalf("remove srcA: %v", err)
+	}
+	// Second run: both tasks are already checkpointed, so should be skipped
+	if err := app.Run(context.Background(), []string{"sync", "--taskfile", taskfile, "--state", stateFile}); err != nil {
+		t.Fatalf("sync resume failed: %v", err)
+	}
+}
+
+func TestCmdSyncTaskfileDryRunNoState(t *testing.T) {
+	dir := t.TempDir()
+	srcA := filepath.Join(dir, "src-a")
+	dstA := filepath.Join(dir, "dst-a")
+	if err := os.MkdirAll(srcA, 0o755); err != nil {
+		t.Fatalf("mkdir srcA: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcA, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write srcA: %v", err)
+	}
+
+	taskfile := filepath.Join(dir, "sync.tasks")
+	if err := os.WriteFile(taskfile, []byte(srcA+" "+dstA+"\n"), 0o644); err != nil {
+		t.Fatalf("write taskfile: %v", err)
+	}
+	stateFile := filepath.Join(dir, "sync.state")
+
+	app := &cli.Command{
+		Action: cmdSync,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "dry-run"},
+			&cli.BoolFlag{Name: "delete"},
+			&cli.StringFlag{Name: "x"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "state"},
+		},
+	}
+	if err := app.Run(context.Background(), []string{"sync", "--dry-run", "--taskfile", taskfile, "--state", stateFile}); err != nil {
+		t.Fatalf("sync dry-run failed: %v", err)
+	}
+	// State file should not be created in dry-run mode
+	if _, err := os.Stat(stateFile); err == nil {
+		t.Fatalf("state file should not exist after dry-run")
+	}
+	// Destination should not be created in dry-run mode
+	if _, err := os.Stat(dstA); err == nil {
+		t.Fatalf("destination should not exist after dry-run")
+	}
+}
+
+func TestCmdCPStateNoTaskfile(t *testing.T) {
+	dir := t.TempDir()
+	srcA := filepath.Join(dir, "a.txt")
+	srcB := filepath.Join(dir, "b.txt")
+	dstDir := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	if err := os.WriteFile(srcA, []byte("aaa"), 0o644); err != nil {
+		t.Fatalf("write srcA: %v", err)
+	}
+	if err := os.WriteFile(srcB, []byte("bbb"), 0o644); err != nil {
+		t.Fatalf("write srcB: %v", err)
+	}
+
+	stateFile := filepath.Join(dir, "cp.state")
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "state"},
+		},
+	}
+	// First run: copy both files
+	if err := app.Run(context.Background(), []string{"cp", "--state", stateFile, srcA, srcB, dstDir}); err != nil {
+		t.Fatalf("cp run 1 failed: %v", err)
+	}
+	// Verify files were copied
+	if _, err := os.Stat(filepath.Join(dstDir, "a.txt")); err != nil {
+		t.Fatalf("a.txt not copied: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, "b.txt")); err != nil {
+		t.Fatalf("b.txt not copied: %v", err)
+	}
+	// Verify state file contains both entries
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if !strings.Contains(string(stateData), taskStateKey(srcA, dstDir)) {
+		t.Fatalf("state missing srcA entry, got:\n%s", stateData)
+	}
+	if !strings.Contains(string(stateData), taskStateKey(srcB, dstDir)) {
+		t.Fatalf("state missing srcB entry, got:\n%s", stateData)
+	}
+	// Remove srcA, second run should skip both via state
+	if err := os.Remove(srcA); err != nil {
+		t.Fatalf("remove srcA: %v", err)
+	}
+	if err := app.Run(context.Background(), []string{"cp", "--state", stateFile, srcA, srcB, dstDir}); err != nil {
+		t.Fatalf("cp run 2 (resume) failed: %v", err)
+	}
+}
+
+func TestCmdSyncStateNoTaskfile(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	dstDir := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "f.txt"), []byte("data"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	stateFile := filepath.Join(dir, "sync.state")
+	app := &cli.Command{
+		Action: cmdSync,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "dry-run"},
+			&cli.BoolFlag{Name: "delete"},
+			&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+			&cli.StringFlag{Name: "x", Aliases: []string{"exclude"}},
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.StringFlag{Name: "state"},
+		},
+	}
+	// First run: sync
+	if err := app.Run(context.Background(), []string{"sync", "--state", stateFile, srcDir, dstDir}); err != nil {
+		t.Fatalf("sync run 1 failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, "f.txt")); err != nil {
+		t.Fatalf("f.txt not synced: %v", err)
+	}
+	// State should record the pair
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if !strings.Contains(string(stateData), taskStateKey(srcDir, dstDir)) {
+		t.Fatalf("state missing entry, got:\n%s", stateData)
+	}
+	// Remove source, second run should skip via state
+	if err := os.RemoveAll(srcDir); err != nil {
+		t.Fatalf("remove src: %v", err)
+	}
+	if err := app.Run(context.Background(), []string{"sync", "--state", stateFile, srcDir, dstDir}); err != nil {
+		t.Fatalf("sync run 2 (resume) failed: %v", err)
 	}
 }
 

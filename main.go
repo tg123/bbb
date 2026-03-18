@@ -107,6 +107,8 @@ func main() {
 				Value:   "info",
 				Sources: cli.EnvVars("BBB_LOG_LEVEL"),
 			},
+			&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
+			&cli.StringFlag{Name: "state", Usage: "State file for crash recovery"},
 		},
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
 			lvlStr := cmd.String("loglevel")
@@ -234,15 +236,13 @@ func main() {
 			{
 				Name:      "cp",
 				Usage:     "Copy files or directories",
-				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] [--taskfile FILE|--taskfile -] [--taskfile-state FILE]\n   or: bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
+				UsageText: "bbb [--taskfile FILE|--taskfile -] [--state FILE] cp [-q|--quiet] [--concurrency N] [--retry-count N]\n   or: bbb [--state FILE] cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
 				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
-					&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
-					&cli.StringFlag{Name: "taskfile-state", Usage: "State file for `cp --taskfile` crash recovery"},
 				},
 				Action: cmdCP,
 			},
@@ -284,7 +284,7 @@ func main() {
 			{
 				Name:      "sync",
 				Usage:     "Synchronise two directory trees",
-				UsageText: "bbb sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] [--taskfile FILE|--taskfile -] src dst",
+				UsageText: "bbb [--taskfile FILE|--taskfile -] [--state FILE] sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N]\n   or: bbb [--state FILE] sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] src dst",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "dry-run", Usage: "show actions without applying"},
 					&cli.BoolFlag{Name: "delete", Usage: "Delete destination files that don't exist in source"},
@@ -292,7 +292,6 @@ func main() {
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
 					&cli.StringFlag{Name: "x", Aliases: []string{"exclude"}, Usage: "Exclude files matching this regex"},
-					&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
 				},
 				Action: cmdSync,
 			},
@@ -326,7 +325,18 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 	fs := bbbfs.Resolve(parentPath)
 	entries, err := fs.List(ctx, parentPath)
 	if err != nil {
-		return err
+		// List may fail on file targets (e.g. ENOTDIR for local paths).
+		// Fall back to Stat when no wildcard was used.
+		if pattern == "" {
+			st, statErr := fs.Stat(ctx, parentPath)
+			if statErr == nil && !st.IsDir {
+				entries = []bbbfs.Entry{st}
+			} else {
+				return err
+			}
+		} else {
+			return err
+		}
 	}
 	// If listing returns nothing and no wildcard was used, the target
 	// may be a file rather than a directory. Fall back to Stat so that
@@ -1390,7 +1400,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
 	taskfile := c.String("taskfile")
-	taskfileState := c.String("taskfile-state")
+	stateFile := c.String("state")
 
 	if taskfile != "" {
 		if c.Args().Len() != 0 {
@@ -1400,7 +1410,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		state, taskCheckpoints, err := loadTaskState(taskfileState)
+		state, taskCheckpoints, err := loadTaskState(stateFile)
 		if err != nil {
 			return err
 		}
@@ -1420,7 +1430,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		for key := range state {
 			seen[key] = struct{}{}
 		}
-		stateAppender, err := newTaskStateAppender(taskfileState)
+		stateAppender, err := newTaskStateAppender(stateFile)
 		if err != nil {
 			return err
 		}
@@ -1489,7 +1499,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 							return
 						}
 						slog.Debug("cp: done", "src", task.src, "dst", task.dst)
-						if taskfileState != "" {
+						if stateFile != "" {
 							if err := stateAppender.append(task.key); err != nil {
 								setErr(err)
 								return
@@ -1543,7 +1553,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 							lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
 						}
 						var tracker *taskTracker
-						if taskfileState != "" {
+						if stateFile != "" {
 							tracker = &taskTracker{key: cpKey}
 						}
 						var pendingCount int64
@@ -1636,12 +1646,40 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	if c.Args().Len() < 2 {
 		return fmt.Errorf("cp: need srcs dst")
 	}
-	srcs := make([]string, c.Args().Len()-1)
-	for i := 0; i < len(srcs); i++ {
-		srcs[i] = c.Args().Get(i)
-	}
 	dst := c.Args().Get(c.Args().Len() - 1)
 	return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, srcs, dst, !quiet, nil)
+	allSrcs := make([]string, c.Args().Len()-1)
+	for i := 0; i < len(allSrcs); i++ {
+		allSrcs[i] = c.Args().Get(i)
+	}
+	if stateFile == "" {
+		return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, allSrcs, dst)
+	}
+	state, _, err := loadTaskState(stateFile)
+	if err != nil {
+		return err
+	}
+	stateAppender, err := newTaskStateAppender(stateFile)
+	if err != nil {
+		return err
+	}
+	for _, src := range allSrcs {
+		key := taskStateKey(src, dst)
+		if _, done := state[key]; done {
+			if !quiet {
+				lockedFprintf(os.Stderr, "cp: skip already completed %s -> %s\n", src, dst)
+			}
+			continue
+		}
+		if err := cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, []string{src}, dst); err != nil {
+			_ = stateAppender.close()
+			return err
+		}
+		if err := stateAppender.append(key); err != nil {
+			return err
+		}
+	}
+	return stateAppender.close()
 }
 
 func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, showCopyBar bool, onBytes func(int64)) error {
@@ -2482,6 +2520,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
 	taskfile := c.String("taskfile")
+	stateFile := c.String("state")
 
 	if taskfile != "" {
 		if c.Args().Len() != 0 {
@@ -2491,8 +2530,39 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
+		_, taskCheckpoints, err := loadTaskState(stateFile)
+		if err != nil {
+			return err
+		}
+		var stateAppender *taskStateAppender
+		if !dry {
+			stateAppender, err = newTaskStateAppender(stateFile)
+			if err != nil {
+				return err
+			}
+		}
 		for _, task := range tasks {
+			cpKey := taskCheckpointKey(task.src, task.dst)
+			if _, done := taskCheckpoints[cpKey]; done {
+				if !quiet {
+					lockedFprintf(os.Stderr, "sync: skip already completed task %s -> %s\n", task.src, task.dst)
+				}
+				continue
+			}
 			if err := cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, task.src, task.dst); err != nil {
+				if stateAppender != nil {
+					_ = stateAppender.close()
+				}
+				return err
+			}
+			if stateAppender != nil {
+				if err := stateAppender.appendCheckpoint(cpKey); err != nil {
+					return err
+				}
+			}
+		}
+		if stateAppender != nil {
+			if err := stateAppender.close(); err != nil {
 				return err
 			}
 		}
@@ -2502,6 +2572,33 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("sync: need src dst")
 	}
 	src, dst := c.Args().Get(0), c.Args().Get(1)
+	if stateFile != "" {
+		state, _, err := loadTaskState(stateFile)
+		if err != nil {
+			return err
+		}
+		key := taskStateKey(src, dst)
+		if _, done := state[key]; done {
+			if !quiet {
+				lockedFprintf(os.Stderr, "sync: skip already completed %s -> %s\n", src, dst)
+			}
+			return nil
+		}
+		if err := cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, src, dst); err != nil {
+			return err
+		}
+		if !dry {
+			stateAppender, err := newTaskStateAppender(stateFile)
+			if err != nil {
+				return err
+			}
+			if err := stateAppender.append(key); err != nil {
+				return err
+			}
+			return stateAppender.close()
+		}
+		return nil
+	}
 	return cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, src, dst)
 }
 
@@ -2897,7 +2994,9 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 		}
 		var totalSize int64
 		var count int
+		var anyListed bool
 		if err := azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
+			anyListed = true
 			name := bm.Name
 			if name == "" || strings.HasSuffix(name, "/") {
 				return nil // skip directories
@@ -2921,6 +3020,24 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		// If listing returned no entries at all and no wildcard was used, the target
+		// may be a single blob. Fall back to HeadBlob so that single-file
+		// paths (e.g. az://account/container/blob) are shown.
+		if !anyListed && pattern == "" {
+			if size, headErr := azblob.HeadBlob(ctx, ap); headErr == nil {
+				display := target
+				if relFlag {
+					display = path.Base(ap.Blob)
+				}
+				if machine {
+					fmt.Printf("f\t%d\t%s\t%s\n", size, "-", display)
+				} else {
+					fmt.Printf("%10s  %s  %s\n", formatSize(size), "-", display)
+				}
+				totalSize = size
+				count = 1
+			}
+		}
 		if !machine {
 			noun := "files"
 			if count == 1 {
@@ -2931,8 +3048,29 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 		return nil
 	}
 	if listErr != nil {
-		fmt.Fprintln(os.Stderr, listErr)
-		os.Exit(1)
+		// List may fail on file targets (e.g. ENOTDIR for local paths).
+		// Fall back to Stat when no wildcard was used.
+		if pattern == "" {
+			st, statErr := fs.Stat(ctx, parentPath)
+			if statErr == nil && !st.IsDir {
+				list = []bbbfs.Entry{st}
+			} else {
+				fmt.Fprintln(os.Stderr, listErr)
+				os.Exit(1)
+			}
+		} else {
+			fmt.Fprintln(os.Stderr, listErr)
+			os.Exit(1)
+		}
+	}
+	// If listing returns nothing and no wildcard was used, the target
+	// may be a file rather than a directory. Fall back to Stat so that
+	// single-file paths are shown.
+	if len(list) == 0 && pattern == "" {
+		st, statErr := fs.Stat(ctx, parentPath)
+		if statErr == nil && !st.IsDir {
+			list = []bbbfs.Entry{st}
+		}
 	}
 	var totalSize int64
 	var count int

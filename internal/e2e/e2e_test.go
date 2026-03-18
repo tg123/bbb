@@ -149,6 +149,30 @@ func bbbLs(path string, recursive bool) ([]string, error) {
 	return filtered, nil
 }
 
+// bbbLL runs "ll --machine" and returns the file paths from the output.
+// ll --machine outputs tab-separated lines: f\tSIZE\tMOD\tPATH
+func bbbLL(path string) ([]string, error) {
+	stdout, err := runBBB("ll", "--machine", path)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
+	var paths []string
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		fields := strings.Split(l, "\t")
+		if len(fields) < 4 {
+			continue
+		}
+		paths = append(paths, fields[3])
+	}
+	return paths, nil
+}
+
 func cleanFolder(t *testing.T, path string) {
 	files, err := bbbLs(path, true)
 	if err != nil {
@@ -334,7 +358,7 @@ func TestBasic(t *testing.T) {
 		if err := os.WriteFile(stateFile, []byte(skippedKey+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := runBBB("cp", "--taskfile", taskfile, "--taskfile-state", stateFile, "--concurrency", "2"); err != nil {
+		if _, err := runBBB("cp", "--taskfile", taskfile, "--state", stateFile, "--concurrency", "2"); err != nil {
 			t.Fatal(err)
 		}
 		files, err := bbbLs(dstPrefix, true)
@@ -391,6 +415,81 @@ func TestBasic(t *testing.T) {
 		expected := []string{singleFile}
 		if !slices.Equal(files, expected) {
 			t.Errorf("ls single file in subdir: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls -l single file (long format stat fallback)
+	{
+		singleFile := "az://" + azuriteAccount + "/test/testfile.txt"
+		stdout, err := runBBB("ls", "-l", "--machine", singleFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
+		var found bool
+		for _, l := range lines {
+			fields := strings.Split(strings.TrimSpace(l), "\t")
+			if len(fields) >= 4 && fields[3] == singleFile {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("ls -l single file: expected %s in output, got %q", singleFile, string(stdout))
+		}
+	}
+
+	// ll single file (stat fallback for exact blob path)
+	{
+		singleFile := "az://" + azuriteAccount + "/test/testfile.txt"
+		files, err := bbbLL(singleFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{singleFile}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll single file: got %v, want %v", files, expected)
+		}
+	}
+
+	// ll single file in subdirectory
+	{
+		singleFile := "az://" + azuriteAccount + "/test/dir/testfile.txt"
+		files, err := bbbLL(singleFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{singleFile}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll single file in subdir: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls local single file (List returns ENOTDIR, falls back to Stat)
+	{
+		files, err := bbbLs(tmpFile.Name(), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{tmpFile.Name()}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls local single file: got %v, want %v", files, expected)
+		}
+	}
+
+	// ll local single file (List returns ENOTDIR, falls back to Stat)
+	{
+		files, err := bbbLL(tmpFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{tmpFile.Name()}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll local single file: got %v, want %v", files, expected)
 		}
 	}
 
