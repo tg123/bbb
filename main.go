@@ -771,6 +771,7 @@ func (p *progressBar) Finish() {
 	total := p.total.Load()
 	if total < 1 {
 		total = 1
+		p.total.Store(total)
 	}
 	p.done.Store(total)
 	outputMu.Lock()
@@ -830,6 +831,9 @@ func clampProgress(done, total int64) (int64, int64) {
 
 func (p *progressBar) render(done int64) {
 	if p == nil {
+		return
+	}
+	if p.finished.Load() {
 		return
 	}
 	total := p.total.Load()
@@ -1815,11 +1819,12 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				if copyBar == nil {
 					return
 				}
-				copyBar.SetTotal(total)
-				// Use monotonic update — callbacks from parallel
-				// StageBlockFromURL goroutines can arrive out of order.
+				// Update done/bytesDone before SetTotal so the first
+				// render (triggered by SetTotal when total transitions
+				// from 0 to N) shows actual progress instead of 0%.
 				atomicMax(&copyBar.bytesDone, copied)
 				atomicMax(&copyBar.done, copied)
+				copyBar.SetTotal(total)
 				copyBar.render(copied)
 			}); err != nil {
 				if copyBar != nil {
