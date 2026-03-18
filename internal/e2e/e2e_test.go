@@ -131,8 +131,7 @@ func bbbLs(path string, recursive bool) ([]string, error) {
 	if recursive {
 		if len(lines) > 0 {
 			last := strings.TrimSpace(lines[len(lines)-1])
-			fields := strings.Fields(last)
-			if len(fields) == 2 && fields[1] == "files" {
+			if strings.HasPrefix(last, "Listed ") {
 				lines = lines[:len(lines)-1]
 			}
 		}

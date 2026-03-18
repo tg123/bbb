@@ -416,6 +416,7 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	var count int64
+	var totalSize int64
 	for _, entry := range list {
 		name := entry.Name
 		if name == "" || entry.IsDir {
@@ -435,6 +436,7 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 			}
 		}
 		count++
+		totalSize += entry.Size
 		display := entry.Path
 		if relFlag {
 			display = name
@@ -447,7 +449,7 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 			if machine {
 				fmt.Printf("f\t%d\t%s\t%s\n", entry.Size, mod, display)
 			} else {
-				fmt.Printf("%10d  %s  %s\n", entry.Size, mod, display)
+				fmt.Printf("%10s  %s  %s\n", formatSize(entry.Size), mod, display)
 			}
 		} else {
 			if machine {
@@ -458,7 +460,11 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 		}
 	}
 	if !machine {
-		fmt.Printf("%d files\n", count)
+		noun := "files"
+		if count == 1 {
+			noun = "file"
+		}
+		fmt.Printf("Listed %d %s summing to %s (%d bytes)\n", count, noun, formatSize(totalSize), totalSize)
 	}
 	return nil
 }
@@ -2791,7 +2797,11 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			}
 		}
 		if !machine {
-			fmt.Printf("Listed %d files summing to %s (%d bytes)\n", count, formatSize(totalSize), totalSize)
+			noun := "files"
+			if count == 1 {
+				noun = "file"
+			}
+			fmt.Printf("Listed %d %s summing to %s (%d bytes)\n", count, noun, formatSize(totalSize), totalSize)
 		}
 		return nil
 	}
@@ -2854,7 +2864,11 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 		count++
 	}
 	if !machine {
-		fmt.Printf("Listed %d files summing to %s (%d bytes)\n", count, formatSize(totalSize), totalSize)
+		noun := "files"
+		if count == 1 {
+			noun = "file"
+		}
+		fmt.Printf("Listed %d %s summing to %s (%d bytes)\n", count, noun, formatSize(totalSize), totalSize)
 	}
 	return nil
 }
