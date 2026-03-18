@@ -68,6 +68,8 @@ var validBlobSuffixes = []string{
 const (
 	defaultCopySASExpiry     = time.Hour
 	copyBlockSize            = 256 * 1024 * 1024 // 256 MiB per block for StageBlockFromURL
+	copyPollInitialDelay     = 100 * time.Millisecond
+	copyPollMaxDelay         = 2 * time.Second
 	uploadStreamMiB          = 1 << 20
 	uploadStreamBlockMin     = 256 * uploadStreamMiB  // Default UploadStream minimum block size.
 	uploadStreamBlockMax     = 4000 * uploadStreamMiB // Azure UploadStream maximum block size.
@@ -712,6 +714,22 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 		return fmt.Errorf("failed to get source properties: %w", err)
 	}
 
+	err = copyBlobBlocks(ctx, client, dst, copySource, totalSize, concurrency, onProgress)
+	if err != nil {
+		// StageBlockFromURL (Put Block From URL) returns 501 in emulators
+		// like Azurite. Fall back to the async StartCopyFromURL approach.
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.StatusCode == 501 {
+			slog.Debug("StageBlockFromURL not supported, falling back to StartCopyFromURL", "dst", dst.String())
+			return copyBlobAsync(ctx, client, dst, copySource, totalSize, onProgress)
+		}
+		return err
+	}
+	return nil
+}
+
+// copyBlobBlocks copies a blob using parallel StageBlockFromURL + CommitBlockList.
+func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource string, totalSize int64, concurrency int, onProgress CopyProgress) error {
 	blockBlobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
 
 	// Plan blocks and generate IDs.
@@ -791,6 +809,80 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 		onProgress(totalSize, totalSize)
 	}
 	return nil
+}
+
+// nextPollDelay doubles the delay up to copyPollMaxDelay.
+func nextPollDelay(d time.Duration) time.Duration {
+	d *= 2
+	if d > copyPollMaxDelay {
+		d = copyPollMaxDelay
+	}
+	return d
+}
+
+// copyBlobAsync copies a blob using StartCopyFromURL with polling.
+// This is the fallback for environments (e.g. Azurite) that don't support
+// StageBlockFromURL.
+func copyBlobAsync(ctx context.Context, client *azblob.Client, dst AzurePath, copySource string, totalSize int64, onProgress CopyProgress) error {
+	blobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlobClient(dst.Blob)
+	startCopy, err := blobClient.StartCopyFromURL(ctx, copySource, nil)
+	if err != nil {
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.ErrorCode == "PendingCopyOperation" {
+			slog.Info("pending copy operation detected, polling progress", "dst", dst.String())
+		} else {
+			return err
+		}
+	}
+
+	copyStatus := blob.CopyStatusTypePending
+	if startCopy.CopyStatus != nil {
+		copyStatus = *startCopy.CopyStatus
+	}
+	if copyStatus != blob.CopyStatusTypePending {
+		props, err := blobClient.GetProperties(ctx, nil)
+		if err == nil && props.CopyStatus != nil {
+			copyStatus = *props.CopyStatus
+			reportCopyProgress(props.CopyProgress, onProgress)
+		}
+	}
+	pollDelay := copyPollInitialDelay
+	for copyStatus == blob.CopyStatusTypePending {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollDelay):
+		}
+		pollDelay = nextPollDelay(pollDelay)
+		props, err := blobClient.GetProperties(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if props.CopyStatus == nil {
+			return errors.New("copy status missing")
+		}
+		copyStatus = *props.CopyStatus
+		reportCopyProgress(props.CopyProgress, onProgress)
+	}
+	if copyStatus != blob.CopyStatusTypeSuccess {
+		return fmt.Errorf("copy failed with status %s", copyStatus)
+	}
+	if onProgress != nil {
+		onProgress(totalSize, totalSize)
+	}
+	return nil
+}
+
+// reportCopyProgress parses the "bytes_copied/total_bytes" progress string
+// from Azure Blob CopyProgress and invokes the callback.
+func reportCopyProgress(progress *string, onProgress CopyProgress) {
+	if onProgress == nil || progress == nil {
+		return
+	}
+	copied, total, ok := parseCopyProgress(*progress)
+	if ok && total > 0 {
+		onProgress(copied, total)
+	}
 }
 
 // parseCopyProgress parses the Azure "bytes_copied/total_bytes" format.

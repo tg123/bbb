@@ -533,9 +533,55 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 }
 
 var (
-	outputMu   sync.Mutex
-	activeBars []*progressBar // guarded by outputMu; rendered in order
+	outputMu        sync.Mutex
+	activeBars      []*progressBar // guarded by outputMu; rendered in order
+	elapsedTickerMu sync.Mutex
+	elapsedTicker   *time.Ticker
+	elapsedDone     chan struct{}
 )
+
+// startElapsedTicker starts a 1-second background ticker that re-renders
+// active progress bars so the elapsed-time field stays up-to-date even when
+// no new progress events arrive. It is safe to call multiple times; only
+// one ticker runs at a time. Requires outputMu NOT to be held.
+func startElapsedTicker() {
+	elapsedTickerMu.Lock()
+	defer elapsedTickerMu.Unlock()
+	if elapsedTicker != nil {
+		return // already running
+	}
+	elapsedTicker = time.NewTicker(1 * time.Second)
+	elapsedDone = make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-elapsedDone:
+				return
+			case <-elapsedTicker.C:
+				outputMu.Lock()
+				if len(activeBars) > 0 {
+					clearActiveBars()
+					rerenderActiveBars()
+				}
+				outputMu.Unlock()
+			}
+		}
+	}()
+}
+
+// stopElapsedTicker stops the background ticker. Safe to call when no
+// ticker is running.
+func stopElapsedTicker() {
+	elapsedTickerMu.Lock()
+	defer elapsedTickerMu.Unlock()
+	if elapsedTicker == nil {
+		return
+	}
+	elapsedTicker.Stop()
+	close(elapsedDone)
+	elapsedTicker = nil
+	elapsedDone = nil
+}
 
 func clearActiveBars() {
 	n := len(activeBars)
@@ -696,6 +742,7 @@ func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progre
 	bar.total.Store(int64(total))
 	bar.lastDone.Store(progressUninitialized)
 	bar.lastTotal.Store(progressUninitialized)
+	startElapsedTicker()
 	bar.render(0)
 	return bar
 }
@@ -715,6 +762,7 @@ func newStreamingProgressBar(label string, quiet bool, showSpeed bool) *progress
 	}
 	bar.lastDone.Store(progressUninitialized)
 	bar.lastTotal.Store(progressUninitialized)
+	startElapsedTicker()
 	// total starts at 0; bar won't render until SetTotal(>0) is called.
 	return bar
 }
@@ -790,7 +838,6 @@ func (p *progressBar) Finish() {
 	}
 	p.done.Store(total)
 	outputMu.Lock()
-	defer outputMu.Unlock()
 	clearActiveBars()
 	removeActiveBar(p)
 	if !neverShown {
@@ -798,6 +845,11 @@ func (p *progressBar) Finish() {
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 	rerenderActiveBars()
+	noActiveBars := len(activeBars) == 0
+	outputMu.Unlock()
+	if noActiveBars {
+		stopElapsedTicker()
+	}
 }
 
 // renderUnlocked writes the progress bar to stderr. outputMu must be held.
