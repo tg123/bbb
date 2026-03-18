@@ -68,7 +68,6 @@ var validBlobSuffixes = []string{
 const (
 	defaultCopySASExpiry     = time.Hour
 	copyBlockSize            = 256 * 1024 * 1024 // 256 MiB per block for StageBlockFromURL
-	syncCopyMaxSize          = 256 * 1024 * 1024 // use UploadBlobFromURL below this
 	uploadStreamMiB          = 1 << 20
 	uploadStreamBlockMin     = 256 * uploadStreamMiB  // Default UploadStream minimum block size.
 	uploadStreamBlockMax     = 4000 * uploadStreamMiB // Azure UploadStream maximum block size.
@@ -674,18 +673,8 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 
 	blockBlobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
 
-	// For small or empty files, use synchronous UploadBlobFromURL.
-	if totalSize <= syncCopyMaxSize {
-		if _, err := blockBlobClient.UploadBlobFromURL(ctx, copySource, nil); err != nil {
-			return err
-		}
-		if onProgress != nil {
-			onProgress(totalSize, totalSize)
-		}
-		return nil
-	}
-
-	// For large files, use parallel StageBlockFromURL + CommitBlockList.
+	// Use parallel StageBlockFromURL + CommitBlockList.
+	// For empty files (0 blocks), CommitBlockList with an empty list creates a 0-byte blob.
 	blkSize := int64(copyBlockSize)
 	numBlocks := (totalSize + blkSize - 1) / blkSize
 	if numBlocks > blockblob.MaxBlocks {
