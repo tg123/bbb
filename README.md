@@ -50,7 +50,9 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 
 ### Taskfile
 
-A taskfile is a plain-text file with one `src dst` pair per line, separated by whitespace. Empty lines are ignored. Paths containing spaces are not supported.
+A taskfile is a plain-text file with one `src dst` pair per line, separated by whitespace. Empty lines are ignored.
+
+> **Note:** Paths containing spaces are not supported in the taskfile format because fields are split on whitespace. Use `cp` or `sync` with positional arguments instead for such paths.
 
 Example `tasks.txt`:
 
@@ -92,7 +94,7 @@ bbb --state copy.state --taskfile tasks.txt cp
 bbb --state copy.state cp ./huge-dataset/ az://myaccount/mycontainer/dataset/
 ```
 
-The state file is a plain-text append-only log. Each successfully copied file is recorded as `src -> dst`, and each completed taskfile pair is recorded with a `TASK\t` prefix:
+The state file is a plain-text append-only log. Each successfully copied **file** is recorded as `src -> dst`, and when all files in a taskfile pair are finished the pair is marked complete with a `TASK\t` prefix so the entire pair can be skipped on resume:
 
 ```
 ./data/model.bin -> az://myaccount/mycontainer/models/model.bin
