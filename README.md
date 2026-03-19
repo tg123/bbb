@@ -42,7 +42,7 @@ bbb --loglevel debug ls az://myaccount/mycontainer/
 Example debug output:
 
 ```
-time=... level=DEBUG msg="DNS lookup" host=myaccount.blob.core.windows.net addrs=["20.60.x.x"]
+time=... level=DEBUG msg="DNS lookup" host=myaccount.blob.core.windows.net addrs=["198.51.100.1"]
 time=... level=DEBUG msg="Decoded JWT payload" payload="{\"aud\":\"https://storage.azure.com\",\"iss\":\"https://sts.windows.net/<tenant-id>/\",\"oid\":\"...\",\"sub\":\"...\",...}"
 ```
 
