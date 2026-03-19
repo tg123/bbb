@@ -33,6 +33,21 @@ These flags must come **before** the subcommand:
 | `--taskfile FILE` | | Batch task file with one `src dst` pair per line; use `-` for stdin (available for `cp` and `sync`) |
 | `--state FILE` | | State file for crash recovery / resuming interrupted operations (available for `cp` and `sync`) |
 
+**Debug logging example** — use `--loglevel debug` to inspect DNS resolution and the Azure AD token issuer (`iss`), which is useful for diagnosing connectivity or authentication problems:
+
+```bash
+bbb --loglevel debug ls az://myaccount/mycontainer/
+```
+
+Example debug output:
+
+```
+time=... level=DEBUG msg="DNS lookup" host=myaccount.blob.core.windows.net addrs=["20.60.x.x"]
+time=... level=DEBUG msg="Decoded JWT payload" payload="{\"aud\":\"https://storage.azure.com\",\"iss\":\"https://sts.windows.net/<tenant-id>/\",\"oid\":\"...\",\"sub\":\"...\",...}"
+```
+
+The `DNS lookup` line shows the resolved IP addresses for the storage account, and the `Decoded JWT payload` line contains the full token claims including `iss` (the token issuer) and `aud` (audience), letting you verify the correct identity and tenant are being used.
+
 ## Commands
 
 ### `ls` — List directory contents
