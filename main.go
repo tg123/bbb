@@ -2845,7 +2845,7 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 				return nil // skip directories
 			}
 			if pattern != "" {
-				matched, mErr := path.Match(pattern, strings.TrimSuffix(name, "/"))
+				matched, mErr := path.Match(pattern, name)
 				if mErr != nil {
 					return mErr
 				}
