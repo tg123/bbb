@@ -48,6 +48,58 @@ time=... level=DEBUG msg="Decoded JWT payload" payload="{\"aud\":\"https://stora
 
 The `DNS lookup` line shows the resolved IP addresses for the storage account, and the `Decoded JWT payload` line contains the full token claims including `iss` (the token issuer) and `aud` (audience), letting you verify the correct identity and tenant are being used.
 
+### Taskfile
+
+A taskfile is a plain-text file with one `src dst` pair per line, separated by whitespace. Empty lines are ignored. Paths containing spaces are not supported.
+
+Example `tasks.txt`:
+
+```
+./data/model.bin   az://myaccount/mycontainer/models/model.bin
+./data/config.json az://myaccount/mycontainer/models/config.json
+./data/vocab.txt   az://myaccount/mycontainer/models/vocab.txt
+```
+
+Use `--taskfile` to pass the file to `cp` or `sync`. Use `-` to read from stdin:
+
+```bash
+# Copy all pairs listed in the taskfile
+bbb --taskfile tasks.txt cp
+
+# Sync all pairs listed in the taskfile
+bbb --taskfile tasks.txt sync
+
+# Pipe pairs from another command
+find ./models -name '*.bin' | awk '{print $0, "az://myaccount/mycontainer/"$0}' | bbb --taskfile - cp
+```
+
+### State file
+
+A state file tracks completed work so interrupted operations can be resumed. Pass `--state` to `cp` or `sync` and re-run the same command after a failure — already-finished items are skipped automatically.
+
+```bash
+# Start a large copy with crash recovery
+bbb --state copy.state --taskfile tasks.txt cp
+
+# If the process is interrupted, re-run the exact same command.
+# Completed files are skipped; only remaining work is executed.
+bbb --state copy.state --taskfile tasks.txt cp
+```
+
+`--state` also works without `--taskfile`:
+
+```bash
+bbb --state copy.state cp ./huge-dataset/ az://myaccount/mycontainer/dataset/
+```
+
+The state file is a plain-text append-only log. Each successfully copied file is recorded as `src -> dst`, and each completed taskfile pair is recorded with a `TASK\t` prefix:
+
+```
+./data/model.bin -> az://myaccount/mycontainer/models/model.bin
+./data/config.json -> az://myaccount/mycontainer/models/config.json
+TASK	./data/model.bin -> az://myaccount/mycontainer/models/model.bin
+```
+
 ## Commands
 
 ### `ls` — List directory contents
@@ -236,7 +288,7 @@ bbb cp --concurrency 16 --retry-count 3 ./big-dataset/ az://myaccount/mycontaine
 
 #### Taskfile Mode
 
-Use `--taskfile` to provide a file of `src dst` pairs (one per line):
+Use `--taskfile` to provide a file of `src dst` pairs (one per line). See [Taskfile](#taskfile) for the file format.
 
 ```bash
 # From a file
@@ -248,11 +300,14 @@ echo "local.txt az://myaccount/c/remote.txt" | bbb --taskfile - cp
 
 #### Crash Recovery with State File
 
-Use `--state` to resume interrupted copies:
+Use `--state` to resume interrupted copies. See [State file](#state-file) for details.
 
 ```bash
-bbb --state copy.state cp ./huge-dataset/ az://myaccount/mycontainer/dataset/
-# If interrupted, re-run the same command — already-copied files are skipped.
+# First run — starts copying and records progress
+bbb --state copy.state --taskfile tasks.txt cp
+
+# If interrupted, re-run the same command — already-copied files are skipped
+bbb --state copy.state --taskfile tasks.txt cp
 ```
 
 ---
@@ -348,7 +403,7 @@ bbb sync --dry-run ./data/ az://myaccount/mycontainer/data/
 # Exclude certain file patterns
 bbb sync --exclude '\.tmp$' ./project/ az://myaccount/mycontainer/project/
 
-# Sync with taskfile and crash recovery
+# Sync with taskfile and crash recovery (see Taskfile and State file sections above)
 bbb --taskfile tasks.txt --state sync.state sync
 ```
 
