@@ -856,7 +856,15 @@ func (p *progressBar) Finish() {
 	clearActiveBars()
 	removeActiveBar(p)
 	if !neverShown {
-		p.renderUnlocked()
+		// Compute max label width across both the finishing bar and all
+		// remaining active bars so the completed line aligns with them.
+		maxLabel := len(p.label)
+		for _, bar := range activeBars {
+			if n := len(bar.label); n > maxLabel {
+				maxLabel = n
+			}
+		}
+		p.renderAligned(maxLabel)
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 	rerenderActiveBars()
@@ -865,11 +873,6 @@ func (p *progressBar) Finish() {
 	if noActiveBars {
 		stopElapsedTicker()
 	}
-}
-
-// renderUnlocked writes the progress bar to stderr. outputMu must be held.
-func (p *progressBar) renderUnlocked() {
-	p.renderAligned(0)
 }
 
 // renderAligned writes the progress bar to stderr with the label padded to
