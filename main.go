@@ -3111,7 +3111,6 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 	relFlag := c.Bool("s")
 	parentPath, pattern := splitWildcard(target)
 	fs := bbbfs.Resolve(parentPath)
-	list, listErr := fs.List(ctx, parentPath)
 	if isAz(parentPath) {
 		ap, err := azblob.Parse(parentPath)
 		if err != nil {
@@ -3136,7 +3135,12 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 					return nil
 				}
 			}
-			fullpath := fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
+			var fullpath string
+			if ap.Container == "" {
+				fullpath = fmt.Sprintf("az://%s/%s", ap.Account, name)
+			} else {
+				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
+			}
 			fullpath = strings.TrimSuffix(fullpath, "/")
 			mod := "-" // Placeholder, modtime not available
 			display := fullpath
@@ -3182,6 +3186,7 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 		}
 		return nil
 	}
+	list, listErr := fs.List(ctx, parentPath)
 	if listErr != nil {
 		// List may fail on file targets (e.g. ENOTDIR for local paths).
 		// Fall back to Stat when no wildcard was used.

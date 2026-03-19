@@ -149,52 +149,41 @@ func bbbLs(path string, recursive bool) ([]string, error) {
 	return filtered, nil
 }
 
+// parseMachineLL parses "--machine" tab-separated output (f\tSIZE\tMOD\tPATH)
+// and returns the file paths. Used by bbbLL and bbbLLR.
+func parseMachineLL(stdout []byte) []string {
+	lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
+	var paths []string
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		fields := strings.Split(l, "\t")
+		if len(fields) < 4 {
+			continue
+		}
+		paths = append(paths, fields[3])
+	}
+	return paths
+}
+
 // bbbLL runs "ll --machine" and returns the file paths from the output.
-// ll --machine outputs tab-separated lines: f\tSIZE\tMOD\tPATH
 func bbbLL(path string) ([]string, error) {
 	stdout, err := runBBB("ll", "--machine", path)
 	if err != nil {
 		return nil, err
 	}
-
-	lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
-	var paths []string
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if l == "" {
-			continue
-		}
-		fields := strings.Split(l, "\t")
-		if len(fields) < 4 {
-			continue
-		}
-		paths = append(paths, fields[3])
-	}
-	return paths, nil
+	return parseMachineLL(stdout), nil
 }
 
 // bbbLLR runs "llr --machine" and returns the file paths from the output.
-// llr --machine outputs tab-separated lines: f\tSIZE\tMOD\tPATH
 func bbbLLR(path string) ([]string, error) {
 	stdout, err := runBBB("llr", "--machine", path)
 	if err != nil {
 		return nil, err
 	}
-
-	lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
-	var paths []string
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if l == "" {
-			continue
-		}
-		fields := strings.Split(l, "\t")
-		if len(fields) < 4 {
-			continue
-		}
-		paths = append(paths, fields[3])
-	}
-	return paths, nil
+	return parseMachineLL(stdout), nil
 }
 
 func cleanFolder(t *testing.T, path string) {
