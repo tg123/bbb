@@ -1634,6 +1634,14 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	pairCh := make(chan taskPair, expanders*2)
 	var seenMu sync.Mutex
 	var expandWG sync.WaitGroup
+	// Add a +1 sentinel to totalPending so the progress bar never shows
+	// 100% while expansion is still running. Without this, fast cp workers
+	// can finish all currently-discovered files before expanders find more,
+	// making the bar flash "done" prematurely. The sentinel is removed
+	// after expandWG.Wait() below.
+	if taskProgress != nil {
+		totalPending.Add(1)
+	}
 	for i := 0; i < expanders; i++ {
 		expandWG.Add(1)
 		go func() {
@@ -1732,6 +1740,11 @@ enqueueLoop:
 	}
 	close(pairCh)
 	expandWG.Wait()
+	// Remove the +1 listing sentinel now that expansion is complete,
+	// and set the final accurate total so the bar can reach 100%.
+	if taskProgress != nil {
+		taskProgress.SetTotal(totalPending.Add(-1))
+	}
 	close(taskCh)
 	wg.Wait()
 	if !queued.Load() && firstErr == nil {
