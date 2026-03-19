@@ -981,44 +981,82 @@ func TestRunOpPoolWithRetry(t *testing.T) {
 }
 
 func TestFormatProgressBarIncludesSpeed(t *testing.T) {
-	line := formatProgressBar("cp", 5, 10, 10, 2.5*1024*1024, true)
-	if line != "cp [=====     ]  50% (5/10, 2.5 MB/s)" {
+	line := formatProgressBar("cp", 5, 10, 10, 2.5*1024*1024, true, false, 30*time.Second)
+	if line != "cp [=====     ]  50% (5/10, 2.5 MB/s) 30s" {
 		t.Fatalf("unexpected progress bar output: %s", line)
 	}
 }
 
 func TestFormatProgressBarClampsDoneToTotal(t *testing.T) {
-	line := formatProgressBar("cp", 7, 5, 10, 1*1024*1024, true)
-	if line != "cp [==========] 100% (5/5, 1.0 MB/s)" {
+	line := formatProgressBar("cp", 7, 5, 10, 1*1024*1024, true, false, 5*time.Second)
+	if line != "cp [==========] 100% (5/5, 1.0 MB/s) 5s" {
 		t.Fatalf("unexpected clamped output: %s", line)
 	}
 }
 
 func TestFormatProgressBarNormalizesWidth(t *testing.T) {
-	line := formatProgressBar("cp", 1, 5, 0, 1*1024*1024, true)
-	if line != "cp [ ]  20% (1/5, 1.0 MB/s)" {
+	line := formatProgressBar("cp", 1, 5, 0, 1*1024*1024, true, false, 10*time.Second)
+	if line != "cp [ ]  20% (1/5, 1.0 MB/s) 10s" {
 		t.Fatalf("unexpected normalized width output: %s", line)
 	}
 }
 
 func TestFormatProgressBarNormalizesNegativeSpeed(t *testing.T) {
-	line := formatProgressBar("cp", 1, 5, 10, -2, true)
-	if line != "cp [==        ]  20% (1/5, 0.0 MB/s)" {
+	line := formatProgressBar("cp", 1, 5, 10, -2, true, false, 0)
+	if line != "cp [==        ]  20% (1/5, 0 B/s) 0s" {
 		t.Fatalf("unexpected normalized speed output: %s", line)
 	}
 }
 
 func TestFormatProgressBarUsesGBSpeedForLargeValues(t *testing.T) {
-	line := formatProgressBar("cp", 5, 10, 10, 1.5*1024*1024*1024, true)
-	if line != "cp [=====     ]  50% (5/10, 1.5 GB/s)" {
+	line := formatProgressBar("cp", 5, 10, 10, 1.5*1024*1024*1024, true, false, 2*time.Minute+15*time.Second)
+	if line != "cp [=====     ]  50% (5/10, 1.5 GB/s) 2m15s" {
 		t.Fatalf("unexpected GB speed output: %s", line)
 	}
 }
 
 func TestFormatProgressBarWithoutSpeed(t *testing.T) {
-	line := formatProgressBar("sync", 3, 10, 10, 10*1024*1024, false)
-	if line != "sync [===       ]  30% (3/10)" {
+	line := formatProgressBar("sync", 3, 10, 10, 10*1024*1024, false, false, 45*time.Second)
+	if line != "sync [===       ]  30% (3/10) 45s" {
 		t.Fatalf("unexpected output without speed: %s", line)
+	}
+}
+
+func TestFormatProgressBarByteSized(t *testing.T) {
+	line := formatProgressBar("file.dat", 50*1024*1024, 100*1024*1024, 10, 5*1024*1024, true, true, 10*time.Second)
+	if line != "file.dat [=====     ]  50% (50.0 MiB/100.0 MiB, 5.0 MB/s) 10s" {
+		t.Fatalf("unexpected byte-sized output: %s", line)
+	}
+}
+
+func TestFormatProgressBarByteSizedNoSpeed(t *testing.T) {
+	line := formatProgressBar("file.dat", 50*1024*1024, 100*1024*1024, 10, 0, false, true, 1*time.Hour+5*time.Minute+30*time.Second)
+	if line != "file.dat [=====     ]  50% (50.0 MiB/100.0 MiB) 1h05m30s" {
+		t.Fatalf("unexpected byte-sized no speed output: %s", line)
+	}
+}
+
+func TestFormatElapsed(t *testing.T) {
+	tests := []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "0s"},
+		{5 * time.Second, "5s"},
+		{59 * time.Second, "59s"},
+		{1 * time.Minute, "1m00s"},
+		{2*time.Minute + 15*time.Second, "2m15s"},
+		{1 * time.Hour, "1h00m00s"},
+		{1*time.Hour + 5*time.Minute + 30*time.Second, "1h05m30s"},
+		{25*time.Hour + 59*time.Minute + 59*time.Second, "25h59m59s"},
+		// sub-second is truncated
+		{5*time.Second + 500*time.Millisecond, "5s"},
+	}
+	for _, tt := range tests {
+		got := formatElapsed(tt.d)
+		if got != tt.want {
+			t.Errorf("formatElapsed(%v) = %q, want %q", tt.d, got, tt.want)
+		}
 	}
 }
 

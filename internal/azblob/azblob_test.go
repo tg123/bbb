@@ -61,20 +61,20 @@ func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 	ctx := context.Background()
 	src := AzurePath{Account: "acct", Container: "container"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
-	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for dir-like source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for trailing slash source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst = AzurePath{Account: "acct", Container: "container"}
-	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for dir-like destination")
 	}
 	dst = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for trailing slash destination")
 	}
 }
@@ -85,7 +85,7 @@ func TestCopyBlobServerSideCrossAccountRequiresCredentials(t *testing.T) {
 	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
-	err := CopyBlobServerSide(ctx, src, dst, nil)
+	err := CopyBlobServerSide(ctx, src, dst, 4, nil)
 	if err == nil {
 		t.Fatal("expected error for cross-account copy without credentials")
 	}
@@ -97,7 +97,7 @@ func TestCopyBlobServerSideFallsBackToUserDelegation(t *testing.T) {
 	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "other.txt"}
-	err := CopyBlobServerSide(ctx, src, dst, nil)
+	err := CopyBlobServerSide(ctx, src, dst, 4, nil)
 	// Without real Azure credentials the user delegation path will fail,
 	// but it must NOT be a MissingSharedKeyCredential error since we now
 	// attempt the delegation path instead.
@@ -126,6 +126,90 @@ func TestParseCopyProgress(t *testing.T) {
 	}
 	if _, _, ok := parseCopyProgress(""); ok {
 		t.Fatal("expected false for empty input")
+	}
+}
+
+func TestPlanBlocksEmpty(t *testing.T) {
+	blkSize, ids, err := planBlocks(0, 256*1024*1024, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize != 256*1024*1024 {
+		t.Fatalf("expected default block size, got %d", blkSize)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected 0 block IDs for empty blob, got %d", len(ids))
+	}
+}
+
+func TestPlanBlocksSingleBlock(t *testing.T) {
+	blkSize, ids, err := planBlocks(100, 256*1024*1024, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize != 256*1024*1024 {
+		t.Fatalf("expected default block size, got %d", blkSize)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("expected 1 block ID, got %d", len(ids))
+	}
+}
+
+func TestPlanBlocksMultipleBlocks(t *testing.T) {
+	// 512 MiB at 256 MiB block size = 2 blocks
+	blkSize, ids, err := planBlocks(512*1024*1024, 256*1024*1024, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize != 256*1024*1024 {
+		t.Fatalf("expected default block size, got %d", blkSize)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 block IDs, got %d", len(ids))
+	}
+	// All IDs must have the same length.
+	if len(ids[0]) != len(ids[1]) {
+		t.Fatalf("block IDs have different lengths: %q vs %q", ids[0], ids[1])
+	}
+}
+
+func TestPlanBlocksAdjustsBlockSizeWhenExceedsMax(t *testing.T) {
+	// maxBlocks=2, 300 bytes at default 100 = 3 blocks → must adjust.
+	blkSize, ids, err := planBlocks(300, 100, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize <= 100 {
+		t.Fatalf("expected increased block size, got %d", blkSize)
+	}
+	if len(ids) > 2 {
+		t.Fatalf("expected at most 2 blocks, got %d", len(ids))
+	}
+	// Verify blocks cover entire size.
+	covered := int64(len(ids)) * blkSize
+	if covered < 300 {
+		t.Fatalf("blocks do not cover total size: %d * %d = %d < 300", len(ids), blkSize, covered)
+	}
+}
+
+func TestPlanBlocksUniqueIDs(t *testing.T) {
+	_, ids, err := planBlocks(1024, 100, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	seen := make(map[string]bool)
+	for _, id := range ids {
+		if seen[id] {
+			t.Fatalf("duplicate block ID: %s", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestPlanBlocksNegativeSize(t *testing.T) {
+	_, _, err := planBlocks(-1, 256*1024*1024, 50000)
+	if err == nil {
+		t.Fatal("expected error for negative total size")
 	}
 }
 
