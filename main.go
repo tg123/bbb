@@ -2829,8 +2829,8 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 	parentPath, pattern := splitWildcard(target)
 	fs := bbbfs.Resolve(parentPath)
 	list, listErr := fs.List(ctx, parentPath)
-	if isAz(target) {
-		ap, err := azblob.Parse(target)
+	if isAz(parentPath) {
+		ap, err := azblob.Parse(parentPath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -2843,6 +2843,15 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			name := bm.Name
 			if name == "" || strings.HasSuffix(name, "/") {
 				return nil // skip directories
+			}
+			if pattern != "" {
+				matched, mErr := path.Match(pattern, strings.TrimSuffix(name, "/"))
+				if mErr != nil {
+					return mErr
+				}
+				if !matched {
+					return nil
+				}
 			}
 			fullpath := fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
 			fullpath = strings.TrimSuffix(fullpath, "/")
