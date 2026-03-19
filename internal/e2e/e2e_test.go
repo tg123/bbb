@@ -660,7 +660,10 @@ func TestBasic(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// Recursive listing matches filename component against pattern, so
+		// dir/testfile.txt also matches testfile* (uploaded earlier).
 		expected := []string{
+			"az://" + azuriteAccount + "/test/dir/testfile.txt",
 			"az://" + azuriteAccount + "/test/testfile.txt",
 			"az://" + azuriteAccount + "/test/testfile2.txt",
 		}
@@ -677,7 +680,10 @@ func TestBasic(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// Recursive listing matches filename component against pattern, so
+		// dir/testfile.txt also matches testfile* (uploaded earlier).
 		expected := []string{
+			"az://" + azuriteAccount + "/test/dir/testfile.txt",
 			"az://" + azuriteAccount + "/test/testfile.txt",
 			"az://" + azuriteAccount + "/test/testfile2.txt",
 		}
