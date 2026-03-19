@@ -21,11 +21,11 @@ go install github.com/tg123/bbb@latest
 |--------|-------------|---------|
 | *(none)* | Local filesystem | `/tmp/data/`, `./file.txt` |
 | `az://` | Azure Blob Storage | `az://myaccount/mycontainer/path/to/blob` |
-| `hf://` | Hugging Face Hub | `hf://models/org/repo/weights.bin` |
+| `hf://` | Hugging Face Hub | `hf://meta-llama/Llama-2-7b/weights.bin`, `hf://datasets/org/repo/data.csv` |
 
 ## Global Flags
 
-These flags must come **before** the subcommand:
+These flags can be provided before or after the subcommand:
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -39,14 +39,16 @@ These flags must come **before** the subcommand:
 bbb --loglevel debug ls az://myaccount/mycontainer/
 ```
 
-Example debug output:
+Example debug output (sensitive fields redacted):
 
 ```
 time=... level=DEBUG msg="DNS lookup" host=myaccount.blob.core.windows.net addrs=["198.51.100.1"]
-time=... level=DEBUG msg="Decoded JWT payload" payload="{\"aud\":\"https://storage.azure.com\",\"iss\":\"https://sts.windows.net/<tenant-id>/\",\"oid\":\"...\",\"sub\":\"...\",...}"
+time=... level=DEBUG msg="Decoded JWT payload" payload="{\"aud\":\"https://storage.azure.com\",\"iss\":\"https://sts.windows.net/<tenant-id>/\",…}"
 ```
 
 The `DNS lookup` line shows the resolved IP addresses for the storage account, and the `Decoded JWT payload` line contains the full token claims including `iss` (the token issuer) and `aud` (audience), letting you verify the correct identity and tenant are being used.
+
+> **Warning:** Debug output may include personally identifiable information such as tenant IDs, object IDs, and other token claims. Do not share debug logs publicly or paste them into tickets without redacting sensitive fields.
 
 ### Taskfile
 
@@ -129,7 +131,7 @@ bbb ls /tmp/data/
 bbb ls -l az://myaccount/mycontainer/
 
 # List Hugging Face repo files with relative paths
-bbb ls -s hf://models/meta-llama/Llama-2-7b/
+bbb ls -s hf://meta-llama/Llama-2-7b/
 ```
 
 ---
@@ -226,9 +228,9 @@ bbb cat file1.txt file2.txt
 
 ---
 
-### `touch` — Create or update file timestamp
+### `touch` — Create or ensure file exists
 
-Creates empty files if they don't exist, or updates the modification timestamp.
+Creates empty files if they don't exist. For local files, also updates the modification timestamp. For Azure blobs, creates an empty blob only when it doesn't already exist — it does **not** update the timestamp on existing blobs.
 
 ```
 bbb touch path [path ...]
@@ -250,7 +252,7 @@ bbb touch az://myaccount/mycontainer/marker.txt
 
 Aliases: `cpr`, `cptree`
 
-Copy one or more source files/directories to a destination. Supports local, Azure Blob, and Hugging Face paths in any combination.
+Copy one or more source files/directories to a destination. Supports local and Azure Blob paths in any combination. Hugging Face (`hf://`) paths are supported as a **source only** (the `hf://` backend is read-only).
 
 ```
 bbb cp [flags] src [src ...] dst
@@ -278,8 +280,8 @@ bbb cp az://myaccount/mycontainer/results/ ./results/
 # Server-side copy between Azure containers
 bbb cp az://myaccount/src-container/data/ az://myaccount/dst-container/data/
 
-# Download from Hugging Face
-bbb cp hf://models/meta-llama/Llama-2-7b/ ./llama-model/
+# Download from Hugging Face (hf:// is source-only)
+bbb cp hf://meta-llama/Llama-2-7b/ ./llama-model/
 
 # Copy multiple sources to one destination
 bbb cp file1.txt file2.txt az://myaccount/mycontainer/uploads/
@@ -446,8 +448,8 @@ For Azure Blob paths, prints an Azure Portal link and a direct blob URL. For loc
 # Get a shareable link for an Azure blob
 bbb share az://myaccount/mycontainer/report.pdf
 # Output:
-#   https://portal.azure.com/#blade/...
-#   https://myaccount.blob.core.windows.net/mycontainer/report.pdf
+#   Azure Portal: https://portal.azure.com/#blade/...
+#   Direct Blob (if public): https://myaccount.blob.core.windows.net/mycontainer/report.pdf
 
 # Get a file:// link for a local file
 bbb share ./report.pdf
@@ -455,9 +457,9 @@ bbb share ./report.pdf
 
 ---
 
-### `edit` — Open a file in your editor
+### `edit` — Open a file in your editor (local only)
 
-Opens a file in the editor specified by the `$EDITOR` environment variable (defaults to `vi`). Creates the file and parent directories if they don't exist.
+Opens a local file in the editor specified by the `$EDITOR` environment variable (defaults to `vi`). Creates the file and parent directories if they don't exist. Remote paths (`az://`, `hf://`) are not supported.
 
 ```
 bbb edit path
