@@ -533,46 +533,141 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 }
 
 var (
-	outputMu     sync.Mutex
-	activeBarPtr *progressBar // guarded by outputMu
+	outputMu        sync.Mutex
+	activeBars      []*progressBar // guarded by outputMu; rendered in order
+	maxLabelWidth   int            // guarded by outputMu; high-water mark for label alignment
+	elapsedTickerMu sync.Mutex
+	elapsedTicker   *time.Ticker
+	elapsedDone     chan struct{}
+	elapsedWg       sync.WaitGroup
 )
 
-func clearActiveBar() {
-	if activeBarPtr != nil && isTerminal(os.Stderr) {
-		fmt.Fprintf(os.Stderr, "\r"+ansiClear)
+// startElapsedTicker starts a 1-second background ticker that re-renders
+// active progress bars so the elapsed-time field stays up-to-date even when
+// no new progress events arrive. It is safe to call multiple times; only
+// one ticker runs at a time. Requires outputMu NOT to be held.
+func startElapsedTicker() {
+	elapsedTickerMu.Lock()
+	defer elapsedTickerMu.Unlock()
+	if elapsedTicker != nil {
+		return // already running
+	}
+	elapsedTicker = time.NewTicker(1 * time.Second)
+	elapsedDone = make(chan struct{})
+	elapsedWg.Add(1)
+	go func() {
+		defer elapsedWg.Done()
+		for {
+			select {
+			case <-elapsedDone:
+				return
+			case _, ok := <-elapsedTicker.C:
+				if !ok {
+					return
+				}
+				outputMu.Lock()
+				if len(activeBars) > 0 {
+					clearActiveBars()
+					rerenderActiveBars()
+				}
+				outputMu.Unlock()
+			}
+		}
+	}()
+}
+
+// stopElapsedTicker stops the background ticker and waits for the
+// goroutine to exit. Safe to call when no ticker is running.
+func stopElapsedTicker() {
+	elapsedTickerMu.Lock()
+	if elapsedTicker == nil {
+		elapsedTickerMu.Unlock()
+		return
+	}
+	elapsedTicker.Stop()
+	close(elapsedDone)
+	elapsedTicker = nil
+	elapsedDone = nil
+	elapsedTickerMu.Unlock()
+	elapsedWg.Wait()
+}
+
+func clearActiveBars() {
+	n := len(activeBars)
+	if n == 0 || !isTerminal(os.Stderr) {
+		return
+	}
+	if n > 1 {
+		fmt.Fprintf(os.Stderr, "\033[%dA", n-1) // move cursor up to first bar line
+	}
+	fmt.Fprintf(os.Stderr, "\r\033[J") // clear from cursor to end of screen
+}
+
+func rerenderActiveBars() {
+	for i, bar := range activeBars {
+		bar.renderAligned(maxLabelWidth)
+		if i < len(activeBars)-1 {
+			fmt.Fprintf(os.Stderr, "\n")
+		}
 	}
 }
 
-func rerenderActiveBar() {
-	if activeBarPtr != nil {
-		activeBarPtr.renderUnlocked()
+func addActiveBar(p *progressBar) {
+	for _, b := range activeBars {
+		if b == p {
+			return
+		}
+	}
+	if n := len(p.label); n > maxLabelWidth {
+		maxLabelWidth = n
+	}
+	if p.pinBottom {
+		activeBars = append(activeBars, p)
+		return
+	}
+	// Insert before any pinBottom bars so they stay at the bottom.
+	insertAt := len(activeBars)
+	for insertAt > 0 && activeBars[insertAt-1].pinBottom {
+		insertAt--
+	}
+	activeBars = append(activeBars, nil)
+	copy(activeBars[insertAt+1:], activeBars[insertAt:])
+	activeBars[insertAt] = p
+}
+
+func removeActiveBar(p *progressBar) {
+	for i, b := range activeBars {
+		if b == p {
+			activeBars = append(activeBars[:i], activeBars[i+1:]...)
+			return
+		}
 	}
 }
 
 func lockedPrintf(format string, args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	clearActiveBar()
+	clearActiveBars()
 	fmt.Printf(format, args...)
-	rerenderActiveBar()
+	rerenderActiveBars()
 }
 
 func lockedPrintln(args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	clearActiveBar()
+	clearActiveBars()
 	fmt.Println(args...)
-	rerenderActiveBar()
+	rerenderActiveBars()
 }
 
 func lockedFprintf(w io.Writer, format string, args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	clearActiveBar()
+	clearActiveBars()
 	if _, err := fmt.Fprintf(w, format, args...); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
-	rerenderActiveBar()
+	rerenderActiveBars()
 }
 
 // barAwareHandler wraps an slog.Handler so log output coordinates with the
@@ -589,9 +684,9 @@ func (h *barAwareHandler) Enabled(ctx context.Context, level slog.Level) bool {
 func (h *barAwareHandler) Handle(ctx context.Context, r slog.Record) error {
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	clearActiveBar()
+	clearActiveBars()
 	err := h.inner.Handle(ctx, r)
-	rerenderActiveBar()
+	rerenderActiveBars()
 	return err
 }
 
@@ -612,21 +707,32 @@ func isTerminal(f *os.File) bool {
 }
 
 type progressBar struct {
-	label     string
-	width     int
-	showSpeed bool
-	startedAt time.Time
-	total     atomic.Int64
-	done      atomic.Int64
-	bytesDone atomic.Int64
-	lastDone  atomic.Int64
-	lastTotal atomic.Int64
-	finished  atomic.Bool
+	label      string
+	width      int
+	showSpeed  bool
+	byteSized  bool // if true, show done/total as formatted byte sizes
+	startedAt  time.Time
+	total      atomic.Int64
+	done       atomic.Int64
+	bytesDone  atomic.Int64
+	lastDone   atomic.Int64
+	lastTotal  atomic.Int64
+	finished   atomic.Bool
+	pinBottom  bool         // if true, renders at the bottom of the bar stack
+	lastRender atomic.Int64 // unix nanos of last actual render; for throttling
 }
 
 const (
 	progressUninitialized = int64(-1)
 	minProgressTotal      = 2
+	renderMinInterval     = 50 * time.Millisecond // throttle renders from parallel goroutines
+
+	// maxServerSideCopyFiles limits the number of files being server-side
+	// copied in parallel. Each CopyBlobServerSide call spawns `concurrency`
+	// block goroutines, so without this cap the total goroutines would be
+	// poolSize × concurrency (N²). Two concurrent files allow overlap
+	// (next file's HeadBlob/SAS while current file finishes its last blocks).
+	maxServerSideCopyFiles = 2
 
 	ansiReset = "\033[0m"
 	ansiBold  = "\033[1m"
@@ -649,6 +755,7 @@ func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progre
 	bar.total.Store(int64(total))
 	bar.lastDone.Store(progressUninitialized)
 	bar.lastTotal.Store(progressUninitialized)
+	startElapsedTicker()
 	bar.render(0)
 	return bar
 }
@@ -656,18 +763,19 @@ func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progre
 // newStreamingProgressBar creates a progress bar with total=0 for streaming
 // mode where the total grows dynamically as items are discovered. The bar
 // stays invisible until the first SetTotal call with a positive value.
-func newStreamingProgressBar(label string, quiet bool) *progressBar {
+func newStreamingProgressBar(label string, quiet bool, showSpeed bool) *progressBar {
 	if quiet || !isTerminal(os.Stderr) {
 		return nil
 	}
 	bar := &progressBar{
 		label:     label,
 		width:     28,
-		showSpeed: false,
+		showSpeed: showSpeed,
 		startedAt: time.Now(),
 	}
 	bar.lastDone.Store(progressUninitialized)
 	bar.lastTotal.Store(progressUninitialized)
+	startElapsedTicker()
 	// total starts at 0; bar won't render until SetTotal(>0) is called.
 	return bar
 }
@@ -685,6 +793,20 @@ func (p *progressBar) AddBytes(n int64) {
 		return
 	}
 	p.bytesDone.Add(n)
+}
+
+// atomicMax updates an atomic.Int64 to val if val is greater than the current
+// value. It is safe for concurrent use.
+func atomicMax(a *atomic.Int64, val int64) {
+	for {
+		cur := a.Load()
+		if val <= cur {
+			return
+		}
+		if a.CompareAndSwap(cur, val) {
+			return
+		}
+	}
 }
 
 func (p *progressBar) SetTotal(total int64) {
@@ -717,22 +839,38 @@ func (p *progressBar) Finish() {
 	if !p.finished.CompareAndSwap(false, true) {
 		return
 	}
+	// If the bar was never actually rendered (e.g. a 0-byte copy where
+	// total was never set, or a streaming bar that never received
+	// SetTotal), skip the final render and trailing newline to avoid
+	// printing a misleading "1 B/1 B" line.
+	neverShown := p.lastTotal.Load() == progressUninitialized
 	total := p.total.Load()
 	if total < 1 {
 		total = 1
+		p.total.Store(total)
 	}
 	p.done.Store(total)
 	outputMu.Lock()
-	defer outputMu.Unlock()
-	p.renderUnlocked()
-	fmt.Fprintf(os.Stderr, "\n")
-	if activeBarPtr == p {
-		activeBarPtr = nil
+	clearActiveBars()
+	removeActiveBar(p)
+	if !neverShown {
+		// Use the global high-water mark for label width so the completed
+		// line aligns with all bars that have ever been shown.
+		p.renderAligned(maxLabelWidth)
+		fmt.Fprintf(os.Stderr, "\n")
+	}
+	rerenderActiveBars()
+	noActiveBars := len(activeBars) == 0
+	outputMu.Unlock()
+	if noActiveBars {
+		stopElapsedTicker()
 	}
 }
 
-// renderUnlocked writes the progress bar to stderr. outputMu must be held.
-func (p *progressBar) renderUnlocked() {
+// renderAligned writes the progress bar to stderr with the label padded to
+// labelWidth characters. This aligns bars with different-length labels.
+// outputMu must be held.
+func (p *progressBar) renderAligned(labelWidth int) {
 	if p == nil {
 		return
 	}
@@ -742,16 +880,21 @@ func (p *progressBar) renderUnlocked() {
 		return
 	}
 	done, total = clampProgress(done, total)
-	elapsed := time.Since(p.startedAt).Seconds()
+	elapsedDur := time.Since(p.startedAt)
+	elapsed := elapsedDur.Seconds()
 	speed := 0.0
 	if p.showSpeed && elapsed > 0 {
 		speed = float64(p.bytesDone.Load()) / elapsed
 	}
+	label := p.label
+	if labelWidth > len(label) {
+		label = label + strings.Repeat(" ", labelWidth-len(label))
+	}
 	if isTerminal(os.Stderr) {
-		line := formatFancyBar(p.label, done, total, p.width, speed, p.showSpeed)
+		line := formatFancyBar(label, done, total, p.width, speed, p.showSpeed, p.byteSized, elapsedDur)
 		fmt.Fprintf(os.Stderr, "\r"+ansiClear+"%s", line)
 	} else {
-		line := formatProgressBar(p.label, done, total, p.width, speed, p.showSpeed)
+		line := formatProgressBar(label, done, total, p.width, speed, p.showSpeed, p.byteSized, elapsedDur)
 		fmt.Fprintf(os.Stderr, "\r%s", line)
 	}
 }
@@ -767,7 +910,7 @@ func clampProgress(done, total int64) (int64, int64) {
 }
 
 func (p *progressBar) render(done int64) {
-	if p == nil {
+	if p == nil || p.finished.Load() {
 		return
 	}
 	total := p.total.Load()
@@ -780,13 +923,24 @@ func (p *progressBar) render(done int64) {
 	}
 	p.lastDone.Store(done)
 	p.lastTotal.Store(total)
+	// Throttle: skip rendering if another render happened within renderMinInterval.
+	// This prevents parallel goroutines from flooding the terminal with ANSI escapes.
+	now := time.Now().UnixNano()
+	last := p.lastRender.Load()
+	if now-last < int64(renderMinInterval) {
+		return
+	}
+	if !p.lastRender.CompareAndSwap(last, now) {
+		return // another goroutine won the race
+	}
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	activeBarPtr = p
-	p.renderUnlocked()
+	clearActiveBars()
+	addActiveBar(p)
+	rerenderActiveBars()
 }
 
-func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
+func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool, elapsed time.Duration) string {
 	if width < 1 {
 		width = 1
 	}
@@ -805,13 +959,20 @@ func formatProgressBar(label string, done, total int64, width int, speed float64
 		filled = width
 	}
 	bar := strings.Repeat("=", filled) + strings.Repeat(" ", width-filled)
-	if !showSpeed {
-		return fmt.Sprintf("%s [%s] %3d%% (%d/%d)", label, bar, percent, done, total)
+	elapsedStr := formatElapsed(elapsed)
+	switch {
+	case byteSized && showSpeed:
+		return fmt.Sprintf("%s [%s] %3d%% (%s/%s, %s) %s", label, bar, percent, formatSize(done), formatSize(total), formatByteSpeed(speed), elapsedStr)
+	case byteSized:
+		return fmt.Sprintf("%s [%s] %3d%% (%s/%s) %s", label, bar, percent, formatSize(done), formatSize(total), elapsedStr)
+	case showSpeed:
+		return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s) %s", label, bar, percent, done, total, formatByteSpeed(speed), elapsedStr)
+	default:
+		return fmt.Sprintf("%s [%s] %3d%% (%d/%d) %s", label, bar, percent, done, total, elapsedStr)
 	}
-	return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s)", label, bar, percent, done, total, formatByteSpeed(speed))
 }
 
-func formatFancyBar(label string, done, total int64, width int, speed float64, showSpeed bool) string {
+func formatFancyBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool, elapsed time.Duration) string {
 	if width < 1 {
 		width = 1
 	}
@@ -836,10 +997,17 @@ func formatFancyBar(label string, done, total int64, width int, speed float64, s
 		pctColor = ansiGreen
 		suffix = " " + ansiGreen + "✓" + ansiReset
 	}
-	if !showSpeed {
-		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d)%s", label, bar, pctColor, percent, done, total, suffix)
+	elapsedStr := formatElapsed(elapsed)
+	switch {
+	case byteSized && showSpeed:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s/%s, %s) %s%s", label, bar, pctColor, percent, formatSize(done), formatSize(total), formatByteSpeed(speed), elapsedStr, suffix)
+	case byteSized:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s/%s) %s%s", label, bar, pctColor, percent, formatSize(done), formatSize(total), elapsedStr, suffix)
+	case showSpeed:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d, %s) %s%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), elapsedStr, suffix)
+	default:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d) %s%s", label, bar, pctColor, percent, done, total, elapsedStr, suffix)
 	}
-	return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d, %s)%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), suffix)
 }
 
 func formatSize(bytes int64) string {
@@ -878,13 +1046,34 @@ func formatByteSpeed(bytesPerSecond float64) string {
 		bytesPerSecond = 0
 	}
 	const (
-		mb = 1024.0 * 1024.0
+		kb = 1024.0
+		mb = 1024.0 * kb
 		gb = 1024.0 * mb
 	)
-	if bytesPerSecond >= gb {
+	switch {
+	case bytesPerSecond >= gb:
 		return fmt.Sprintf("%.1f GB/s", bytesPerSecond/gb)
+	case bytesPerSecond >= mb:
+		return fmt.Sprintf("%.1f MB/s", bytesPerSecond/mb)
+	case bytesPerSecond >= kb:
+		return fmt.Sprintf("%.1f KB/s", bytesPerSecond/kb)
+	default:
+		return fmt.Sprintf("%.0f B/s", bytesPerSecond)
 	}
-	return fmt.Sprintf("%.1f MB/s", bytesPerSecond/mb)
+}
+
+func formatElapsed(d time.Duration) string {
+	d = d.Truncate(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm%02ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
 }
 
 func sizeOfReader(reader io.Reader) int64 {
@@ -1299,271 +1488,283 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	taskfile := c.String("taskfile")
 	stateFile := c.String("state")
 
+	var tasks []taskPair
 	if taskfile != "" {
 		if c.Args().Len() != 0 {
 			return fmt.Errorf("cp: cannot use positional args with --taskfile")
 		}
-		tasks, err := loadTaskPairs(taskfile)
+		var err error
+		tasks, err = loadTaskPairs(taskfile)
 		if err != nil {
 			return err
 		}
-		state, taskCheckpoints, err := loadTaskState(stateFile)
-		if err != nil {
-			return err
+	} else {
+		// Convert positional args into task pairs so both modes share the
+		// same execution path (expansion, state tracking, progress bars).
+		if c.Args().Len() < 2 {
+			return fmt.Errorf("cp: need srcs dst")
 		}
-		// Streaming progress bar: total starts at 0 and grows as files are
-		// discovered during expansion. The bar stays invisible until the
-		// first file is found, then updates on every change.
-		taskProgress := newStreamingProgressBar("cp files", quiet)
-		defer func() {
-			if taskProgress != nil {
-				taskProgress.Finish()
-			}
-		}()
-		seen := make(map[string]struct{}, len(state)+len(tasks))
-		for key := range state {
-			seen[key] = struct{}{}
+		dst := c.Args().Get(c.Args().Len() - 1)
+		for i := 0; i < c.Args().Len()-1; i++ {
+			tasks = append(tasks, taskPair{src: c.Args().Get(i), dst: dst})
 		}
-		stateAppender, err := newTaskStateAppender(stateFile)
-		if err != nil {
-			return err
-		}
+	}
 
-		workers := concurrency
-		if workers < 1 {
-			workers = 1
-		}
-		// Split concurrency budget: at least 1 expander, at least 1 cp worker.
-		// When concurrency is high, allocate ~25% to expansion.
-		expanders := max(1, workers/4)
-		cpWorkers := workers - expanders
-		if cpWorkers < 1 {
-			cpWorkers = 1
-		}
-		innerConcurrency := 1
-		innerQuiet := true
-		workerCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
+	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
+}
 
-		var wg sync.WaitGroup
-		// Buffer taskCh larger than cpWorkers so expanders can push ahead
-		// without blocking while cp workers are busy.
-		taskCh := make(chan cpTask, cpWorkers*4)
-		var firstErr error
-		var firstErrMu sync.Mutex
-		var totalPending atomic.Int64
-		var queued atomic.Bool
-
-		setErr := func(err error) {
-			firstErrMu.Lock()
-			if firstErr == nil {
-				firstErr = err
-				cancel()
-			}
-			firstErrMu.Unlock()
+// runCPTasks executes a list of task pairs through the unified expansion +
+// parallel copy pipeline. Both taskfile mode and positional-arg mode convert
+// their inputs to []taskPair and call this function, ensuring a single code
+// path for state tracking, progress bars, and concurrency control.
+func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, concurrency, retryCount int, stateFile string) error {
+	state, taskCheckpoints, err := loadTaskState(stateFile)
+	if err != nil {
+		return err
+	}
+	// Streaming progress bar: total starts at 0 and grows as files are
+	// discovered during expansion. The bar stays invisible until the
+	// first file is found, then updates on every change.
+	taskProgress := newStreamingProgressBar("cp files", quiet, true)
+	if taskProgress != nil {
+		taskProgress.pinBottom = true
+	}
+	defer func() {
+		if taskProgress != nil {
+			taskProgress.Finish()
 		}
+	}()
+	seen := make(map[string]struct{}, len(state)+len(tasks))
+	for key := range state {
+		seen[key] = struct{}{}
+	}
+	stateAppender, err := newTaskStateAppender(stateFile)
+	if err != nil {
+		return err
+	}
 
-		for i := 0; i < cpWorkers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					select {
-					case <-workerCtx.Done():
+	workers := concurrency
+	if workers < 1 {
+		workers = 1
+	}
+	// Split concurrency budget: at least 1 expander, at least 1 cp worker.
+	// When concurrency is high, allocate ~25% to expansion.
+	expanders := max(1, workers/4)
+	cpWorkers := workers - expanders
+	if cpWorkers < 1 {
+		cpWorkers = 1
+	}
+	// Limit concurrent file copies so block-level parallelism (StageBlockFromURL)
+	// focuses on finishing each file ASAP rather than spreading across many files.
+	// Two workers allow the next file's setup (HeadBlob, SAS) to overlap with the
+	// current file's final blocks, hiding latency between files.
+	if cpWorkers > maxServerSideCopyFiles {
+		cpWorkers = maxServerSideCopyFiles
+	}
+	innerConcurrency := concurrency
+	innerQuiet := true
+	showCopyBars := !quiet
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	// Buffer taskCh larger than cpWorkers so expanders can push ahead
+	// without blocking while cp workers are busy.
+	taskCh := make(chan cpTask, cpWorkers*4)
+	var firstErr error
+	var firstErrMu sync.Mutex
+	var totalPending atomic.Int64
+	var queued atomic.Bool
+
+	setErr := func(err error) {
+		firstErrMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		firstErrMu.Unlock()
+	}
+
+	for i := 0; i < cpWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case task, ok := <-taskCh:
+					if !ok {
 						return
-					case task, ok := <-taskCh:
-						if !ok {
-							return
-						}
-						slog.Debug("cp: start", "src", task.src, "dst", task.dst)
-						if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst); err != nil {
+					}
+					slog.Debug("cp: start", "src", task.src, "dst", task.dst)
+					var bytesCb func(int64)
+					if taskProgress != nil {
+						bytesCb = taskProgress.AddBytes
+					}
+					if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, showCopyBars, bytesCb); err != nil {
+						setErr(err)
+						return
+					}
+					slog.Debug("cp: done", "src", task.src, "dst", task.dst)
+					if stateFile != "" {
+						if err := stateAppender.append(task.key); err != nil {
 							setErr(err)
 							return
 						}
-						slog.Debug("cp: done", "src", task.src, "dst", task.dst)
-						if stateFile != "" {
-							if err := stateAppender.append(task.key); err != nil {
+						if task.tracker != nil && task.tracker.remaining.Add(-1) == 0 {
+							if err := stateAppender.appendCheckpoint(task.tracker.key); err != nil {
 								setErr(err)
 								return
 							}
-							if task.tracker != nil && task.tracker.remaining.Add(-1) == 0 {
-								if err := stateAppender.appendCheckpoint(task.tracker.key); err != nil {
-									setErr(err)
-									return
-								}
-							}
-						}
-						if taskProgress != nil {
-							taskProgress.Increment()
 						}
 					}
+					if taskProgress != nil {
+						taskProgress.Increment()
+					}
 				}
-			}()
-		}
+			}
+		}()
+	}
 
-		// Dedicated expander pool uses goroutines from the concurrency budget.
-		if expanders > len(tasks) {
-			expanders = len(tasks)
-		}
-		pairCh := make(chan taskPair, expanders*2)
-		var seenMu sync.Mutex
-		var expandWG sync.WaitGroup
-		for i := 0; i < expanders; i++ {
-			expandWG.Add(1)
-			go func() {
-				defer expandWG.Done()
-				for {
-					select {
-					case <-workerCtx.Done():
+	// Dedicated expander pool uses goroutines from the concurrency budget.
+	if expanders > len(tasks) {
+		expanders = len(tasks)
+	}
+	pairCh := make(chan taskPair, expanders*2)
+	var seenMu sync.Mutex
+	var expandWG sync.WaitGroup
+	// Add a +1 sentinel to totalPending so the progress bar never shows
+	// 100% while expansion is still running. Without this, fast cp workers
+	// can finish all currently-discovered files before expanders find more,
+	// making the bar flash "done" prematurely. The sentinel is removed
+	// after expandWG.Wait() below.
+	if taskProgress != nil {
+		totalPending.Add(1)
+	}
+	for i := 0; i < expanders; i++ {
+		expandWG.Add(1)
+		go func() {
+			defer expandWG.Done()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case task, ok := <-pairCh:
+					if !ok {
 						return
-					case task, ok := <-pairCh:
-						if !ok {
-							return
+					}
+					cpKey := taskCheckpointKey(task.src, task.dst)
+					if _, done := taskCheckpoints[cpKey]; done {
+						if !quiet {
+							lockedFprintf(os.Stderr, "cp: skip already completed task %s -> %s\n", task.src, task.dst)
 						}
-						cpKey := taskCheckpointKey(task.src, task.dst)
-						if _, done := taskCheckpoints[cpKey]; done {
-							if !quiet {
-								lockedFprintf(os.Stderr, "cp: skip already completed task %s -> %s\n", task.src, task.dst)
+						if taskProgress != nil {
+							taskProgress.SetTotal(totalPending.Add(1))
+							taskProgress.Increment()
+						}
+						continue
+					}
+					if !quiet {
+						lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
+					}
+					var tracker *taskTracker
+					if stateFile != "" {
+						tracker = &taskTracker{key: cpKey}
+					}
+					var pendingCount int64
+					expandEmit := func(expandedTask cpTask) error {
+						seenMu.Lock()
+						_, alreadySeen := seen[expandedTask.key]
+						if !alreadySeen {
+							seen[expandedTask.key] = struct{}{}
+						}
+						seenMu.Unlock()
+						if alreadySeen {
+							_, inState := state[expandedTask.key]
+							if !quiet && inState {
+								lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
 							}
-							if taskProgress != nil {
+							if taskProgress != nil && inState {
 								taskProgress.SetTotal(totalPending.Add(1))
 								taskProgress.Increment()
 							}
-							continue
-						}
-						if !quiet {
-							lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
-						}
-						var tracker *taskTracker
-						if stateFile != "" {
-							tracker = &taskTracker{key: cpKey}
-						}
-						var pendingCount int64
-						expandEmit := func(expandedTask cpTask) error {
-							seenMu.Lock()
-							_, alreadySeen := seen[expandedTask.key]
-							if !alreadySeen {
-								seen[expandedTask.key] = struct{}{}
-							}
-							seenMu.Unlock()
-							if alreadySeen {
-								_, inState := state[expandedTask.key]
-								if !quiet && inState {
-									lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
-								}
-								if taskProgress != nil && inState {
-									taskProgress.SetTotal(totalPending.Add(1))
-									taskProgress.Increment()
-								}
-								return nil
-							}
-							expandedTask.tracker = tracker
-							pendingCount++
-							select {
-							case <-workerCtx.Done():
-								return workerCtx.Err()
-							case taskCh <- expandedTask:
-								slog.Debug("cp: queued", "src", expandedTask.src, "dst", expandedTask.dst)
-								queued.Store(true)
-								if taskProgress != nil {
-									taskProgress.SetTotal(totalPending.Add(1))
-								}
-							}
 							return nil
 						}
-						if err := retryOp(workerCtx, retryCount, func() error {
-							pendingCount = 0
-							return expandCPTask(workerCtx, task, expandEmit)
-						}); err != nil {
-							setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
-							return
+						expandedTask.tracker = tracker
+						pendingCount++
+						select {
+						case <-workerCtx.Done():
+							return workerCtx.Err()
+						case taskCh <- expandedTask:
+							slog.Debug("cp: queued", "src", expandedTask.src, "dst", expandedTask.dst)
+							queued.Store(true)
+							if taskProgress != nil {
+								taskProgress.SetTotal(totalPending.Add(1))
+							}
 						}
-						// Reconcile progress bar total after expansion completes
-						// so it reflects all discovered files (queued + skipped).
-						if taskProgress != nil {
-							taskProgress.SetTotal(totalPending.Load())
-						}
-						if tracker != nil {
-							tracker.remaining.Store(pendingCount)
-							if pendingCount == 0 {
-								if err := stateAppender.appendCheckpoint(cpKey); err != nil {
-									setErr(err)
-									return
-								}
+						return nil
+					}
+					if err := retryOp(workerCtx, retryCount, func() error {
+						pendingCount = 0
+						return expandCPTask(workerCtx, task, expandEmit)
+					}); err != nil {
+						setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
+						return
+					}
+					// Reconcile progress bar total after expansion completes
+					// so it reflects all discovered files (queued + skipped).
+					if taskProgress != nil {
+						taskProgress.SetTotal(totalPending.Load())
+					}
+					if tracker != nil {
+						tracker.remaining.Store(pendingCount)
+						if pendingCount == 0 {
+							if err := stateAppender.appendCheckpoint(cpKey); err != nil {
+								setErr(err)
+								return
 							}
 						}
 					}
 				}
-			}()
-		}
-	enqueueTasks:
-		for _, task := range tasks {
-			select {
-			case <-workerCtx.Done():
-				break enqueueTasks
-			case pairCh <- task:
 			}
+		}()
+	}
+enqueueLoop:
+	for _, task := range tasks {
+		select {
+		case <-workerCtx.Done():
+			break enqueueLoop
+		case pairCh <- task:
 		}
-		close(pairCh)
-		expandWG.Wait()
-		close(taskCh)
-		wg.Wait()
-		if !queued.Load() && firstErr == nil {
-			if err := stateAppender.close(); err != nil {
-				return err
-			}
-			return nil
-		}
-
-		if firstErr != nil {
-			_ = stateAppender.close()
-			return firstErr
-		}
+	}
+	close(pairCh)
+	expandWG.Wait()
+	// Remove the +1 listing sentinel now that expansion is complete,
+	// and set the final accurate total so the bar can reach 100%.
+	if taskProgress != nil {
+		taskProgress.SetTotal(totalPending.Add(-1))
+	}
+	close(taskCh)
+	wg.Wait()
+	if !queued.Load() && firstErr == nil {
 		if err := stateAppender.close(); err != nil {
 			return err
 		}
 		return nil
 	}
 
-	if c.Args().Len() < 2 {
-		return fmt.Errorf("cp: need srcs dst")
+	if firstErr != nil {
+		_ = stateAppender.close()
+		return firstErr
 	}
-	dst := c.Args().Get(c.Args().Len() - 1)
-	allSrcs := make([]string, c.Args().Len()-1)
-	for i := 0; i < len(allSrcs); i++ {
-		allSrcs[i] = c.Args().Get(i)
-	}
-	if stateFile == "" {
-		return cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, allSrcs, dst)
-	}
-	state, _, err := loadTaskState(stateFile)
-	if err != nil {
+	if err := stateAppender.close(); err != nil {
 		return err
 	}
-	stateAppender, err := newTaskStateAppender(stateFile)
-	if err != nil {
-		return err
-	}
-	for _, src := range allSrcs {
-		key := taskStateKey(src, dst)
-		if _, done := state[key]; done {
-			if !quiet {
-				lockedFprintf(os.Stderr, "cp: skip already completed %s -> %s\n", src, dst)
-			}
-			continue
-		}
-		if err := cmdCPPaths(ctx, overwrite, quiet, concurrency, retryCount, []string{src}, dst); err != nil {
-			_ = stateAppender.close()
-			return err
-		}
-		if err := stateAppender.append(key); err != nil {
-			return err
-		}
-	}
-	return stateAppender.close()
+	return nil
 }
 
-func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string) error {
+func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, showCopyBar bool, onBytes func(int64)) error {
 	if isHF(dst) {
 		return fmt.Errorf("cp: hf:// only supported as source")
 	}
@@ -1682,7 +1883,17 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			return fmt.Errorf("cp: %s -> %s: %w", op.src, op.dst, err)
 		}
 	}
-	if err := runOpPoolWithRetryProgressBytes(ctx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
+	// When any file ops involve az→az server-side copy, limit file-level
+	// parallelism to 2 so the block-level goroutines (concurrency per file)
+	// don't cause N² total goroutines and TLS handshake starvation.
+	cpPoolSize := concurrency
+	for _, op := range fileOps {
+		if op.srcAz && op.dstAz {
+			cpPoolSize = min(maxServerSideCopyFiles, concurrency)
+			break
+		}
+	}
+	if err := runOpPoolWithRetryProgressBytes(ctx, cpPoolSize, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
 			if err := sendOp(ctx, pending, op); err != nil {
 				return err
@@ -1691,7 +1902,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		return nil
 	}, func(op cpFileOp, trackBytes bool) (int64, error) {
 		size := op.size
-		if trackBytes && size <= 0 {
+		if (trackBytes || onBytes != nil) && size <= 0 {
 			info, err := bbbfs.Resolve(op.src).Stat(ctx, op.src)
 			if err != nil {
 				slog.Debug("unable to stat source size for progress speed", "src", op.src, "error", err)
@@ -1701,6 +1912,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		}
 		if op.srcHF {
 			err := copyHFFile(ctx, op.hf, op.base, op.dst, op.dstAz, overwrite, quiet, isDstDir)
+			if err == nil && onBytes != nil {
+				onBytes(size)
+			}
 			return size, err
 		}
 		if op.srcAz && op.dstAz {
@@ -1711,15 +1925,41 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				}
 			}
 			var copyBar *progressBar
-			if !quiet && isTerminal(os.Stderr) {
-				copyBar = newProgressBar(100, path.Base(op.src), false, true)
+			if showCopyBar {
+				copyBar = newStreamingProgressBar(path.Base(op.src), false, true)
+				if copyBar != nil {
+					copyBar.byteSized = true
+				}
 			}
-			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, func(copied, total int64) {
-				if copyBar == nil || total <= 0 {
+			var lastReported atomic.Int64
+			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, concurrency, func(copied, total int64) {
+				if total <= 0 {
 					return
 				}
-				copyBar.bytesDone.Store(copied)
-				copyBar.render(copied * 100 / total)
+				// Report incremental bytes to the overall taskbar.
+				// Use CAS loop because callbacks arrive from parallel goroutines.
+				if onBytes != nil {
+					for {
+						prev := lastReported.Load()
+						if copied <= prev {
+							break
+						}
+						if lastReported.CompareAndSwap(prev, copied) {
+							onBytes(copied - prev)
+							break
+						}
+					}
+				}
+				if copyBar == nil {
+					return
+				}
+				// Update done/bytesDone before SetTotal so the first
+				// render (triggered by SetTotal when total transitions
+				// from 0 to N) shows actual progress instead of 0%.
+				atomicMax(&copyBar.bytesDone, copied)
+				atomicMax(&copyBar.done, copied)
+				copyBar.SetTotal(total)
+				copyBar.render(copied)
 			}); err != nil {
 				if copyBar != nil {
 					copyBar.Finish()
@@ -1755,6 +1995,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
+			if onBytes != nil {
+				onBytes(size)
+			}
 			return size, nil
 		}
 		if !op.srcAz && op.dstAz {
@@ -1779,6 +2022,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
+			if onBytes != nil {
+				onBytes(size)
+			}
 			return size, nil
 		}
 		if err := fsops.CopyFile(op.src, op.dst, overwrite); err != nil {
@@ -1786,6 +2032,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		}
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
+		}
+		if onBytes != nil {
+			onBytes(size)
 		}
 		return size, nil
 	}); err != nil {
@@ -1808,7 +2057,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			type azToAzOp struct {
 				name string
 			}
-			return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(list), quiet, errPrefix, func(pending chan<- azToAzOp) error {
+			// Limit file-level parallelism to avoid N² goroutines: each
+			// CopyBlobServerSide spawns `concurrency` block goroutines, so
+			// fileWorkers × concurrency must stay bounded.
+			fileWorkers := min(maxServerSideCopyFiles, concurrency)
+			return runOpPoolWithRetryProgress(ctx, fileWorkers, retryCount, len(list), quiet, errPrefix, func(pending chan<- azToAzOp) error {
 				for _, bm := range list {
 					if err := sendOp(ctx, pending, azToAzOp{name: bm.Name}); err != nil {
 						return err
@@ -1816,24 +2069,35 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				return nil
 			}, func(work azToAzOp) error {
-				reader, err := azblob.DownloadStream(ctx, sap.Child(work.name))
-				if err != nil {
-					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
-					return err
-				}
 				if !overwrite {
 					if _, err := azblob.HeadBlob(ctx, dap.Child(work.name)); err == nil {
-						if cerr := reader.Close(); cerr != nil {
-							return cerr
-						}
 						return nil
 					}
 				}
-				if err := withReadCloser(reader, func(r io.Reader) error {
-					return azblob.UploadStream(ctx, dap.Child(work.name), r)
+				var copyBar *progressBar
+				if !quiet {
+					copyBar = newStreamingProgressBar(path.Base(work.name), false, true)
+					if copyBar != nil {
+						copyBar.byteSized = true
+					}
+				}
+				if err := azblob.CopyBlobServerSide(ctx, sap.Child(work.name), dap.Child(work.name), concurrency, func(copied, total int64) {
+					if total <= 0 || copyBar == nil {
+						return
+					}
+					atomicMax(&copyBar.bytesDone, copied)
+					atomicMax(&copyBar.done, copied)
+					copyBar.SetTotal(total)
+					copyBar.render(copied)
 				}); err != nil {
-					lockedFprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, work.name, err)
+					if copyBar != nil {
+						copyBar.Finish()
+					}
+					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 					return err
+				}
+				if copyBar != nil {
+					copyBar.Finish()
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", sap.Child(work.name).String(), dap.Child(work.name).String())
@@ -2540,7 +2804,15 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				return err
 			}
 		}
-		workerErr := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(files), quiet, "sync", func(pending chan<- item) error {
+		// When both src and dst are Azure, CopyBlobServerSide spawns
+		// `concurrency` block goroutines per file. Limit file-level
+		// parallelism to 2 so total goroutines stay bounded at
+		// 2 × concurrency instead of concurrency².
+		syncWorkers := concurrency
+		if srcAz && dstAz {
+			syncWorkers = min(maxServerSideCopyFiles, concurrency)
+		}
+		workerErr := runOpPoolWithRetryProgress(ctx, syncWorkers, retryCount, len(files), quiet, "sync", func(pending chan<- item) error {
 			for _, f := range files {
 				if err := sendOp(ctx, pending, f); err != nil {
 					return err
@@ -2550,25 +2822,36 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		}, func(f item) error {
 			sPath := f.rel
 			if srcAz && dstAz {
-				reader, err := azblob.DownloadStream(ctx, sap.Child(sPath))
-				if err != nil {
-					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync: %s: %w", sPath, err)
-				}
 				if dry {
 					if !quiet {
 						lockedPrintln("COPY", sap.Child(sPath).String(), "->", dap.Child(sPath).String())
 					}
-					if cerr := reader.Close(); cerr != nil {
-						return cerr
-					}
 					return nil
 				}
-				if err := withReadCloser(reader, func(r io.Reader) error {
-					return azblob.UploadStream(ctx, dap.Child(sPath), r)
+				var copyBar *progressBar
+				if !quiet {
+					copyBar = newStreamingProgressBar(path.Base(sPath), false, true)
+					if copyBar != nil {
+						copyBar.byteSized = true
+					}
+				}
+				if err := azblob.CopyBlobServerSide(ctx, sap.Child(sPath), dap.Child(sPath), concurrency, func(copied, total int64) {
+					if total <= 0 || copyBar == nil {
+						return
+					}
+					atomicMax(&copyBar.bytesDone, copied)
+					atomicMax(&copyBar.done, copied)
+					copyBar.SetTotal(total)
+					copyBar.render(copied)
 				}); err != nil {
-					lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync upload: %s: %w", sPath, err)
+					if copyBar != nil {
+						copyBar.Finish()
+					}
+					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
+					return fmt.Errorf("sync: %s: %w", sPath, err)
+				}
+				if copyBar != nil {
+					copyBar.Finish()
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", sap.Child(sPath).String(), dap.Child(sPath).String())
