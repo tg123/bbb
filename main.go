@@ -1046,13 +1046,20 @@ func formatByteSpeed(bytesPerSecond float64) string {
 		bytesPerSecond = 0
 	}
 	const (
-		mb = 1024.0 * 1024.0
+		kb = 1024.0
+		mb = 1024.0 * kb
 		gb = 1024.0 * mb
 	)
-	if bytesPerSecond >= gb {
+	switch {
+	case bytesPerSecond >= gb:
 		return fmt.Sprintf("%.1f GB/s", bytesPerSecond/gb)
+	case bytesPerSecond >= mb:
+		return fmt.Sprintf("%.1f MB/s", bytesPerSecond/mb)
+	case bytesPerSecond >= kb:
+		return fmt.Sprintf("%.1f KB/s", bytesPerSecond/kb)
+	default:
+		return fmt.Sprintf("%.0f B/s", bytesPerSecond)
 	}
-	return fmt.Sprintf("%.1f MB/s", bytesPerSecond/mb)
 }
 
 func formatElapsed(d time.Duration) string {

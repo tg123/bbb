@@ -1003,7 +1003,7 @@ func TestFormatProgressBarNormalizesWidth(t *testing.T) {
 
 func TestFormatProgressBarNormalizesNegativeSpeed(t *testing.T) {
 	line := formatProgressBar("cp", 1, 5, 10, -2, true, false, 0)
-	if line != "cp [==        ]  20% (1/5, 0.0 MB/s) 0s" {
+	if line != "cp [==        ]  20% (1/5, 0 B/s) 0s" {
 		t.Fatalf("unexpected normalized speed output: %s", line)
 	}
 }
