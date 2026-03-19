@@ -535,6 +535,7 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 var (
 	outputMu        sync.Mutex
 	activeBars      []*progressBar // guarded by outputMu; rendered in order
+	maxLabelWidth   int            // guarded by outputMu; high-water mark for label alignment
 	elapsedTickerMu sync.Mutex
 	elapsedTicker   *time.Ticker
 	elapsedDone     chan struct{}
@@ -603,14 +604,8 @@ func clearActiveBars() {
 }
 
 func rerenderActiveBars() {
-	maxLabel := 0
-	for _, bar := range activeBars {
-		if n := len(bar.label); n > maxLabel {
-			maxLabel = n
-		}
-	}
 	for i, bar := range activeBars {
-		bar.renderAligned(maxLabel)
+		bar.renderAligned(maxLabelWidth)
 		if i < len(activeBars)-1 {
 			fmt.Fprintf(os.Stderr, "\n")
 		}
@@ -622,6 +617,9 @@ func addActiveBar(p *progressBar) {
 		if b == p {
 			return
 		}
+	}
+	if n := len(p.label); n > maxLabelWidth {
+		maxLabelWidth = n
 	}
 	if p.pinBottom {
 		activeBars = append(activeBars, p)
@@ -856,15 +854,9 @@ func (p *progressBar) Finish() {
 	clearActiveBars()
 	removeActiveBar(p)
 	if !neverShown {
-		// Compute max label width across both the finishing bar and all
-		// remaining active bars so the completed line aligns with them.
-		maxLabel := len(p.label)
-		for _, bar := range activeBars {
-			if n := len(bar.label); n > maxLabel {
-				maxLabel = n
-			}
-		}
-		p.renderAligned(maxLabel)
+		// Use the global high-water mark for label width so the completed
+		// line aligns with all bars that have ever been shown.
+		p.renderAligned(maxLabelWidth)
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 	rerenderActiveBars()
