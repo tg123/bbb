@@ -149,14 +149,9 @@ func bbbLs(path string, recursive bool) ([]string, error) {
 	return filtered, nil
 }
 
-// bbbLL runs "ll --machine" and returns the file paths from the output.
-// ll --machine outputs tab-separated lines: f\tSIZE\tMOD\tPATH
-func bbbLL(path string) ([]string, error) {
-	stdout, err := runBBB("ll", "--machine", path)
-	if err != nil {
-		return nil, err
-	}
-
+// parseMachineLL parses "--machine" tab-separated output (f\tSIZE\tMOD\tPATH)
+// and returns the file paths. Used by bbbLL and bbbLLR.
+func parseMachineLL(stdout []byte) []string {
 	lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
 	var paths []string
 	for _, l := range lines {
@@ -170,7 +165,25 @@ func bbbLL(path string) ([]string, error) {
 		}
 		paths = append(paths, fields[3])
 	}
-	return paths, nil
+	return paths
+}
+
+// bbbLL runs "ll --machine" and returns the file paths from the output.
+func bbbLL(path string) ([]string, error) {
+	stdout, err := runBBB("ll", "--machine", path)
+	if err != nil {
+		return nil, err
+	}
+	return parseMachineLL(stdout), nil
+}
+
+// bbbLLR runs "llr --machine" and returns the file paths from the output.
+func bbbLLR(path string) ([]string, error) {
+	stdout, err := runBBB("llr", "--machine", path)
+	if err != nil {
+		return nil, err
+	}
+	return parseMachineLL(stdout), nil
 }
 
 func cleanFolder(t *testing.T, path string) {
@@ -593,6 +606,79 @@ func TestBasic(t *testing.T) {
 
 		if !slices.Equal(files, expected) {
 			t.Errorf("ls [char class] wildcard: got %v, want %v", files, expected)
+		}
+	}
+
+	// ll with * wildcard
+	{
+		files, err := bbbLL("az://" + azuriteAccount + "/test/testfile*")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll * wildcard: got %v, want %v", files, expected)
+		}
+	}
+
+	// ll with ? wildcard
+	{
+		files, err := bbbLL("az://" + azuriteAccount + "/test/testfile?.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll ? wildcard: got %v, want %v", files, expected)
+		}
+	}
+
+	// lsr with * wildcard
+	{
+		files, err := bbbLs("az://"+azuriteAccount+"/test/testfile*", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Recursive listing matches filename component against pattern, so
+		// dir/testfile.txt also matches testfile* (uploaded earlier).
+		expected := []string{
+			"az://" + azuriteAccount + "/test/dir/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("lsr * wildcard: got %v, want %v", files, expected)
+		}
+	}
+
+	// llr with * wildcard
+	{
+		files, err := bbbLLR("az://" + azuriteAccount + "/test/testfile*")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Recursive listing matches filename component against pattern, so
+		// dir/testfile.txt also matches testfile* (uploaded earlier).
+		expected := []string{
+			"az://" + azuriteAccount + "/test/dir/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("llr * wildcard: got %v, want %v", files, expected)
 		}
 	}
 
