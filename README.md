@@ -25,13 +25,9 @@ go install github.com/tg123/bbb@latest
 
 ## Global Flags
 
-These flags can be provided before or after the subcommand:
-
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--loglevel` | `info` | Log level: `debug`, `info`, `warn`, `error` (env: `BBB_LOG_LEVEL`) |
-| `--taskfile FILE` | | Batch task file with one `src dst` pair per line; use `-` for stdin (available for `cp` and `sync`) |
-| `--state FILE` | | State file for crash recovery / resuming interrupted operations (available for `cp` and `sync`) |
 
 **Debug logging example** — use `--loglevel debug` to inspect DNS resolution and the Azure AD token issuer (`iss`), which is useful for diagnosing connectivity or authentication problems:
 
@@ -68,13 +64,13 @@ Use `--taskfile` to pass the file to `cp` or `sync`. Use `-` to read from stdin:
 
 ```bash
 # Copy all pairs listed in the taskfile
-bbb --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt
 
 # Sync all pairs listed in the taskfile
-bbb --taskfile tasks.txt sync
+bbb sync --taskfile tasks.txt
 
 # Pipe pairs from another command
-find ./models -name '*.bin' | awk '{print $0, "az://myaccount/mycontainer/"$0}' | bbb --taskfile - cp
+find ./models -name '*.bin' | awk '{print $0, "az://myaccount/mycontainer/"$0}' | bbb cp --taskfile -
 ```
 
 ### State file
@@ -83,17 +79,17 @@ A state file tracks completed work so interrupted operations can be resumed. Pas
 
 ```bash
 # Start a large copy with crash recovery
-bbb --state copy.state --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt --state copy.state
 
 # If the process is interrupted, re-run the exact same command.
 # Completed files are skipped; only remaining work is executed.
-bbb --state copy.state --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt --state copy.state
 ```
 
 `--state` also works without `--taskfile`:
 
 ```bash
-bbb --state copy.state cp ./huge-dataset/ az://myaccount/mycontainer/dataset/
+bbb cp --state copy.state ./huge-dataset/ az://myaccount/mycontainer/dataset/
 ```
 
 The state file is a plain-text append-only log. Each successfully copied **file** is recorded as `src -> dst`, and when all files in a taskfile pair are finished the pair is marked complete with a `TASK\t` prefix so the entire pair can be skipped on resume:
@@ -260,6 +256,8 @@ bbb cp [flags] src [src ...] dst
 
 | Flag | Description |
 |------|-------------|
+| `--taskfile FILE` | Batch task file with one `src dst` pair per line; use `-` for stdin |
+| `--state FILE` | State file for crash recovery / resuming interrupted operations |
 | `-f` | Force overwrite existing files |
 | `-q`, `--quiet` | Suppress output |
 | `--concurrency N` | Number of concurrent transfers (default: CPU cores) |
@@ -296,10 +294,10 @@ Use `--taskfile` to provide a file of `src dst` pairs (one per line). See [Taskf
 
 ```bash
 # From a file
-bbb --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt
 
 # From stdin (pipe)
-echo "local.txt az://myaccount/c/remote.txt" | bbb --taskfile - cp
+echo "local.txt az://myaccount/c/remote.txt" | bbb cp --taskfile -
 ```
 
 #### Crash Recovery with State File
@@ -308,10 +306,10 @@ Use `--state` to resume interrupted copies. See [State file](#state-file) for de
 
 ```bash
 # First run — starts copying and records progress
-bbb --state copy.state --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt --state copy.state
 
 # If interrupted, re-run the same command — already-copied files are skipped
-bbb --state copy.state --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt --state copy.state
 ```
 
 ---
@@ -382,6 +380,8 @@ bbb sync [flags] src dst
 
 | Flag | Description |
 |------|-------------|
+| `--taskfile FILE` | Batch task file with one `src dst` pair per line; use `-` for stdin |
+| `--state FILE` | State file for crash recovery / resuming interrupted operations |
 | `--dry-run` | Show what would be done without making changes |
 | `--delete` | Delete destination files that don't exist in source |
 | `-x`, `--exclude PATTERN` | Exclude files matching this regex pattern |
@@ -408,7 +408,7 @@ bbb sync --dry-run ./data/ az://myaccount/mycontainer/data/
 bbb sync --exclude '\.tmp$' ./project/ az://myaccount/mycontainer/project/
 
 # Sync with taskfile and crash recovery (see Taskfile and State file sections above)
-bbb --taskfile tasks.txt --state sync.state sync
+bbb sync --taskfile tasks.txt --state sync.state
 ```
 
 ---
