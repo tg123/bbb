@@ -26,17 +26,11 @@ import (
 
 	"github.com/urfave/cli/v3"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-
-	"github.com/tg123/bbb/internal/azblob"
 	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/fsops"
-	"github.com/tg123/bbb/internal/hf"
 )
 
 var mainver string = "(devel)"
-
-const hfScheme = bbbfs.HFScheme
 
 func version() string {
 	v := mainver
@@ -61,11 +55,11 @@ func version() string {
 }
 
 func isAz(s string) bool {
-	return strings.HasPrefix(s, "az://") || azblob.IsBlobURL(s)
+	return bbbfs.IsAz(s)
 }
 
 func isHF(s string) bool {
-	return strings.HasPrefix(s, hfScheme)
+	return bbbfs.IsHF(s)
 }
 
 type dialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -159,18 +153,15 @@ func main() {
 							if !isAz(target) {
 								return fmt.Errorf("mkcontainer: only az:// paths supported")
 							}
-							ap, err := azblob.Parse(target)
-							if err != nil {
-								return err
-							}
-							if ap.Container == "" {
+							account, container := bbbfs.AzAccountContainer(target)
+							if container == "" {
 								return fmt.Errorf("mkcontainer: need az://account/container")
 							}
-							err = azblob.MkContainer(ctx, ap.Account, ap.Container)
+							err := bbbfs.MkDir(ctx, target)
 							if err != nil {
 								return err
 							}
-							fmt.Printf("Created container %s/%s\n", ap.Account, ap.Container)
+							fmt.Printf("Created container %s/%s\n", account, container)
 							return nil
 						},
 					},
@@ -516,11 +507,7 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 	for i := 0; i < c.Args().Len(); i++ {
 		p := c.Args().Get(i)
 		if isAz(p) {
-			ap, err := azblob.Parse(p)
-			if err != nil {
-				return err
-			}
-			if err := azblob.Touch(ctx, ap); err != nil {
+			if err := bbbfs.Touch(ctx, p); err != nil {
 				return err
 			}
 			continue
@@ -1147,15 +1134,7 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 // isNonRetryableHTTPErr returns true if err contains an HTTP 401, 403, or 404 status,
 // indicating an authentication/authorization failure or missing resource that should not be retried.
 func isNonRetryableHTTPErr(err error) bool {
-	var hfErr *hf.HTTPStatusError
-	if errors.As(err, &hfErr) && (hfErr.StatusCode == 401 || hfErr.StatusCode == 403 || hfErr.StatusCode == 404) {
-		return true
-	}
-	var azErr *azcore.ResponseError
-	if errors.As(err, &azErr) && (azErr.StatusCode == 401 || azErr.StatusCode == 403 || azErr.StatusCode == 404) {
-		return true
-	}
-	return false
+	return bbbfs.IsNonRetryableHTTPErr(err)
 }
 
 func retryOp(ctx context.Context, retryCount int, op func() error) error {
@@ -1413,53 +1392,21 @@ type cpTask struct {
 // emit for each discovered file; for file-like sources it emits a single task.
 // Returning a non-nil error from emit stops expansion early.
 func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) error {
-	if isHF(task.src) {
-		hfPath, err := hf.Parse(task.src)
+	// Check if source is a single file (not a directory)
+	if isHF(task.src) || isAz(task.src) {
+		dirLike, err := bbbfs.IsDirLike(ctx, task.src)
 		if err != nil {
 			return err
 		}
-		if hfPath.File != "" {
+		if !dirLike {
 			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
 		}
-	}
-
-	if isAz(task.src) {
-		sap, err := azblob.Parse(task.src)
-		if err != nil {
-			return err
-		}
-		if !sap.IsDirLike() {
-			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
-		}
-	} else if !isHF(task.src) {
+	} else {
 		if info, err := os.Stat(task.src); err != nil || !info.IsDir() {
 			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
 		}
 	}
 
-	if isAz(task.dst) {
-		dap, err := azblob.Parse(task.dst)
-		if err != nil {
-			return err
-		}
-		for result := range bbbfs.ListRecursive(ctx, task.src) {
-			if result.Err != nil {
-				return result.Err
-			}
-			entry := result.Entry
-			if entry.IsDir {
-				continue
-			}
-			if err := emit(cpTask{
-				src: entry.Path,
-				dst: dap.Child(filepath.ToSlash(entry.Name)).String(),
-				key: taskStateKey(entry.Path, task.dst),
-			}); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
 	for result := range bbbfs.ListRecursive(ctx, task.src) {
 		if result.Err != nil {
 			return result.Err
@@ -1468,9 +1415,10 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 		if entry.IsDir {
 			continue
 		}
+		dstPath := bbbfs.ChildPath(task.dst, filepath.ToSlash(entry.Name))
 		if err := emit(cpTask{
 			src: entry.Path,
-			dst: filepath.Join(task.dst, entry.Name),
+			dst: dstPath,
 			key: taskStateKey(entry.Path, task.dst),
 		}); err != nil {
 			return err
@@ -1770,115 +1718,55 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	}
 	dstAz := isAz(dst)
 	// Determine if dst is directory (local or Azure)
-	isDstDir := false
-	if dstAz {
-		dap, err := azblob.Parse(dst)
-		if err != nil {
-			return fmt.Errorf("cp: parse destination %q: %w", dst, err)
-		}
-		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-			isDstDir = true
-		}
-	} else {
-		info, err := os.Stat(dst)
-		if err == nil && info.IsDir() {
-			isDstDir = true
-		} else if strings.HasSuffix(dst, string(os.PathSeparator)) || strings.HasSuffix(dst, "/") {
-			isDstDir = true
-		}
-	}
+	isDstDir := bbbfs.IsDirLikeFromPath(dst)
 	type cpDirOp struct {
-		src   string
-		dst   string
-		srcHF bool
-		hf    hf.Path
+		src string
+		dst string
 	}
 	type cpFileOp struct {
-		src       string
-		dst       string
-		srcAz     bool
-		dstAz     bool
-		srcHF     bool
-		size      int64
-		srcAzPath azblob.AzurePath
-		hf        hf.Path
-		base      string
+		src   string
+		dst   string
+		srcAz bool
+		dstAz bool
+		size  int64
+		base  string
 	}
 	dirOps := make([]cpDirOp, 0, len(srcs))
 	fileOps := make([]cpFileOp, 0, len(srcs))
 	for _, src := range srcs {
 		src := src
 		srcAz := isAz(src)
-		srcHF := isHF(src)
-		base := filepath.Base(src)
-		var srcAzPath azblob.AzurePath
-		if srcAz {
-			var err error
-			srcAzPath, err = azblob.Parse(src)
+		base := bbbfs.BaseName(src)
+		if isHF(src) || srcAz {
+			dirLike, err := bbbfs.IsDirLike(ctx, src)
 			if err != nil {
 				return err
 			}
-		}
-		if srcHF {
-			hfPath, err := hf.Parse(src)
-			if err != nil {
-				return err
-			}
-			if hfPath.File == "" {
-				dirOps = append(dirOps, cpDirOp{src: src, dst: dst, srcHF: true, hf: hfPath})
-				continue
-			}
-			base = hfPath.DefaultFilename()
-			fileOps = append(fileOps, cpFileOp{
-				src:   src,
-				dst:   dst,
-				dstAz: dstAz,
-				srcHF: true,
-				hf:    hfPath,
-				base:  base,
-			})
-			continue
-		}
-		if srcAz {
-			if srcAzPath.IsDirLike() {
+			if dirLike {
 				dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
 				continue
 			}
+			// Single file
 		} else if info, err := os.Stat(src); err == nil && info.IsDir() {
 			dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
 			continue
 		}
 		var dstPath string
 		if isDstDir {
-			if dstAz {
-				dap, _ := azblob.Parse(dst)
-				if dap.Blob == "" {
-					dap.Blob = base
-				} else {
-					dap.Blob = strings.TrimSuffix(dap.Blob, "/") + "/" + base
-				}
-				dstPath = dap.String()
-			} else {
-				dstPath = filepath.Join(dst, base)
-			}
+			dstPath, _ = bbbfs.ResolveDstPath(dst, base, false)
 		} else {
 			dstPath = dst
 		}
 		fileOps = append(fileOps, cpFileOp{
-			src:       src,
-			dst:       dstPath,
-			srcAz:     srcAz,
-			dstAz:     dstAz,
-			srcAzPath: srcAzPath,
+			src:   src,
+			dst:   dstPath,
+			srcAz: srcAz,
+			dstAz: dstAz,
+			base:  base,
 		})
 	}
 	for _, op := range dirOps {
-		var err error
-		if op.srcHF {
-			err = copyHFDir(ctx, op.hf, op.dst, dstAz, overwrite, quiet, concurrency, retryCount)
-		} else {
-			err = copyTree(ctx, op.src, op.dst, overwrite, quiet, "cp", concurrency, retryCount)
-		}
+		err := copyTree(ctx, op.src, op.dst, overwrite, quiet, "cp", concurrency, retryCount)
 		if err != nil {
 			return fmt.Errorf("cp: %s -> %s: %w", op.src, op.dst, err)
 		}
@@ -1910,17 +1798,10 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				size = info.Size
 			}
 		}
-		if op.srcHF {
-			err := copyHFFile(ctx, op.hf, op.base, op.dst, op.dstAz, overwrite, quiet, isDstDir)
-			if err == nil && onBytes != nil {
-				onBytes(size)
-			}
-			return size, err
-		}
+		// Az→Az: server-side copy with progress
 		if op.srcAz && op.dstAz {
-			dap, _ := azblob.Parse(op.dst)
 			if !overwrite {
-				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
+				if exists, _ := bbbfs.ExistsAsBlob(ctx, op.dst); exists {
 					return 0, errors.New("cp: destination exists")
 				}
 			}
@@ -1932,7 +1813,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				}
 			}
 			var lastReported atomic.Int64
-			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, concurrency, func(copied, total int64) {
+			if err := bbbfs.CopyServerSide(ctx, op.src, op.dst, concurrency, func(copied, total int64) {
 				if total <= 0 {
 					return
 				}
@@ -1974,61 +1855,26 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			}
 			return size, nil
 		}
-		if op.srcAz && !op.dstAz {
-			reader, err := azblob.DownloadStream(ctx, op.srcAzPath)
+		// Generic copy via bbbfs Read+Write (covers HF→local, HF→Az, Az→local, local→Az)
+		if !overwrite {
+			if exists, _ := bbbfs.ExistsAsBlob(ctx, op.dst); exists {
+				return 0, errors.New("cp: destination exists")
+			}
+		}
+		if bbbfs.IsRemote(op.src) || bbbfs.IsRemote(op.dst) {
+			reader, err := bbbfs.Resolve(op.src).Read(ctx, op.src)
 			if err != nil {
 				return 0, err
 			}
-			if !overwrite {
-				if _, err := os.Stat(op.dst); err == nil {
-					if cerr := reader.Close(); cerr != nil {
-						return 0, cerr
-					}
-					return 0, errors.New("cp: destination exists")
-				}
-			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return writeStreamToFile(op.dst, r, 0o644)
+				return bbbfs.Resolve(op.dst).Write(ctx, op.dst, r)
 			}); err != nil {
 				return 0, err
 			}
-			if !quiet {
-				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
+		} else {
+			if err := fsops.CopyFile(op.src, op.dst, overwrite); err != nil {
+				return 0, fmt.Errorf("cp: %w", err)
 			}
-			if onBytes != nil {
-				onBytes(size)
-			}
-			return size, nil
-		}
-		if !op.srcAz && op.dstAz {
-			dap, _ := azblob.Parse(op.dst)
-			reader, err := os.Open(op.src)
-			if err != nil {
-				return 0, err
-			}
-			if !overwrite {
-				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-					if cerr := reader.Close(); cerr != nil {
-						return 0, cerr
-					}
-					return 0, errors.New("cp: destination exists")
-				}
-			}
-			if err := withReadCloser(reader, func(r io.Reader) error {
-				return azblob.UploadStream(ctx, dap, r)
-			}); err != nil {
-				return 0, err
-			}
-			if !quiet {
-				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
-			}
-			if onBytes != nil {
-				onBytes(size)
-			}
-			return size, nil
-		}
-		if err := fsops.CopyFile(op.src, op.dst, overwrite); err != nil {
-			return 0, fmt.Errorf("cp: %w", err)
 		}
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
@@ -2044,33 +1890,34 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 }
 
 func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPrefix string, concurrency int, retryCount int) error {
-	if isAz(src) || isAz(dst) {
-		// naive recursive copy via listing + per-blob cp
+	if bbbfs.IsRemote(src) || bbbfs.IsRemote(dst) {
+		// Remote copy: list source files and copy each
 		srcAz, dstAz := isAz(src), isAz(dst)
 		if srcAz && dstAz {
-			sap, _ := azblob.Parse(src)
-			dap, _ := azblob.Parse(dst)
-			list, err := azblob.ListRecursive(ctx, sap)
+			// Az→Az: server-side copy with per-file progress
+			list, err := bbbfs.ListRecursiveWithSize(ctx, src)
 			if err != nil {
 				return err
 			}
-			type azToAzOp struct {
+			type ssOp struct {
 				name string
 			}
 			// Limit file-level parallelism to avoid N² goroutines: each
-			// CopyBlobServerSide spawns `concurrency` block goroutines, so
+			// CopyServerSide spawns `concurrency` block goroutines, so
 			// fileWorkers × concurrency must stay bounded.
 			fileWorkers := min(maxServerSideCopyFiles, concurrency)
-			return runOpPoolWithRetryProgress(ctx, fileWorkers, retryCount, len(list), quiet, errPrefix, func(pending chan<- azToAzOp) error {
-				for _, bm := range list {
-					if err := sendOp(ctx, pending, azToAzOp{name: bm.Name}); err != nil {
+			return runOpPoolWithRetryProgress(ctx, fileWorkers, retryCount, len(list), quiet, errPrefix, func(pending chan<- ssOp) error {
+				for _, entry := range list {
+					if err := sendOp(ctx, pending, ssOp{name: entry.Name}); err != nil {
 						return err
 					}
 				}
 				return nil
-			}, func(work azToAzOp) error {
+			}, func(work ssOp) error {
+				srcChild := bbbfs.ChildPath(src, work.name)
+				dstChild := bbbfs.ChildPath(dst, work.name)
 				if !overwrite {
-					if _, err := azblob.HeadBlob(ctx, dap.Child(work.name)); err == nil {
+					if exists, _ := bbbfs.ExistsAsBlob(ctx, dstChild); exists {
 						return nil
 					}
 				}
@@ -2081,7 +1928,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 						copyBar.byteSized = true
 					}
 				}
-				if err := azblob.CopyBlobServerSide(ctx, sap.Child(work.name), dap.Child(work.name), concurrency, func(copied, total int64) {
+				if err := bbbfs.CopyServerSide(ctx, srcChild, dstChild, concurrency, func(copied, total int64) {
 					if total <= 0 || copyBar == nil {
 						return
 					}
@@ -2100,62 +1947,28 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					copyBar.Finish()
 				}
 				if !quiet {
-					lockedPrintf("Copied %s -> %s\n", sap.Child(work.name).String(), dap.Child(work.name).String())
+					lockedPrintf("Copied %s -> %s\n", srcChild, dstChild)
 				}
 				return nil
 			})
 		}
-		if srcAz && !dstAz { // Azure -> local
-			sap, _ := azblob.Parse(src)
-			list, err := azblob.ListRecursive(ctx, sap)
-			if err != nil {
-				return err
-			}
-			type azToLocalOp struct {
-				name string
-			}
-			return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(list), quiet, errPrefix, func(pending chan<- azToLocalOp) error {
-				for _, bm := range list {
-					if err := sendOp(ctx, pending, azToLocalOp{name: bm.Name}); err != nil {
-						return err
-					}
-				}
-				return nil
-			}, func(work azToLocalOp) error {
-				reader, err := azblob.DownloadStream(ctx, sap.Child(work.name))
-				if err != nil {
-					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
-					return err
-				}
-				outPath := filepath.Join(dst, work.name)
-				if !overwrite {
-					if _, err := os.Stat(outPath); err == nil {
-						if cerr := reader.Close(); cerr != nil {
-							return cerr
-						}
-						return nil
-					}
-				}
-				if err := withReadCloser(reader, func(r io.Reader) error {
-					return writeStreamToFile(outPath, r, 0o644)
-				}); err != nil {
-					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
-					return err
-				}
-				if !quiet {
-					lockedPrintf("Copied %s -> %s\n", sap.Child(work.name).String(), outPath)
-				}
-				return nil
-			})
+		// Generic remote copy: read via bbbfs + write via bbbfs
+		type remoteCopyOp struct {
+			name string
 		}
-		if !srcAz && dstAz { // local -> Azure
-			dap, _ := azblob.Parse(dst)
-			// walk local
-			type localToAzOp struct {
-				rel string
+		var ops []remoteCopyOp
+		var walkIssues bool
+		if bbbfs.IsRemote(src) {
+			for result := range bbbfs.ListRecursive(ctx, src) {
+				if result.Err != nil {
+					return result.Err
+				}
+				if result.Entry.IsDir {
+					continue
+				}
+				ops = append(ops, remoteCopyOp{name: result.Entry.Name})
 			}
-			var walkIssues bool
-			ops := make([]localToAzOp, 0)
+		} else {
 			walkErr := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
 					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, p, err)
@@ -2169,54 +1982,52 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					return ctx.Err()
 				}
 				rel, _ := filepath.Rel(src, p)
-				ops = append(ops, localToAzOp{rel: rel})
+				ops = append(ops, remoteCopyOp{name: rel})
 				return nil
 			})
 			if walkErr != nil {
 				return walkErr
 			}
-			var walkIssueErr error
-			if walkIssues {
-				walkIssueErr = fmt.Errorf("%s: one or more files failed to copy", errPrefix)
-			}
-			err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(ops), quiet, errPrefix, func(pending chan<- localToAzOp) error {
-				for _, op := range ops {
-					if err := sendOp(ctx, pending, op); err != nil {
-						return err
-					}
-				}
-				return nil
-			}, func(work localToAzOp) error {
-				p := filepath.Join(src, work.rel)
-				reader, err := os.Open(p)
-				if err != nil {
-					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.rel, err)
-					return err
-				}
-				if !overwrite {
-					if _, err := azblob.HeadBlob(ctx, dap.Child(work.rel)); err == nil {
-						if cerr := reader.Close(); cerr != nil {
-							return cerr
-						}
-						return nil
-					}
-				}
-				if err := withReadCloser(reader, func(r io.Reader) error {
-					return azblob.UploadStream(ctx, dap.Child(work.rel), r)
-				}); err != nil {
-					lockedFprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, work.rel, err)
-					return err
-				}
-				if !quiet {
-					lockedPrintf("Copied %s -> %s\n", p, dap.Child(work.rel).String())
-				}
-				return nil
-			})
-			if walkIssueErr != nil {
-				return errors.Join(err, walkIssueErr)
-			}
-			return err
 		}
+		var walkIssueErr error
+		if walkIssues {
+			walkIssueErr = fmt.Errorf("%s: one or more files failed to copy", errPrefix)
+		}
+		err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(ops), quiet, errPrefix, func(pending chan<- remoteCopyOp) error {
+			for _, op := range ops {
+				if err := sendOp(ctx, pending, op); err != nil {
+					return err
+				}
+			}
+			return nil
+		}, func(work remoteCopyOp) error {
+			srcPath := bbbfs.ChildPath(src, work.name)
+			dstPath := bbbfs.ChildPath(dst, work.name)
+			if !overwrite {
+				if exists, _ := bbbfs.ExistsAsBlob(ctx, dstPath); exists {
+					return nil
+				}
+			}
+			reader, err := bbbfs.Resolve(srcPath).Read(ctx, srcPath)
+			if err != nil {
+				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
+				return err
+			}
+			if err := withReadCloser(reader, func(r io.Reader) error {
+				return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
+			}); err != nil {
+				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
+				return err
+			}
+			if !quiet {
+				lockedPrintf("Copied %s -> %s\n", srcPath, dstPath)
+			}
+			return nil
+		})
+		if walkIssueErr != nil {
+			return errors.Join(err, walkIssueErr)
+		}
+		return err
 	}
 	type copyOp struct {
 		src   string
@@ -2263,161 +2074,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 	})
 }
 
-func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, overwrite, quiet, dstDir bool) error {
-	dstPath, err := resolveDstPath(dst, dstAz, base, dstDir)
-	if err != nil {
-		return err
-	}
-	if !overwrite {
-		if dstAz {
-			dap, err := azblob.Parse(dstPath)
-			if err != nil {
-				return err
-			}
-			if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-				return errors.New("cp: destination must be a blob path")
-			}
-			if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-				return errors.New("cp: destination exists")
-			}
-		} else if _, err := os.Stat(dstPath); err == nil {
-			return errors.New("cp: destination exists")
-		}
-	}
-	reader, err := bbbfs.Resolve(hfPath.String()).Read(ctx, hfPath.String())
-	if err != nil {
-		return err
-	}
-	if err := withReadCloser(reader, func(r io.Reader) error {
-		return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
-	}); err != nil {
-		return err
-	}
-	if !quiet {
-		lockedPrintf("Copied %s -> %s\n", hfPath.String(), dstPath)
-	}
-	return nil
-}
-
-func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite, quiet bool, concurrency int, retryCount int) error {
-	files, err := hf.ListFiles(ctx, hfPath)
-	if err != nil {
-		return err
-	}
-	type hfOp struct {
-		file string
-	}
-	return runOpPoolWithRetryProgressBytes(ctx, concurrency, retryCount, len(files), quiet, "cp", func(pending chan<- hfOp) error {
-		for _, file := range files {
-			if err := sendOp(ctx, pending, hfOp{file: file}); err != nil {
-				return err
-			}
-		}
-		return nil
-	}, func(op hfOp, trackBytes bool) (int64, error) {
-		filePath := hf.Path{Repo: hfPath.Repo, File: op.file}
-		dstPath, err := resolveDstPath(dst, dstAz, op.file, true)
-		if err != nil {
-			return 0, err
-		}
-		if !overwrite {
-			if dstAz {
-				dap, err := azblob.Parse(dstPath)
-				if err != nil {
-					return 0, err
-				}
-				if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-					return 0, errors.New("cp: destination must be a blob path")
-				}
-				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-					return 0, nil
-				}
-			} else if _, err := os.Stat(dstPath); err == nil {
-				return 0, nil
-			}
-		}
-		size := int64(0)
-		if trackBytes {
-			info, err := bbbfs.Resolve(filePath.String()).Stat(ctx, filePath.String())
-			if err == nil {
-				size = info.Size
-			}
-		}
-		reader, err := bbbfs.Resolve(filePath.String()).Read(ctx, filePath.String())
-		if err != nil {
-			return 0, err
-		}
-		if trackBytes && size <= 0 {
-			size = sizeOfReader(reader)
-		}
-		if err := withReadCloser(reader, func(r io.Reader) error {
-			return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
-		}); err != nil {
-			return 0, err
-		}
-		if !quiet {
-			lockedPrintf("Copied %s -> %s\n", filePath.String(), dstPath)
-		}
-		return size, nil
-	})
-}
-
-func writeStreamToFile(dstPath string, reader io.Reader, perm os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-		return err
-	}
-	dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
-	if err != nil {
-		return err
-	}
-	_, copyErr := io.Copy(dstFile, reader)
-	closeErr := dstFile.Close()
-	if copyErr != nil {
-		return copyErr
-	}
-	return closeErr
-}
-
 func withReadCloser(reader io.ReadCloser, fn func(io.Reader) error) error {
 	defer func() {
 		_ = reader.Close()
 	}()
 	return fn(reader)
-}
-
-func resolveDstPath(dst string, dstAz bool, base string, mustBeDir bool) (string, error) {
-	if dstAz {
-		dap, err := azblob.Parse(dst)
-		if err != nil {
-			return "", err
-		}
-		if mustBeDir && dap.Blob != "" && !strings.HasSuffix(dap.Blob, "/") {
-			dap.Blob += "/"
-		}
-		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-			if dap.Blob == "" {
-				dap.Blob = base
-			} else {
-				dap.Blob = strings.TrimSuffix(dap.Blob, "/") + "/" + base
-			}
-			return dap.String(), nil
-		}
-		if mustBeDir {
-			return "", errors.New("cp: destination must be a directory")
-		}
-		return dst, nil
-	}
-	info, err := os.Stat(dst)
-	if err == nil && info.IsDir() {
-		return filepath.Join(dst, base), nil
-	}
-	if strings.HasSuffix(dst, string(os.PathSeparator)) || strings.HasSuffix(dst, "/") {
-		return filepath.Join(dst, base), nil
-	}
-	if mustBeDir {
-		return "", errors.New("cp: destination must be a directory")
-	}
-	return dst, nil
 }
 func cmdEdit(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdEdit called", "args", c.Args().Slice())
@@ -2481,14 +2142,7 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 		return nil
 	}, func(op rmOp) error {
 		if isAz(op.path) {
-			ap, err := azblob.Parse(op.path)
-			if err != nil {
-				if force {
-					return nil
-				}
-				return err
-			}
-			if err := azblob.Delete(ctx, ap); err != nil {
+			if err := bbbfs.Delete(ctx, op.path); err != nil {
 				if force && strings.Contains(strings.ToLower(err.Error()), "notfound") {
 					return nil
 				}
@@ -2522,23 +2176,19 @@ func cmdRMTree(ctx context.Context, c *cli.Command) error {
 	}
 	root := c.Args().Get(0)
 	if isAz(root) {
-		ap, err := azblob.Parse(root)
-		if err != nil {
-			return err
-		}
-		list, err := azblob.ListRecursive(ctx, ap)
+		files, err := bbbfs.ListFilesFlat(ctx, root)
 		if err != nil {
 			return err
 		}
 		type rmTreeOp struct {
 			name string
 		}
-		ops := make([]rmTreeOp, 0, len(list))
-		for _, bm := range list {
-			if bm.Name == "" || strings.HasSuffix(bm.Name, "/") {
+		ops := make([]rmTreeOp, 0, len(files))
+		for _, name := range files {
+			if name == "" {
 				continue
 			}
-			ops = append(ops, rmTreeOp{name: bm.Name})
+			ops = append(ops, rmTreeOp{name: name})
 		}
 		return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(ops), quiet, "rmtree", func(pending chan<- rmTreeOp) error {
 			for _, op := range ops {
@@ -2548,12 +2198,13 @@ func cmdRMTree(ctx context.Context, c *cli.Command) error {
 			}
 			return nil
 		}, func(op rmTreeOp) error {
-			if err := azblob.Delete(ctx, ap.Child(op.name)); err != nil {
+			childPath := bbbfs.ChildPath(root, op.name)
+			if err := bbbfs.Delete(ctx, childPath); err != nil {
 				lockedFprintf(os.Stderr, "rmtree: %s: %v\n", op.name, err)
 				return err
 			}
 			if !quiet {
-				lockedPrintf("Deleted %s\n", ap.Child(op.name).String())
+				lockedPrintf("Deleted %s\n", childPath)
 			}
 			return nil
 		})
@@ -2571,17 +2222,12 @@ func cmdShare(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("share: need exactly one path")
 	}
 	p := c.Args().Get(0)
-	// For Azure paths, print a browser link (e.g., https://portal.azure.com/#blade/Microsoft_Azure_Storage/ContainerMenuBlade/...) or a direct blob URL if public
 	if isAz(p) {
-		ap, err := azblob.Parse(p)
+		portal, direct, err := bbbfs.ParseShareInfo(p)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "share: %s: %v\n", p, err)
 			return err
 		}
-		// Example: https://portal.azure.com/#blade/Microsoft_Azure_Storage/ContainerMenuBlade/overview/storageaccount/%s/container/%s/path/%s
-		// Or direct blob link if public: https://%s.blob.core.windows.net/%s/%s
-		portal := fmt.Sprintf("https://portal.azure.com/#blade/Microsoft_Azure_Storage/ContainerMenuBlade/overview/storageaccount/%s/container/%s/path/%s", ap.Account, ap.Container, ap.Blob)
-		direct := fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s", ap.Account, ap.Container, ap.Blob)
 		fmt.Println("Azure Portal:", portal)
 		fmt.Println("Direct Blob (if public):", direct)
 		return nil
@@ -2596,18 +2242,15 @@ func cmdShare(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
-func syncHFFiles(ctx context.Context, hfPath hf.Path, excludeMatch func(string) bool) ([]string, error) {
-	if hfPath.File != "" {
-		return nil, errors.New("sync: hf:// path must target repository root, not individual files")
-	}
-	files, err := hf.ListFiles(ctx, hfPath)
+func syncRemoteFiles(ctx context.Context, src string, excludeMatch func(string) bool) ([]string, error) {
+	files, err := bbbfs.ListFilesFlat(ctx, src)
 	if err != nil {
 		return nil, err
 	}
-	return syncHFFilesFromList(files, excludeMatch), nil
+	return filterExclude(files, excludeMatch), nil
 }
 
-func syncHFFilesFromList(files []string, excludeMatch func(string) bool) []string {
+func filterExclude(files []string, excludeMatch func(string) bool) []string {
 	out := make([]string, 0, len(files))
 	for _, file := range files {
 		if excludeMatch(file) {
@@ -2717,14 +2360,12 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 	if srcHF && !isAz(dst) {
 		return fmt.Errorf("sync: hf:// only supported with az:// destination")
 	}
-	var hfPath hf.Path
 	if srcHF {
-		var err error
-		hfPath, err = hf.Parse(src)
+		dirLike, err := bbbfs.IsDirLike(ctx, src)
 		if err != nil {
 			return fmt.Errorf("sync: %w", err)
 		}
-		if hfPath.File != "" {
+		if !dirLike {
 			return errors.New("sync: hf:// path must target repository root, not individual files")
 		}
 	}
@@ -2750,22 +2391,18 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		}
 		var files []item
 		if srcAz {
-			sap, err := azblob.Parse(src)
-			if err != nil {
-				return fmt.Errorf("sync: %w", err)
-			}
-			list, err := azblob.ListRecursive(ctx, sap)
+			list, err := bbbfs.ListRecursiveWithSize(ctx, src)
 			if err != nil {
 				return fmt.Errorf("sync: list %s: %w", src, err)
 			}
-			for _, bm := range list {
-				if bm.Name == "" || excludeMatch(bm.Name) {
+			for _, entry := range list {
+				if entry.Name == "" || excludeMatch(entry.Name) {
 					continue
 				}
-				files = append(files, item{rel: bm.Name, size: bm.Size})
+				files = append(files, item{rel: entry.Name, size: entry.Size})
 			}
 		} else if srcHF {
-			list, err := syncHFFiles(ctx, hfPath, excludeMatch)
+			list, err := syncRemoteFiles(ctx, src, excludeMatch)
 			if err != nil {
 				return err
 			}
@@ -2791,19 +2428,6 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				return err
 			}
 		}
-		var sap azblob.AzurePath
-		var dap azblob.AzurePath
-		if srcAz {
-			sap, _ = azblob.Parse(src)
-		}
-		if dstAz {
-			var err error
-			dap, err = azblob.Parse(dst)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "sync: %s: %v\n", dst, err)
-				return err
-			}
-		}
 		// When both src and dst are Azure, CopyBlobServerSide spawns
 		// `concurrency` block goroutines per file. Limit file-level
 		// parallelism to 2 so total goroutines stay bounded at
@@ -2821,10 +2445,12 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			return nil
 		}, func(f item) error {
 			sPath := f.rel
+			srcChild := bbbfs.ChildPath(src, sPath)
+			dstChild := bbbfs.ChildPath(dst, sPath)
 			if srcAz && dstAz {
 				if dry {
 					if !quiet {
-						lockedPrintln("COPY", sap.Child(sPath).String(), "->", dap.Child(sPath).String())
+						lockedPrintln("COPY", srcChild, "->", dstChild)
 					}
 					return nil
 				}
@@ -2835,7 +2461,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 						copyBar.byteSized = true
 					}
 				}
-				if err := azblob.CopyBlobServerSide(ctx, sap.Child(sPath), dap.Child(sPath), concurrency, func(copied, total int64) {
+				if err := bbbfs.CopyServerSide(ctx, srcChild, dstChild, concurrency, func(copied, total int64) {
 					if total <= 0 || copyBar == nil {
 						return
 					}
@@ -2854,86 +2480,30 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 					copyBar.Finish()
 				}
 				if !quiet {
-					lockedPrintf("Copied %s -> %s\n", sap.Child(sPath).String(), dap.Child(sPath).String())
+					lockedPrintf("Copied %s -> %s\n", srcChild, dstChild)
 				}
 				return nil
 			}
-			if srcHF && dstAz {
-				hfFile := hf.Path{Repo: hfPath.Repo, File: sPath}
-				if dry {
-					if !quiet {
-						lockedPrintln("COPY", hfFile.String(), "->", dap.Child(sPath).String())
-					}
-					return nil
-				}
-				reader, err := hf.DownloadStream(ctx, hfFile)
-				if err != nil {
-					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync: %s: %w", sPath, err)
-				}
-				if err := withReadCloser(reader, func(r io.Reader) error {
-					return azblob.UploadStream(ctx, dap.Child(sPath), r)
-				}); err != nil {
-					lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync upload: %s: %w", sPath, err)
-				}
+			// Generic remote copy: bbbfs Read + bbbfs Write
+			if dry {
 				if !quiet {
-					lockedPrintf("Copied %s -> %s\n", hfFile.String(), dap.Child(sPath).String())
+					lockedPrintln("COPY", srcChild, "->", dstChild)
 				}
 				return nil
 			}
-			if srcAz && !dstAz {
-				reader, err := azblob.DownloadStream(ctx, sap.Child(sPath))
-				if err != nil {
-					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync: %s: %w", sPath, err)
-				}
-				out := filepath.Join(dst, sPath)
-				if dry {
-					if !quiet {
-						lockedPrintln("COPY", sap.Child(sPath).String(), "->", out)
-					}
-					if cerr := reader.Close(); cerr != nil {
-						return cerr
-					}
-					return nil
-				}
-				if err := withReadCloser(reader, func(r io.Reader) error {
-					return writeStreamToFile(out, r, 0o644)
-				}); err != nil {
-					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync: %s: %w", sPath, err)
-				}
-				if !quiet {
-					lockedPrintf("Copied %s -> %s\n", sap.Child(sPath).String(), out)
-				}
-				return nil
+			reader, err := bbbfs.Resolve(srcChild).Read(ctx, srcChild)
+			if err != nil {
+				lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
+				return fmt.Errorf("sync: %s: %w", sPath, err)
 			}
-			if !srcAz && dstAz {
-				reader, err := os.Open(filepath.Join(src, sPath))
-				if err != nil {
-					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync: %s: %w", sPath, err)
-				}
-				if dry {
-					if !quiet {
-						lockedPrintln("COPY", filepath.Join(src, sPath), "->", dap.Child(sPath).String())
-					}
-					if cerr := reader.Close(); cerr != nil {
-						return cerr
-					}
-					return nil
-				}
-				if err := withReadCloser(reader, func(r io.Reader) error {
-					return azblob.UploadStream(ctx, dap.Child(sPath), r)
-				}); err != nil {
-					lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync upload: %s: %w", sPath, err)
-				}
-				if !quiet {
-					lockedPrintf("Copied %s -> %s\n", filepath.Join(src, sPath), dap.Child(sPath).String())
-				}
-				return nil
+			if err := withReadCloser(reader, func(r io.Reader) error {
+				return bbbfs.Resolve(dstChild).Write(ctx, dstChild, r)
+			}); err != nil {
+				lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
+				return fmt.Errorf("sync: %s: %w", sPath, err)
+			}
+			if !quiet {
+				lockedPrintf("Copied %s -> %s\n", srcChild, dstChild)
 			}
 			return nil
 		})
@@ -3112,17 +2682,12 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 	parentPath, pattern := splitWildcard(target)
 	fs := bbbfs.Resolve(parentPath)
 	if isAz(parentPath) {
-		ap, err := azblob.Parse(parentPath)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
 		var totalSize int64
 		var count int
 		var anyListed bool
-		if err := azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
+		if err := bbbfs.ListStream(ctx, parentPath, func(entry bbbfs.Entry) error {
 			anyListed = true
-			name := bm.Name
+			name := entry.Name
 			if name == "" || strings.HasSuffix(name, "/") {
 				return nil // skip directories
 			}
@@ -3135,24 +2700,18 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 					return nil
 				}
 			}
-			var fullpath string
-			if ap.Container == "" {
-				fullpath = fmt.Sprintf("az://%s/%s", ap.Account, name)
-			} else {
-				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
-			}
-			fullpath = strings.TrimSuffix(fullpath, "/")
+			fullpath := strings.TrimSuffix(entry.Path, "/")
 			mod := "-" // Placeholder, modtime not available
 			display := fullpath
 			if relFlag {
 				display = strings.TrimSuffix(name, "/")
 			}
 			if machine {
-				fmt.Printf("f\t%d\t%s\t%s\n", bm.Size, mod, display)
+				fmt.Printf("f\t%d\t%s\t%s\n", entry.Size, mod, display)
 			} else {
-				fmt.Printf("%10s  %s  %s\n", formatSize(bm.Size), mod, display)
+				fmt.Printf("%10s  %s  %s\n", formatSize(entry.Size), mod, display)
 			}
-			totalSize += bm.Size
+			totalSize += entry.Size
 			count++
 			return nil
 		}); err != nil {
@@ -3160,20 +2719,21 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			os.Exit(1)
 		}
 		// If listing returned no entries at all and no wildcard was used, the target
-		// may be a single blob. Fall back to HeadBlob so that single-file
+		// may be a single blob. Fall back to Stat so that single-file
 		// paths (e.g. az://account/container/blob) are shown.
 		if !anyListed && pattern == "" {
-			if size, headErr := azblob.HeadBlob(ctx, ap); headErr == nil {
+			st, statErr := fs.Stat(ctx, parentPath)
+			if statErr == nil && !st.IsDir {
 				display := target
 				if relFlag {
-					display = path.Base(ap.Blob)
+					display = bbbfs.BaseName(parentPath)
 				}
 				if machine {
-					fmt.Printf("f\t%d\t%s\t%s\n", size, "-", display)
+					fmt.Printf("f\t%d\t%s\t%s\n", st.Size, "-", display)
 				} else {
-					fmt.Printf("%10s  %s  %s\n", formatSize(size), "-", display)
+					fmt.Printf("%10s  %s  %s\n", formatSize(st.Size), "-", display)
 				}
-				totalSize = size
+				totalSize = st.Size
 				count = 1
 			}
 		}

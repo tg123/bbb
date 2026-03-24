@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/hf"
 	"github.com/urfave/cli/v3"
 )
@@ -106,18 +107,18 @@ func TestHFPathDatasetDefaults(t *testing.T) {
 }
 
 func TestResolveDstPathAzDir(t *testing.T) {
-	dst, err := resolveDstPath("az://acct/container/prefix", true, "model.bin", true)
+	dst, err := bbbfs.ResolveDstPath("az://acct/container/prefix", "model.bin", true)
 	if err != nil {
-		t.Fatalf("resolveDstPath failed: %v", err)
+		t.Fatalf("ResolveDstPath failed: %v", err)
 	}
 	if dst != "az://acct/container/prefix/model.bin" {
 		t.Fatalf("unexpected dst: %s", dst)
 	}
 }
 
-func TestSyncHFFiles(t *testing.T) {
+func TestSyncFilterExclude(t *testing.T) {
 	files := []string{"file.txt", "dir/file2.txt", "dir/skip.txt"}
-	list := syncHFFilesFromList(files, func(name string) bool { return strings.Contains(name, "skip") })
+	list := filterExclude(files, func(name string) bool { return strings.Contains(name, "skip") })
 	if len(list) != 2 {
 		t.Fatalf("unexpected list length: %d", len(list))
 	}
@@ -1106,12 +1107,12 @@ func TestSplitWildcardGlobChars(t *testing.T) {
 	}
 }
 
-func TestWriteStreamToFile(t *testing.T) {
+func TestWriteStreamToLocal(t *testing.T) {
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "nested", "file.txt")
 	content := "stream data"
-	if err := writeStreamToFile(dst, strings.NewReader(content), 0o644); err != nil {
-		t.Fatalf("writeStreamToFile failed: %v", err)
+	if err := bbbfs.Resolve(dst).Write(context.Background(), dst, strings.NewReader(content)); err != nil {
+		t.Fatalf("write failed: %v", err)
 	}
 	data, err := os.ReadFile(dst)
 	if err != nil {

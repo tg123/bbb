@@ -131,6 +131,46 @@ func (hfFS) ListRecursive(ctx context.Context, target string, emit func(Entry) e
 	return nil
 }
 
+func (hfFS) IsDirLike(_ context.Context, p string) (bool, error) {
+	hp, err := hf.Parse(p)
+	if err != nil {
+		return false, err
+	}
+	return hp.File == "", nil
+}
+
+func (hfFS) ChildPath(parent, child string) string {
+	hp, err := hf.Parse(parent)
+	if err != nil {
+		return parent + "/" + child
+	}
+	if hp.File == "" {
+		hp.File = child
+	} else {
+		hp.File = path.Join(hp.File, child)
+	}
+	return hp.String()
+}
+
+func (hfFS) BaseName(p string) string {
+	hp, err := hf.Parse(p)
+	if err != nil {
+		return path.Base(p)
+	}
+	return hp.DefaultFilename()
+}
+
+func (hfFS) ListFilesFlat(ctx context.Context, p string) ([]string, error) {
+	hp, err := hf.Parse(p)
+	if err != nil {
+		return nil, err
+	}
+	if hp.File != "" {
+		return nil, fmt.Errorf("hf:// path must target repository root, not individual files")
+	}
+	return hf.ListFiles(ctx, hp)
+}
+
 func normalizeHFPrefix(prefix string) string {
 	for strings.HasPrefix(prefix, "/") {
 		prefix = strings.TrimPrefix(prefix, "/")
