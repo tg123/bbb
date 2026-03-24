@@ -107,8 +107,8 @@ func main() {
 				Value:   "info",
 				Sources: cli.EnvVars("BBB_LOG_LEVEL"),
 			},
-			&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
-			&cli.StringFlag{Name: "state", Usage: "State file for crash recovery"},
+			&cli.StringFlag{Name: "taskfile", Hidden: true},
+			&cli.StringFlag{Name: "state", Hidden: true},
 		},
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
 			lvlStr := cmd.String("loglevel")
@@ -236,9 +236,11 @@ func main() {
 			{
 				Name:      "cp",
 				Usage:     "Copy files or directories",
-				UsageText: "bbb [--taskfile FILE|--taskfile -] [--state FILE] cp [-q|--quiet] [--concurrency N] [--retry-count N]\n   or: bbb [--state FILE] cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
+				UsageText: "bbb cp [--taskfile FILE|--taskfile -] [--state FILE] [-q|--quiet] [--concurrency N] [--retry-count N]\n   or: bbb cp [--state FILE] [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
 				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
+					&cli.StringFlag{Name: "state", Usage: "State file for crash recovery"},
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
@@ -284,8 +286,10 @@ func main() {
 			{
 				Name:      "sync",
 				Usage:     "Synchronise two directory trees",
-				UsageText: "bbb [--taskfile FILE|--taskfile -] [--state FILE] sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N]\n   or: bbb [--state FILE] sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] src dst",
+				UsageText: "bbb sync [--taskfile FILE|--taskfile -] [--state FILE] [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N]\n   or: bbb sync [--state FILE] [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] src dst",
 				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
+					&cli.StringFlag{Name: "state", Usage: "State file for crash recovery"},
 					&cli.BoolFlag{Name: "dry-run", Usage: "show actions without applying"},
 					&cli.BoolFlag{Name: "delete", Usage: "Delete destination files that don't exist in source"},
 					&cli.BoolFlag{Name: "q", Aliases: []string{"quiet"}, Usage: "Suppress output"},
@@ -949,7 +953,13 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
 	taskfile := c.String("taskfile")
+	if taskfile == "" {
+		taskfile = c.Root().String("taskfile")
+	}
 	stateFile := c.String("state")
+	if stateFile == "" {
+		stateFile = c.Root().String("state")
+	}
 
 	var tasks []taskPair
 	if taskfile != "" {
@@ -2090,7 +2100,13 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
 	taskfile := c.String("taskfile")
+	if taskfile == "" {
+		taskfile = c.Root().String("taskfile")
+	}
 	stateFile := c.String("state")
+	if stateFile == "" {
+		stateFile = c.Root().String("state")
+	}
 
 	if taskfile != "" {
 		if c.Args().Len() != 0 {
