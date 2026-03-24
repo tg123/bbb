@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/md5"
 	"errors"
@@ -52,14 +51,6 @@ func version() string {
 	v = fmt.Sprintf("%v, %v", v, bi.GoVersion)
 
 	return v
-}
-
-func isAz(s string) bool {
-	return bbbfs.IsAz(s)
-}
-
-func isHF(s string) bool {
-	return bbbfs.IsHF(s)
 }
 
 type dialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -150,7 +141,7 @@ func main() {
 								return fmt.Errorf("mkcontainer: need az://account/container")
 							}
 							target := c.Args().Get(0)
-							if !isAz(target) {
+							if !bbbfs.IsAz(target) {
 								return fmt.Errorf("mkcontainer: only az:// paths supported")
 							}
 							account, container := bbbfs.AzAccountContainer(target)
@@ -510,7 +501,7 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 	ts := time.Now()
 	for i := 0; i < c.Args().Len(); i++ {
 		p := c.Args().Get(i)
-		if isAz(p) {
+		if bbbfs.IsAz(p) {
 			if err := bbbfs.Touch(ctx, p); err != nil {
 				return err
 			}
@@ -598,12 +589,6 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 	return errors.Join(collected...)
 }
 
-// isNonRetryableHTTPErr returns true if err contains an HTTP 401, 403, or 404 status,
-// indicating an authentication/authorization failure or missing resource that should not be retried.
-func isNonRetryableHTTPErr(err error) bool {
-	return bbbfs.IsNonRetryableHTTPErr(err)
-}
-
 func retryOp(ctx context.Context, retryCount int, op func() error) error {
 	if retryCount < 0 {
 		retryCount = 0
@@ -617,7 +602,7 @@ func retryOp(ctx context.Context, retryCount int, op func() error) error {
 		if err == nil {
 			return nil
 		}
-		if isNonRetryableHTTPErr(err) {
+		if bbbfs.IsNonRetryableHTTPErr(err) {
 			return err
 		}
 	}
@@ -662,236 +647,6 @@ func runOpPoolWithRetryProgressBytes[T any](ctx context.Context, concurrency int
 		progress.Finish()
 	}
 	return err
-}
-
-type taskPair struct {
-	src string
-	dst string
-}
-
-const maxTaskfileLineSize = 4 * 1024 * 1024
-
-func parseTaskPairLine(line string, lineNo int) (taskPair, error) {
-	parts := strings.Fields(line)
-	if len(parts) != 2 {
-		return taskPair{}, fmt.Errorf("taskfile: line %d: expected exactly two whitespace-separated fields `src dst` (paths with spaces are not supported)", lineNo)
-	}
-	return taskPair{src: parts[0], dst: parts[1]}, nil
-}
-
-func loadTaskPairs(taskfile string) ([]taskPair, error) {
-	var (
-		reader io.Reader
-		file   *os.File
-		err    error
-	)
-	if taskfile == "-" {
-		reader = os.Stdin
-	} else {
-		file, err = os.Open(taskfile)
-		if err != nil {
-			return nil, err
-		}
-		defer func() {
-			_ = file.Close()
-		}()
-		reader = file
-	}
-
-	var tasks []taskPair
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxTaskfileLineSize)
-	for lineNo := 1; scanner.Scan(); lineNo++ {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		task, err := parseTaskPairLine(line, lineNo)
-		if err != nil {
-			return nil, err
-		}
-		tasks = append(tasks, task)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return tasks, nil
-}
-
-func loadTaskState(path string) (fileState map[string]struct{}, taskCheckpoints map[string]struct{}, err error) {
-	fileState = map[string]struct{}{}
-	taskCheckpoints = map[string]struct{}{}
-	if path == "" {
-		return fileState, taskCheckpoints, nil
-	}
-
-	file, ferr := os.Open(path)
-	if ferr != nil {
-		if os.IsNotExist(ferr) {
-			return fileState, taskCheckpoints, nil
-		}
-		return nil, nil, ferr
-	}
-	defer func() {
-		_ = file.Close()
-	}()
-
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxTaskfileLineSize)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, taskCheckpointPrefix) {
-			taskCheckpoints[line] = struct{}{}
-		} else {
-			fileState[line] = struct{}{}
-		}
-	}
-	if serr := scanner.Err(); serr != nil {
-		return nil, nil, serr
-	}
-	return fileState, taskCheckpoints, nil
-}
-
-type taskStateAppender struct {
-	mu   sync.Mutex
-	file *os.File
-}
-
-func newTaskStateAppender(path string) (*taskStateAppender, error) {
-	if path == "" {
-		return &taskStateAppender{}, nil
-	}
-
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	return &taskStateAppender{file: file}, nil
-}
-
-func (a *taskStateAppender) append(taskKey string) error {
-	if a.file == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
-		return a.closeOnError(err)
-	}
-
-	return nil
-}
-
-func (a *taskStateAppender) appendCheckpoint(taskKey string) error {
-	if a.file == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
-		return a.closeOnError(err)
-	}
-
-	if err := a.file.Sync(); err != nil {
-		return a.closeOnError(err)
-	}
-
-	return nil
-}
-
-func (a *taskStateAppender) closeOnError(err error) error {
-	if a.file == nil {
-		return err
-	}
-	if cerr := a.file.Close(); cerr != nil {
-		a.file = nil
-		return errors.Join(err, cerr)
-	}
-	a.file = nil
-	return err
-}
-
-func (a *taskStateAppender) close() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.file == nil {
-		return nil
-	}
-	if serr := a.file.Sync(); serr != nil {
-		_ = a.file.Close()
-		a.file = nil
-		return serr
-	}
-	err := a.file.Close()
-	a.file = nil
-	return err
-}
-
-const taskCheckpointPrefix = "TASK\t"
-
-func taskStateKey(src, dst string) string {
-	return src + " -> " + dst
-}
-
-func taskCheckpointKey(src, dst string) string {
-	return taskCheckpointPrefix + src + " -> " + dst
-}
-
-type taskTracker struct {
-	remaining atomic.Int64
-	key       string // task checkpoint key
-}
-
-type cpTask struct {
-	src     string
-	dst     string
-	key     string
-	tracker *taskTracker // nil when no task-level checkpoint tracking
-}
-
-// expandCPTask streams file-level copy tasks for a taskfile pair via the emit
-// callback. When the source is directory-like it expands recursively and calls
-// emit for each discovered file; for file-like sources it emits a single task.
-// Returning a non-nil error from emit stops expansion early.
-func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) error {
-	// Check if source is a single file (not a directory)
-	if isHF(task.src) || isAz(task.src) {
-		dirLike, err := bbbfs.IsDirLike(ctx, task.src)
-		if err != nil {
-			return err
-		}
-		if !dirLike {
-			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
-		}
-	} else {
-		if info, err := os.Stat(task.src); err != nil || !info.IsDir() {
-			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
-		}
-	}
-
-	for result := range bbbfs.ListRecursive(ctx, task.src) {
-		if result.Err != nil {
-			return result.Err
-		}
-		entry := result.Entry
-		if entry.IsDir {
-			continue
-		}
-		dstPath := bbbfs.ChildPath(task.dst, filepath.ToSlash(entry.Name))
-		if err := emit(cpTask{
-			src: entry.Path,
-			dst: dstPath,
-			key: taskStateKey(entry.Path, task.dst),
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func cmdCP(ctx context.Context, c *cli.Command) error {
@@ -1186,10 +941,10 @@ enqueueLoop:
 }
 
 func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, showCopyBar bool, onBytes func(int64)) error {
-	if isHF(dst) {
+	if bbbfs.IsHF(dst) {
 		return fmt.Errorf("cp: hf:// only supported as source")
 	}
-	dstAz := isAz(dst)
+	dstAz := bbbfs.IsAz(dst)
 	// Determine if dst is directory (local or Azure)
 	isDstDir := bbbfs.IsDirLikeFromPath(dst)
 	type cpDirOp struct {
@@ -1208,9 +963,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	fileOps := make([]cpFileOp, 0, len(srcs))
 	for _, src := range srcs {
 		src := src
-		srcAz := isAz(src)
+		srcAz := bbbfs.IsAz(src)
 		base := bbbfs.BaseName(src)
-		if isHF(src) || srcAz {
+		if bbbfs.IsHF(src) || srcAz {
 			dirLike, err := bbbfs.IsDirLike(ctx, src)
 			if err != nil {
 				return err
@@ -1369,7 +1124,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPrefix string, concurrency int, retryCount int) error {
 	if bbbfs.IsRemote(src) || bbbfs.IsRemote(dst) {
 		// Remote copy: list source files and copy each
-		srcAz, dstAz := isAz(src), isAz(dst)
+		srcAz, dstAz := bbbfs.IsAz(src), bbbfs.IsAz(dst)
 		if srcAz && dstAz {
 			// Az→Az: server-side copy with per-file progress
 			list, err := bbbfs.ListRecursiveWithSize(ctx, src)
@@ -1618,7 +1373,7 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 		}
 		return nil
 	}, func(op rmOp) error {
-		if isAz(op.path) {
+		if bbbfs.IsAz(op.path) {
 			if err := bbbfs.Delete(ctx, op.path); err != nil {
 				if force && strings.Contains(strings.ToLower(err.Error()), "notfound") {
 					return nil
@@ -1652,7 +1407,7 @@ func cmdRMTree(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("rmtree: need directory root")
 	}
 	root := c.Args().Get(0)
-	if isAz(root) {
+	if bbbfs.IsAz(root) {
 		files, err := bbbfs.ListFilesFlat(ctx, root)
 		if err != nil {
 			return err
@@ -1699,7 +1454,7 @@ func cmdShare(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("share: need exactly one path")
 	}
 	p := c.Args().Get(0)
-	if isAz(p) {
+	if bbbfs.IsAz(p) {
 		portal, direct, err := bbbfs.ParseShareInfo(p)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "share: %s: %v\n", p, err)
@@ -1836,11 +1591,11 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 }
 
 func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, concurrency, retryCount int, src, dst string) error {
-	if isHF(dst) {
+	if bbbfs.IsHF(dst) {
 		return fmt.Errorf("sync: hf:// only supported as source")
 	}
-	srcHF := isHF(src)
-	if srcHF && !isAz(dst) {
+	srcHF := bbbfs.IsHF(src)
+	if srcHF && !bbbfs.IsAz(dst) {
 		return fmt.Errorf("sync: hf:// only supported with az:// destination")
 	}
 	if srcHF {
@@ -1865,8 +1620,8 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 	} else {
 		excludeMatch = func(string) bool { return false }
 	}
-	if isAz(src) || isAz(dst) || srcHF {
-		srcAz, dstAz := isAz(src), isAz(dst)
+	if bbbfs.IsAz(src) || bbbfs.IsAz(dst) || srcHF {
+		srcAz, dstAz := bbbfs.IsAz(src), bbbfs.IsAz(dst)
 		// Build src file list
 		type item struct {
 			rel  string
@@ -2164,7 +1919,7 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 	relFlag := c.Bool("s")
 	parentPath, pattern := splitWildcard(target)
 	fs := bbbfs.Resolve(parentPath)
-	if isAz(parentPath) {
+	if bbbfs.IsAz(parentPath) {
 		var totalSize int64
 		var count int
 		var anyListed bool
