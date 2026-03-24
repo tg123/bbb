@@ -144,11 +144,14 @@ func main() {
 							if !bbbfs.IsAz(target) {
 								return fmt.Errorf("mkcontainer: only az:// paths supported")
 							}
-							account, container := bbbfs.AzAccountContainer(target)
+							account, container, err := bbbfs.AzAccountContainer(target)
+							if err != nil {
+								return fmt.Errorf("mkcontainer: %w", err)
+							}
 							if container == "" {
 								return fmt.Errorf("mkcontainer: need az://account/container")
 							}
-							err := bbbfs.MkDir(ctx, target)
+							err = bbbfs.MkDir(ctx, target)
 							if err != nil {
 								return err
 							}
@@ -1363,8 +1366,13 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 	}, func(op rmOp) error {
 		if bbbfs.IsAz(op.path) {
 			if err := bbbfs.Delete(ctx, op.path); err != nil {
-				if force && strings.Contains(strings.ToLower(err.Error()), "notfound") {
-					return nil
+				if force {
+					lower := strings.ToLower(err.Error())
+					if strings.Contains(lower, "notfound") ||
+						strings.Contains(lower, "parse") ||
+						strings.Contains(lower, "invalid") {
+						return nil
+					}
 				}
 				return err
 			}

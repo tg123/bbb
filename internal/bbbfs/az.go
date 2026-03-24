@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -138,7 +139,7 @@ func (azFS) ChildPath(parent, child string) string {
 	if err != nil {
 		return parent + "/" + child
 	}
-	return ap.Child(child).String()
+	return ap.Child(filepath.ToSlash(child)).String()
 }
 
 func (azFS) BaseName(p string) string {
@@ -271,12 +272,12 @@ func (azFS) ShareInfo(p string) (portal, direct string, err error) {
 
 // AzAccountContainer returns the account and container from an Azure path.
 // Returns empty strings for non-Azure paths.
-func AzAccountContainer(p string) (account, container string) {
+func AzAccountContainer(p string) (account, container string, err error) {
 	ap, err := azblob.Parse(p)
 	if err != nil {
-		return "", ""
+		return "", "", err
 	}
-	return ap.Account, ap.Container
+	return ap.Account, ap.Container, nil
 }
 
 // ListRecursiveWithSize lists all entries recursively with their sizes.

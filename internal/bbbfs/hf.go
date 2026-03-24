@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -152,6 +153,7 @@ func (hfFS) ChildPath(parent, child string) string {
 	if err != nil {
 		return parent + "/" + child
 	}
+	child = filepath.ToSlash(child)
 	if hp.File == "" {
 		hp.File = child
 	} else {
