@@ -81,7 +81,10 @@ func BaseName(p string) string {
 func Exists(ctx context.Context, p string) (bool, error) {
 	_, err := Resolve(p).Stat(ctx, p)
 	if err != nil {
-		return false, nil
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	return true, nil
 }
@@ -275,4 +278,22 @@ func ParseShareInfo(p string) (portal, direct string, err error) {
 		return "", "", fmt.Errorf("share: %s: %w", p, err)
 	}
 	return "", "file://" + abs, nil
+}
+
+// IsDirLikeFromPath checks if a path is directory-like without making any
+// network calls. Uses path structure only.
+func IsDirLikeFromPath(p string) bool {
+	fs := Resolve(p)
+	type pathOnlyDirChecker interface {
+		IsDirLikeFromPath(path string) bool
+	}
+	if dc, ok := fs.(pathOnlyDirChecker); ok {
+		return dc.IsDirLikeFromPath(p)
+	}
+	// local fallback
+	info, err := os.Stat(p)
+	if err != nil {
+		return strings.HasSuffix(p, string(os.PathSeparator)) || strings.HasSuffix(p, "/")
+	}
+	return info.IsDir()
 }

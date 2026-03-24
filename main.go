@@ -1753,7 +1753,11 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		}
 		var dstPath string
 		if isDstDir {
-			dstPath, _ = bbbfs.ResolveDstPath(dst, base, false)
+			var err error
+			dstPath, err = bbbfs.ResolveDstPath(dst, base, false)
+			if err != nil {
+				return err
+			}
 		} else {
 			dstPath = dst
 		}

@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/tg123/bbb/internal/azblob"
-	"github.com/tg123/bbb/internal/hf"
 )
 
 type azFS struct{}
@@ -127,6 +125,14 @@ func (azFS) IsDirLike(_ context.Context, p string) (bool, error) {
 	return ap.IsDirLike(), nil
 }
 
+func (azFS) IsDirLikeFromPath(p string) bool {
+	ap, err := azblob.Parse(p)
+	if err != nil {
+		return false
+	}
+	return ap.IsDirLike()
+}
+
 func (azFS) ChildPath(parent, child string) string {
 	ap, err := azblob.Parse(parent)
 	if err != nil {
@@ -171,7 +177,7 @@ func (azFS) MkDir(ctx context.Context, p string) error {
 		return err
 	}
 	if ap.Container == "" {
-		return fmt.Errorf("mkcontainer: need az://account/container")
+		return fmt.Errorf("container name is required")
 	}
 	return azblob.MkContainer(ctx, ap.Account, ap.Container)
 }
@@ -339,49 +345,3 @@ func (azFS) DeletePrefix(ctx context.Context, p string) error {
 	return azblob.DeletePrefix(ctx, ap)
 }
 
-// HeadSize returns the file size without downloading. For backends that
-// do not support HEAD-like queries, it falls back to Stat.
-func HeadSize(ctx context.Context, p string) (int64, error) {
-	entry, err := Resolve(p).Stat(ctx, p)
-	if err != nil {
-		return 0, err
-	}
-	return entry.Size, nil
-}
-
-// IsDirLikeFromPath checks if a path is directory-like without making any
-// network calls. Uses path structure only.
-func IsDirLikeFromPath(p string) bool {
-	if IsAz(p) {
-		ap, err := azblob.Parse(p)
-		if err != nil {
-			return false
-		}
-		return ap.IsDirLike()
-	}
-	if IsHF(p) {
-		hp, err := hfParse(p)
-		if err != nil {
-			return false
-		}
-		return hp.file == ""
-	}
-	info, err := os.Stat(p)
-	if err != nil {
-		return strings.HasSuffix(p, string(os.PathSeparator)) || strings.HasSuffix(p, "/")
-	}
-	return info.IsDir()
-}
-
-// hfParsed is a minimal internal struct to avoid exposing hf.Path.
-type hfParsed struct {
-	file string
-}
-
-func hfParse(p string) (hfParsed, error) {
-	hp, err := hf.Parse(p)
-	if err != nil {
-		return hfParsed{}, err
-	}
-	return hfParsed{file: hp.File}, nil
-}

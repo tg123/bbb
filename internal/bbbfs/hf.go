@@ -139,6 +139,14 @@ func (hfFS) IsDirLike(_ context.Context, p string) (bool, error) {
 	return hp.File == "", nil
 }
 
+func (hfFS) IsDirLikeFromPath(p string) bool {
+	hp, err := hf.Parse(p)
+	if err != nil {
+		return false
+	}
+	return hp.File == ""
+}
+
 func (hfFS) ChildPath(parent, child string) string {
 	hp, err := hf.Parse(parent)
 	if err != nil {
