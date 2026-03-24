@@ -153,7 +153,7 @@ func (hfFS) ChildPath(parent, child string) string {
 	if err != nil {
 		return parent + "/" + child
 	}
-	child = filepath.ToSlash(child)
+	child = filepath.ToSlash(child) // normalize Windows backslash separators
 	if hp.File == "" {
 		hp.File = child
 	} else {

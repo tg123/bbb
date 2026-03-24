@@ -139,7 +139,7 @@ func (azFS) ChildPath(parent, child string) string {
 	if err != nil {
 		return parent + "/" + child
 	}
-	return ap.Child(filepath.ToSlash(child)).String()
+	return ap.Child(filepath.ToSlash(child)).String() // normalize Windows backslash separators
 }
 
 func (azFS) BaseName(p string) string {
