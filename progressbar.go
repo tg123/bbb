@@ -34,14 +34,18 @@ func startElapsedTicker() {
 	}
 	elapsedTicker = time.NewTicker(1 * time.Second)
 	elapsedDone = make(chan struct{})
+	// Capture the current ticker and done channel so the goroutine does not
+	// depend on the mutable package-level pointers.
+	t := elapsedTicker
+	done := elapsedDone
 	elapsedWg.Add(1)
 	go func() {
 		defer elapsedWg.Done()
 		for {
 			select {
-			case <-elapsedDone:
+			case <-done:
 				return
-			case _, ok := <-elapsedTicker.C:
+			case _, ok := <-t.C:
 				if !ok {
 					return
 				}
@@ -204,7 +208,6 @@ type progressBar struct {
 
 const (
 	progressUninitialized = int64(-1)
-	minProgressTotal      = 2
 	renderMinInterval     = 50 * time.Millisecond // throttle renders from parallel goroutines
 
 	ansiReset = "\033[0m"
