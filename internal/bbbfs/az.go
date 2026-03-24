@@ -344,4 +344,3 @@ func (azFS) DeletePrefix(ctx context.Context, p string) error {
 	}
 	return azblob.DeletePrefix(ctx, ap)
 }
-
