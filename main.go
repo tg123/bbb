@@ -521,18 +521,6 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 // (next file's HeadBlob/SAS while current file finishes its last blocks).
 const maxServerSideCopyFiles = 2
 
-func sizeOfReader(reader io.Reader) int64 {
-	sizer, ok := reader.(interface{ Size() int64 })
-	if !ok {
-		return 0
-	}
-	size := sizer.Size()
-	if size <= 0 {
-		return 0
-	}
-	return size
-}
-
 func sendOp[T any](ctx context.Context, ch chan<- T, op T) error {
 	select {
 	case <-ctx.Done():
