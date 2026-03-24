@@ -16,6 +16,16 @@ var doRequest = func(req *http.Request) (*http.Response, error) {
 	return http.DefaultClient.Do(req)
 }
 
+// HTTPStatusError is returned when an HTTP request returns a non-2xx status code.
+type HTTPStatusError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return e.Status
+}
+
 // Path represents a Hugging Face repository or file.
 type Path struct {
 	Repo string // owner/name
@@ -112,10 +122,8 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if cerr := resp.Body.Close(); cerr != nil {
-			return nil, fmt.Errorf("hf download failed: %s (close error: %v)", resp.Status, cerr)
-		}
-		return nil, fmt.Errorf("hf download failed: %s", resp.Status)
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("hf download failed: %w", &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status})
 	}
 	return downloadReadCloser{
 		ReadCloser: resp.Body,
@@ -157,7 +165,7 @@ func ListFiles(ctx context.Context, p Path) ([]string, error) {
 		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("hf list failed: %s", resp.Status)
+		return nil, fmt.Errorf("hf list failed: %w", &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status})
 	}
 	var payload struct {
 		Siblings []struct {

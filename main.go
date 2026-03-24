@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -23,14 +26,17 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+
 	"github.com/tg123/bbb/internal/azblob"
+	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/fsops"
 	"github.com/tg123/bbb/internal/hf"
 )
 
 var mainver string = "(devel)"
 
-const hfScheme = "hf://"
+const hfScheme = bbbfs.HFScheme
 
 func version() string {
 	v := mainver
@@ -55,14 +61,37 @@ func version() string {
 }
 
 func isAz(s string) bool {
-	if strings.HasPrefix(s, "az://") {
-		return true
-	}
-	return azblob.IsBlobURL(s)
+	return strings.HasPrefix(s, "az://") || azblob.IsBlobURL(s)
 }
 
 func isHF(s string) bool {
 	return strings.HasPrefix(s, hfScheme)
+}
+
+type dialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// dnsLoggingDialContext wraps a base dialer to log DNS resolution results at
+// debug level before each connection. When debug logging is not enabled the
+// wrapper is a no-op and delegates directly to baseDial, so there is no extra
+// overhead in normal operation. The original address is always passed through
+// to baseDial, preserving Go's standard happy-eyeballs dialing behaviour.
+func dnsLoggingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dialContextFunc {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if slog.Default().Enabled(ctx, slog.LevelDebug) {
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil {
+				addrs, dnsErr := resolver.LookupHost(ctx, host)
+				if dnsErr != nil {
+					slog.Debug("DNS lookup error", "host", host, "error", dnsErr)
+				} else if len(addrs) == 0 {
+					slog.Debug("DNS lookup returned no addresses", "host", host)
+				} else {
+					slog.Debug("DNS lookup", "host", host, "addrs", addrs)
+				}
+			}
+		}
+		return baseDial(ctx, network, addr)
+	}
 }
 
 func main() {
@@ -78,6 +107,8 @@ func main() {
 				Value:   "info",
 				Sources: cli.EnvVars("BBB_LOG_LEVEL"),
 			},
+			&cli.StringFlag{Name: "taskfile", Usage: "Task file containing one `src dst` pair per line (`-` for stdin)"},
+			&cli.StringFlag{Name: "state", Usage: "State file for crash recovery"},
 		},
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
 			lvlStr := cmd.String("loglevel")
@@ -95,8 +126,19 @@ func main() {
 				lvl = slog.LevelInfo
 			}
 			handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
-			slog.SetDefault(slog.New(handler))
+			slog.SetDefault(slog.New(&barAwareHandler{inner: handler}))
 			slog.Debug("Logger initialized", "level", lvlStr)
+
+			if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+				transport = transport.Clone()
+				baseDial := (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext
+				transport.DialContext = dnsLoggingDialContext(baseDial, net.DefaultResolver)
+				http.DefaultTransport = transport
+			}
+
 			return ctx, nil
 		},
 		Commands: []*cli.Command{
@@ -194,7 +236,7 @@ func main() {
 			{
 				Name:      "cp",
 				Usage:     "Copy files or directories",
-				UsageText: "bbb cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
+				UsageText: "bbb [--taskfile FILE|--taskfile -] [--state FILE] cp [-q|--quiet] [--concurrency N] [--retry-count N]\n   or: bbb [--state FILE] cp [-q|--quiet] [--concurrency N] [--retry-count N] srcs [srcs ...] dst",
 				Aliases:   []string{"cpr", "cptree"},
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "f", Usage: "force overwrite"},
@@ -242,7 +284,7 @@ func main() {
 			{
 				Name:      "sync",
 				Usage:     "Synchronise two directory trees",
-				UsageText: "bbb sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] src dst",
+				UsageText: "bbb [--taskfile FILE|--taskfile -] [--state FILE] sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N]\n   or: bbb [--state FILE] sync [-q|--quiet] [--delete] [-x EXCLUDE|--exclude EXCLUDE] [--concurrency N] [--retry-count N] src dst",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "dry-run", Usage: "show actions without applying"},
 					&cli.BoolFlag{Name: "delete", Usage: "Delete destination files that don't exist in source"},
@@ -269,79 +311,6 @@ func main() {
 	// Remove any stray cli.Before assignment
 }
 
-func normalizeHFPrefix(prefix string) string {
-	for strings.HasPrefix(prefix, "/") {
-		prefix = strings.TrimPrefix(prefix, "/")
-	}
-	if prefix == "" {
-		return ""
-	}
-	prefix = path.Clean(prefix)
-	if prefix == "." {
-		return ""
-	}
-	return prefix
-}
-
-func hfFilterFiles(files []string, prefix string) []string {
-	prefix = normalizeHFPrefix(prefix)
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-	out := make([]string, 0, len(files))
-	for _, file := range files {
-		if file == "" {
-			continue
-		}
-		if prefix != "" {
-			if !strings.HasPrefix(file, prefix) {
-				continue
-			}
-			file = strings.TrimPrefix(file, prefix)
-			if file == "" {
-				continue
-			}
-		}
-		out = append(out, file)
-	}
-	return out
-}
-
-func hfListEntries(files []string, prefix string) []string {
-	seen := map[string]struct{}{}
-	for _, file := range hfFilterFiles(files, prefix) {
-		parts := strings.SplitN(file, "/", 2)
-		name := parts[0]
-		if name == "" {
-			continue
-		}
-		if len(parts) > 1 {
-			name += "/"
-		}
-		seen[name] = struct{}{}
-	}
-	entries := make([]string, 0, len(seen))
-	for name := range seen {
-		entries = append(entries, name)
-	}
-	sort.Strings(entries)
-	return entries
-}
-
-func hfSplitWildcard(target string) (string, string) {
-	parentPath := target
-	var pattern string
-	if strings.Contains(target, "*") {
-		starIdx := strings.Index(target, "*")
-		lastSlash := strings.LastIndex(target[:starIdx], "/")
-		if lastSlash >= len(hfScheme) {
-			parentPath = target[:lastSlash+1]
-			pattern = target[lastSlash+1:]
-		}
-	}
-	return parentPath, pattern
-}
-
 func cmdLS(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdLS called", "args", c.Args().Slice())
 	long := c.Bool("l")
@@ -352,166 +321,71 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 	}
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s")
-	if isHF(target) {
-		parentPath, pattern := hfSplitWildcard(target)
-		hp, err := hf.Parse(parentPath)
-		if err != nil {
-			return err
-		}
-		hp.File = normalizeHFPrefix(hp.File)
-		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
-		if err != nil {
-			return err
-		}
-		entries := hfListEntries(files, hp.File)
-		for _, name := range entries {
-			trimmed := strings.TrimSuffix(name, "/")
-			if trimmed == "" {
-				continue
-			}
-			if !all && len(trimmed) > 0 && trimmed[0] == '.' {
-				continue
-			}
-			if pattern != "" {
-				matched, err := path.Match(pattern, trimmed)
-				if err != nil {
-					return err
-				}
-				if !matched {
-					continue
-				}
-			}
-			fullFile := path.Join(hp.File, trimmed)
-			fullpath := hf.Path{Repo: hp.Repo, File: fullFile}.String()
-			displayPath := fullpath
-			if relFlag {
-				displayPath = trimmed
-			}
-			if long {
-				typ := "-"
-				if strings.HasSuffix(name, "/") {
-					typ = "d"
-				}
-				if machine {
-					fmt.Printf("%s\t%d\t-\t%s\n", typ, 0, displayPath)
-				} else {
-					fmt.Printf("%1s %10d %s %s\n", typ, 0, "-", displayPath)
-				}
+	parentPath, pattern := splitWildcard(target)
+	fs := bbbfs.Resolve(parentPath)
+	entries, err := fs.List(ctx, parentPath)
+	if err != nil {
+		// List may fail on file targets (e.g. ENOTDIR for local paths).
+		// Fall back to Stat when no wildcard was used.
+		if pattern == "" {
+			st, statErr := fs.Stat(ctx, parentPath)
+			if statErr == nil && !st.IsDir {
+				entries = []bbbfs.Entry{st}
 			} else {
-				fmt.Println(displayPath)
-			}
-		}
-		return nil
-	}
-	if isAz(target) {
-		// Wildcard support for Azure paths
-		var pattern string
-		var parentPath string
-		if strings.Contains(target, "*") {
-			// Split at last slash before the wildcard
-			lastSlash := strings.LastIndex(target, "/")
-			if lastSlash >= 0 {
-				parentPath = target[:lastSlash+1]
-				pattern = target[lastSlash+1:]
-			} else {
-				parentPath = target
-				pattern = "*"
+				return err
 			}
 		} else {
-			parentPath = target
-		}
-		ap, err := azblob.Parse(parentPath)
-		if err != nil {
 			return err
 		}
-		err = azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
-			name := bm.Name
-			if name == "" {
-				return nil
-			}
-			if !all && name[0] == '.' {
-				return nil
-			}
-			// Wildcard filtering
-			if pattern != "" {
-				matched, err := path.Match(pattern, strings.TrimSuffix(name, "/"))
-				if err != nil {
-					return err
-				}
-				if !matched {
-					return nil
-				}
-			}
-			var fullpath string
-			if ap.Container == "" {
-				fullpath = fmt.Sprintf("az://%s/%s", ap.Account, strings.TrimSuffix(name, "/"))
-			} else if ap.Blob == "" {
-				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, strings.TrimSuffix(name, "/"))
-			} else {
-				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
-				fullpath = strings.TrimSuffix(fullpath, "/")
-			}
-			displayPath := fullpath
-			if relFlag {
-				displayPath = strings.TrimSuffix(name, "/")
-			}
-			if long {
-				typ := "-"
-				if strings.HasSuffix(name, "/") || (bm.Size == 0 && strings.HasSuffix(ap.Blob, "/")) || ap.Container == "" {
-					typ = "d"
-				}
-				if machine {
-					fmt.Printf("%s\t%d\t-\t%s\n", typ, bm.Size, displayPath)
-				} else {
-					fmt.Printf("%1s %10d %s %s\n", typ, bm.Size, "-", displayPath)
-				}
-			} else {
-				fmt.Println(displayPath)
-			}
-			return nil
-		})
-		if err != nil {
-			return err
+	}
+	// If listing returns nothing and no wildcard was used, the target
+	// may be a file rather than a directory. Fall back to Stat so that
+	// single-file paths (e.g. az://account/container/blob) are shown.
+	if len(entries) == 0 && pattern == "" {
+		st, statErr := fs.Stat(ctx, parentPath)
+		if statErr == nil && !st.IsDir {
+			entries = []bbbfs.Entry{st}
 		}
-		return nil
 	}
-	entries, err := fsops.List(target)
-	if err != nil {
-		return err
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	for _, e := range entries {
-		name := e.Name()
-		if !all && name != "." && name != ".." && name[0] == '.' {
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	for _, entry := range entries {
+		name := entry.Name
+		trimmed := strings.TrimSuffix(name, "/")
+		if trimmed == "" {
 			continue
 		}
-		if long {
-			info, err := e.Info()
+		if !all && len(trimmed) > 0 && trimmed[0] == '.' {
+			continue
+		}
+		if pattern != "" {
+			matched, err := path.Match(pattern, trimmed)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
+				return err
+			}
+			if !matched {
 				continue
 			}
-			mod := info.ModTime().Format(time.RFC3339)
-			size := info.Size()
+		}
+		displayPath := entry.Path
+		if relFlag {
+			displayPath = trimmed
+		}
+		if long {
 			typ := "-"
-			if info.IsDir() {
+			if entry.IsDir {
 				typ = "d"
 			}
-			outName := name
-			if relFlag {
-				outName = filepath.Clean(name)
+			mod := "-"
+			if !entry.ModTime.IsZero() {
+				mod = entry.ModTime.Format(time.RFC3339)
 			}
 			if machine {
-				fmt.Printf("%s\t%d\t%s\t%s\n", typ, size, mod, outName)
+				fmt.Printf("%s\t%d\t%s\t%s\n", typ, entry.Size, mod, displayPath)
 			} else {
-				fmt.Printf("%1s %10d %s %s\n", typ, size, mod, outName)
+				fmt.Printf("%1s %10d %s %s\n", typ, entry.Size, mod, displayPath)
 			}
 		} else {
-			outName := name
-			if relFlag {
-				outName = filepath.Clean(name)
-			}
-			fmt.Println(outName)
+			fmt.Println(displayPath)
 		}
 	}
 	return nil
@@ -531,156 +405,50 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s") || c.Bool("relative")
 
-	if isHF(root) {
-		parentPath, pattern := hfSplitWildcard(root)
-		hp, err := hf.Parse(parentPath)
-		if err != nil {
-			return err
+	parentPath, pattern := splitWildcard(root)
+	var list []bbbfs.Entry
+	for result := range bbbfs.ListRecursive(ctx, parentPath) {
+		if result.Err != nil {
+			return result.Err
 		}
-		hp.File = normalizeHFPrefix(hp.File)
-		files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
-		if err != nil {
-			return err
-		}
-		list := hfFilterFiles(files, hp.File)
-		sort.Strings(list)
-		var count int64
-		for _, name := range list {
-			if name == "" {
-				continue
-			}
-			if pattern != "" {
-				last := name
-				if idx := strings.LastIndex(name, "/"); idx >= 0 {
-					last = name[idx+1:]
-				}
-				matched, err := path.Match(pattern, last)
-				if err != nil {
-					return err
-				}
-				if !matched {
-					continue
-				}
-			}
-			count++
-			fullFile := path.Join(hp.File, name)
-			fullpath := hf.Path{Repo: hp.Repo, File: fullFile}.String()
-			display := fullpath
-			if relFlag {
-				display = name
-			}
-			if longFlag {
-				if machine {
-					fmt.Printf("f\t%d\t-\t%s\n", 0, display)
-				} else {
-					fmt.Printf("%10d  -  %s\n", 0, display)
-				}
-			} else {
-				if machine {
-					fmt.Printf("f\t%s\n", display)
-				} else {
-					fmt.Println(display)
-				}
-			}
-		}
-		if !machine {
-			fmt.Printf("%d files\n", count)
-		}
-		return nil
+		list = append(list, result.Entry)
 	}
-	if isAz(root) {
-		// Wildcard support for Azure paths
-		var pattern string
-		if strings.Contains(root, "*") {
-			starIdx := strings.Index(root, "*")
-			pattern = root[starIdx:]
-			root = root[:starIdx]
-		}
-		ap, err := azblob.Parse(root)
-		if err != nil {
-			return err
-		}
-		list, err := azblob.ListRecursive(ctx, ap)
-		if err != nil {
-			return err
-		}
-		prefix := ap.Blob
-		if relFlag && prefix != "" && !strings.HasSuffix(prefix, "/") {
-			prefix += "/"
-		}
-		var count int64
-		for _, bm := range list {
-			name := bm.Name
-			if name == "" || strings.HasSuffix(name, "/") {
-				continue
-			}
-			// Wildcard filtering: match only last segment
-			if pattern != "" {
-				last := name
-				if idx := strings.LastIndex(name, "/"); idx >= 0 {
-					last = name[idx+1:]
-				}
-				matched, _ := path.Match(pattern, last)
-				if !matched {
-					continue
-				}
-			}
-			count++
-			fullpath := ap.Child(name).String()
-			display := fullpath
-			if relFlag && prefix != "" && strings.HasPrefix(name, prefix) {
-				display = strings.TrimPrefix(name, prefix)
-			}
-			if longFlag {
-				if machine {
-					fmt.Printf("f\t%d\t-\t%s\n", bm.Size, display)
-				} else {
-					fmt.Printf("%10d  -  %s\n", bm.Size, display)
-				}
-			} else {
-				if machine {
-					fmt.Printf("f\t%s\n", display)
-				} else {
-					fmt.Println(display)
-				}
-			}
-		}
-		if !machine {
-			fmt.Printf("%d files\n", count)
-		}
-		return nil
-	}
-
-	// Local
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	var count int64
-	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
+	var totalSize int64
+	for _, entry := range list {
+		name := entry.Name
+		if name == "" || entry.IsDir {
+			continue
 		}
-		if d.IsDir() {
-			return nil
+		if pattern != "" {
+			last := name
+			if idx := strings.LastIndex(name, "/"); idx >= 0 {
+				last = name[idx+1:]
+			}
+			matched, err := path.Match(pattern, last)
+			if err != nil {
+				return err
+			}
+			if !matched {
+				continue
+			}
 		}
 		count++
-		display := p
+		totalSize += entry.Size
+		display := entry.Path
 		if relFlag {
-			if root == "." {
-				display = p
-			} else if rel, rerr := filepath.Rel(root, p); rerr == nil {
-				display = rel
-			}
+			display = name
 		}
 		if longFlag {
-			info, serr := os.Stat(p)
-			var size int64
-			modStr := "-"
-			if serr == nil {
-				size = info.Size()
-				modStr = info.ModTime().Format(time.RFC3339)
+			mod := "-"
+			if !entry.ModTime.IsZero() {
+				mod = entry.ModTime.Format(time.RFC3339)
 			}
 			if machine {
-				fmt.Printf("f\t%d\t%s\t%s\n", size, modStr, display)
+				fmt.Printf("f\t%d\t%s\t%s\n", entry.Size, mod, display)
 			} else {
-				fmt.Printf("%10d  %s  %s\n", size, modStr, display)
+				fmt.Printf("%10s  %s  %s\n", formatSize(entry.Size), mod, display)
 			}
 		} else {
 			if machine {
@@ -689,15 +457,32 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 				fmt.Println(display)
 			}
 		}
-		return nil
-	})
-	if err != nil {
-		return err
 	}
 	if !machine {
-		fmt.Printf("%d files\n", count)
+		noun := "files"
+		if count == 1 {
+			noun = "file"
+		}
+		fmt.Printf("Listed %d %s summing to %s (%d bytes)\n", count, noun, formatSize(totalSize), totalSize)
 	}
 	return nil
+}
+
+func splitWildcard(target string) (string, string) {
+	metaIdx := strings.IndexAny(target, "*?[")
+	if metaIdx < 0 {
+		return target, ""
+	}
+	if schemeIdx := strings.Index(target, "://"); schemeIdx >= 0 && schemeIdx < metaIdx {
+		pathStart := schemeIdx + len("://")
+		if !strings.Contains(target[pathStart:metaIdx], "/") {
+			return target, "*"
+		}
+	}
+	if lastSlash := strings.LastIndex(target[:metaIdx], "/"); lastSlash >= 0 {
+		return target[:lastSlash+1], target[lastSlash+1:]
+	}
+	return target, "*"
 }
 
 func cmdCat(ctx context.Context, c *cli.Command) error {
@@ -707,54 +492,15 @@ func cmdCat(ctx context.Context, c *cli.Command) error {
 	}
 	for i := 0; i < c.Args().Len(); i++ {
 		p := c.Args().Get(i)
-		if isAz(p) {
-			ap, err := azblob.Parse(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-				continue
-			}
-			reader, err := azblob.DownloadStream(ctx, ap)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-				continue
-			}
-			if err := withReadCloser(reader, func(r io.Reader) error {
-				_, err := io.Copy(os.Stdout, r)
-				return err
-			}); err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-			}
-			continue
-		}
-		if isHF(p) {
-			hfPath, err := hf.Parse(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-				continue
-			}
-			reader, err := hf.DownloadStream(ctx, hfPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-				continue
-			}
-			if err := withReadCloser(reader, func(r io.Reader) error {
-				_, err := io.Copy(os.Stdout, r)
-				return err
-			}); err != nil {
-				fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
-			}
-			continue
-		}
-		f, err := os.Open(p)
+		reader, err := bbbfs.Resolve(p).Read(ctx, p)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
 			continue
 		}
-		_, err = io.Copy(os.Stdout, f)
-		if cerr := f.Close(); cerr != nil && err == nil {
-			err = cerr
-		}
-		if err != nil {
+		if err := withReadCloser(reader, func(r io.Reader) error {
+			_, err := io.Copy(os.Stdout, r)
+			return err
+		}); err != nil {
 			fmt.Fprintf(os.Stderr, "cat: %s: %v\n", p, err)
 		}
 	}
@@ -786,26 +532,170 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
-var outputMu sync.Mutex
+var (
+	outputMu        sync.Mutex
+	activeBars      []*progressBar // guarded by outputMu; rendered in order
+	maxLabelWidth   int            // guarded by outputMu; high-water mark for label alignment
+	elapsedTickerMu sync.Mutex
+	elapsedTicker   *time.Ticker
+	elapsedDone     chan struct{}
+	elapsedWg       sync.WaitGroup
+)
+
+// startElapsedTicker starts a 1-second background ticker that re-renders
+// active progress bars so the elapsed-time field stays up-to-date even when
+// no new progress events arrive. It is safe to call multiple times; only
+// one ticker runs at a time. Requires outputMu NOT to be held.
+func startElapsedTicker() {
+	elapsedTickerMu.Lock()
+	defer elapsedTickerMu.Unlock()
+	if elapsedTicker != nil {
+		return // already running
+	}
+	elapsedTicker = time.NewTicker(1 * time.Second)
+	elapsedDone = make(chan struct{})
+	elapsedWg.Add(1)
+	go func() {
+		defer elapsedWg.Done()
+		for {
+			select {
+			case <-elapsedDone:
+				return
+			case _, ok := <-elapsedTicker.C:
+				if !ok {
+					return
+				}
+				outputMu.Lock()
+				if len(activeBars) > 0 {
+					clearActiveBars()
+					rerenderActiveBars()
+				}
+				outputMu.Unlock()
+			}
+		}
+	}()
+}
+
+// stopElapsedTicker stops the background ticker and waits for the
+// goroutine to exit. Safe to call when no ticker is running.
+func stopElapsedTicker() {
+	elapsedTickerMu.Lock()
+	if elapsedTicker == nil {
+		elapsedTickerMu.Unlock()
+		return
+	}
+	elapsedTicker.Stop()
+	close(elapsedDone)
+	elapsedTicker = nil
+	elapsedDone = nil
+	elapsedTickerMu.Unlock()
+	elapsedWg.Wait()
+}
+
+func clearActiveBars() {
+	n := len(activeBars)
+	if n == 0 || !isTerminal(os.Stderr) {
+		return
+	}
+	if n > 1 {
+		fmt.Fprintf(os.Stderr, "\033[%dA", n-1) // move cursor up to first bar line
+	}
+	fmt.Fprintf(os.Stderr, "\r\033[J") // clear from cursor to end of screen
+}
+
+func rerenderActiveBars() {
+	for i, bar := range activeBars {
+		bar.renderAligned(maxLabelWidth)
+		if i < len(activeBars)-1 {
+			fmt.Fprintf(os.Stderr, "\n")
+		}
+	}
+}
+
+func addActiveBar(p *progressBar) {
+	for _, b := range activeBars {
+		if b == p {
+			return
+		}
+	}
+	if n := len(p.label); n > maxLabelWidth {
+		maxLabelWidth = n
+	}
+	if p.pinBottom {
+		activeBars = append(activeBars, p)
+		return
+	}
+	// Insert before any pinBottom bars so they stay at the bottom.
+	insertAt := len(activeBars)
+	for insertAt > 0 && activeBars[insertAt-1].pinBottom {
+		insertAt--
+	}
+	activeBars = append(activeBars, nil)
+	copy(activeBars[insertAt+1:], activeBars[insertAt:])
+	activeBars[insertAt] = p
+}
+
+func removeActiveBar(p *progressBar) {
+	for i, b := range activeBars {
+		if b == p {
+			activeBars = append(activeBars[:i], activeBars[i+1:]...)
+			return
+		}
+	}
+}
 
 func lockedPrintf(format string, args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
+	clearActiveBars()
 	fmt.Printf(format, args...)
+	rerenderActiveBars()
 }
 
 func lockedPrintln(args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
+	clearActiveBars()
 	fmt.Println(args...)
+	rerenderActiveBars()
 }
 
 func lockedFprintf(w io.Writer, format string, args ...any) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
+	clearActiveBars()
 	if _, err := fmt.Fprintf(w, format, args...); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
+	rerenderActiveBars()
+}
+
+// barAwareHandler wraps an slog.Handler so log output coordinates with the
+// pinned progress bar. It clears the active bar before writing and
+// re-renders it after, preventing log lines from clobbering the bar.
+type barAwareHandler struct {
+	inner slog.Handler
+}
+
+func (h *barAwareHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h *barAwareHandler) Handle(ctx context.Context, r slog.Record) error {
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	clearActiveBars()
+	err := h.inner.Handle(ctx, r)
+	rerenderActiveBars()
+	return err
+}
+
+func (h *barAwareHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &barAwareHandler{inner: h.inner.WithAttrs(attrs)}
+}
+
+func (h *barAwareHandler) WithGroup(name string) slog.Handler {
+	return &barAwareHandler{inner: h.inner.WithGroup(name)}
 }
 
 func isTerminal(f *os.File) bool {
@@ -817,24 +707,76 @@ func isTerminal(f *os.File) bool {
 }
 
 type progressBar struct {
-	label       string
-	total       int64
-	width       int
-	done        atomic.Int64
-	lastPercent atomic.Int64
-	finished    atomic.Bool
+	label      string
+	width      int
+	showSpeed  bool
+	byteSized  bool // if true, show done/total as formatted byte sizes
+	startedAt  time.Time
+	total      atomic.Int64
+	done       atomic.Int64
+	bytesDone  atomic.Int64
+	lastDone   atomic.Int64
+	lastTotal  atomic.Int64
+	finished   atomic.Bool
+	pinBottom  bool         // if true, renders at the bottom of the bar stack
+	lastRender atomic.Int64 // unix nanos of last actual render; for throttling
 }
 
-func newProgressBar(total int, label string, quiet bool) *progressBar {
+const (
+	progressUninitialized = int64(-1)
+	minProgressTotal      = 2
+	renderMinInterval     = 50 * time.Millisecond // throttle renders from parallel goroutines
+
+	// maxServerSideCopyFiles limits the number of files being server-side
+	// copied in parallel. Each CopyBlobServerSide call spawns `concurrency`
+	// block goroutines, so without this cap the total goroutines would be
+	// poolSize × concurrency (N²). Two concurrent files allow overlap
+	// (next file's HeadBlob/SAS while current file finishes its last blocks).
+	maxServerSideCopyFiles = 2
+
+	ansiReset = "\033[0m"
+	ansiBold  = "\033[1m"
+	ansiGreen = "\033[32m"
+	ansiCyan  = "\033[36m"
+	ansiGray  = "\033[90m"
+	ansiClear = "\033[K"
+)
+
+func newProgressBar(total int, label string, quiet bool, showSpeed bool) *progressBar {
 	if quiet || total <= 1 || !isTerminal(os.Stderr) {
 		return nil
 	}
 	bar := &progressBar{
-		label: label,
-		total: int64(total),
-		width: 28,
+		label:     label,
+		width:     28,
+		showSpeed: showSpeed,
+		startedAt: time.Now(),
 	}
+	bar.total.Store(int64(total))
+	bar.lastDone.Store(progressUninitialized)
+	bar.lastTotal.Store(progressUninitialized)
+	startElapsedTicker()
 	bar.render(0)
+	return bar
+}
+
+// newStreamingProgressBar creates a progress bar with total=0 for streaming
+// mode where the total grows dynamically as items are discovered. The bar
+// stays invisible until the first SetTotal call with a positive value.
+func newStreamingProgressBar(label string, quiet bool, showSpeed bool) *progressBar {
+	if quiet || !isTerminal(os.Stderr) {
+		return nil
+	}
+	bar := &progressBar{
+		label:     label,
+		width:     28,
+		showSpeed: showSpeed,
+		startedAt: time.Now(),
+	}
+	bar.lastDone.Store(progressUninitialized)
+	bar.lastTotal.Store(progressUninitialized)
+	startElapsedTicker()
+	// total starts at 0; bar won't render until SetTotal(>0) is called.
 	return bar
 }
 
@@ -846,49 +788,159 @@ func (p *progressBar) Increment() {
 	p.render(done)
 }
 
+func (p *progressBar) AddBytes(n int64) {
+	if p == nil || n <= 0 {
+		return
+	}
+	p.bytesDone.Add(n)
+}
+
+// atomicMax updates an atomic.Int64 to val if val is greater than the current
+// value. It is safe for concurrent use.
+func atomicMax(a *atomic.Int64, val int64) {
+	for {
+		cur := a.Load()
+		if val <= cur {
+			return
+		}
+		if a.CompareAndSwap(cur, val) {
+			return
+		}
+	}
+}
+
+func (p *progressBar) SetTotal(total int64) {
+	if p == nil {
+		return
+	}
+	if total < 1 {
+		total = 1
+	}
+	// Monotonically increasing: only allow total to grow, never shrink.
+	for {
+		cur := p.total.Load()
+		if total <= cur {
+			return
+		}
+		if p.total.CompareAndSwap(cur, total) {
+			break
+		}
+	}
+	if p.done.Load() < total {
+		p.finished.Store(false)
+	}
+	p.render(p.done.Load())
+}
+
 func (p *progressBar) Finish() {
 	if p == nil {
 		return
 	}
-	p.done.Store(p.total)
-	p.render(p.total)
+	if !p.finished.CompareAndSwap(false, true) {
+		return
+	}
+	// If the bar was never actually rendered (e.g. a 0-byte copy where
+	// total was never set, or a streaming bar that never received
+	// SetTotal), skip the final render and trailing newline to avoid
+	// printing a misleading "1 B/1 B" line.
+	neverShown := p.lastTotal.Load() == progressUninitialized
+	total := p.total.Load()
+	if total < 1 {
+		total = 1
+		p.total.Store(total)
+	}
+	p.done.Store(total)
+	outputMu.Lock()
+	clearActiveBars()
+	removeActiveBar(p)
+	if !neverShown {
+		// Use the global high-water mark for label width so the completed
+		// line aligns with all bars that have ever been shown.
+		p.renderAligned(maxLabelWidth)
+		fmt.Fprintf(os.Stderr, "\n")
+	}
+	rerenderActiveBars()
+	noActiveBars := len(activeBars) == 0
+	outputMu.Unlock()
+	if noActiveBars {
+		stopElapsedTicker()
+	}
 }
 
-func (p *progressBar) render(done int64) {
+// renderAligned writes the progress bar to stderr with the label padded to
+// labelWidth characters. This aligns bars with different-length labels.
+// outputMu must be held.
+func (p *progressBar) renderAligned(labelWidth int) {
 	if p == nil {
 		return
 	}
-	if p.total <= 0 {
+	done := p.done.Load()
+	total := p.total.Load()
+	if total <= 0 {
 		return
 	}
-	if done < 0 {
-		done = 0
+	done, total = clampProgress(done, total)
+	elapsedDur := time.Since(p.startedAt)
+	elapsed := elapsedDur.Seconds()
+	speed := 0.0
+	if p.showSpeed && elapsed > 0 {
+		speed = float64(p.bytesDone.Load()) / elapsed
 	}
-	if done > p.total {
-		done = p.total
+	label := p.label
+	if labelWidth > len(label) {
+		label = label + strings.Repeat(" ", labelWidth-len(label))
 	}
-	percent := done * 100 / p.total
-	if done != p.total {
-		for {
-			prev := p.lastPercent.Load()
-			if percent == prev {
-				return
-			}
-			if p.lastPercent.CompareAndSwap(prev, percent) {
-				break
-			}
-		}
-	} else if !p.finished.CompareAndSwap(false, true) {
-		return
-	}
-	line := formatProgressBar(p.label, done, p.total, p.width)
-	lockedFprintf(os.Stderr, "\r%s", line)
-	if done == p.total {
-		lockedFprintf(os.Stderr, "\n")
+	if isTerminal(os.Stderr) {
+		line := formatFancyBar(label, done, total, p.width, speed, p.showSpeed, p.byteSized, elapsedDur)
+		fmt.Fprintf(os.Stderr, "\r"+ansiClear+"%s", line)
+	} else {
+		line := formatProgressBar(label, done, total, p.width, speed, p.showSpeed, p.byteSized, elapsedDur)
+		fmt.Fprintf(os.Stderr, "\r%s", line)
 	}
 }
 
-func formatProgressBar(label string, done, total int64, width int) string {
+func clampProgress(done, total int64) (int64, int64) {
+	if done < 0 {
+		done = 0
+	}
+	if done > total {
+		done = total
+	}
+	return done, total
+}
+
+func (p *progressBar) render(done int64) {
+	if p == nil || p.finished.Load() {
+		return
+	}
+	total := p.total.Load()
+	if total <= 0 {
+		return
+	}
+	done, total = clampProgress(done, total)
+	if p.lastDone.Load() == done && p.lastTotal.Load() == total {
+		return
+	}
+	p.lastDone.Store(done)
+	p.lastTotal.Store(total)
+	// Throttle: skip rendering if another render happened within renderMinInterval.
+	// This prevents parallel goroutines from flooding the terminal with ANSI escapes.
+	now := time.Now().UnixNano()
+	last := p.lastRender.Load()
+	if now-last < int64(renderMinInterval) {
+		return
+	}
+	if !p.lastRender.CompareAndSwap(last, now) {
+		return // another goroutine won the race
+	}
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	clearActiveBars()
+	addActiveBar(p)
+	rerenderActiveBars()
+}
+
+func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool, elapsed time.Duration) string {
 	if width < 1 {
 		width = 1
 	}
@@ -907,81 +959,133 @@ func formatProgressBar(label string, done, total int64, width int) string {
 		filled = width
 	}
 	bar := strings.Repeat("=", filled) + strings.Repeat(" ", width-filled)
-	return fmt.Sprintf("%s [%s] %3d%% (%d/%d)", label, bar, percent, done, total)
+	elapsedStr := formatElapsed(elapsed)
+	switch {
+	case byteSized && showSpeed:
+		return fmt.Sprintf("%s [%s] %3d%% (%s/%s, %s) %s", label, bar, percent, formatSize(done), formatSize(total), formatByteSpeed(speed), elapsedStr)
+	case byteSized:
+		return fmt.Sprintf("%s [%s] %3d%% (%s/%s) %s", label, bar, percent, formatSize(done), formatSize(total), elapsedStr)
+	case showSpeed:
+		return fmt.Sprintf("%s [%s] %3d%% (%d/%d, %s) %s", label, bar, percent, done, total, formatByteSpeed(speed), elapsedStr)
+	default:
+		return fmt.Sprintf("%s [%s] %3d%% (%d/%d) %s", label, bar, percent, done, total, elapsedStr)
+	}
 }
 
-func runWorkerPool(ctx context.Context, concurrency int, ops []func() error) error {
-	if len(ops) == 0 {
-		return nil
+func formatFancyBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool, elapsed time.Duration) string {
+	if width < 1 {
+		width = 1
 	}
-	if concurrency < 1 {
-		concurrency = 1
+	if total < 1 {
+		total = 1
 	}
-	if concurrency > len(ops) {
-		concurrency = len(ops)
+	if done < 0 {
+		done = 0
 	}
-	var collected []error
-	if concurrency == 1 {
-		for _, op := range ops {
-			if err := ctx.Err(); err != nil {
-				collected = append(collected, err)
-				break
-			}
-			if err := op(); err != nil {
-				collected = append(collected, err)
-			}
-		}
-		if len(collected) == 0 {
-			return nil
-		}
-		if len(collected) == 1 {
-			return collected[0]
-		}
-		return errors.Join(collected...)
+	if done > total {
+		done = total
 	}
-	work := make(chan func() error, len(ops))
-	for _, op := range ops {
-		work <- op
+	percent := done * 100 / total
+	filled := int(done * int64(width) / total)
+	if filled > width {
+		filled = width
 	}
-	close(work)
-	errs := make(chan error, len(ops))
-	var wg sync.WaitGroup
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case op, ok := <-work:
-					if !ok {
-						return
-					}
-					if err := op(); err != nil {
-						errs <- err
-					}
-				}
-			}
-		}()
+	bar := ansiGreen + strings.Repeat("━", filled) + ansiGray + strings.Repeat("━", width-filled) + ansiReset
+	pctColor := ansiCyan
+	suffix := ""
+	if done == total {
+		pctColor = ansiGreen
+		suffix = " " + ansiGreen + "✓" + ansiReset
 	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			collected = append(collected, err)
-		}
+	elapsedStr := formatElapsed(elapsed)
+	switch {
+	case byteSized && showSpeed:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s/%s, %s) %s%s", label, bar, pctColor, percent, formatSize(done), formatSize(total), formatByteSpeed(speed), elapsedStr, suffix)
+	case byteSized:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%s/%s) %s%s", label, bar, pctColor, percent, formatSize(done), formatSize(total), elapsedStr, suffix)
+	case showSpeed:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d, %s) %s%s", label, bar, pctColor, percent, done, total, formatByteSpeed(speed), elapsedStr, suffix)
+	default:
+		return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %s%3d%%"+ansiReset+" (%d/%d) %s%s", label, bar, pctColor, percent, done, total, elapsedStr, suffix)
 	}
-	if err := ctx.Err(); err != nil {
-		collected = append(collected, err)
+}
+
+func formatSize(bytes int64) string {
+	if bytes < 0 {
+		bytes = 0
 	}
-	if len(collected) == 0 {
-		return nil
+	const (
+		kib int64 = 1024
+		mib       = 1024 * kib
+		gib       = 1024 * mib
+		tib       = 1024 * gib
+	)
+	// formatUnit formats bytes in terms of the given unit using integer
+	// arithmetic (no float64 conversion) and truncates to 1 decimal place.
+	formatUnit := func(b, unit int64, suffix string) string {
+		whole := b / unit
+		frac := (b % unit) * 10 / unit // truncated tenths
+		return fmt.Sprintf("%d.%d %s", whole, frac, suffix)
 	}
-	if len(collected) == 1 {
-		return collected[0]
+	switch {
+	case bytes >= tib:
+		return formatUnit(bytes, tib, "TiB")
+	case bytes >= gib:
+		return formatUnit(bytes, gib, "GiB")
+	case bytes >= mib:
+		return formatUnit(bytes, mib, "MiB")
+	case bytes >= kib:
+		return formatUnit(bytes, kib, "KiB")
+	default:
+		return fmt.Sprintf("%d B", bytes)
 	}
-	return errors.Join(collected...)
+}
+
+func formatByteSpeed(bytesPerSecond float64) string {
+	if bytesPerSecond < 0 {
+		bytesPerSecond = 0
+	}
+	const (
+		kb = 1024.0
+		mb = 1024.0 * kb
+		gb = 1024.0 * mb
+	)
+	switch {
+	case bytesPerSecond >= gb:
+		return fmt.Sprintf("%.1f GB/s", bytesPerSecond/gb)
+	case bytesPerSecond >= mb:
+		return fmt.Sprintf("%.1f MB/s", bytesPerSecond/mb)
+	case bytesPerSecond >= kb:
+		return fmt.Sprintf("%.1f KB/s", bytesPerSecond/kb)
+	default:
+		return fmt.Sprintf("%.0f B/s", bytesPerSecond)
+	}
+}
+
+func formatElapsed(d time.Duration) string {
+	d = d.Truncate(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm%02ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
+}
+
+func sizeOfReader(reader io.Reader) int64 {
+	sizer, ok := reader.(interface{ Size() int64 })
+	if !ok {
+		return 0
+	}
+	size := sizer.Size()
+	if size <= 0 {
+		return 0
+	}
+	return size
 }
 
 func sendOp[T any](ctx context.Context, ch chan<- T, op T) error {
@@ -1040,6 +1144,20 @@ func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<-
 	return errors.Join(collected...)
 }
 
+// isNonRetryableHTTPErr returns true if err contains an HTTP 401, 403, or 404 status,
+// indicating an authentication/authorization failure or missing resource that should not be retried.
+func isNonRetryableHTTPErr(err error) bool {
+	var hfErr *hf.HTTPStatusError
+	if errors.As(err, &hfErr) && (hfErr.StatusCode == 401 || hfErr.StatusCode == 403 || hfErr.StatusCode == 404) {
+		return true
+	}
+	var azErr *azcore.ResponseError
+	if errors.As(err, &azErr) && (azErr.StatusCode == 401 || azErr.StatusCode == 403 || azErr.StatusCode == 404) {
+		return true
+	}
+	return false
+}
+
 func retryOp(ctx context.Context, retryCount int, op func() error) error {
 	if retryCount < 0 {
 		retryCount = 0
@@ -1052,6 +1170,9 @@ func retryOp(ctx context.Context, retryCount int, op func() error) error {
 		err = op()
 		if err == nil {
 			return nil
+		}
+		if isNonRetryableHTTPErr(err) {
+			return err
 		}
 	}
 	return err
@@ -1066,7 +1187,7 @@ func runOpPoolWithRetry[T any](ctx context.Context, concurrency int, retryCount 
 }
 
 func runOpPoolWithRetryProgress[T any](ctx context.Context, concurrency int, retryCount int, total int, quiet bool, label string, producer func(chan<- T) error, worker func(T) error) error {
-	progress := newProgressBar(total, label, quiet)
+	progress := newProgressBar(total, label, quiet, false)
 	err := runOpPoolWithRetry(ctx, concurrency, retryCount, producer, func(op T) error {
 		err := worker(op)
 		if progress != nil {
@@ -1080,20 +1201,570 @@ func runOpPoolWithRetryProgress[T any](ctx context.Context, concurrency int, ret
 	return err
 }
 
+func runOpPoolWithRetryProgressBytes[T any](ctx context.Context, concurrency int, retryCount int, total int, quiet bool, label string, producer func(chan<- T) error, worker func(T, bool) (int64, error)) error {
+	progress := newProgressBar(total, label, quiet, true)
+	err := runOpPoolWithRetry(ctx, concurrency, retryCount, producer, func(op T) error {
+		trackBytes := progress != nil
+		bytesDone, err := worker(op, trackBytes)
+		if progress != nil && err == nil {
+			progress.AddBytes(bytesDone)
+			progress.Increment()
+		}
+		return err
+	})
+	if progress != nil {
+		progress.Finish()
+	}
+	return err
+}
+
+type taskPair struct {
+	src string
+	dst string
+}
+
+const maxTaskfileLineSize = 4 * 1024 * 1024
+
+func parseTaskPairLine(line string, lineNo int) (taskPair, error) {
+	parts := strings.Fields(line)
+	if len(parts) != 2 {
+		return taskPair{}, fmt.Errorf("taskfile: line %d: expected exactly two whitespace-separated fields `src dst` (paths with spaces are not supported)", lineNo)
+	}
+	return taskPair{src: parts[0], dst: parts[1]}, nil
+}
+
+func loadTaskPairs(taskfile string) ([]taskPair, error) {
+	var (
+		reader io.Reader
+		file   *os.File
+		err    error
+	)
+	if taskfile == "-" {
+		reader = os.Stdin
+	} else {
+		file, err = os.Open(taskfile)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			_ = file.Close()
+		}()
+		reader = file
+	}
+
+	var tasks []taskPair
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxTaskfileLineSize)
+	for lineNo := 1; scanner.Scan(); lineNo++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		task, err := parseTaskPairLine(line, lineNo)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
+func loadTaskState(path string) (fileState map[string]struct{}, taskCheckpoints map[string]struct{}, err error) {
+	fileState = map[string]struct{}{}
+	taskCheckpoints = map[string]struct{}{}
+	if path == "" {
+		return fileState, taskCheckpoints, nil
+	}
+
+	file, ferr := os.Open(path)
+	if ferr != nil {
+		if os.IsNotExist(ferr) {
+			return fileState, taskCheckpoints, nil
+		}
+		return nil, nil, ferr
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxTaskfileLineSize)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, taskCheckpointPrefix) {
+			taskCheckpoints[line] = struct{}{}
+		} else {
+			fileState[line] = struct{}{}
+		}
+	}
+	if serr := scanner.Err(); serr != nil {
+		return nil, nil, serr
+	}
+	return fileState, taskCheckpoints, nil
+}
+
+type taskStateAppender struct {
+	mu   sync.Mutex
+	file *os.File
+}
+
+func newTaskStateAppender(path string) (*taskStateAppender, error) {
+	if path == "" {
+		return &taskStateAppender{}, nil
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return &taskStateAppender{file: file}, nil
+}
+
+func (a *taskStateAppender) append(taskKey string) error {
+	if a.file == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
+		return a.closeOnError(err)
+	}
+
+	return nil
+}
+
+func (a *taskStateAppender) appendCheckpoint(taskKey string) error {
+	if a.file == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
+		return a.closeOnError(err)
+	}
+
+	if err := a.file.Sync(); err != nil {
+		return a.closeOnError(err)
+	}
+
+	return nil
+}
+
+func (a *taskStateAppender) closeOnError(err error) error {
+	if a.file == nil {
+		return err
+	}
+	if cerr := a.file.Close(); cerr != nil {
+		a.file = nil
+		return errors.Join(err, cerr)
+	}
+	a.file = nil
+	return err
+}
+
+func (a *taskStateAppender) close() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.file == nil {
+		return nil
+	}
+	if serr := a.file.Sync(); serr != nil {
+		_ = a.file.Close()
+		a.file = nil
+		return serr
+	}
+	err := a.file.Close()
+	a.file = nil
+	return err
+}
+
+const taskCheckpointPrefix = "TASK\t"
+
+func taskStateKey(src, dst string) string {
+	return src + " -> " + dst
+}
+
+func taskCheckpointKey(src, dst string) string {
+	return taskCheckpointPrefix + src + " -> " + dst
+}
+
+type taskTracker struct {
+	remaining atomic.Int64
+	key       string // task checkpoint key
+}
+
+type cpTask struct {
+	src     string
+	dst     string
+	key     string
+	tracker *taskTracker // nil when no task-level checkpoint tracking
+}
+
+// expandCPTask streams file-level copy tasks for a taskfile pair via the emit
+// callback. When the source is directory-like it expands recursively and calls
+// emit for each discovered file; for file-like sources it emits a single task.
+// Returning a non-nil error from emit stops expansion early.
+func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) error {
+	if isHF(task.src) {
+		hfPath, err := hf.Parse(task.src)
+		if err != nil {
+			return err
+		}
+		if hfPath.File != "" {
+			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+		}
+	}
+
+	if isAz(task.src) {
+		sap, err := azblob.Parse(task.src)
+		if err != nil {
+			return err
+		}
+		if !sap.IsDirLike() {
+			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+		}
+	} else if !isHF(task.src) {
+		if info, err := os.Stat(task.src); err != nil || !info.IsDir() {
+			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+		}
+	}
+
+	if isAz(task.dst) {
+		dap, err := azblob.Parse(task.dst)
+		if err != nil {
+			return err
+		}
+		for result := range bbbfs.ListRecursive(ctx, task.src) {
+			if result.Err != nil {
+				return result.Err
+			}
+			entry := result.Entry
+			if entry.IsDir {
+				continue
+			}
+			if err := emit(cpTask{
+				src: entry.Path,
+				dst: dap.Child(filepath.ToSlash(entry.Name)).String(),
+				key: taskStateKey(entry.Path, task.dst),
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for result := range bbbfs.ListRecursive(ctx, task.src) {
+		if result.Err != nil {
+			return result.Err
+		}
+		entry := result.Entry
+		if entry.IsDir {
+			continue
+		}
+		if err := emit(cpTask{
+			src: entry.Path,
+			dst: filepath.Join(task.dst, entry.Name),
+			key: taskStateKey(entry.Path, task.dst),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func cmdCP(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdCP called", "args", c.Args().Slice())
-	if c.Args().Len() < 2 {
-		return fmt.Errorf("cp: need srcs dst")
-	}
 	overwrite := c.Bool("f")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
-	srcs := make([]string, c.Args().Len()-1)
-	for i := 0; i < len(srcs); i++ {
-		srcs[i] = c.Args().Get(i)
+	taskfile := c.String("taskfile")
+	stateFile := c.String("state")
+
+	var tasks []taskPair
+	if taskfile != "" {
+		if c.Args().Len() != 0 {
+			return fmt.Errorf("cp: cannot use positional args with --taskfile")
+		}
+		var err error
+		tasks, err = loadTaskPairs(taskfile)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Convert positional args into task pairs so both modes share the
+		// same execution path (expansion, state tracking, progress bars).
+		if c.Args().Len() < 2 {
+			return fmt.Errorf("cp: need srcs dst")
+		}
+		dst := c.Args().Get(c.Args().Len() - 1)
+		for i := 0; i < c.Args().Len()-1; i++ {
+			tasks = append(tasks, taskPair{src: c.Args().Get(i), dst: dst})
+		}
 	}
-	dst := c.Args().Get(c.Args().Len() - 1)
+
+	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
+}
+
+// runCPTasks executes a list of task pairs through the unified expansion +
+// parallel copy pipeline. Both taskfile mode and positional-arg mode convert
+// their inputs to []taskPair and call this function, ensuring a single code
+// path for state tracking, progress bars, and concurrency control.
+func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, concurrency, retryCount int, stateFile string) error {
+	state, taskCheckpoints, err := loadTaskState(stateFile)
+	if err != nil {
+		return err
+	}
+	// Streaming progress bar: total starts at 0 and grows as files are
+	// discovered during expansion. The bar stays invisible until the
+	// first file is found, then updates on every change.
+	taskProgress := newStreamingProgressBar("cp files", quiet, true)
+	if taskProgress != nil {
+		taskProgress.pinBottom = true
+	}
+	defer func() {
+		if taskProgress != nil {
+			taskProgress.Finish()
+		}
+	}()
+	seen := make(map[string]struct{}, len(state)+len(tasks))
+	for key := range state {
+		seen[key] = struct{}{}
+	}
+	stateAppender, err := newTaskStateAppender(stateFile)
+	if err != nil {
+		return err
+	}
+
+	workers := concurrency
+	if workers < 1 {
+		workers = 1
+	}
+	// Split concurrency budget: at least 1 expander, at least 1 cp worker.
+	// When concurrency is high, allocate ~25% to expansion.
+	expanders := max(1, workers/4)
+	cpWorkers := workers - expanders
+	if cpWorkers < 1 {
+		cpWorkers = 1
+	}
+	// Limit concurrent file copies so block-level parallelism (StageBlockFromURL)
+	// focuses on finishing each file ASAP rather than spreading across many files.
+	// Two workers allow the next file's setup (HeadBlob, SAS) to overlap with the
+	// current file's final blocks, hiding latency between files.
+	if cpWorkers > maxServerSideCopyFiles {
+		cpWorkers = maxServerSideCopyFiles
+	}
+	innerConcurrency := concurrency
+	innerQuiet := true
+	showCopyBars := !quiet
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	// Buffer taskCh larger than cpWorkers so expanders can push ahead
+	// without blocking while cp workers are busy.
+	taskCh := make(chan cpTask, cpWorkers*4)
+	var firstErr error
+	var firstErrMu sync.Mutex
+	var totalPending atomic.Int64
+	var queued atomic.Bool
+
+	setErr := func(err error) {
+		firstErrMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		firstErrMu.Unlock()
+	}
+
+	for i := 0; i < cpWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case task, ok := <-taskCh:
+					if !ok {
+						return
+					}
+					slog.Debug("cp: start", "src", task.src, "dst", task.dst)
+					var bytesCb func(int64)
+					if taskProgress != nil {
+						bytesCb = taskProgress.AddBytes
+					}
+					if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, showCopyBars, bytesCb); err != nil {
+						setErr(err)
+						return
+					}
+					slog.Debug("cp: done", "src", task.src, "dst", task.dst)
+					if stateFile != "" {
+						if err := stateAppender.append(task.key); err != nil {
+							setErr(err)
+							return
+						}
+						if task.tracker != nil && task.tracker.remaining.Add(-1) == 0 {
+							if err := stateAppender.appendCheckpoint(task.tracker.key); err != nil {
+								setErr(err)
+								return
+							}
+						}
+					}
+					if taskProgress != nil {
+						taskProgress.Increment()
+					}
+				}
+			}
+		}()
+	}
+
+	// Dedicated expander pool uses goroutines from the concurrency budget.
+	if expanders > len(tasks) {
+		expanders = len(tasks)
+	}
+	pairCh := make(chan taskPair, expanders*2)
+	var seenMu sync.Mutex
+	var expandWG sync.WaitGroup
+	// Add a +1 sentinel to totalPending so the progress bar never shows
+	// 100% while expansion is still running. Without this, fast cp workers
+	// can finish all currently-discovered files before expanders find more,
+	// making the bar flash "done" prematurely. The sentinel is removed
+	// after expandWG.Wait() below.
+	if taskProgress != nil {
+		totalPending.Add(1)
+	}
+	for i := 0; i < expanders; i++ {
+		expandWG.Add(1)
+		go func() {
+			defer expandWG.Done()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case task, ok := <-pairCh:
+					if !ok {
+						return
+					}
+					cpKey := taskCheckpointKey(task.src, task.dst)
+					if _, done := taskCheckpoints[cpKey]; done {
+						if !quiet {
+							lockedFprintf(os.Stderr, "cp: skip already completed task %s -> %s\n", task.src, task.dst)
+						}
+						if taskProgress != nil {
+							taskProgress.SetTotal(totalPending.Add(1))
+							taskProgress.Increment()
+						}
+						continue
+					}
+					if !quiet {
+						lockedFprintf(os.Stderr, "cp: listing %s -> %s\n", task.src, task.dst)
+					}
+					var tracker *taskTracker
+					if stateFile != "" {
+						tracker = &taskTracker{key: cpKey}
+					}
+					var pendingCount int64
+					expandEmit := func(expandedTask cpTask) error {
+						seenMu.Lock()
+						_, alreadySeen := seen[expandedTask.key]
+						if !alreadySeen {
+							seen[expandedTask.key] = struct{}{}
+						}
+						seenMu.Unlock()
+						if alreadySeen {
+							_, inState := state[expandedTask.key]
+							if !quiet && inState {
+								lockedFprintf(os.Stderr, "cp: skip already copied %s -> %s\n", expandedTask.src, expandedTask.dst)
+							}
+							if taskProgress != nil && inState {
+								taskProgress.SetTotal(totalPending.Add(1))
+								taskProgress.Increment()
+							}
+							return nil
+						}
+						expandedTask.tracker = tracker
+						pendingCount++
+						select {
+						case <-workerCtx.Done():
+							return workerCtx.Err()
+						case taskCh <- expandedTask:
+							slog.Debug("cp: queued", "src", expandedTask.src, "dst", expandedTask.dst)
+							queued.Store(true)
+							if taskProgress != nil {
+								taskProgress.SetTotal(totalPending.Add(1))
+							}
+						}
+						return nil
+					}
+					if err := retryOp(workerCtx, retryCount, func() error {
+						pendingCount = 0
+						return expandCPTask(workerCtx, task, expandEmit)
+					}); err != nil {
+						setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
+						return
+					}
+					// Reconcile progress bar total after expansion completes
+					// so it reflects all discovered files (queued + skipped).
+					if taskProgress != nil {
+						taskProgress.SetTotal(totalPending.Load())
+					}
+					if tracker != nil {
+						tracker.remaining.Store(pendingCount)
+						if pendingCount == 0 {
+							if err := stateAppender.appendCheckpoint(cpKey); err != nil {
+								setErr(err)
+								return
+							}
+						}
+					}
+				}
+			}
+		}()
+	}
+enqueueLoop:
+	for _, task := range tasks {
+		select {
+		case <-workerCtx.Done():
+			break enqueueLoop
+		case pairCh <- task:
+		}
+	}
+	close(pairCh)
+	expandWG.Wait()
+	// Remove the +1 listing sentinel now that expansion is complete,
+	// and set the final accurate total so the bar can reach 100%.
+	if taskProgress != nil {
+		taskProgress.SetTotal(totalPending.Add(-1))
+	}
+	close(taskCh)
+	wg.Wait()
+	if !queued.Load() && firstErr == nil {
+		if err := stateAppender.close(); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if firstErr != nil {
+		_ = stateAppender.close()
+		return firstErr
+	}
+	if err := stateAppender.close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, showCopyBar bool, onBytes func(int64)) error {
 	if isHF(dst) {
 		return fmt.Errorf("cp: hf:// only supported as source")
 	}
@@ -1103,8 +1774,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	if dstAz {
 		dap, err := azblob.Parse(dst)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return fmt.Errorf("cp: parse destination %q: %w", dst, err)
 		}
 		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
 			isDstDir = true
@@ -1129,6 +1799,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		srcAz     bool
 		dstAz     bool
 		srcHF     bool
+		size      int64
 		srcAzPath azblob.AzurePath
 		hf        hf.Path
 		base      string
@@ -1209,93 +1880,165 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			err = copyTree(ctx, op.src, op.dst, overwrite, quiet, "cp", concurrency, retryCount)
 		}
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return fmt.Errorf("cp: %s -> %s: %w", op.src, op.dst, err)
 		}
 	}
-	if err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
+	// When any file ops involve az→az server-side copy, limit file-level
+	// parallelism to 2 so the block-level goroutines (concurrency per file)
+	// don't cause N² total goroutines and TLS handshake starvation.
+	cpPoolSize := concurrency
+	for _, op := range fileOps {
+		if op.srcAz && op.dstAz {
+			cpPoolSize = min(maxServerSideCopyFiles, concurrency)
+			break
+		}
+	}
+	if err := runOpPoolWithRetryProgressBytes(ctx, cpPoolSize, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
 			if err := sendOp(ctx, pending, op); err != nil {
 				return err
 			}
 		}
 		return nil
-	}, func(op cpFileOp) error {
+	}, func(op cpFileOp, trackBytes bool) (int64, error) {
+		size := op.size
+		if (trackBytes || onBytes != nil) && size <= 0 {
+			info, err := bbbfs.Resolve(op.src).Stat(ctx, op.src)
+			if err != nil {
+				slog.Debug("unable to stat source size for progress speed", "src", op.src, "error", err)
+			} else {
+				size = info.Size
+			}
+		}
 		if op.srcHF {
-			return copyHFFile(ctx, op.hf, op.base, op.dst, op.dstAz, overwrite, quiet, isDstDir)
+			err := copyHFFile(ctx, op.hf, op.base, op.dst, op.dstAz, overwrite, quiet, isDstDir)
+			if err == nil && onBytes != nil {
+				onBytes(size)
+			}
+			return size, err
 		}
 		if op.srcAz && op.dstAz {
 			dap, _ := azblob.Parse(op.dst)
 			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-					return errors.New("cp: destination exists")
+					return 0, errors.New("cp: destination exists")
 				}
 			}
-			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap); err != nil {
-				return err
+			var copyBar *progressBar
+			if showCopyBar {
+				copyBar = newStreamingProgressBar(path.Base(op.src), false, true)
+				if copyBar != nil {
+					copyBar.byteSized = true
+				}
+			}
+			var lastReported atomic.Int64
+			if err := azblob.CopyBlobServerSide(ctx, op.srcAzPath, dap, concurrency, func(copied, total int64) {
+				if total <= 0 {
+					return
+				}
+				// Report incremental bytes to the overall taskbar.
+				// Use CAS loop because callbacks arrive from parallel goroutines.
+				if onBytes != nil {
+					for {
+						prev := lastReported.Load()
+						if copied <= prev {
+							break
+						}
+						if lastReported.CompareAndSwap(prev, copied) {
+							onBytes(copied - prev)
+							break
+						}
+					}
+				}
+				if copyBar == nil {
+					return
+				}
+				// Update done/bytesDone before SetTotal so the first
+				// render (triggered by SetTotal when total transitions
+				// from 0 to N) shows actual progress instead of 0%.
+				atomicMax(&copyBar.bytesDone, copied)
+				atomicMax(&copyBar.done, copied)
+				copyBar.SetTotal(total)
+				copyBar.render(copied)
+			}); err != nil {
+				if copyBar != nil {
+					copyBar.Finish()
+				}
+				return 0, err
+			}
+			if copyBar != nil {
+				copyBar.Finish()
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
-			return nil
+			return size, nil
 		}
 		if op.srcAz && !op.dstAz {
 			reader, err := azblob.DownloadStream(ctx, op.srcAzPath)
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if !overwrite {
 				if _, err := os.Stat(op.dst); err == nil {
 					if cerr := reader.Close(); cerr != nil {
-						return cerr
+						return 0, cerr
 					}
-					return errors.New("cp: destination exists")
+					return 0, errors.New("cp: destination exists")
 				}
 			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
 				return writeStreamToFile(op.dst, r, 0o644)
 			}); err != nil {
-				return err
+				return 0, err
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
-			return nil
+			if onBytes != nil {
+				onBytes(size)
+			}
+			return size, nil
 		}
 		if !op.srcAz && op.dstAz {
 			dap, _ := azblob.Parse(op.dst)
 			reader, err := os.Open(op.src)
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
 					if cerr := reader.Close(); cerr != nil {
-						return cerr
+						return 0, cerr
 					}
-					return errors.New("cp: destination exists")
+					return 0, errors.New("cp: destination exists")
 				}
 			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
 				return azblob.UploadStream(ctx, dap, r)
 			}); err != nil {
-				return err
+				return 0, err
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 			}
-			return nil
+			if onBytes != nil {
+				onBytes(size)
+			}
+			return size, nil
 		}
 		if err := fsops.CopyFile(op.src, op.dst, overwrite); err != nil {
-			return fmt.Errorf("cp: %w", err)
+			return 0, fmt.Errorf("cp: %w", err)
 		}
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
 		}
-		return nil
+		if onBytes != nil {
+			onBytes(size)
+		}
+		return size, nil
 	}); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return fmt.Errorf("cp: file operations: %w", err)
 	}
 	return nil
 }
@@ -1314,7 +2057,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			type azToAzOp struct {
 				name string
 			}
-			return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(list), quiet, errPrefix, func(pending chan<- azToAzOp) error {
+			// Limit file-level parallelism to avoid N² goroutines: each
+			// CopyBlobServerSide spawns `concurrency` block goroutines, so
+			// fileWorkers × concurrency must stay bounded.
+			fileWorkers := min(maxServerSideCopyFiles, concurrency)
+			return runOpPoolWithRetryProgress(ctx, fileWorkers, retryCount, len(list), quiet, errPrefix, func(pending chan<- azToAzOp) error {
 				for _, bm := range list {
 					if err := sendOp(ctx, pending, azToAzOp{name: bm.Name}); err != nil {
 						return err
@@ -1322,24 +2069,35 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				return nil
 			}, func(work azToAzOp) error {
-				reader, err := azblob.DownloadStream(ctx, sap.Child(work.name))
-				if err != nil {
-					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
-					return err
-				}
 				if !overwrite {
 					if _, err := azblob.HeadBlob(ctx, dap.Child(work.name)); err == nil {
-						if cerr := reader.Close(); cerr != nil {
-							return cerr
-						}
 						return nil
 					}
 				}
-				if err := withReadCloser(reader, func(r io.Reader) error {
-					return azblob.UploadStream(ctx, dap.Child(work.name), r)
+				var copyBar *progressBar
+				if !quiet {
+					copyBar = newStreamingProgressBar(path.Base(work.name), false, true)
+					if copyBar != nil {
+						copyBar.byteSized = true
+					}
+				}
+				if err := azblob.CopyBlobServerSide(ctx, sap.Child(work.name), dap.Child(work.name), concurrency, func(copied, total int64) {
+					if total <= 0 || copyBar == nil {
+						return
+					}
+					atomicMax(&copyBar.bytesDone, copied)
+					atomicMax(&copyBar.done, copied)
+					copyBar.SetTotal(total)
+					copyBar.render(copied)
 				}); err != nil {
-					lockedFprintf(os.Stderr, "%s: upload %s: %v\n", errPrefix, work.name, err)
+					if copyBar != nil {
+						copyBar.Finish()
+					}
+					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 					return err
+				}
+				if copyBar != nil {
+					copyBar.Finish()
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", sap.Child(work.name).String(), dap.Child(work.name).String())
@@ -1510,52 +2268,30 @@ func copyHFFile(ctx context.Context, hfPath hf.Path, base, dst string, dstAz, ov
 	if err != nil {
 		return err
 	}
-	if dstAz {
-		reader, err := hf.DownloadStream(ctx, hfPath)
-		if err != nil {
-			return err
-		}
-		dap, err := azblob.Parse(dstPath)
-		if err != nil {
-			if cerr := reader.Close(); cerr != nil {
-				return cerr
+	if !overwrite {
+		if dstAz {
+			dap, err := azblob.Parse(dstPath)
+			if err != nil {
+				return err
 			}
-			return err
-		}
-		if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-			if cerr := reader.Close(); cerr != nil {
-				return cerr
+			if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
+				return errors.New("cp: destination must be a blob path")
 			}
-			return errors.New("cp: destination must be a blob path")
-		}
-		if !overwrite {
 			if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-				if cerr := reader.Close(); cerr != nil {
-					return cerr
-				}
 				return errors.New("cp: destination exists")
 			}
+		} else if _, err := os.Stat(dstPath); err == nil {
+			return errors.New("cp: destination exists")
 		}
-		if err := withReadCloser(reader, func(r io.Reader) error {
-			return azblob.UploadStream(ctx, dap, r)
-		}); err != nil {
-			return err
-		}
-	} else {
-		if !overwrite {
-			if _, err := os.Stat(dstPath); err == nil {
-				return errors.New("cp: destination exists")
-			}
-		}
-		reader, err := hf.DownloadStream(ctx, hfPath)
-		if err != nil {
-			return err
-		}
-		if err := withReadCloser(reader, func(r io.Reader) error {
-			return writeStreamToFile(dstPath, r, 0o644)
-		}); err != nil {
-			return err
-		}
+	}
+	reader, err := bbbfs.Resolve(hfPath.String()).Read(ctx, hfPath.String())
+	if err != nil {
+		return err
+	}
+	if err := withReadCloser(reader, func(r io.Reader) error {
+		return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
+	}); err != nil {
+		return err
 	}
 	if !quiet {
 		lockedPrintf("Copied %s -> %s\n", hfPath.String(), dstPath)
@@ -1571,72 +2307,58 @@ func copyHFDir(ctx context.Context, hfPath hf.Path, dst string, dstAz, overwrite
 	type hfOp struct {
 		file string
 	}
-	return runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(files), quiet, "cp", func(pending chan<- hfOp) error {
+	return runOpPoolWithRetryProgressBytes(ctx, concurrency, retryCount, len(files), quiet, "cp", func(pending chan<- hfOp) error {
 		for _, file := range files {
 			if err := sendOp(ctx, pending, hfOp{file: file}); err != nil {
 				return err
 			}
 		}
 		return nil
-	}, func(op hfOp) error {
+	}, func(op hfOp, trackBytes bool) (int64, error) {
 		filePath := hf.Path{Repo: hfPath.Repo, File: op.file}
-		reader, err := hf.DownloadStream(ctx, filePath)
-		if err != nil {
-			return err
-		}
 		dstPath, err := resolveDstPath(dst, dstAz, op.file, true)
 		if err != nil {
-			if cerr := reader.Close(); cerr != nil {
-				return cerr
-			}
-			return err
+			return 0, err
 		}
-		if dstAz {
-			dap, err := azblob.Parse(dstPath)
-			if err != nil {
-				if cerr := reader.Close(); cerr != nil {
-					return cerr
+		if !overwrite {
+			if dstAz {
+				dap, err := azblob.Parse(dstPath)
+				if err != nil {
+					return 0, err
 				}
-				return err
-			}
-			if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
-				if cerr := reader.Close(); cerr != nil {
-					return cerr
+				if dap.Blob == "" || strings.HasSuffix(dap.Blob, "/") {
+					return 0, errors.New("cp: destination must be a blob path")
 				}
-				return errors.New("cp: destination must be a blob path")
-			}
-			if !overwrite {
 				if _, err := azblob.HeadBlob(ctx, dap); err == nil {
-					if cerr := reader.Close(); cerr != nil {
-						return cerr
-					}
-					return nil
+					return 0, nil
 				}
+			} else if _, err := os.Stat(dstPath); err == nil {
+				return 0, nil
 			}
-			if err := withReadCloser(reader, func(r io.Reader) error {
-				return azblob.UploadStream(ctx, dap, r)
-			}); err != nil {
-				return err
+		}
+		size := int64(0)
+		if trackBytes {
+			info, err := bbbfs.Resolve(filePath.String()).Stat(ctx, filePath.String())
+			if err == nil {
+				size = info.Size
 			}
-		} else {
-			if !overwrite {
-				if _, err := os.Stat(dstPath); err == nil {
-					if cerr := reader.Close(); cerr != nil {
-						return cerr
-					}
-					return nil
-				}
-			}
-			if err := withReadCloser(reader, func(r io.Reader) error {
-				return writeStreamToFile(dstPath, r, 0o644)
-			}); err != nil {
-				return err
-			}
+		}
+		reader, err := bbbfs.Resolve(filePath.String()).Read(ctx, filePath.String())
+		if err != nil {
+			return 0, err
+		}
+		if trackBytes && size <= 0 {
+			size = sizeOfReader(reader)
+		}
+		if err := withReadCloser(reader, func(r io.Reader) error {
+			return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
+		}); err != nil {
+			return 0, err
 		}
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", filePath.String(), dstPath)
 		}
-		return nil
+		return size, nil
 	})
 }
 
@@ -1882,6 +2604,10 @@ func syncHFFiles(ctx context.Context, hfPath hf.Path, excludeMatch func(string) 
 	if err != nil {
 		return nil, err
 	}
+	return syncHFFilesFromList(files, excludeMatch), nil
+}
+
+func syncHFFilesFromList(files []string, excludeMatch func(string) bool) []string {
 	out := make([]string, 0, len(files))
 	for _, file := range files {
 		if excludeMatch(file) {
@@ -1889,21 +2615,101 @@ func syncHFFiles(ctx context.Context, hfPath hf.Path, excludeMatch func(string) 
 		}
 		out = append(out, file)
 	}
-	return out, nil
+	return out
 }
 
 func cmdSync(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdSync called", "args", c.Args().Slice())
-	if c.Args().Len() != 2 {
-		return fmt.Errorf("sync: need src dst")
-	}
 	dry := c.Bool("dry-run")
 	del := c.Bool("delete")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	exclude := c.String("x")
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
+	taskfile := c.String("taskfile")
+	stateFile := c.String("state")
+
+	if taskfile != "" {
+		if c.Args().Len() != 0 {
+			return fmt.Errorf("sync: cannot use positional args with --taskfile")
+		}
+		tasks, err := loadTaskPairs(taskfile)
+		if err != nil {
+			return err
+		}
+		_, taskCheckpoints, err := loadTaskState(stateFile)
+		if err != nil {
+			return err
+		}
+		var stateAppender *taskStateAppender
+		if !dry {
+			stateAppender, err = newTaskStateAppender(stateFile)
+			if err != nil {
+				return err
+			}
+		}
+		for _, task := range tasks {
+			cpKey := taskCheckpointKey(task.src, task.dst)
+			if _, done := taskCheckpoints[cpKey]; done {
+				if !quiet {
+					lockedFprintf(os.Stderr, "sync: skip already completed task %s -> %s\n", task.src, task.dst)
+				}
+				continue
+			}
+			if err := cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, task.src, task.dst); err != nil {
+				if stateAppender != nil {
+					_ = stateAppender.close()
+				}
+				return err
+			}
+			if stateAppender != nil {
+				if err := stateAppender.appendCheckpoint(cpKey); err != nil {
+					return err
+				}
+			}
+		}
+		if stateAppender != nil {
+			if err := stateAppender.close(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if c.Args().Len() != 2 {
+		return fmt.Errorf("sync: need src dst")
+	}
 	src, dst := c.Args().Get(0), c.Args().Get(1)
+	if stateFile != "" {
+		state, _, err := loadTaskState(stateFile)
+		if err != nil {
+			return err
+		}
+		key := taskStateKey(src, dst)
+		if _, done := state[key]; done {
+			if !quiet {
+				lockedFprintf(os.Stderr, "sync: skip already completed %s -> %s\n", src, dst)
+			}
+			return nil
+		}
+		if err := cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, src, dst); err != nil {
+			return err
+		}
+		if !dry {
+			stateAppender, err := newTaskStateAppender(stateFile)
+			if err != nil {
+				return err
+			}
+			if err := stateAppender.append(key); err != nil {
+				return err
+			}
+			return stateAppender.close()
+		}
+		return nil
+	}
+	return cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, src, dst)
+}
+
+func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, concurrency, retryCount int, src, dst string) error {
 	if isHF(dst) {
 		return fmt.Errorf("sync: hf:// only supported as source")
 	}
@@ -1946,13 +2752,11 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		if srcAz {
 			sap, err := azblob.Parse(src)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
+				return fmt.Errorf("sync: %w", err)
 			}
 			list, err := azblob.ListRecursive(ctx, sap)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
+				return fmt.Errorf("sync: list %s: %w", src, err)
 			}
 			for _, bm := range list {
 				if bm.Name == "" || excludeMatch(bm.Name) {
@@ -2000,7 +2804,15 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				return err
 			}
 		}
-		workerErr := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(files), quiet, "sync", func(pending chan<- item) error {
+		// When both src and dst are Azure, CopyBlobServerSide spawns
+		// `concurrency` block goroutines per file. Limit file-level
+		// parallelism to 2 so total goroutines stay bounded at
+		// 2 × concurrency instead of concurrency².
+		syncWorkers := concurrency
+		if srcAz && dstAz {
+			syncWorkers = min(maxServerSideCopyFiles, concurrency)
+		}
+		workerErr := runOpPoolWithRetryProgress(ctx, syncWorkers, retryCount, len(files), quiet, "sync", func(pending chan<- item) error {
 			for _, f := range files {
 				if err := sendOp(ctx, pending, f); err != nil {
 					return err
@@ -2010,25 +2822,36 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 		}, func(f item) error {
 			sPath := f.rel
 			if srcAz && dstAz {
-				reader, err := azblob.DownloadStream(ctx, sap.Child(sPath))
-				if err != nil {
-					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync: %s: %w", sPath, err)
-				}
 				if dry {
 					if !quiet {
 						lockedPrintln("COPY", sap.Child(sPath).String(), "->", dap.Child(sPath).String())
 					}
-					if cerr := reader.Close(); cerr != nil {
-						return cerr
-					}
 					return nil
 				}
-				if err := withReadCloser(reader, func(r io.Reader) error {
-					return azblob.UploadStream(ctx, dap.Child(sPath), r)
+				var copyBar *progressBar
+				if !quiet {
+					copyBar = newStreamingProgressBar(path.Base(sPath), false, true)
+					if copyBar != nil {
+						copyBar.byteSized = true
+					}
+				}
+				if err := azblob.CopyBlobServerSide(ctx, sap.Child(sPath), dap.Child(sPath), concurrency, func(copied, total int64) {
+					if total <= 0 || copyBar == nil {
+						return
+					}
+					atomicMax(&copyBar.bytesDone, copied)
+					atomicMax(&copyBar.done, copied)
+					copyBar.SetTotal(total)
+					copyBar.render(copied)
 				}); err != nil {
-					lockedFprintf(os.Stderr, "sync upload: %s: %v\n", sPath, err)
-					return fmt.Errorf("sync upload: %s: %w", sPath, err)
+					if copyBar != nil {
+						copyBar.Finish()
+					}
+					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
+					return fmt.Errorf("sync: %s: %w", sPath, err)
+				}
+				if copyBar != nil {
+					copyBar.Finish()
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", sap.Child(sPath).String(), dap.Child(sPath).String())
@@ -2245,39 +3068,12 @@ func cmdMD5Sum(ctx context.Context, c *cli.Command) error {
 	}
 	for i := 0; i < c.Args().Len(); i++ {
 		p := c.Args().Get(i)
-		switch {
-		case isAz(p):
-			ap, err := azblob.Parse(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
-				continue
-			}
-			reader, err := azblob.DownloadStream(ctx, ap)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
-				continue
-			}
-			printMD5Sum(reader, p)
-		case isHF(p):
-			hfPath, err := hf.Parse(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
-				continue
-			}
-			reader, err := hf.DownloadStream(ctx, hfPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
-				continue
-			}
-			printMD5Sum(reader, p)
-		default:
-			f, err := os.Open(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
-				continue
-			}
-			printMD5Sum(f, p)
+		reader, err := bbbfs.Resolve(p).Read(ctx, p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "md5sum: %s: %v\n", p, err)
+			continue
 		}
+		printMD5Sum(reader, p)
 	}
 	return nil
 }
@@ -2313,22 +3109,39 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 	}
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s")
-	if isAz(target) {
-		ap, err := azblob.Parse(target)
+	parentPath, pattern := splitWildcard(target)
+	fs := bbbfs.Resolve(parentPath)
+	if isAz(parentPath) {
+		ap, err := azblob.Parse(parentPath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		var totalSize int64
 		var count int
+		var anyListed bool
 		if err := azblob.ListStream(ctx, ap, func(bm azblob.BlobMeta) error {
+			anyListed = true
 			name := bm.Name
 			if name == "" || strings.HasSuffix(name, "/") {
 				return nil // skip directories
 			}
-			fullpath := fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
+			if pattern != "" {
+				matched, mErr := path.Match(pattern, name)
+				if mErr != nil {
+					return mErr
+				}
+				if !matched {
+					return nil
+				}
+			}
+			var fullpath string
+			if ap.Container == "" {
+				fullpath = fmt.Sprintf("az://%s/%s", ap.Account, name)
+			} else {
+				fullpath = fmt.Sprintf("az://%s/%s/%s", ap.Account, ap.Container, path.Join(ap.Blob, name))
+			}
 			fullpath = strings.TrimSuffix(fullpath, "/")
-			sizeMiB := float64(bm.Size) / (1024 * 1024)
 			mod := "-" // Placeholder, modtime not available
 			display := fullpath
 			if relFlag {
@@ -2337,7 +3150,7 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			if machine {
 				fmt.Printf("f\t%d\t%s\t%s\n", bm.Size, mod, display)
 			} else {
-				fmt.Printf("%10.1f MiB  %s  %s\n", sizeMiB, mod, display)
+				fmt.Printf("%10s  %s  %s\n", formatSize(bm.Size), mod, display)
 			}
 			totalSize += bm.Size
 			count++
@@ -2346,43 +3159,98 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		// If listing returned no entries at all and no wildcard was used, the target
+		// may be a single blob. Fall back to HeadBlob so that single-file
+		// paths (e.g. az://account/container/blob) are shown.
+		if !anyListed && pattern == "" {
+			if size, headErr := azblob.HeadBlob(ctx, ap); headErr == nil {
+				display := target
+				if relFlag {
+					display = path.Base(ap.Blob)
+				}
+				if machine {
+					fmt.Printf("f\t%d\t%s\t%s\n", size, "-", display)
+				} else {
+					fmt.Printf("%10s  %s  %s\n", formatSize(size), "-", display)
+				}
+				totalSize = size
+				count = 1
+			}
+		}
 		if !machine {
-			fmt.Printf("Listed %d files summing to %d bytes (%.1f MiB)\n", count, totalSize, float64(totalSize)/(1024*1024))
+			noun := "files"
+			if count == 1 {
+				noun = "file"
+			}
+			fmt.Printf("Listed %d %s summing to %s (%d bytes)\n", count, noun, formatSize(totalSize), totalSize)
 		}
 		return nil
 	}
-	// fallback: local
-	entries, err := fsops.List(target)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	list, listErr := fs.List(ctx, parentPath)
+	if listErr != nil {
+		// List may fail on file targets (e.g. ENOTDIR for local paths).
+		// Fall back to Stat when no wildcard was used.
+		if pattern == "" {
+			st, statErr := fs.Stat(ctx, parentPath)
+			if statErr == nil && !st.IsDir {
+				list = []bbbfs.Entry{st}
+			} else {
+				fmt.Fprintln(os.Stderr, listErr)
+				os.Exit(1)
+			}
+		} else {
+			fmt.Fprintln(os.Stderr, listErr)
+			os.Exit(1)
+		}
+	}
+	// If listing returns nothing and no wildcard was used, the target
+	// may be a file rather than a directory. Fall back to Stat so that
+	// single-file paths are shown.
+	if len(list) == 0 && pattern == "" {
+		st, statErr := fs.Stat(ctx, parentPath)
+		if statErr == nil && !st.IsDir {
+			list = []bbbfs.Entry{st}
+		}
 	}
 	var totalSize int64
 	var count int
-	for _, e := range entries {
-		info, err := e.Info()
-		if err != nil {
+	for _, entry := range list {
+		name := entry.Name
+		if name == "" || entry.IsDir {
 			continue
 		}
-		if info.IsDir() {
-			continue
+		if pattern != "" {
+			matched, err := path.Match(pattern, strings.TrimSuffix(name, "/"))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			if !matched {
+				continue
+			}
 		}
-		sizeMiB := float64(info.Size()) / (1024 * 1024)
-		mod := info.ModTime().Format(time.RFC3339)
-		display := e.Name()
+		mod := "-"
+		if !entry.ModTime.IsZero() {
+			mod = entry.ModTime.Format(time.RFC3339)
+		}
+		display := entry.Path
 		if relFlag {
-			display = filepath.Clean(e.Name())
+			display = strings.TrimSuffix(name, "/")
 		}
 		if machine {
-			fmt.Printf("f\t%d\t%s\t%s\n", info.Size(), mod, display)
+			fmt.Printf("f\t%d\t%s\t%s\n", entry.Size, mod, display)
 		} else {
-			fmt.Printf("%10.1f MiB  %s  %s\n", sizeMiB, mod, display)
+			fmt.Printf("%10s  %s  %s\n", formatSize(entry.Size), mod, display)
 		}
-		totalSize += info.Size()
+		totalSize += entry.Size
 		count++
 	}
 	if !machine {
-		fmt.Printf("Listed %d files summing to %d bytes (%.1f MiB)\n", count, totalSize, float64(totalSize)/(1024*1024))
+		noun := "files"
+		if count == 1 {
+			noun = "file"
+		}
+		fmt.Printf("Listed %d %s summing to %s (%d bytes)\n", count, noun, formatSize(totalSize), totalSize)
 	}
 	return nil
 }

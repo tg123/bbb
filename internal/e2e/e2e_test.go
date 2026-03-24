@@ -43,6 +43,10 @@ func parseMD5Output(out []byte) string {
 	return fields[0]
 }
 
+func taskStateKey(src, dst string) string {
+	return src + " -> " + dst
+}
+
 func waitForEndpointReady(addr string) bool {
 	return waitForEndpointReadyWithTimeout(addr, waitTimeout)
 }
@@ -127,8 +131,7 @@ func bbbLs(path string, recursive bool) ([]string, error) {
 	if recursive {
 		if len(lines) > 0 {
 			last := strings.TrimSpace(lines[len(lines)-1])
-			fields := strings.Fields(last)
-			if len(fields) == 2 && fields[1] == "files" {
+			if strings.HasPrefix(last, "Listed ") {
 				lines = lines[:len(lines)-1]
 			}
 		}
@@ -144,6 +147,43 @@ func bbbLs(path string, recursive bool) ([]string, error) {
 	}
 
 	return filtered, nil
+}
+
+// parseMachineLL parses "--machine" tab-separated output (f\tSIZE\tMOD\tPATH)
+// and returns the file paths. Used by bbbLL and bbbLLR.
+func parseMachineLL(stdout []byte) []string {
+	lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
+	var paths []string
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		fields := strings.Split(l, "\t")
+		if len(fields) < 4 {
+			continue
+		}
+		paths = append(paths, fields[3])
+	}
+	return paths
+}
+
+// bbbLL runs "ll --machine" and returns the file paths from the output.
+func bbbLL(path string) ([]string, error) {
+	stdout, err := runBBB("ll", "--machine", path)
+	if err != nil {
+		return nil, err
+	}
+	return parseMachineLL(stdout), nil
+}
+
+// bbbLLR runs "llr --machine" and returns the file paths from the output.
+func bbbLLR(path string) ([]string, error) {
+	stdout, err := runBBB("llr", "--machine", path)
+	if err != nil {
+		return nil, err
+	}
+	return parseMachineLL(stdout), nil
 }
 
 func cleanFolder(t *testing.T, path string) {
@@ -269,6 +309,81 @@ func TestBasic(t *testing.T) {
 		}
 	}
 
+	t.Run("cp taskfile parallel", func(t *testing.T) {
+		taskDir := t.TempDir()
+		srcA := filepath.Join(taskDir, "task-a.txt")
+		srcB := filepath.Join(taskDir, "task-b.txt")
+		if err := os.WriteFile(srcA, []byte("task-a"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(srcB, []byte("task-b"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		taskfile := filepath.Join(taskDir, "cp.tasks")
+		dstPrefix := fmt.Sprintf("az://%s/test/taskfile-%d/", azuriteAccount, time.Now().UnixNano())
+		t.Cleanup(func() {
+			cleanFolder(t, dstPrefix)
+		})
+		content := strings.Join([]string{
+			srcA + " " + dstPrefix,
+			srcB + " " + dstPrefix,
+		}, "\n") + "\n"
+		if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runBBB("cp", "--taskfile", taskfile, "--concurrency", "2"); err != nil {
+			t.Fatal(err)
+		}
+		files, err := bbbLs(dstPrefix, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{
+			strings.TrimSuffix(dstPrefix, "/") + "/task-a.txt",
+			strings.TrimSuffix(dstPrefix, "/") + "/task-b.txt",
+		}
+		if !slices.Equal(files, expected) {
+			t.Fatalf("unexpected taskfile cp files: got %v, want %v", files, expected)
+		}
+	})
+
+	t.Run("cp taskfile state recovery skip finished", func(t *testing.T) {
+		taskDir := t.TempDir()
+		srcMissing := filepath.Join(taskDir, "missing.txt")
+		srcOK := filepath.Join(taskDir, "task-ok.txt")
+		if err := os.WriteFile(srcOK, []byte("task-ok"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		taskfile := filepath.Join(taskDir, "cp-recovery.tasks")
+		dstPrefix := fmt.Sprintf("az://%s/test/taskfile-recovery-%d/", azuriteAccount, time.Now().UnixNano())
+		t.Cleanup(func() {
+			cleanFolder(t, dstPrefix)
+		})
+		content := strings.Join([]string{
+			srcMissing + " " + dstPrefix,
+			srcOK + " " + dstPrefix,
+		}, "\n") + "\n"
+		if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		stateFile := filepath.Join(taskDir, "cp-recovery.state")
+		skippedKey := taskStateKey(srcMissing, dstPrefix)
+		if err := os.WriteFile(stateFile, []byte(skippedKey+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runBBB("cp", "--taskfile", taskfile, "--state", stateFile, "--concurrency", "2"); err != nil {
+			t.Fatal(err)
+		}
+		files, err := bbbLs(dstPrefix, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{strings.TrimSuffix(dstPrefix, "/") + "/task-ok.txt"}
+		if !slices.Equal(files, expected) {
+			t.Fatalf("unexpected taskfile recovery files: got %v, want %v", files, expected)
+		}
+	})
+
 	// ls
 	{
 		files, err := bbbLs("az://"+azuriteAccount+"/test", false)
@@ -287,6 +402,140 @@ func TestBasic(t *testing.T) {
 		}
 
 	}
+
+	// ls single file (stat fallback for exact blob path)
+	{
+		singleFile := "az://" + azuriteAccount + "/test/testfile.txt"
+		files, err := bbbLs(singleFile, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{singleFile}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls single file: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls single file in subdirectory
+	{
+		singleFile := "az://" + azuriteAccount + "/test/dir/testfile.txt"
+		files, err := bbbLs(singleFile, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{singleFile}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls single file in subdir: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls -l single file (long format stat fallback)
+	{
+		singleFile := "az://" + azuriteAccount + "/test/testfile.txt"
+		stdout, err := runBBB("ls", "-l", "--machine", singleFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
+		var found bool
+		for _, l := range lines {
+			fields := strings.Split(strings.TrimSpace(l), "\t")
+			if len(fields) >= 4 && fields[3] == singleFile {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("ls -l single file: expected %s in output, got %q", singleFile, string(stdout))
+		}
+	}
+
+	// ll single file (stat fallback for exact blob path)
+	{
+		singleFile := "az://" + azuriteAccount + "/test/testfile.txt"
+		files, err := bbbLL(singleFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{singleFile}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll single file: got %v, want %v", files, expected)
+		}
+	}
+
+	// ll single file in subdirectory
+	{
+		singleFile := "az://" + azuriteAccount + "/test/dir/testfile.txt"
+		files, err := bbbLL(singleFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{singleFile}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll single file in subdir: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls local single file (List returns ENOTDIR, falls back to Stat)
+	{
+		files, err := bbbLs(tmpFile.Name(), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{tmpFile.Name()}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls local single file: got %v, want %v", files, expected)
+		}
+	}
+
+	// ll local single file (List returns ENOTDIR, falls back to Stat)
+	{
+		files, err := bbbLL(tmpFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{tmpFile.Name()}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll local single file: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls subdirectory-only prefix: files exist only in nested paths
+	t.Run("ls returns subdirectory when only nested files exist", func(t *testing.T) {
+		prefix := fmt.Sprintf("az://%s/test/lsonly-%d", azuriteAccount, time.Now().UnixNano())
+		t.Cleanup(func() {
+			cleanFolder(t, prefix)
+		})
+
+		// Upload files only into nested subdirectories — no direct children.
+		nestedFile := prefix + "/subdir/nested.txt"
+		if _, err := runBBB("cp", tmpFile.Name(), nestedFile); err != nil {
+			t.Fatal(err)
+		}
+		deepFile := prefix + "/another/deep/file.txt"
+		if _, err := runBBB("cp", tmpFile.Name(), deepFile); err != nil {
+			t.Fatal(err)
+		}
+
+		// ls on the prefix should return the two subdirectories.
+		files, err := bbbLs(prefix, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{
+			prefix + "/another",
+			prefix + "/subdir",
+		}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls subdirectory-only: got %v, want %v", files, expected)
+		}
+	})
 
 	// lsr
 	{
@@ -325,6 +574,111 @@ func TestBasic(t *testing.T) {
 
 		if !slices.Equal(files, expected) {
 			t.Errorf("unexpected files: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls with ? wildcard
+	{
+		files, err := bbbLs("az://"+azuriteAccount+"/test/testfile?.txt", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls ? wildcard: got %v, want %v", files, expected)
+		}
+	}
+
+	// ls with [char class] wildcard
+	{
+		files, err := bbbLs("az://"+azuriteAccount+"/test/testfile[0-9].txt", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("ls [char class] wildcard: got %v, want %v", files, expected)
+		}
+	}
+
+	// ll with * wildcard
+	{
+		files, err := bbbLL("az://" + azuriteAccount + "/test/testfile*")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll * wildcard: got %v, want %v", files, expected)
+		}
+	}
+
+	// ll with ? wildcard
+	{
+		files, err := bbbLL("az://" + azuriteAccount + "/test/testfile?.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected := []string{
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll ? wildcard: got %v, want %v", files, expected)
+		}
+	}
+
+	// lsr with * wildcard
+	{
+		files, err := bbbLs("az://"+azuriteAccount+"/test/testfile*", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Recursive listing matches filename component against pattern, so
+		// dir/testfile.txt also matches testfile* (uploaded earlier).
+		expected := []string{
+			"az://" + azuriteAccount + "/test/dir/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("lsr * wildcard: got %v, want %v", files, expected)
+		}
+	}
+
+	// llr with * wildcard
+	{
+		files, err := bbbLLR("az://" + azuriteAccount + "/test/testfile*")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Recursive listing matches filename component against pattern, so
+		// dir/testfile.txt also matches testfile* (uploaded earlier).
+		expected := []string{
+			"az://" + azuriteAccount + "/test/dir/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile.txt",
+			"az://" + azuriteAccount + "/test/testfile2.txt",
+		}
+
+		if !slices.Equal(files, expected) {
+			t.Errorf("llr * wildcard: got %v, want %v", files, expected)
 		}
 	}
 

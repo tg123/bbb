@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -22,8 +24,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
 
 // MkContainer creates a new Azure Blob container
@@ -64,9 +67,9 @@ var validBlobSuffixes = []string{
 
 const (
 	defaultCopySASExpiry     = time.Hour
-	copyPollInitialDelay     = time.Second
-	copyPollMaxDelay         = 30 * time.Second
-	copyPollBackoffFactor    = 2
+	copyBlockSize            = 256 * 1024 * 1024 // 256 MiB per block for StageBlockFromURL
+	copyPollInitialDelay     = 100 * time.Millisecond
+	copyPollMaxDelay         = 2 * time.Second
 	uploadStreamMiB          = 1 << 20
 	uploadStreamBlockMin     = 256 * uploadStreamMiB  // Default UploadStream minimum block size.
 	uploadStreamBlockMax     = 4000 * uploadStreamMiB // Azure UploadStream maximum block size.
@@ -229,6 +232,52 @@ type BlobMeta struct {
 	Size int64
 }
 
+// flatBlobEntry represents a blob item from a flat listing suitable for
+// first-level child extraction. Size is nil when the blob is a
+// directory-marker or otherwise lacks a content-length.
+type flatBlobEntry struct {
+	Name string
+	Size *int64
+}
+
+// extractFirstLevel derives immediate children (files and virtual dirs)
+// from flat blob entries under the given prefix. Directories are emitted
+// with a trailing "/" and size 0. Files require a non-nil Size.
+func extractFirstLevel(entries []flatBlobEntry, prefix string, cb func(BlobMeta) error) error {
+	seen := make(map[string]struct{})
+	for _, e := range entries {
+		rel := strings.TrimPrefix(e.Name, prefix)
+		if rel == "" {
+			continue
+		}
+		parts := strings.SplitN(rel, "/", 2)
+		if len(parts) == 1 {
+			// file at first level — require valid size
+			if e.Size == nil {
+				continue
+			}
+			if _, exists := seen[parts[0]]; exists {
+				continue
+			}
+			seen[parts[0]] = struct{}{}
+			if err := cb(BlobMeta{Name: parts[0], Size: *e.Size}); err != nil {
+				return err
+			}
+		} else if len(parts) == 2 {
+			// directory — no size needed
+			dirName := parts[0] + "/"
+			if _, exists := seen[dirName]; exists {
+				continue
+			}
+			seen[dirName] = struct{}{}
+			if err := cb(BlobMeta{Name: dirName, Size: 0}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // ListStream streams immediate children (non-recursive). If dir-like path provided, lists under it.
 func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) error {
 	if ap.Container == "" { // account root: list containers
@@ -257,11 +306,16 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 		return err
 	}
 	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
-	pager := containerClient.NewListBlobsFlatPager(&azblob.ListBlobsFlatOptions{
-		Prefix:  &prefix,
+	opts := &azblob.ListBlobsFlatOptions{
 		Include: azblob.ListBlobsInclude{Metadata: true},
-	})
-	firstLevel := make(map[string]*BlobMeta)
+	}
+	// Use nil Prefix (omit query param) for container root instead of &""
+	// to avoid potential Azure SDK/API differences with empty string prefix.
+	if prefix != "" {
+		opts.Prefix = &prefix
+	}
+	pager := containerClient.NewListBlobsFlatPager(opts)
+	seen := make(map[string]struct{})
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
@@ -270,37 +324,25 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 		if resp.Segment == nil {
 			return nil
 		}
+		var batch []flatBlobEntry
 		for _, blob := range resp.Segment.BlobItems {
-			if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
+			if blob == nil || blob.Name == nil {
 				continue
 			}
-			rel := strings.TrimPrefix(*blob.Name, prefix)
-			if rel == "" {
-				continue
+			var size *int64
+			if blob.Properties != nil {
+				size = blob.Properties.ContentLength
 			}
-			parts := strings.SplitN(rel, "/", 2)
-			if len(parts) == 1 {
-				// file at first level
-				if _, exists := firstLevel[parts[0]]; exists {
-					continue
-				}
-				bm := &BlobMeta{Name: parts[0], Size: *blob.Properties.ContentLength}
-				firstLevel[parts[0]] = bm
-				if err := cb(*bm); err != nil {
-					return err
-				}
-			} else if len(parts) == 2 {
-				// directory
-				dirName := parts[0] + "/"
-				if _, exists := firstLevel[dirName]; exists {
-					continue
-				}
-				bm := &BlobMeta{Name: dirName, Size: 0}
-				firstLevel[dirName] = bm
-				if err := cb(*bm); err != nil {
-					return err
-				}
+			batch = append(batch, flatBlobEntry{Name: *blob.Name, Size: size})
+		}
+		if err := extractFirstLevel(batch, prefix, func(bm BlobMeta) error {
+			if _, exists := seen[bm.Name]; exists {
+				return nil
 			}
+			seen[bm.Name] = struct{}{}
+			return cb(bm)
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -367,10 +409,14 @@ func ListRecursive(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 		return nil, err
 	}
 	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
-	pager := containerClient.NewListBlobsFlatPager(&azblob.ListBlobsFlatOptions{
-		Prefix:  &prefix,
+	opts := &azblob.ListBlobsFlatOptions{
 		Include: azblob.ListBlobsInclude{Metadata: true},
-	})
+	}
+	// Use nil Prefix for container root; see ListStream comment.
+	if prefix != "" {
+		opts.Prefix = &prefix
+	}
+	pager := containerClient.NewListBlobsFlatPager(opts)
 	var out []BlobMeta
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
@@ -598,54 +644,222 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 	return nil
 }
 
-func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error {
+// planBlocks computes the block size and generates base64-encoded block IDs for
+// a server-side copy of totalSize bytes. defaultBlockSize is the preferred block
+// size; maxBlocks is the maximum number of blocks allowed by Azure. For empty
+// blobs (totalSize == 0) it returns blockSize == defaultBlockSize and an empty
+// ID slice. The returned blockSize may exceed defaultBlockSize when totalSize is
+// large enough to require more than maxBlocks blocks at the default size.
+func planBlocks(totalSize int64, defaultBlockSize int64, maxBlocks int64) (blockSize int64, blockIDs []string, err error) {
+	if totalSize < 0 {
+		return 0, nil, fmt.Errorf("negative total size: %d", totalSize)
+	}
+	blockSize = defaultBlockSize
+	if blockSize < 1 {
+		blockSize = 1
+	}
+
+	// For empty blobs, CommitBlockList with an empty list creates a 0-byte blob.
+	if totalSize == 0 {
+		return blockSize, nil, nil
+	}
+
+	numBlocks := (totalSize + blockSize - 1) / blockSize
+	if numBlocks > maxBlocks {
+		blockSize = (totalSize + maxBlocks - 1) / maxBlocks
+		numBlocks = (totalSize + blockSize - 1) / blockSize
+	}
+	if numBlocks > maxBlocks {
+		return 0, nil, fmt.Errorf("blob too large: %d bytes requires more than %d blocks", totalSize, maxBlocks)
+	}
+	if numBlocks > math.MaxInt {
+		return 0, nil, fmt.Errorf("block count %d exceeds platform int limit", numBlocks)
+	}
+
+	// Block IDs must all be the same length; 6-digit format supports up to
+	// 999,999 which exceeds MaxBlocks (50,000).
+	ids := make([]string, int(numBlocks))
+	for i := range ids {
+		ids[i] = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%06d", i)))
+	}
+	return blockSize, ids, nil
+}
+
+// CopyProgress is called during server-side copy with the number of
+// bytes copied so far and the total size in bytes.
+type CopyProgress func(copied, total int64)
+
+func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concurrency int, onProgress CopyProgress) error {
 	if src.Blob == "" || strings.HasSuffix(src.Blob, "/") {
 		return errors.New("source path is directory-like")
 	}
 	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
 		return errors.New("destination path is directory-like")
 	}
-	if src.Account != dst.Account {
-		return errors.New("server-side copy requires same storage account")
-	}
-	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") == "" {
-		return bloberror.MissingSharedKeyCredential
+	if concurrency < 1 {
+		concurrency = 1
 	}
 	client, err := getAzBlobClient(ctx, dst.Account)
 	if err != nil {
 		return err
 	}
-	blobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlobClient(dst.Blob)
 	copySource, err := blobSASURL(ctx, src)
 	if err != nil {
 		return err
 	}
-	startCopy, err := blobClient.StartCopyFromURL(ctx, copySource, nil)
+
+	// Get source size for block splitting.
+	totalSize, err := HeadBlob(ctx, src)
+	if err != nil {
+		return fmt.Errorf("failed to get source properties: %w", err)
+	}
+
+	err = copyBlobBlocks(ctx, client, dst, copySource, totalSize, concurrency, onProgress)
+	if err != nil {
+		// StageBlockFromURL (Put Block From URL) returns 501 in emulators
+		// like Azurite. Fall back to the async StartCopyFromURL approach.
+		// The 501 occurs on the very first block attempt (the API is either
+		// supported or not), so no partial staged blocks need cleanup —
+		// uncommitted blocks are garbage-collected by Azure automatically.
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.StatusCode == 501 {
+			slog.Debug("StageBlockFromURL not supported, falling back to StartCopyFromURL", "dst", dst.String())
+			return copyBlobAsync(ctx, client, dst, copySource, totalSize, onProgress)
+		}
+		return err
+	}
+	return nil
+}
+
+// copyBlobBlocks copies a blob using parallel StageBlockFromURL + CommitBlockList.
+func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource string, totalSize int64, concurrency int, onProgress CopyProgress) error {
+	blockBlobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
+
+	// Plan blocks and generate IDs.
+	blkSize, blockIDs, err := planBlocks(totalSize, copyBlockSize, blockblob.MaxBlocks)
 	if err != nil {
 		return err
 	}
-	if startCopy.CopyStatus == nil {
-		return errors.New("copy status missing")
+
+	var copiedBytes atomic.Int64
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+
+	for i, blockID := range blockIDs {
+		if ctx.Err() != nil {
+			break
+		}
+
+		offset := int64(i) * blkSize
+		count := min(blkSize, totalSize-offset)
+
+		// Acquire semaphore slot, respecting context cancellation so the
+		// loop doesn't block forever when a peer goroutine cancels ctx.
+		gotSlot := false
+		select {
+		case sem <- struct{}{}:
+			gotSlot = true
+		case <-ctx.Done():
+		}
+		if !gotSlot {
+			break
+		}
+		wg.Add(1)
+		go func(blockID string, offset, count int64) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+
+			_, err := blockBlobClient.StageBlockFromURL(ctx, blockID, copySource, &blockblob.StageBlockFromURLOptions{
+				Range: blob.HTTPRange{Offset: offset, Count: count},
+			})
+			if err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+				cancel()
+				return
+			}
+
+			copied := copiedBytes.Add(count)
+			if onProgress != nil {
+				onProgress(copied, totalSize)
+			}
+		}(blockID, offset, count)
 	}
-	var lastProps blob.GetPropertiesResponse
-	hasProps := false
-	copyStatus := *startCopy.CopyStatus
+
+	wg.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+
+	// Commit all staged blocks.
+	if _, err := blockBlobClient.CommitBlockList(ctx, blockIDs, nil); err != nil {
+		return fmt.Errorf("commit block list failed: %w", err)
+	}
+
+	if onProgress != nil {
+		onProgress(totalSize, totalSize)
+	}
+	return nil
+}
+
+// nextPollDelay doubles the delay up to copyPollMaxDelay.
+func nextPollDelay(d time.Duration) time.Duration {
+	d *= 2
+	if d > copyPollMaxDelay {
+		d = copyPollMaxDelay
+	}
+	return d
+}
+
+// copyBlobAsync copies a blob using StartCopyFromURL with polling.
+// This is the fallback for environments (e.g. Azurite) that don't support
+// StageBlockFromURL.
+func copyBlobAsync(ctx context.Context, client *azblob.Client, dst AzurePath, copySource string, totalSize int64, onProgress CopyProgress) error {
+	blobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlobClient(dst.Blob)
+	startCopy, err := blobClient.StartCopyFromURL(ctx, copySource, nil)
+	if err != nil {
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.ErrorCode == "PendingCopyOperation" {
+			slog.Info("pending copy operation detected, polling progress", "dst", dst.String())
+		} else {
+			return err
+		}
+	}
+
+	copyStatus := blob.CopyStatusTypePending
+	if startCopy.CopyStatus != nil {
+		copyStatus = *startCopy.CopyStatus
+	}
 	if copyStatus != blob.CopyStatusTypePending {
 		props, err := blobClient.GetProperties(ctx, nil)
 		if err == nil && props.CopyStatus != nil {
-			lastProps = props
-			hasProps = true
 			copyStatus = *props.CopyStatus
+			reportCopyProgress(props.CopyProgress, onProgress)
 		}
 	}
 	pollDelay := copyPollInitialDelay
+	pollTimer := time.NewTimer(pollDelay)
+	defer pollTimer.Stop()
 	for copyStatus == blob.CopyStatusTypePending {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(pollDelay):
+		case <-pollTimer.C:
 		}
 		pollDelay = nextPollDelay(pollDelay)
+		pollTimer.Reset(pollDelay)
 		props, err := blobClient.GetProperties(ctx, nil)
 		if err != nil {
 			return err
@@ -653,45 +867,102 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath) error
 		if props.CopyStatus == nil {
 			return errors.New("copy status missing")
 		}
-		lastProps = props
-		hasProps = true
 		copyStatus = *props.CopyStatus
+		reportCopyProgress(props.CopyProgress, onProgress)
 	}
 	if copyStatus != blob.CopyStatusTypeSuccess {
-		statusDescription := ""
-		if hasProps && lastProps.CopyStatusDescription != nil {
-			statusDescription = *lastProps.CopyStatusDescription
-		}
-		if statusDescription != "" {
-			return fmt.Errorf("copy failed with status %s: %s", copyStatus, statusDescription)
-		}
 		return fmt.Errorf("copy failed with status %s", copyStatus)
+	}
+	if onProgress != nil {
+		onProgress(totalSize, totalSize)
 	}
 	return nil
 }
 
-func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
-	client, err := getAzBlobClient(ctx, ap.Account)
-	if err != nil {
-		return "", err
+// reportCopyProgress parses the "bytes_copied/total_bytes" progress string
+// from Azure Blob CopyProgress and invokes the callback.
+func reportCopyProgress(progress *string, onProgress CopyProgress) {
+	if onProgress == nil || progress == nil {
+		return
 	}
-	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob)
-	sasURL, err := blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(copySASDuration()), nil)
-	if err != nil {
-		return "", fmt.Errorf("generate SAS URL: %w", err)
+	copied, total, ok := parseCopyProgress(*progress)
+	if ok && total > 0 {
+		onProgress(copied, total)
 	}
-	return sasURL, nil
 }
 
-func nextPollDelay(current time.Duration) time.Duration {
-	if current >= copyPollMaxDelay {
-		return copyPollMaxDelay
+// parseCopyProgress parses the Azure "bytes_copied/total_bytes" format.
+func parseCopyProgress(s string) (copied, total int64, ok bool) {
+	parts := strings.SplitN(s, "/", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
 	}
-	next := current * copyPollBackoffFactor
-	if next > copyPollMaxDelay {
-		return copyPollMaxDelay
+	c, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false
 	}
-	return next
+	t, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return c, t, true
+}
+
+func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
+	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") != "" {
+		client, err := getAzBlobClient(ctx, ap.Account)
+		if err != nil {
+			return "", err
+		}
+		blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob)
+		sasURL, err := blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().UTC().Add(copySASDuration()), nil)
+		if err != nil {
+			return "", fmt.Errorf("generate SAS URL: %w", err)
+		}
+		return sasURL, nil
+	}
+	return blobDelegationSASURL(ctx, ap)
+}
+
+// blobDelegationSASURL generates a SAS URL using a User Delegation Key obtained
+// via OAuth. This enables cross-account server-side copy within the same tenant.
+func blobDelegationSASURL(ctx context.Context, ap AzurePath) (string, error) {
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return "", fmt.Errorf("default credential: %w", err)
+	}
+	endpoint := getEndpoint(ap.Account)
+	svcClient, err := service.NewClient(endpoint, cred, nil)
+	if err != nil {
+		return "", fmt.Errorf("service client: %w", err)
+	}
+	now := time.Now().UTC().Add(-5 * time.Minute) // backdate to tolerate clock skew
+	expiry := now.Add(copySASDuration())
+	startStr := now.Format(sas.TimeFormat)
+	expiryStr := expiry.Format(sas.TimeFormat)
+	udc, err := svcClient.GetUserDelegationCredential(ctx, service.KeyInfo{
+		Start:  &startStr,
+		Expiry: &expiryStr,
+	}, nil)
+	if err != nil {
+		return "", fmt.Errorf("get user delegation credential: %w", err)
+	}
+	sasValues := sas.BlobSignatureValues{
+		Protocol:      sas.ProtocolHTTPS,
+		StartTime:     now,
+		ExpiryTime:    expiry,
+		Permissions:   (&sas.BlobPermissions{Read: true}).String(),
+		ContainerName: ap.Container,
+		BlobName:      ap.Blob,
+	}
+	qp, err := sasValues.SignWithUserDelegation(udc)
+	if err != nil {
+		return "", fmt.Errorf("sign user delegation SAS: %w", err)
+	}
+	containerClient := svcClient.NewContainerClient(ap.Container)
+	blobClient := containerClient.NewBlobClient(ap.Blob)
+	blobURL := blobClient.URL()
+	return fmt.Sprintf("%s?%s", blobURL, qp.Encode()), nil
 }
 
 func copySASDuration() time.Duration {

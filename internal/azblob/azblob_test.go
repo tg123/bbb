@@ -61,42 +61,155 @@ func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 	ctx := context.Background()
 	src := AzurePath{Account: "acct", Container: "container"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
-	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for dir-like source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for trailing slash source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst = AzurePath{Account: "acct", Container: "container"}
-	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for dir-like destination")
 	}
 	dst = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
 		t.Fatal("expected error for trailing slash destination")
 	}
 }
 
-func TestCopyBlobServerSideRequiresSameAccount(t *testing.T) {
-	ctx := context.Background()
+func TestCopyBlobServerSideCrossAccountRequiresCredentials(t *testing.T) {
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
-	err := CopyBlobServerSide(ctx, src, dst)
+	err := CopyBlobServerSide(ctx, src, dst, 4, nil)
 	if err == nil {
-		t.Fatal("expected error for cross-account copy")
+		t.Fatal("expected error for cross-account copy without credentials")
 	}
 }
 
-func TestCopyBlobServerSideRequiresSharedKey(t *testing.T) {
+func TestCopyBlobServerSideFallsBackToUserDelegation(t *testing.T) {
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "other.txt"}
-	err := CopyBlobServerSide(ctx, src, dst)
-	if !errors.Is(err, bloberror.MissingSharedKeyCredential) {
-		t.Fatalf("expected missing shared key error, got %v", err)
+	err := CopyBlobServerSide(ctx, src, dst, 4, nil)
+	// Without real Azure credentials the user delegation path will fail,
+	// but it must NOT be a MissingSharedKeyCredential error since we now
+	// attempt the delegation path instead.
+	if errors.Is(err, bloberror.MissingSharedKeyCredential) {
+		t.Fatalf("should not require shared key, got %v", err)
+	}
+	if err == nil {
+		t.Fatal("expected error without real credentials")
+	}
+}
+
+func TestParseCopyProgress(t *testing.T) {
+	copied, total, ok := parseCopyProgress("1024/2048")
+	if !ok || copied != 1024 || total != 2048 {
+		t.Fatalf("expected 1024/2048, got %d/%d ok=%v", copied, total, ok)
+	}
+	copied, total, ok = parseCopyProgress("0/0")
+	if !ok || copied != 0 || total != 0 {
+		t.Fatalf("expected 0/0, got %d/%d ok=%v", copied, total, ok)
+	}
+	if _, _, ok := parseCopyProgress("invalid"); ok {
+		t.Fatal("expected false for invalid input")
+	}
+	if _, _, ok := parseCopyProgress("abc/def"); ok {
+		t.Fatal("expected false for non-numeric input")
+	}
+	if _, _, ok := parseCopyProgress(""); ok {
+		t.Fatal("expected false for empty input")
+	}
+}
+
+func TestPlanBlocksEmpty(t *testing.T) {
+	blkSize, ids, err := planBlocks(0, 256*1024*1024, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize != 256*1024*1024 {
+		t.Fatalf("expected default block size, got %d", blkSize)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected 0 block IDs for empty blob, got %d", len(ids))
+	}
+}
+
+func TestPlanBlocksSingleBlock(t *testing.T) {
+	blkSize, ids, err := planBlocks(100, 256*1024*1024, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize != 256*1024*1024 {
+		t.Fatalf("expected default block size, got %d", blkSize)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("expected 1 block ID, got %d", len(ids))
+	}
+}
+
+func TestPlanBlocksMultipleBlocks(t *testing.T) {
+	// 512 MiB at 256 MiB block size = 2 blocks
+	blkSize, ids, err := planBlocks(512*1024*1024, 256*1024*1024, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize != 256*1024*1024 {
+		t.Fatalf("expected default block size, got %d", blkSize)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 block IDs, got %d", len(ids))
+	}
+	// All IDs must have the same length.
+	if len(ids[0]) != len(ids[1]) {
+		t.Fatalf("block IDs have different lengths: %q vs %q", ids[0], ids[1])
+	}
+}
+
+func TestPlanBlocksAdjustsBlockSizeWhenExceedsMax(t *testing.T) {
+	// maxBlocks=2, 300 bytes at default 100 = 3 blocks → must adjust.
+	blkSize, ids, err := planBlocks(300, 100, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if blkSize <= 100 {
+		t.Fatalf("expected increased block size, got %d", blkSize)
+	}
+	if len(ids) > 2 {
+		t.Fatalf("expected at most 2 blocks, got %d", len(ids))
+	}
+	// Verify blocks cover entire size.
+	covered := int64(len(ids)) * blkSize
+	if covered < 300 {
+		t.Fatalf("blocks do not cover total size: %d * %d = %d < 300", len(ids), blkSize, covered)
+	}
+}
+
+func TestPlanBlocksUniqueIDs(t *testing.T) {
+	_, ids, err := planBlocks(1024, 100, 50000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	seen := make(map[string]bool)
+	for _, id := range ids {
+		if seen[id] {
+			t.Fatalf("duplicate block ID: %s", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestPlanBlocksNegativeSize(t *testing.T) {
+	_, _, err := planBlocks(-1, 256*1024*1024, 50000)
+	if err == nil {
+		t.Fatal("expected error for negative total size")
 	}
 }
 
@@ -240,5 +353,138 @@ func TestReaderSizeSeekError(t *testing.T) {
 	reader := failingSeeker{read: strings.NewReader("size")}
 	if got := readerSize(reader); got != -1 {
 		t.Fatalf("expected size -1, got %d", got)
+	}
+}
+
+func int64Ptr(v int64) *int64 { return &v }
+
+func TestExtractFirstLevelDirectoryFromNestedBlob(t *testing.T) {
+	// Scenario from bug report: only deeply nested blobs exist (no direct children).
+	// Listing the parent should return the subdirectory.
+	entries := []flatBlobEntry{
+		{Name: "zz/file", Size: int64Ptr(100)},
+	}
+	var got []BlobMeta
+	if err := extractFirstLevel(entries, "", func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry, got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "zz/" {
+		t.Fatalf("expected directory name 'zz/', got %q", got[0].Name)
+	}
+	if got[0].Size != 0 {
+		t.Fatalf("expected directory size 0, got %d", got[0].Size)
+	}
+}
+
+func TestExtractFirstLevelDirectoryFromNilContentLength(t *testing.T) {
+	// Azure ADLS Gen2 / HNS may return directory-marker blobs with nil
+	// ContentLength. These blobs should still contribute to directory
+	// detection when their name contains a "/".
+	entries := []flatBlobEntry{
+		{Name: "dir/subdir/file", Size: nil}, // nil ContentLength
+	}
+	var got []BlobMeta
+	if err := extractFirstLevel(entries, "", func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry, got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "dir/" {
+		t.Fatalf("expected directory name 'dir/', got %q", got[0].Name)
+	}
+}
+
+func TestExtractFirstLevelSkipsNilContentLengthFile(t *testing.T) {
+	// A first-level blob with nil ContentLength should be skipped (e.g.
+	// directory-marker blobs without a trailing slash).
+	entries := []flatBlobEntry{
+		{Name: "marker", Size: nil},
+	}
+	var got []BlobMeta
+	if err := extractFirstLevel(entries, "", func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected 0 entries, got %d: %+v", len(got), got)
+	}
+}
+
+func TestExtractFirstLevelMixedEntries(t *testing.T) {
+	entries := []flatBlobEntry{
+		{Name: "prefix/file.txt", Size: int64Ptr(42)},
+		{Name: "prefix/dir/a.txt", Size: int64Ptr(10)},
+		{Name: "prefix/dir/b.txt", Size: int64Ptr(20)},
+		{Name: "prefix/other/deep/c.txt", Size: int64Ptr(30)},
+	}
+	var got []BlobMeta
+	if err := extractFirstLevel(entries, "prefix/", func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 entries, got %d: %+v", len(got), got)
+	}
+	want := map[string]int64{"file.txt": 42, "dir/": 0, "other/": 0}
+	for _, bm := range got {
+		wantSize, ok := want[bm.Name]
+		if !ok {
+			t.Fatalf("unexpected entry %q", bm.Name)
+		}
+		if bm.Size != wantSize {
+			t.Fatalf("entry %q: expected size %d, got %d", bm.Name, wantSize, bm.Size)
+		}
+	}
+}
+
+func TestExtractFirstLevelDedup(t *testing.T) {
+	entries := []flatBlobEntry{
+		{Name: "dir/a.txt", Size: int64Ptr(10)},
+		{Name: "dir/b.txt", Size: int64Ptr(20)},
+	}
+	var got []BlobMeta
+	if err := extractFirstLevel(entries, "", func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 deduped directory, got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "dir/" {
+		t.Fatalf("expected 'dir/', got %q", got[0].Name)
+	}
+}
+
+func TestExtractFirstLevelEmptyPrefix(t *testing.T) {
+	// Listing container root (empty prefix) with only nested blobs.
+	entries := []flatBlobEntry{
+		{Name: "a/b/c", Size: int64Ptr(5)},
+		{Name: "x.txt", Size: int64Ptr(3)},
+	}
+	var got []BlobMeta
+	if err := extractFirstLevel(entries, "", func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d: %+v", len(got), got)
 	}
 }
