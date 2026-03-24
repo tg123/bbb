@@ -107,6 +107,8 @@ func main() {
 				Value:   "info",
 				Sources: cli.EnvVars("BBB_LOG_LEVEL"),
 			},
+			&cli.StringFlag{Name: "taskfile", Hidden: true},
+			&cli.StringFlag{Name: "state", Hidden: true},
 		},
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
 			lvlStr := cmd.String("loglevel")
@@ -1488,7 +1490,13 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
 	taskfile := c.String("taskfile")
+	if taskfile == "" {
+		taskfile = c.Root().String("taskfile")
+	}
 	stateFile := c.String("state")
+	if stateFile == "" {
+		stateFile = c.Root().String("state")
+	}
 
 	var tasks []taskPair
 	if taskfile != "" {
@@ -2629,7 +2637,13 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 	concurrency := c.Int("concurrency")
 	retryCount := c.Int("retry-count")
 	taskfile := c.String("taskfile")
+	if taskfile == "" {
+		taskfile = c.Root().String("taskfile")
+	}
 	stateFile := c.String("state")
+	if stateFile == "" {
+		stateFile = c.Root().String("state")
+	}
 
 	if taskfile != "" {
 		if c.Args().Len() != 0 {
