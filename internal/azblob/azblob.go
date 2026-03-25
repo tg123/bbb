@@ -474,11 +474,7 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 	// Size is scanConcurrency-1 because the root walk runs inline in
 	// the caller's goroutine, so total concurrent walks = 1 (root) +
 	// len(sem) ≤ scanConcurrency.
-	semSize := scanConcurrency - 1
-	if semSize < 1 {
-		semSize = 1
-	}
-	sem := make(chan struct{}, semSize)
+	sem := make(chan struct{}, scanConcurrency-1)
 	var wg sync.WaitGroup
 
 	// Track seen prefixes to avoid walking the same subdirectory twice
