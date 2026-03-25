@@ -162,7 +162,7 @@ type CopyProgress = func(copied, total int64)
 
 // serverSideCopier is an optional FS extension for server-side copy.
 type serverSideCopier interface {
-	CopyServerSide(ctx context.Context, src, dst string, concurrency int, onProgress CopyProgress) error
+	CopyServerSide(ctx context.Context, src, dst string, concurrency int, sizeHint int64, onProgress CopyProgress) error
 }
 
 // CanCopyServerSide returns true when both src and dst can use server-side copy.
@@ -175,11 +175,12 @@ func CanCopyServerSide(src, dst string) bool {
 }
 
 // CopyServerSide performs an optimised server-side copy (e.g. Azure→Azure).
+// sizeHint, when > 0, avoids a HeadBlob round-trip for the source size.
 // Returns an error if the backends do not support server-side copy.
-func CopyServerSide(ctx context.Context, src, dst string, concurrency int, onProgress CopyProgress) error {
+func CopyServerSide(ctx context.Context, src, dst string, concurrency int, sizeHint int64, onProgress CopyProgress) error {
 	srcFS := Resolve(src)
 	if sc, ok := srcFS.(serverSideCopier); ok {
-		return sc.CopyServerSide(ctx, src, dst, concurrency, onProgress)
+		return sc.CopyServerSide(ctx, src, dst, concurrency, sizeHint, onProgress)
 	}
 	return errors.New("server-side copy not supported")
 }

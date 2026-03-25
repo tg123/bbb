@@ -177,7 +177,7 @@ func (azFS) MkDir(ctx context.Context, p string) error {
 	return azblob.MkContainer(ctx, ap.Account, ap.Container)
 }
 
-func (azFS) CopyServerSide(ctx context.Context, src, dst string, concurrency int, onProgress CopyProgress) error {
+func (azFS) CopyServerSide(ctx context.Context, src, dst string, concurrency int, sizeHint int64, onProgress CopyProgress) error {
 	srcAP, err := azblob.Parse(src)
 	if err != nil {
 		return err
@@ -186,7 +186,7 @@ func (azFS) CopyServerSide(ctx context.Context, src, dst string, concurrency int
 	if err != nil {
 		return err
 	}
-	return azblob.CopyBlobServerSide(ctx, srcAP, dstAP, concurrency, onProgress)
+	return azblob.CopyBlobServerSide(ctx, srcAP, dstAP, concurrency, sizeHint, onProgress)
 }
 
 func (azFS) ListStream(ctx context.Context, p string, fn func(Entry) error) error {

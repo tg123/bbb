@@ -30,6 +30,19 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
 
+// --- Cached credentials and clients ---
+// These are safe for concurrent use and amortize the cost of credential
+// acquisition across all API calls in the process lifetime.
+
+var (
+	cachedDefaultCred     *azidentity.DefaultAzureCredential
+	cachedDefaultCredOnce sync.Once
+	cachedDefaultCredErr  error
+
+	// Per-account blob client cache (thread-safe via sync.Map).
+	blobClientCache sync.Map // map[string]*azblob.Client
+)
+
 // MkContainer creates a new Azure Blob container
 func MkContainer(ctx context.Context, account, container string) error {
 	client, err := getAzBlobClient(ctx, account)
@@ -374,41 +387,67 @@ func processHierarchySegment(seg *container.BlobHierarchyListSegment, prefix str
 	return nil
 }
 
+// getDefaultCredential returns a process-wide cached DefaultAzureCredential.
+// The credential is thread-safe and handles token refresh internally.
+func getDefaultCredential() (*azidentity.DefaultAzureCredential, error) {
+	cachedDefaultCredOnce.Do(func() {
+		cachedDefaultCred, cachedDefaultCredErr = azidentity.NewDefaultAzureCredential(nil)
+	})
+	return cachedDefaultCred, cachedDefaultCredErr
+}
+
 // getAzBlobClient returns an Azure Blob client for the given account using either a shared key
 // from BBB_AZBLOB_ACCOUNTKEY or the default Azure credential.
+// Clients are cached per account for the process lifetime.
 func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
+	// Check cache first.
+	if cached, ok := blobClientCache.Load(account); ok {
+		return cached.(*azblob.Client), nil
+	}
 	endpoint := getEndpoint(account)
+	var client *azblob.Client
 	if key := os.Getenv("BBB_AZBLOB_ACCOUNTKEY"); key != "" {
 		cred, err := azblob.NewSharedKeyCredential(account, key)
 		if err != nil {
 			return nil, err
 		}
-		return azblob.NewClientWithSharedKeyCredential(endpoint, cred, nil)
-	}
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if slog.Default().Enabled(ctx, slog.LevelDebug) {
-		tok, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
+		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, cred, nil)
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		cred, credErr := getDefaultCredential()
+		if credErr != nil {
+			return nil, credErr
+		}
 
-		parts := strings.Split(tok.Token, ".")
-		if len(parts) == 3 {
-			payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-			if err == nil {
-				slog.Debug("Decoded JWT payload", "payload", string(payload))
-			} else {
-				slog.Debug("Failed to decode JWT payload", "error", err)
+		if slog.Default().Enabled(ctx, slog.LevelDebug) {
+			tok, tokErr := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
+			if tokErr != nil {
+				return nil, tokErr
 			}
-		} else {
-			slog.Debug("Token is not a JWT")
+
+			parts := strings.Split(tok.Token, ".")
+			if len(parts) == 3 {
+				payload, decErr := base64.RawURLEncoding.DecodeString(parts[1])
+				if decErr == nil {
+					slog.Debug("Decoded JWT payload", "payload", string(payload))
+				} else {
+					slog.Debug("Failed to decode JWT payload", "error", decErr)
+				}
+			} else {
+				slog.Debug("Token is not a JWT")
+			}
+		}
+		var clientErr error
+		client, clientErr = azblob.NewClient(endpoint, cred, nil)
+		if clientErr != nil {
+			return nil, clientErr
 		}
 	}
-	return azblob.NewClient(endpoint, cred, nil)
+	// Store-or-load: if another goroutine raced and stored first, use theirs.
+	actual, _ := blobClientCache.LoadOrStore(account, client)
+	return actual.(*azblob.Client), nil
 }
 
 // List lists immediate children (non-recursive). If dir-like path provided, lists under it.
@@ -886,7 +925,7 @@ func planBlocks(totalSize int64, defaultBlockSize int64, maxBlocks int64) (block
 // bytes copied so far and the total size in bytes.
 type CopyProgress func(copied, total int64)
 
-func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concurrency int, onProgress CopyProgress) error {
+func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concurrency int, sizeHint int64, onProgress CopyProgress) error {
 	if src.Blob == "" || strings.HasSuffix(src.Blob, "/") {
 		return errors.New("source path is directory-like")
 	}
@@ -905,10 +944,13 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 		return err
 	}
 
-	// Get source size for block splitting.
-	totalSize, err := HeadBlob(ctx, src)
-	if err != nil {
-		return fmt.Errorf("failed to get source properties: %w", err)
+	// Use provided size when available to avoid a HeadBlob round-trip.
+	totalSize := sizeHint
+	if totalSize <= 0 {
+		totalSize, err = HeadBlob(ctx, src)
+		if err != nil {
+			return fmt.Errorf("failed to get source properties: %w", err)
+		}
 	}
 
 	err = copyBlobBlocks(ctx, client, dst, copySource, totalSize, concurrency, onProgress)
@@ -1105,6 +1147,75 @@ func parseCopyProgress(s string) (copied, total int64, ok bool) {
 	return c, t, true
 }
 
+// --- Cached User Delegation Credential for SAS URL generation ---
+
+// udcCacheEntry caches a User Delegation Credential for an account.
+// The UDK is valid from start to expiry; we refresh when the current time
+// exceeds refreshAt (50% of the remaining validity).
+type udcCacheEntry struct {
+	udc       *service.UserDelegationCredential
+	svcClient *service.Client
+	start     time.Time
+	expiry    time.Time
+	refreshAt time.Time
+}
+
+var (
+	udcCacheMu sync.Mutex
+	udcCache   = make(map[string]*udcCacheEntry) // keyed by account
+)
+
+// getUDC returns a cached User Delegation Credential for the account,
+// refreshing it when necessary. Thread-safe.
+func getUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
+	udcCacheMu.Lock()
+	entry, ok := udcCache[account]
+	if ok && time.Now().UTC().Before(entry.refreshAt) {
+		udcCacheMu.Unlock()
+		return entry.udc, entry.svcClient, entry.start, entry.expiry, nil
+	}
+	udcCacheMu.Unlock()
+
+	// Acquire or refresh UDK outside the lock.
+	cred, err := getDefaultCredential()
+	if err != nil {
+		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("default credential: %w", err)
+	}
+	endpoint := getEndpoint(account)
+	svcClient, err := service.NewClient(endpoint, cred, nil)
+	if err != nil {
+		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("service client: %w", err)
+	}
+	now := time.Now().UTC().Add(-5 * time.Minute) // backdate to tolerate clock skew
+	expiry := now.Add(copySASDuration())
+	startStr := now.Format(sas.TimeFormat)
+	expiryStr := expiry.Format(sas.TimeFormat)
+	udc, err := svcClient.GetUserDelegationCredential(ctx, service.KeyInfo{
+		Start:  &startStr,
+		Expiry: &expiryStr,
+	}, nil)
+	if err != nil {
+		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("get user delegation credential: %w", err)
+	}
+
+	// Refresh at 50% of remaining validity (so we never use an about-to-expire key).
+	remaining := time.Until(expiry)
+	refreshAt := time.Now().UTC().Add(remaining / 2)
+
+	newEntry := &udcCacheEntry{
+		udc:       udc,
+		svcClient: svcClient,
+		start:     now,
+		expiry:    expiry,
+		refreshAt: refreshAt,
+	}
+	udcCacheMu.Lock()
+	udcCache[account] = newEntry
+	udcCacheMu.Unlock()
+
+	return udc, svcClient, now, expiry, nil
+}
+
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
 	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") != "" {
 		client, err := getAzBlobClient(ctx, ap.Account)
@@ -1121,32 +1232,18 @@ func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
 	return blobDelegationSASURL(ctx, ap)
 }
 
-// blobDelegationSASURL generates a SAS URL using a User Delegation Key obtained
-// via OAuth. This enables cross-account server-side copy within the same tenant.
+// blobDelegationSASURL generates a SAS URL using a cached User Delegation Key
+// obtained via OAuth. This enables cross-account server-side copy within the
+// same tenant. The UDK is cached per account and refreshed at 50% of its
+// validity period.
 func blobDelegationSASURL(ctx context.Context, ap AzurePath) (string, error) {
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	udc, svcClient, start, expiry, err := getUDC(ctx, ap.Account)
 	if err != nil {
-		return "", fmt.Errorf("default credential: %w", err)
-	}
-	endpoint := getEndpoint(ap.Account)
-	svcClient, err := service.NewClient(endpoint, cred, nil)
-	if err != nil {
-		return "", fmt.Errorf("service client: %w", err)
-	}
-	now := time.Now().UTC().Add(-5 * time.Minute) // backdate to tolerate clock skew
-	expiry := now.Add(copySASDuration())
-	startStr := now.Format(sas.TimeFormat)
-	expiryStr := expiry.Format(sas.TimeFormat)
-	udc, err := svcClient.GetUserDelegationCredential(ctx, service.KeyInfo{
-		Start:  &startStr,
-		Expiry: &expiryStr,
-	}, nil)
-	if err != nil {
-		return "", fmt.Errorf("get user delegation credential: %w", err)
+		return "", err
 	}
 	sasValues := sas.BlobSignatureValues{
 		Protocol:      sas.ProtocolHTTPS,
-		StartTime:     now,
+		StartTime:     start,
 		ExpiryTime:    expiry,
 		Permissions:   (&sas.BlobPermissions{Read: true}).String(),
 		ContainerName: ap.Container,

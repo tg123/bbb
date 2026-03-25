@@ -202,6 +202,7 @@ type cpTask struct {
 	src     string
 	dst     string
 	key     string
+	size    int64       // known size from listing; 0 = unknown
 	tracker *taskTracker // nil when no task-level checkpoint tracking
 }
 
@@ -235,9 +236,10 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 		}
 		dstPath := bbbfs.ChildPath(task.dst, filepath.ToSlash(entry.Name))
 		if err := emit(cpTask{
-			src: entry.Path,
-			dst: dstPath,
-			key: taskStateKey(entry.Path, task.dst),
+			src:  entry.Path,
+			dst:  dstPath,
+			key:  taskStateKey(entry.Path, task.dst),
+			size: entry.Size,
 		}); err != nil {
 			return err
 		}

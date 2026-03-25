@@ -725,11 +725,8 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	}
 	// Limit concurrent file copies so block-level parallelism (StageBlockFromURL)
 	// focuses on finishing each file ASAP rather than spreading across many files.
-	// Two workers allow the next file's setup (HeadBlob, SAS) to overlap with the
-	// current file's final blocks, hiding latency between files.
-	if cpWorkers > maxServerSideCopyFiles {
-		cpWorkers = maxServerSideCopyFiles
-	}
+	// For many small files, this allows high throughput since each file only needs
+	// one block goroutine. Total block goroutines = cpWorkers × innerConcurrency.
 	innerConcurrency := concurrency
 	innerQuiet := true
 	showCopyBars := !quiet
@@ -777,7 +774,7 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 					if taskProgress != nil {
 						bytesCb = taskProgress.AddBytes
 					}
-					if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, showCopyBars, bytesCb); err != nil {
+					if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, task.size, showCopyBars, bytesCb); err != nil {
 						setErr(err)
 						return
 					}
@@ -931,7 +928,7 @@ enqueueLoop:
 	return nil
 }
 
-func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, showCopyBar bool, onBytes func(int64)) error {
+func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, srcSize int64, showCopyBar bool, onBytes func(int64)) error {
 	if bbbfs.IsHF(dst) {
 		return fmt.Errorf("cp: hf:// only supported as source")
 	}
@@ -985,6 +982,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			dst:   dstPath,
 			srcAz: srcAz,
 			dstAz: dstAz,
+			size:  srcSize,
 			base:  base,
 		})
 	}
@@ -1036,7 +1034,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				}
 			}
 			var lastReported atomic.Int64
-			if err := bbbfs.CopyServerSide(ctx, op.src, op.dst, concurrency, func(copied, total int64) {
+			if err := bbbfs.CopyServerSide(ctx, op.src, op.dst, concurrency, size, func(copied, total int64) {
 				if total <= 0 {
 					return
 				}
@@ -1157,7 +1155,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 						copyBar.byteSized = true
 					}
 				}
-				if err := bbbfs.CopyServerSide(ctx, srcChild, dstChild, concurrency, func(copied, total int64) {
+				if err := bbbfs.CopyServerSide(ctx, srcChild, dstChild, concurrency, 0, func(copied, total int64) {
 					if total <= 0 || copyBar == nil {
 						return
 					}
@@ -1727,7 +1725,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 						copyBar.byteSized = true
 					}
 				}
-				if err := bbbfs.CopyServerSide(ctx, srcChild, dstChild, concurrency, func(copied, total int64) {
+				if err := bbbfs.CopyServerSide(ctx, srcChild, dstChild, concurrency, f.size, func(copied, total int64) {
 					if total <= 0 || copyBar == nil {
 						return
 					}
