@@ -518,13 +518,6 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
-// maxServerSideCopyFiles limits the number of files being server-side
-// copied in parallel. Each CopyBlobServerSide call spawns `concurrency`
-// block goroutines, so without this cap the total goroutines would be
-// poolSize × concurrency (N²). Two concurrent files allow overlap
-// (next file's HeadBlob/SAS while current file finishes its last blocks).
-const maxServerSideCopyFiles = 2
-
 func sendOp[T any](ctx context.Context, ch chan<- T, op T) error {
 	select {
 	case <-ctx.Done():
@@ -722,18 +715,17 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	// for a single pair, only 1 expander runs (capped below by len(tasks)).
 	expanders := max(1, workers/4)
 	cpWorkers := max(1, workers-expanders)
-	// Cap file-level parallelism for server-side copies: each
-	// CopyBlobServerSide spawns `concurrency` block goroutines, so
-	// uncapped cpWorkers would cause N² total goroutines and TLS
-	// handshake starvation.
-	if cpWorkers > maxServerSideCopyFiles {
-		cpWorkers = maxServerSideCopyFiles
+	// Distribute the concurrency budget between file-level and block-level
+	// parallelism: total goroutines = cpWorkers × innerConcurrency ≤ concurrency.
+	// For many small files (≤1 block each), cpWorkers dominates and each file
+	// finishes with a single StageBlockFromURL. For few large files, workers
+	// naturally converge to fewer active files and each gets more block parallelism.
+	// Cap cpWorkers so large files still get enough inner parallelism.
+	maxCPWorkers := max(2, concurrency/4)
+	if cpWorkers > maxCPWorkers {
+		cpWorkers = maxCPWorkers
 	}
-	// Limit concurrent file copies so block-level parallelism (StageBlockFromURL)
-	// focuses on finishing each file ASAP rather than spreading across many files.
-	// For many small files, this allows high throughput since each file only needs
-	// one block goroutine. Total block goroutines = cpWorkers × innerConcurrency.
-	innerConcurrency := concurrency
+	innerConcurrency := max(1, concurrency/cpWorkers)
 	innerQuiet := true
 	showCopyBars := !quiet
 	workerCtx, cancel := context.WithCancel(ctx)
@@ -1005,13 +997,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			return fmt.Errorf("cp: %s -> %s: %w", op.src, op.dst, err)
 		}
 	}
-	// When any file ops involve az→az server-side copy, limit file-level
-	// parallelism to 2 so the block-level goroutines (concurrency per file)
-	// don't cause N² total goroutines and TLS handshake starvation.
+	// Distribute concurrency between file-level and block-level parallelism
+	// for az→az server-side copies: total goroutines = cpPoolSize × blockConcurrency ≤ concurrency.
 	cpPoolSize := concurrency
+	blockConcurrency := concurrency
 	for _, op := range fileOps {
 		if op.srcAz && op.dstAz {
-			cpPoolSize = min(maxServerSideCopyFiles, concurrency)
+			cpPoolSize = max(2, concurrency/4)
+			blockConcurrency = max(1, concurrency/cpPoolSize)
 			break
 		}
 	}
@@ -1047,7 +1040,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				}
 			}
 			var lastReported atomic.Int64
-			if err := bbbfs.CopyServerSide(ctx, op.src, op.dst, concurrency, size, func(copied, total int64) {
+			if err := bbbfs.CopyServerSide(ctx, op.src, op.dst, blockConcurrency, size, func(copied, total int64) {
 				if total <= 0 {
 					return
 				}
@@ -1134,10 +1127,10 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			type ssOp struct {
 				name string
 			}
-			// Limit file-level parallelism to avoid N² goroutines: each
-			// CopyServerSide spawns `concurrency` block goroutines, so
-			// fileWorkers × concurrency must stay bounded.
-			fileWorkers := min(maxServerSideCopyFiles, concurrency)
+			// Distribute concurrency between file-level and block-level parallelism:
+			// total goroutines = fileWorkers × blockConcurrency ≤ concurrency.
+			fileWorkers := max(2, concurrency/4)
+			blockConcurrency := max(1, concurrency/fileWorkers)
 			var totalItems atomic.Int64
 			copyTreeProgress := newStreamingProgressBar(errPrefix, quiet, false)
 			if copyTreeProgress != nil {
@@ -1168,7 +1161,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 						copyBar.byteSized = true
 					}
 				}
-				if err := bbbfs.CopyServerSide(ctx, srcChild, dstChild, concurrency, 0, func(copied, total int64) {
+				if err := bbbfs.CopyServerSide(ctx, srcChild, dstChild, blockConcurrency, 0, func(copied, total int64) {
 					if total <= 0 || copyBar == nil {
 						return
 					}
@@ -1646,13 +1639,13 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			rel  string
 			size int64
 		}
-		// When both src and dst are Azure, CopyBlobServerSide spawns
-		// `concurrency` block goroutines per file. Limit file-level
-		// parallelism to 2 so total goroutines stay bounded at
-		// 2 × concurrency instead of concurrency².
+		// Distribute concurrency between file-level and block-level parallelism
+		// for Az→Az server-side copies: total goroutines = syncWorkers × blockConcurrency ≤ concurrency.
 		syncWorkers := concurrency
+		blockConcurrency := concurrency
 		if srcAz && dstAz {
-			syncWorkers = min(maxServerSideCopyFiles, concurrency)
+			syncWorkers = max(2, concurrency/4)
+			blockConcurrency = max(1, concurrency/syncWorkers)
 		}
 		// Build producer: for Azure sources, stream listing into the worker
 		// pool so processing starts while listing continues. For HF and
@@ -1738,7 +1731,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 						copyBar.byteSized = true
 					}
 				}
-				if err := bbbfs.CopyServerSide(ctx, srcChild, dstChild, concurrency, f.size, func(copied, total int64) {
+				if err := bbbfs.CopyServerSide(ctx, srcChild, dstChild, blockConcurrency, f.size, func(copied, total int64) {
 					if total <= 0 || copyBar == nil {
 						return
 					}
