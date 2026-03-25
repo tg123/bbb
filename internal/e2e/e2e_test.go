@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -550,6 +551,8 @@ func TestBasic(t *testing.T) {
 			"az://" + azuriteAccount + "/test/testfile.txt",
 		}
 
+		sort.Strings(files)
+		sort.Strings(expected)
 		if !slices.Equal(files, expected) {
 			t.Errorf("unexpected files: got %v, want %v", files, expected)
 		}
@@ -657,6 +660,8 @@ func TestBasic(t *testing.T) {
 			"az://" + azuriteAccount + "/test/testfile2.txt",
 		}
 
+		sort.Strings(files)
+		sort.Strings(expected)
 		if !slices.Equal(files, expected) {
 			t.Errorf("lsr * wildcard: got %v, want %v", files, expected)
 		}
@@ -677,6 +682,8 @@ func TestBasic(t *testing.T) {
 			"az://" + azuriteAccount + "/test/testfile2.txt",
 		}
 
+		sort.Strings(files)
+		sort.Strings(expected)
 		if !slices.Equal(files, expected) {
 			t.Errorf("llr * wildcard: got %v, want %v", files, expected)
 		}
@@ -924,6 +931,8 @@ func TestBasic(t *testing.T) {
 			"az://" + azuriteAccount + "/test/test/3.txt",
 		}
 
+		sort.Strings(files)
+		sort.Strings(expected)
 		if !slices.Equal(files, expected) {
 			t.Errorf("unexpected files after cpr: got %v, want %v", files, expected)
 		}
