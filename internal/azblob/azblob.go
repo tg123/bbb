@@ -81,6 +81,7 @@ var validBlobSuffixes = []string{
 
 const (
 	defaultCopySASExpiry     = time.Hour
+	clockSkewTolerance       = 5 * time.Minute // backdate SAS start to tolerate clock differences
 	copyBlockSize            = 256 * 1024 * 1024 // 256 MiB per block for StageBlockFromURL
 	copyPollInitialDelay     = 100 * time.Millisecond
 	copyPollMaxDelay         = 2 * time.Second
@@ -1186,7 +1187,7 @@ func getUDC(ctx context.Context, account string) (*service.UserDelegationCredent
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("service client: %w", err)
 	}
-	now := time.Now().UTC().Add(-5 * time.Minute) // backdate to tolerate clock skew
+	now := time.Now().UTC().Add(-clockSkewTolerance)
 	expiry := now.Add(copySASDuration())
 	startStr := now.Format(sas.TimeFormat)
 	expiryStr := expiry.Format(sas.TimeFormat)
@@ -1198,9 +1199,9 @@ func getUDC(ctx context.Context, account string) (*service.UserDelegationCredent
 		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("get user delegation credential: %w", err)
 	}
 
-	// Refresh at 50% of remaining validity (so we never use an about-to-expire key).
-	remaining := time.Until(expiry)
-	refreshAt := time.Now().UTC().Add(remaining / 2)
+	// Refresh at 50% of the key's validity window so we never use an
+	// about-to-expire key. Use the same time base (now) for consistency.
+	refreshAt := now.Add(copySASDuration() / 2)
 
 	newEntry := &udcCacheEntry{
 		udc:       udc,
