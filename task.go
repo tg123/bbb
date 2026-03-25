@@ -218,7 +218,13 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 			return err
 		}
 		if !dirLike {
-			return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+			// IsDirLike only checks path syntax (trailing "/").
+			// Verify the blob actually exists; if not, the path
+			// may be a virtual directory prefix — fall through to
+			// recursive listing.
+			if _, statErr := bbbfs.Resolve(task.src).Stat(ctx, task.src); statErr == nil {
+				return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+			}
 		}
 	} else {
 		if info, err := os.Stat(task.src); err != nil || !info.IsDir() {

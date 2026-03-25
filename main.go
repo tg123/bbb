@@ -720,10 +720,18 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	// Listing runs as a sequential flat pager, so each expander is lightweight.
 	// Multiple expanders help when there are multiple source→destination pairs;
 	// for a single pair, only 1 expander runs (capped below by len(tasks)).
-	// Copy workers get the full concurrency budget — listing is independent
-	// sequential I/O and doesn't compete with copy for network or CPU.
 	expanders := max(1, workers/4)
-	cpWorkers := workers
+	cpWorkers := workers - expanders
+	if cpWorkers < 1 {
+		cpWorkers = 1
+	}
+	// Cap file-level parallelism for server-side copies: each
+	// CopyBlobServerSide spawns `concurrency` block goroutines, so
+	// uncapped cpWorkers would cause N² total goroutines and TLS
+	// handshake starvation.
+	if cpWorkers > maxServerSideCopyFiles {
+		cpWorkers = maxServerSideCopyFiles
+	}
 	// Limit concurrent file copies so block-level parallelism (StageBlockFromURL)
 	// focuses on finishing each file ASAP rather than spreading across many files.
 	// For many small files, this allows high throughput since each file only needs
@@ -960,6 +968,12 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				return err
 			}
 			if dirLike {
+				dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
+				continue
+			}
+			// IsDirLike only checks path syntax. If the blob doesn't
+			// exist, the path may be a virtual directory prefix.
+			if _, statErr := bbbfs.Resolve(src).Stat(ctx, src); statErr != nil {
 				dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
 				continue
 			}
