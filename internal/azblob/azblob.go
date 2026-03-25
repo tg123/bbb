@@ -25,6 +25,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
@@ -306,16 +307,13 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 		return err
 	}
 	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
-	opts := &azblob.ListBlobsFlatOptions{
-		Include: azblob.ListBlobsInclude{Metadata: true},
-	}
+	opts := &container.ListBlobsHierarchyOptions{}
 	// Use nil Prefix (omit query param) for container root instead of &""
 	// to avoid potential Azure SDK/API differences with empty string prefix.
 	if prefix != "" {
 		opts.Prefix = &prefix
 	}
-	pager := containerClient.NewListBlobsFlatPager(opts)
-	seen := make(map[string]struct{})
+	pager := containerClient.NewListBlobsHierarchyPager("/", opts)
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
@@ -324,25 +322,35 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 		if resp.Segment == nil {
 			return nil
 		}
-		var batch []flatBlobEntry
+		// Emit virtual directories (blob prefixes)
+		for _, bp := range resp.Segment.BlobPrefixes {
+			if bp == nil || bp.Name == nil {
+				continue
+			}
+			dirName := strings.TrimPrefix(*bp.Name, prefix)
+			if dirName == "" {
+				continue
+			}
+			if err := cb(BlobMeta{Name: dirName, Size: 0}); err != nil {
+				return err
+			}
+		}
+		// Emit files at this level
 		for _, blob := range resp.Segment.BlobItems {
 			if blob == nil || blob.Name == nil {
 				continue
 			}
-			var size *int64
-			if blob.Properties != nil {
-				size = blob.Properties.ContentLength
+			var size int64
+			if blob.Properties != nil && blob.Properties.ContentLength != nil {
+				size = *blob.Properties.ContentLength
 			}
-			batch = append(batch, flatBlobEntry{Name: *blob.Name, Size: size})
-		}
-		if err := extractFirstLevel(batch, prefix, func(bm BlobMeta) error {
-			if _, exists := seen[bm.Name]; exists {
-				return nil
+			name := strings.TrimPrefix(*blob.Name, prefix)
+			if name == "" {
+				continue
 			}
-			seen[bm.Name] = struct{}{}
-			return cb(bm)
-		}); err != nil {
-			return err
+			if err := cb(BlobMeta{Name: name, Size: size}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -398,46 +406,56 @@ func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 	return out, nil
 }
 
-// ListRecursive retrieves all blobs under path (treats path as prefix root)
-func ListRecursive(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
+// ListRecursiveStream streams all blobs under path via callback (treats path as prefix root).
+// This avoids collecting all results in memory before processing.
+func ListRecursiveStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) error {
 	prefix := ap.Blob
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
 	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
-	opts := &azblob.ListBlobsFlatOptions{
-		Include: azblob.ListBlobsInclude{Metadata: true},
-	}
+	opts := &azblob.ListBlobsFlatOptions{}
 	// Use nil Prefix for container root; see ListStream comment.
 	if prefix != "" {
 		opts.Prefix = &prefix
 	}
 	pager := containerClient.NewListBlobsFlatPager(opts)
-	var out []BlobMeta
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if resp.Segment == nil {
-			// Check if error is due to missing container
 			var respErr *azcore.ResponseError
 			if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerNotFound" {
-				return nil, fmt.Errorf("container '%s' not found", ap.Container)
+				return fmt.Errorf("container '%s' not found", ap.Container)
 			}
-			// If Segment is nil but no error, treat as empty container
-			return []BlobMeta{}, nil
+			return nil
 		}
 		for _, blob := range resp.Segment.BlobItems {
 			if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
 				continue
 			}
-			out = append(out, BlobMeta{Name: strings.TrimPrefix(*blob.Name, prefix), Size: *blob.Properties.ContentLength})
+			if err := cb(BlobMeta{Name: strings.TrimPrefix(*blob.Name, prefix), Size: *blob.Properties.ContentLength}); err != nil {
+				return err
+			}
 		}
+	}
+	return nil
+}
+
+// ListRecursive retrieves all blobs under path (treats path as prefix root)
+func ListRecursive(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
+	var out []BlobMeta
+	if err := ListRecursiveStream(ctx, ap, func(bm BlobMeta) error {
+		out = append(out, bm)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

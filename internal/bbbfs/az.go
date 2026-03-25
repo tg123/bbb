@@ -91,26 +91,19 @@ func (azFS) ListRecursive(ctx context.Context, target string, emit func(Entry) e
 	if err != nil {
 		return err
 	}
-	list, err := azblob.ListRecursive(ctx, ap)
-	if err != nil {
-		return err
-	}
-	for _, bm := range list {
+	return azblob.ListRecursiveStream(ctx, ap, func(bm azblob.BlobMeta) error {
 		name := strings.TrimSuffix(bm.Name, "/")
 		if name == "" {
-			continue
+			return nil
 		}
-		if err := emit(Entry{
+		return emit(Entry{
 			Name:    name,
 			Path:    azChildPath(ap, name),
 			Size:    bm.Size,
 			IsDir:   false,
 			ModTime: time.Time{},
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
+		})
+	})
 }
 
 func azChildPath(ap azblob.AzurePath, name string) string {
@@ -224,16 +217,15 @@ func (azFS) ListFilesFlat(ctx context.Context, p string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	list, err := azblob.ListRecursive(ctx, ap)
-	if err != nil {
-		return nil, err
-	}
-	names := make([]string, 0, len(list))
-	for _, bm := range list {
+	var names []string
+	if err := azblob.ListRecursiveStream(ctx, ap, func(bm azblob.BlobMeta) error {
 		if bm.Name == "" || strings.HasSuffix(bm.Name, "/") {
-			continue
+			return nil
 		}
 		names = append(names, bm.Name)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return names, nil
 }
@@ -305,15 +297,11 @@ func (azFS) ListRecursiveWithSize(ctx context.Context, p string) ([]Entry, error
 	if err != nil {
 		return nil, err
 	}
-	list, err := azblob.ListRecursive(ctx, ap)
-	if err != nil {
-		return nil, err
-	}
-	entries := make([]Entry, 0, len(list))
-	for _, bm := range list {
+	var entries []Entry
+	if err := azblob.ListRecursiveStream(ctx, ap, func(bm azblob.BlobMeta) error {
 		name := strings.TrimSuffix(bm.Name, "/")
 		if name == "" {
-			continue
+			return nil
 		}
 		entries = append(entries, Entry{
 			Name:    name,
@@ -322,6 +310,9 @@ func (azFS) ListRecursiveWithSize(ctx context.Context, p string) ([]Entry, error
 			IsDir:   false,
 			ModTime: time.Time{},
 		})
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return entries, nil
 }
