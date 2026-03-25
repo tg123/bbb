@@ -425,9 +425,12 @@ func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 }
 
 // ListRecursiveStream streams all blobs under path via callback (treats path as prefix root).
-// Uses parallel prefix walking (similar to azcopy) to enumerate blobs across multiple
-// subdirectories concurrently, dramatically improving scan speed for deep hierarchies.
-// scanConcurrency controls how many directory prefixes are listed in parallel.
+// Uses parallel flat-per-partition listing: a single hierarchy listing discovers top-level
+// prefixes, then parallel flat listings enumerate all blobs under each prefix concurrently.
+// This avoids the overhead of recursive hierarchy listing at every directory level while
+// getting full parallelism across top-level partitions.
+// scanConcurrency controls how many flat listings run in parallel.
+// When scanConcurrency > 1, cb must be safe for concurrent use by multiple goroutines.
 func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int, cb func(BlobMeta) error) error {
 	rootPrefix := ap.Blob
 	if rootPrefix != "" && !strings.HasSuffix(rootPrefix, "/") {
@@ -448,151 +451,127 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 		return listRecursiveFlat(ctx, containerClient, ap.Container, rootPrefix, cb)
 	}
 
-	// Parallel prefix walking: use hierarchy listing to discover subdirectories
-	// and walk them concurrently with bounded parallelism.
+	// Parallel flat-per-partition: use one level of hierarchy listing to discover
+	// top-level prefixes, then run a flat listing for each prefix in parallel.
+	// Each flat listing returns ALL blobs under its prefix (no recursive hierarchy
+	// overhead). This dramatically reduces API calls compared to recursive hierarchy
+	// walking for deep directory structures.
 	var (
-		mu      sync.Mutex
-		cbErr   error // first callback error
-		walkErr error // first walk error
+		firstErr error
+		errOnce  sync.Once
+		hasError atomic.Bool
 	)
 
-	// safeCB serializes callback invocations so callers don't need thread-safe callbacks.
-	safeCB := func(bm BlobMeta) error {
-		mu.Lock()
-		defer mu.Unlock()
-		if cbErr != nil {
-			return cbErr
-		}
-		if err := cb(bm); err != nil {
-			cbErr = err
-			return err
-		}
-		return nil
-	}
-
-	setWalkErr := func(err error) {
-		mu.Lock()
-		if walkErr == nil {
-			walkErr = err
-		}
-		mu.Unlock()
+	setErr := func(err error) {
+		errOnce.Do(func() {
+			firstErr = err
+			hasError.Store(true)
+		})
 	}
 
 	hasErr := func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return cbErr != nil || walkErr != nil
+		return hasError.Load()
 	}
 
-	// Semaphore to bound concurrent listing goroutines.
-	// Size is scanConcurrency-1 because the root walk runs inline in
-	// the caller's goroutine, so total concurrent walks = 1 (root) +
-	// len(sem) ≤ scanConcurrency.
-	semSize := scanConcurrency - 1
-	if semSize < 1 {
-		semSize = 1
-	}
-	sem := make(chan struct{}, semSize)
+	// Semaphore to bound concurrent flat listing goroutines.
+	sem := make(chan struct{}, scanConcurrency)
 	var wg sync.WaitGroup
 
-	// Track seen prefixes to avoid walking the same subdirectory twice
+	// Track seen prefixes to avoid listing the same partition twice
 	// (a prefix can appear on multiple pages of a hierarchy listing).
 	seenPrefixes := make(map[string]struct{})
 
-	// walkPrefix lists blobs and subdirectories under the given prefix.
-	// For each subdirectory, it spawns a goroutine (bounded by sem) to walk recursively.
-	var walkPrefix func(prefix string)
-	walkPrefix = func(prefix string) {
-		defer wg.Done()
+	// flatPartition runs a flat listing for a single prefix and emits
+	// results with names relative to rootPrefix.
+	flatPartition := func(prefix, relPrefix string) {
+		if err := listRecursiveFlat(ctx, containerClient, ap.Container, prefix, func(bm BlobMeta) error {
+			if hasErr() {
+				return context.Canceled
+			}
+			bm.Name = relPrefix + bm.Name
+			return cb(bm)
+		}); err != nil {
+			setErr(err)
+		}
+	}
 
+	// Discover top-level prefixes via hierarchy listing at root level.
+	// Blobs directly under rootPrefix are emitted inline; subdirectory
+	// prefixes are dispatched to parallel flat listings.
+	opts := &container.ListBlobsHierarchyOptions{}
+	if rootPrefix != "" {
+		opts.Prefix = &rootPrefix
+	}
+	pager := containerClient.NewListBlobsHierarchyPager("/", opts)
+
+	for pager.More() {
 		if ctx.Err() != nil || hasErr() {
-			return
+			break
+		}
+		resp, err := pager.NextPage(ctx)
+		if err != nil {
+			var respErr *azcore.ResponseError
+			if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerNotFound" {
+				setErr(fmt.Errorf("container '%s' not found", ap.Container))
+			} else {
+				setErr(err)
+			}
+			break
+		}
+		if resp.Segment == nil {
+			break
 		}
 
-		opts := &container.ListBlobsHierarchyOptions{}
-		if prefix != "" {
-			opts.Prefix = &prefix
+		// Emit root-level blobs (files directly under rootPrefix).
+		for _, blob := range resp.Segment.BlobItems {
+			if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
+				continue
+			}
+			if hasErr() {
+				break
+			}
+			if err := cb(BlobMeta{
+				Name: strings.TrimPrefix(*blob.Name, rootPrefix),
+				Size: *blob.Properties.ContentLength,
+			}); err != nil {
+				setErr(err)
+				break
+			}
 		}
-		pager := containerClient.NewListBlobsHierarchyPager("/", opts)
 
-		for pager.More() {
-			if ctx.Err() != nil || hasErr() {
-				return
+		// Launch parallel flat listings for each discovered prefix.
+		for _, bp := range resp.Segment.BlobPrefixes {
+			if bp == nil || bp.Name == nil {
+				continue
 			}
-			resp, err := pager.NextPage(ctx)
-			if err != nil {
-				var respErr *azcore.ResponseError
-				if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerNotFound" {
-					setWalkErr(fmt.Errorf("container '%s' not found", ap.Container))
-				} else {
-					setWalkErr(err)
-				}
-				return
+			subPrefix := *bp.Name
+			if _, seen := seenPrefixes[subPrefix]; seen {
+				continue
 			}
-			if resp.Segment == nil {
-				return
+			seenPrefixes[subPrefix] = struct{}{}
+
+			if hasErr() {
+				break
 			}
 
-			// Emit files at this level
-			for _, blob := range resp.Segment.BlobItems {
-				if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
-					continue
-				}
-				bm := BlobMeta{
-					Name: strings.TrimPrefix(*blob.Name, rootPrefix),
-					Size: *blob.Properties.ContentLength,
-				}
-				if err := safeCB(bm); err != nil {
-					return
-				}
-			}
-
-			// Spawn parallel walks for subdirectories
-			for _, bp := range resp.Segment.BlobPrefixes {
-				if bp == nil || bp.Name == nil {
-					continue
-				}
-				subPrefix := *bp.Name
-				// Deduplicate: a prefix can appear across multiple pages.
-				mu.Lock()
-				_, already := seenPrefixes[subPrefix]
-				if !already {
-					seenPrefixes[subPrefix] = struct{}{}
-				}
-				mu.Unlock()
-				if already {
-					continue
-				}
-				wg.Add(1)
-				// Try to acquire semaphore; if full, walk inline in current goroutine.
-				// Inline walking reuses the parent goroutine's stack. Directory depth
-				// in blob storage is typically shallow, so stack growth is bounded.
-				select {
-				case sem <- struct{}{}:
-					go func(p string) {
-						defer func() { <-sem }()
-						walkPrefix(p)
-					}(subPrefix)
-				default:
-					walkPrefix(subPrefix)
-				}
+			relPrefix := strings.TrimPrefix(subPrefix, rootPrefix)
+			wg.Add(1)
+			// Acquire semaphore; block if all slots are busy so
+			// hierarchy discovery pauses until capacity frees up.
+			select {
+			case sem <- struct{}{}:
+				go func(prefix, rel string) {
+					defer func() { <-sem; wg.Done() }()
+					flatPartition(prefix, rel)
+				}(subPrefix, relPrefix)
+			case <-ctx.Done():
+				wg.Done()
 			}
 		}
 	}
 
-	// Start root walk. Run inline (no goroutine) — the caller already
-	// blocks until wg.Wait() completes, so there's no benefit to a goroutine
-	// for root, and starting inline avoids consuming a semaphore slot.
-	wg.Add(1)
-	walkPrefix(rootPrefix)
 	wg.Wait()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if cbErr != nil {
-		return cbErr
-	}
-	return walkErr
+	return firstErr
 }
 
 // listRecursiveFlat is the sequential fallback using a flat pager.

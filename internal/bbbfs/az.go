@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tg123/bbb/internal/azblob"
@@ -217,12 +218,15 @@ func (azFS) ListFilesFlat(ctx context.Context, p string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	var mu sync.Mutex
 	var names []string
 	if err := azblob.ListRecursiveStream(ctx, ap, ScanConcurrency(ctx), func(bm azblob.BlobMeta) error {
 		if bm.Name == "" || strings.HasSuffix(bm.Name, "/") {
 			return nil
 		}
+		mu.Lock()
 		names = append(names, bm.Name)
+		mu.Unlock()
 		return nil
 	}); err != nil {
 		return nil, err
@@ -340,9 +344,12 @@ func (azFS) ListRecursiveWithSizeStream(ctx context.Context, p string, emit func
 }
 
 func (f azFS) ListRecursiveWithSize(ctx context.Context, p string) ([]Entry, error) {
+	var mu sync.Mutex
 	var entries []Entry
 	if err := f.ListRecursiveWithSizeStream(ctx, p, func(e Entry) error {
+		mu.Lock()
 		entries = append(entries, e)
+		mu.Unlock()
 		return nil
 	}); err != nil {
 		return nil, err

@@ -738,11 +738,12 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 
 	var wg sync.WaitGroup
 	// Buffer taskCh so listing can stay well ahead of copy workers.
-	// With parallel prefix walking, the scanner discovers files much faster
-	// than workers can copy them. A large buffer decouples the two phases.
-	taskBuf := concurrency * 64
-	if taskBuf < 256 {
-		taskBuf = 256
+	// With parallel flat-per-partition scanning, the scanner discovers files
+	// much faster than workers can copy them. A large buffer decouples the
+	// two phases and prevents scanner back-pressure.
+	taskBuf := concurrency * 128
+	if taskBuf < 4096 {
+		taskBuf = 4096
 	}
 	taskCh := make(chan cpTask, taskBuf)
 	var firstErr error
