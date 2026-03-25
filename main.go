@@ -212,6 +212,9 @@ func main() {
 						if err != nil {
 							return ctx, fmt.Errorf("invalid BBB_DNS_CACHE_TTL %q: %w", raw, err)
 						}
+						if d < 0 {
+							return ctx, fmt.Errorf("invalid BBB_DNS_CACHE_TTL %q: must be non-negative", raw)
+						}
 						ttl = d
 					}
 					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver, ttl)
