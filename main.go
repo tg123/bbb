@@ -188,21 +188,23 @@ func main() {
 				Name:      "lstree",
 				Aliases:   []string{"lsr"},
 				Usage:     "List all files recursively (files only)",
-				UsageText: "bbb lstree [-l|--long] [--machine] [-s|--relative] [path]",
+				UsageText: "bbb lstree [-l|--long] [--machine] [-s|--relative] [--concurrency N] [path]",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "l", Aliases: []string{"long"}, Usage: "List information about each file"},
 					&cli.BoolFlag{Name: "machine", Usage: "Machine-readable (tab-separated) output"},
 					&cli.BoolFlag{Name: "s", Aliases: []string{"relative"}, Usage: "Show relative paths"},
+					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent listing requests", Value: runtime.NumCPU()},
 				},
 				Action: cmdLSTree,
 			},
 			{
 				Name:      "llr",
 				Usage:     "Alias for 'lstree -l' (recursive long file list)",
-				UsageText: "bbb llr [-s|--relative] [--machine] [path]",
+				UsageText: "bbb llr [-s|--relative] [--machine] [--concurrency N] [path]",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "s", Aliases: []string{"relative"}, Usage: "Show relative paths"},
 					&cli.BoolFlag{Name: "machine", Usage: "Machine-readable (tab-separated) output"},
+					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent listing requests", Value: runtime.NumCPU()},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					return runListTree(ctx, c, true)
@@ -393,19 +395,18 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	longFlag := c.Bool("l") || c.Bool("long") || longForced
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s") || c.Bool("relative")
+	if conc := c.Int("concurrency"); conc > 0 {
+		ctx = bbbfs.WithScanConcurrency(ctx, conc)
+	}
 
 	parentPath, pattern := splitWildcard(root)
-	var list []bbbfs.Entry
+	var count int64
+	var totalSize int64
 	for result := range bbbfs.ListRecursive(ctx, parentPath) {
 		if result.Err != nil {
 			return result.Err
 		}
-		list = append(list, result.Entry)
-	}
-	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
-	var count int64
-	var totalSize int64
-	for _, entry := range list {
+		entry := result.Entry
 		name := entry.Name
 		if name == "" || entry.IsDir {
 			continue
@@ -645,6 +646,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	overwrite := c.Bool("f")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
+	ctx = bbbfs.WithScanConcurrency(ctx, concurrency)
 	retryCount := c.Int("retry-count")
 	taskfile := c.String("taskfile")
 	if taskfile == "" {
@@ -735,9 +737,14 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	defer cancel()
 
 	var wg sync.WaitGroup
-	// Buffer taskCh larger than cpWorkers so expanders can push ahead
-	// without blocking while cp workers are busy.
-	taskCh := make(chan cpTask, cpWorkers*4)
+	// Buffer taskCh so listing can stay well ahead of copy workers.
+	// With parallel prefix walking, the scanner discovers files much faster
+	// than workers can copy them. A large buffer decouples the two phases.
+	taskBuf := concurrency * 64
+	if taskBuf < 256 {
+		taskBuf = 256
+	}
+	taskCh := make(chan cpTask, taskBuf)
 	var firstErr error
 	var firstErrMu sync.Mutex
 	var totalPending atomic.Int64
@@ -801,14 +808,6 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	pairCh := make(chan taskPair, expanders*2)
 	var seenMu sync.Mutex
 	var expandWG sync.WaitGroup
-	// Add a +1 sentinel to totalPending so the progress bar never shows
-	// 100% while expansion is still running. Without this, fast cp workers
-	// can finish all currently-discovered files before expanders find more,
-	// making the bar flash "done" prematurely. The sentinel is removed
-	// after expandWG.Wait() below.
-	if taskProgress != nil {
-		totalPending.Add(1)
-	}
 	for i := 0; i < expanders; i++ {
 		expandWG.Add(1)
 		go func() {
@@ -907,10 +906,10 @@ enqueueLoop:
 	}
 	close(pairCh)
 	expandWG.Wait()
-	// Remove the +1 listing sentinel now that expansion is complete,
-	// and set the final accurate total so the bar can reach 100%.
+	// Set the final total now that expansion is complete so the bar
+	// can reach 100% once all workers finish.
 	if taskProgress != nil {
-		taskProgress.SetTotal(totalPending.Add(-1))
+		taskProgress.SetTotal(totalPending.Load())
 	}
 	close(taskCh)
 	wg.Wait()
@@ -1117,11 +1116,9 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		// Remote copy: list source files and copy each
 		srcAz, dstAz := bbbfs.IsAz(src), bbbfs.IsAz(dst)
 		if srcAz && dstAz {
-			// Az→Az: server-side copy with per-file progress
-			list, err := bbbfs.ListRecursiveWithSize(ctx, src)
-			if err != nil {
-				return err
-			}
+			// Az→Az: server-side copy with per-file progress.
+			// Stream listing into the worker pool so copy work starts
+			// while listing is still in progress.
 			type ssOp struct {
 				name string
 			}
@@ -1129,14 +1126,22 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			// CopyServerSide spawns `concurrency` block goroutines, so
 			// fileWorkers × concurrency must stay bounded.
 			fileWorkers := min(maxServerSideCopyFiles, concurrency)
-			return runOpPoolWithRetryProgress(ctx, fileWorkers, retryCount, len(list), quiet, errPrefix, func(pending chan<- ssOp) error {
-				for _, entry := range list {
-					if err := sendOp(ctx, pending, ssOp{name: entry.Name}); err != nil {
-						return err
+			var totalItems atomic.Int64
+			copyTreeProgress := newStreamingProgressBar(errPrefix, quiet, false)
+			if copyTreeProgress != nil {
+				copyTreeProgress.pinBottom = true
+			}
+			poolErr := runOpPoolWithRetry(ctx, fileWorkers, retryCount, func(pending chan<- ssOp) error {
+				return bbbfs.ListRecursiveWithSizeStream(ctx, src, func(entry bbbfs.Entry) error {
+					if copyTreeProgress != nil {
+						copyTreeProgress.SetTotal(totalItems.Add(1))
 					}
-				}
-				return nil
+					return sendOp(ctx, pending, ssOp{name: entry.Name})
+				})
 			}, func(work ssOp) error {
+				if copyTreeProgress != nil {
+					defer copyTreeProgress.Increment()
+				}
 				srcChild := bbbfs.ChildPath(src, work.name)
 				dstChild := bbbfs.ChildPath(dst, work.name)
 				if !overwrite {
@@ -1174,6 +1179,10 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				return nil
 			})
+			if copyTreeProgress != nil {
+				copyTreeProgress.Finish()
+			}
+			return poolErr
 		}
 		// Generic remote copy: read via bbbfs + write via bbbfs
 		type remoteCopyOp struct {
@@ -1345,6 +1354,7 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 	force := c.Bool("f")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
+	ctx = bbbfs.WithScanConcurrency(ctx, concurrency)
 	retryCount := c.Int("retry-count")
 	if c.Args().Len() == 0 {
 		return fmt.Errorf("rm: need at least one path")
@@ -1398,6 +1408,7 @@ func cmdRMTree(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdRMTree called", "args", c.Args().Slice())
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
+	ctx = bbbfs.WithScanConcurrency(ctx, concurrency)
 	retryCount := c.Int("retry-count")
 	if c.Args().Len() != 1 {
 		return fmt.Errorf("rmtree: need directory root")
@@ -1496,6 +1507,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 	quiet := c.Bool("q") || c.Bool("quiet")
 	exclude := c.String("x")
 	concurrency := c.Int("concurrency")
+	ctx = bbbfs.WithScanConcurrency(ctx, concurrency)
 	retryCount := c.Int("retry-count")
 	taskfile := c.String("taskfile")
 	if taskfile == "" {
@@ -1618,49 +1630,9 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 	}
 	if bbbfs.IsAz(src) || bbbfs.IsAz(dst) || srcHF {
 		srcAz, dstAz := bbbfs.IsAz(src), bbbfs.IsAz(dst)
-		// Build src file list
 		type item struct {
 			rel  string
 			size int64
-		}
-		var files []item
-		if srcAz {
-			list, err := bbbfs.ListRecursiveWithSize(ctx, src)
-			if err != nil {
-				return fmt.Errorf("sync: list %s: %w", src, err)
-			}
-			for _, entry := range list {
-				if entry.Name == "" || excludeMatch(entry.Name) {
-					continue
-				}
-				files = append(files, item{rel: entry.Name, size: entry.Size})
-			}
-		} else if srcHF {
-			list, err := syncRemoteFiles(ctx, src, excludeMatch)
-			if err != nil {
-				return err
-			}
-			for _, name := range list {
-				files = append(files, item{rel: name})
-			}
-		} else {
-			if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-				if d.IsDir() {
-					return nil
-				}
-				rel, _ := filepath.Rel(src, p)
-				if excludeMatch(rel) {
-					return nil
-				}
-				info, _ := d.Info()
-				files = append(files, item{rel: rel, size: info.Size()})
-				return nil
-			}); err != nil {
-				return err
-			}
 		}
 		// When both src and dst are Azure, CopyBlobServerSide spawns
 		// `concurrency` block goroutines per file. Limit file-level
@@ -1670,14 +1642,73 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		if srcAz && dstAz {
 			syncWorkers = min(maxServerSideCopyFiles, concurrency)
 		}
-		workerErr := runOpPoolWithRetryProgress(ctx, syncWorkers, retryCount, len(files), quiet, "sync", func(pending chan<- item) error {
+		// Build producer: for Azure sources, stream listing into the worker
+		// pool so processing starts while listing continues. For HF and
+		// local→remote paths, collect first (these are either small or have
+		// different constraints).
+		var syncProgress *progressBar
+		if !quiet {
+			syncProgress = newStreamingProgressBar("sync", quiet, false)
+			if syncProgress != nil {
+				syncProgress.pinBottom = true
+			}
+		}
+		var totalItems atomic.Int64
+		producer := func(pending chan<- item) error {
+			if srcAz {
+				return bbbfs.ListRecursiveWithSizeStream(ctx, src, func(entry bbbfs.Entry) error {
+					if entry.Name == "" || excludeMatch(entry.Name) {
+						return nil
+					}
+					if syncProgress != nil {
+						syncProgress.SetTotal(totalItems.Add(1))
+					}
+					return sendOp(ctx, pending, item{rel: entry.Name, size: entry.Size})
+				})
+			}
+			// HF and local→remote: collect first, then feed
+			var files []item
+			if srcHF {
+				list, err := syncRemoteFiles(ctx, src, excludeMatch)
+				if err != nil {
+					return err
+				}
+				for _, name := range list {
+					files = append(files, item{rel: name})
+				}
+			} else {
+				if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+					if err != nil {
+						return err
+					}
+					if d.IsDir() {
+						return nil
+					}
+					rel, _ := filepath.Rel(src, p)
+					if excludeMatch(rel) {
+						return nil
+					}
+					info, _ := d.Info()
+					files = append(files, item{rel: rel, size: info.Size()})
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+			if syncProgress != nil {
+				syncProgress.SetTotal(totalItems.Add(int64(len(files))))
+			}
 			for _, f := range files {
 				if err := sendOp(ctx, pending, f); err != nil {
 					return err
 				}
 			}
 			return nil
-		}, func(f item) error {
+		}
+		workerErr := runOpPoolWithRetry(ctx, syncWorkers, retryCount, producer, func(f item) error {
+			if syncProgress != nil {
+				defer syncProgress.Increment()
+			}
 			sPath := f.rel
 			srcChild := bbbfs.ChildPath(src, sPath)
 			dstChild := bbbfs.ChildPath(dst, sPath)
@@ -1741,6 +1772,9 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			}
 			return nil
 		})
+		if syncProgress != nil {
+			syncProgress.Finish()
+		}
 		// delete phase not implemented for cloud combos yet
 		return workerErr
 	}

@@ -91,26 +91,19 @@ func (azFS) ListRecursive(ctx context.Context, target string, emit func(Entry) e
 	if err != nil {
 		return err
 	}
-	list, err := azblob.ListRecursive(ctx, ap)
-	if err != nil {
-		return err
-	}
-	for _, bm := range list {
-		name := strings.TrimSuffix(bm.Name, "/")
-		if name == "" {
-			continue
+	return azblob.ListRecursiveStream(ctx, ap, ScanConcurrency(ctx), func(bm azblob.BlobMeta) error {
+		name := bm.Name
+		if name == "" || strings.HasSuffix(name, "/") {
+			return nil
 		}
-		if err := emit(Entry{
+		return emit(Entry{
 			Name:    name,
 			Path:    azChildPath(ap, name),
 			Size:    bm.Size,
 			IsDir:   false,
 			ModTime: time.Time{},
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
+		})
+	})
 }
 
 func azChildPath(ap azblob.AzurePath, name string) string {
@@ -224,16 +217,15 @@ func (azFS) ListFilesFlat(ctx context.Context, p string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	list, err := azblob.ListRecursive(ctx, ap)
-	if err != nil {
-		return nil, err
-	}
-	names := make([]string, 0, len(list))
-	for _, bm := range list {
+	var names []string
+	if err := azblob.ListRecursiveStream(ctx, ap, ScanConcurrency(ctx), func(bm azblob.BlobMeta) error {
 		if bm.Name == "" || strings.HasSuffix(bm.Name, "/") {
-			continue
+			return nil
 		}
 		names = append(names, bm.Name)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return names, nil
 }
@@ -300,28 +292,60 @@ func ListRecursiveWithSize(ctx context.Context, p string) ([]Entry, error) {
 	return entries, nil
 }
 
-func (azFS) ListRecursiveWithSize(ctx context.Context, p string) ([]Entry, error) {
+// sizedRecursiveStreamLister is an optional FS extension for streaming
+// recursive listing with sizes.
+type sizedRecursiveStreamLister interface {
+	ListRecursiveWithSizeStream(ctx context.Context, path string, emit func(Entry) error) error
+}
+
+// ListRecursiveWithSizeStream streams all entries recursively with their sizes
+// via a callback. If the backend does not implement streaming, it falls back
+// to collecting all entries and emitting them one by one.
+func ListRecursiveWithSizeStream(ctx context.Context, p string, emit func(Entry) error) error {
+	fs := Resolve(p)
+	if srl, ok := fs.(sizedRecursiveStreamLister); ok {
+		return srl.ListRecursiveWithSizeStream(ctx, p, emit)
+	}
+	// fallback: collect and emit
+	entries, err := ListRecursiveWithSize(ctx, p)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := emit(e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (azFS) ListRecursiveWithSizeStream(ctx context.Context, p string, emit func(Entry) error) error {
 	ap, err := azblob.Parse(p)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	list, err := azblob.ListRecursive(ctx, ap)
-	if err != nil {
-		return nil, err
-	}
-	entries := make([]Entry, 0, len(list))
-	for _, bm := range list {
-		name := strings.TrimSuffix(bm.Name, "/")
-		if name == "" {
-			continue
+	return azblob.ListRecursiveStream(ctx, ap, ScanConcurrency(ctx), func(bm azblob.BlobMeta) error {
+		name := bm.Name
+		if name == "" || strings.HasSuffix(name, "/") {
+			return nil
 		}
-		entries = append(entries, Entry{
+		return emit(Entry{
 			Name:    name,
 			Path:    azChildPath(ap, name),
 			Size:    bm.Size,
 			IsDir:   false,
 			ModTime: time.Time{},
 		})
+	})
+}
+
+func (f azFS) ListRecursiveWithSize(ctx context.Context, p string) ([]Entry, error) {
+	var entries []Entry
+	if err := f.ListRecursiveWithSizeStream(ctx, p, func(e Entry) error {
+		entries = append(entries, e)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return entries, nil
 }
