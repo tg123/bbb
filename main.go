@@ -716,13 +716,14 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	if workers < 1 {
 		workers = 1
 	}
-	// Split concurrency budget: at least 1 expander, at least 1 cp worker.
-	// When concurrency is high, allocate ~25% to expansion.
+	// Expanders discover files (via listing) and push them to the task channel.
+	// Listing runs as a sequential flat pager inside each expander, so expander
+	// count only matters when there are multiple source→destination pairs.
+	// Copy workers get the full concurrency budget — listing is lightweight
+	// (sequential I/O) and runs independently, so it doesn't need to share
+	// the concurrency budget with copy workers.
 	expanders := max(1, workers/4)
-	cpWorkers := workers - expanders
-	if cpWorkers < 1 {
-		cpWorkers = 1
-	}
+	cpWorkers := workers
 	// Limit concurrent file copies so block-level parallelism (StageBlockFromURL)
 	// focuses on finishing each file ASAP rather than spreading across many files.
 	// For many small files, this allows high throughput since each file only needs
