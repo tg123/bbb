@@ -46,6 +46,26 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 
 > **Warning:** Debug output may include personally identifiable information such as tenant IDs, object IDs, and other token claims. Do not share debug logs publicly or paste them into tickets without redacting sensitive fields.
 
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BBB_LOG_LEVEL` | `info` | Same as `--loglevel` flag |
+| `BBB_DNS_CACHE` | *(off)* | Set to `1`, `true`, `yes`, or `on` to enable process-local DNS caching |
+
+### `BBB_DNS_CACHE`
+
+When enabled, bbb caches DNS resolution results in memory so that repeated connections to the same hostname (e.g. an Azure Storage endpoint) skip the DNS lookup. Cached entries expire after 5 minutes.
+
+```bash
+BBB_DNS_CACHE=1 bbb cp ./data/ az://myaccount/mycontainer/data/
+```
+
+**Caveats:**
+
+- DNS records that change during the TTL window (e.g. IP rotations) will not be picked up until the cached entry expires.
+- Because cached addresses are dialled as IP literals, Go's standard Happy Eyeballs (RFC 6555) connection racing is bypassed. For Azure Blob Storage endpoints (typically single-stack) this has no practical impact.
+
 ### Taskfile
 
 A taskfile is a plain-text file with one `src dst` pair per line, separated by whitespace. Empty lines are ignored.
