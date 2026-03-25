@@ -829,9 +829,8 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 
 	var wg sync.WaitGroup
 	// Buffer taskCh so listing can stay well ahead of copy workers.
-	// With parallel prefix walking, the scanner discovers files much faster
-	// than workers can copy them. A large buffer decouples the two phases
-	// and prevents scanner back-pressure.
+	// A large buffer decouples listing from copying and prevents
+	// scanner back-pressure.
 	taskBuf := concurrency * 128
 	if taskBuf < 4096 {
 		taskBuf = 4096
@@ -1056,12 +1055,15 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
 				continue
 			}
-			// IsDirLike only checks path syntax. If the blob doesn't
-			// exist, the path may be a virtual directory prefix.
-			if _, statErr := bbbfs.Resolve(src).Stat(ctx, src); statErr != nil {
-				slog.Debug("source not found as blob, trying as directory", "src", src, "error", statErr)
-				dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
-				continue
+			// IsDirLike only checks path syntax. For Azure sources,
+			// verify the blob exists; if not, the path may be a virtual
+			// directory prefix. Skip the expensive Stat for HF sources.
+			if srcAz {
+				if _, statErr := bbbfs.Resolve(src).Stat(ctx, src); statErr != nil {
+					slog.Debug("source not found as blob, trying as directory", "src", src, "error", statErr)
+					dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
+					continue
+				}
 			}
 			// Single file
 		} else if info, err := os.Stat(src); err == nil && info.IsDir() {
@@ -1099,7 +1101,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	blockConcurrency := concurrency
 	for _, op := range fileOps {
 		if op.srcAz && op.dstAz {
-			cpPoolSize = max(2, concurrency/4)
+			if concurrency >= 2 {
+				cpPoolSize = max(2, concurrency/4)
+				if cpPoolSize > concurrency {
+					cpPoolSize = concurrency
+				}
+			} else {
+				cpPoolSize = 1
+			}
 			blockConcurrency = max(1, concurrency/cpPoolSize)
 			break
 		}
@@ -1226,6 +1235,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			// Distribute concurrency between file-level and block-level parallelism:
 			// total goroutines = fileWorkers × blockConcurrency ≤ concurrency.
 			fileWorkers := max(2, concurrency/4)
+			if concurrency < 2 {
+				fileWorkers = 1
+			} else if fileWorkers > concurrency {
+				fileWorkers = concurrency
+			}
 			blockConcurrency := max(1, concurrency/fileWorkers)
 			var totalItems atomic.Int64
 			copyTreeProgress := newStreamingProgressBar(errPrefix, quiet, false)
@@ -1740,8 +1754,16 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		syncWorkers := concurrency
 		blockConcurrency := concurrency
 		if srcAz && dstAz {
-			syncWorkers = max(2, concurrency/4)
-			blockConcurrency = max(1, concurrency/syncWorkers)
+			if concurrency < 2 {
+				syncWorkers = 1
+				blockConcurrency = 1
+			} else {
+				syncWorkers = max(2, concurrency/4)
+				if syncWorkers > concurrency {
+					syncWorkers = concurrency
+				}
+				blockConcurrency = max(1, concurrency/syncWorkers)
+			}
 		}
 		// Build producer: for Azure sources, stream listing into the worker
 		// pool so processing starts while listing continues. For HF and

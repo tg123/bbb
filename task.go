@@ -203,7 +203,7 @@ type cpTask struct {
 	src     string
 	dst     string
 	key     string
-	size    int64       // known size from listing; 0 = unknown
+	size    int64        // known size from listing; 0 = unknown
 	tracker *taskTracker // nil when no task-level checkpoint tracking
 }
 
@@ -219,14 +219,24 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 			return err
 		}
 		if !dirLike {
-			// IsDirLike only checks path syntax (trailing "/").
-			// Verify the blob actually exists; if not, the path
-			// may be a virtual directory prefix — fall through to
-			// recursive listing.
-			if _, statErr := bbbfs.Resolve(task.src).Stat(ctx, task.src); statErr == nil {
-				return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+			// For Azure sources, verify the blob actually exists; if not,
+			// the path may be a virtual directory prefix — fall through to
+			// recursive listing. For HF sources, skip the Stat-based check
+			// to avoid a potentially expensive full-repo listing and emit
+			// a single-file task directly.
+			if bbbfs.IsAz(task.src) {
+				if entry, statErr := bbbfs.Resolve(task.src).Stat(ctx, task.src); statErr == nil {
+					return emit(cpTask{
+						src:  task.src,
+						dst:  task.dst,
+						key:  taskStateKey(task.src, task.dst),
+						size: entry.Size,
+					})
+				} else {
+					slog.Debug("source not found as blob, trying as directory prefix", "src", task.src, "error", statErr)
+				}
 			} else {
-				slog.Debug("source not found as blob, trying as directory prefix", "src", task.src, "error", statErr)
+				return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
 			}
 		}
 	} else {

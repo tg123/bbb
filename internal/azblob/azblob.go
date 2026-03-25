@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
@@ -81,7 +80,7 @@ var validBlobSuffixes = []string{
 
 const (
 	defaultCopySASExpiry     = time.Hour
-	clockSkewTolerance       = 5 * time.Minute // backdate SAS start to tolerate clock differences
+	clockSkewTolerance       = 5 * time.Minute   // backdate SAS start to tolerate clock differences
 	copyBlockSize            = 256 * 1024 * 1024 // 256 MiB per block for StageBlockFromURL
 	copyPollInitialDelay     = 100 * time.Millisecond
 	copyPollMaxDelay         = 2 * time.Second
@@ -422,24 +421,6 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 			return nil, credErr
 		}
 
-		if slog.Default().Enabled(ctx, slog.LevelDebug) {
-			tok, tokErr := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
-			if tokErr != nil {
-				return nil, tokErr
-			}
-
-			parts := strings.Split(tok.Token, ".")
-			if len(parts) == 3 {
-				payload, decErr := base64.RawURLEncoding.DecodeString(parts[1])
-				if decErr == nil {
-					slog.Debug("Decoded JWT payload", "payload", string(payload))
-				} else {
-					slog.Debug("Failed to decode JWT payload", "error", decErr)
-				}
-			} else {
-				slog.Debug("Token is not a JWT")
-			}
-		}
 		var clientErr error
 		client, clientErr = azblob.NewClient(endpoint, cred, nil)
 		if clientErr != nil {
@@ -1022,22 +1003,53 @@ type udcCacheEntry struct {
 }
 
 var (
-	udcCacheMu sync.Mutex
-	udcCache   = make(map[string]*udcCacheEntry) // keyed by account
+	udcCacheMu  sync.Mutex
+	udcCache    = make(map[string]*udcCacheEntry) // keyed by account
+	udcInflight = make(map[string]chan struct{})  // per-account in-flight guard
 )
 
 // getUDC returns a cached User Delegation Credential for the account,
-// refreshing it when necessary. Thread-safe.
+// refreshing it when necessary. Thread-safe. Concurrent refresh requests
+// for the same account are deduped: the first goroutine performs the
+// network call while others wait for it to finish.
 func getUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
-	udcCacheMu.Lock()
-	entry, ok := udcCache[account]
-	if ok && time.Now().UTC().Before(entry.refreshAt) {
+	for {
+		udcCacheMu.Lock()
+		entry, ok := udcCache[account]
+		if ok && time.Now().UTC().Before(entry.refreshAt) {
+			udcCacheMu.Unlock()
+			return entry.udc, entry.svcClient, entry.start, entry.expiry, nil
+		}
+		// Check if another goroutine is already refreshing this account.
+		if ch, inflight := udcInflight[account]; inflight {
+			udcCacheMu.Unlock()
+			// Wait for the in-flight refresh to complete, then retry.
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return nil, nil, time.Time{}, time.Time{}, ctx.Err()
+			}
+			continue
+		}
+		// Claim the refresh slot for this account.
+		ch := make(chan struct{})
+		udcInflight[account] = ch
 		udcCacheMu.Unlock()
-		return entry.udc, entry.svcClient, entry.start, entry.expiry, nil
-	}
-	udcCacheMu.Unlock()
 
-	// Acquire or refresh UDK outside the lock.
+		udc, svcClient, start, expiry, err := refreshUDC(ctx, account)
+
+		udcCacheMu.Lock()
+		delete(udcInflight, account)
+		close(ch)
+		udcCacheMu.Unlock()
+
+		return udc, svcClient, start, expiry, err
+	}
+}
+
+// refreshUDC performs the actual UDC refresh (network call). Called at most
+// once per account at a time, guarded by udcInflight.
+func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
 	cred, err := getDefaultCredential()
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("default credential: %w", err)
