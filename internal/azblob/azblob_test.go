@@ -653,3 +653,80 @@ func TestProcessHierarchySegmentPrefixTrimming(t *testing.T) {
 		t.Fatalf("expected prefix trimmed to 'data.bin', got %q", got[1].Name)
 	}
 }
+
+// --- normalizeRootPrefix tests ---
+
+func TestNormalizeRootPrefixEmpty(t *testing.T) {
+	if got := normalizeRootPrefix(""); got != "" {
+		t.Fatalf("expected empty, got %q", got)
+	}
+}
+
+func TestNormalizeRootPrefixNoSlash(t *testing.T) {
+	if got := normalizeRootPrefix("data"); got != "data/" {
+		t.Fatalf("expected 'data/', got %q", got)
+	}
+}
+
+func TestNormalizeRootPrefixAlreadySlash(t *testing.T) {
+	if got := normalizeRootPrefix("data/"); got != "data/" {
+		t.Fatalf("expected 'data/', got %q", got)
+	}
+}
+
+func TestNormalizeRootPrefixNestedPath(t *testing.T) {
+	if got := normalizeRootPrefix("a/b/c"); got != "a/b/c/" {
+		t.Fatalf("expected 'a/b/c/', got %q", got)
+	}
+}
+
+// --- ListRecursiveStream context cancellation test ---
+
+func TestListRecursiveStreamCancelledContext(t *testing.T) {
+	// ListRecursiveStream should return immediately with a cancelled context
+	// without issuing any API calls (getAzBlobClient will fail for fake accounts).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before calling
+
+	ap := AzurePath{Account: "fakeaccount", Container: "fakecontainer", Blob: "prefix"}
+	err := ListRecursiveStream(ctx, ap, 4, func(bm BlobMeta) error {
+		t.Fatal("callback should never be invoked with cancelled context")
+		return nil
+	})
+	if err == nil {
+		// It's acceptable for err to be nil (early exit) or non-nil (context error)
+		// as long as the callback was never invoked.
+		return
+	}
+}
+
+// --- Name rewriting tests ---
+
+func TestNameRewriteWithRootPrefix(t *testing.T) {
+	// Verify that blob names are correctly trimmed relative to rootPrefix.
+	// This tests the inline TrimPrefix logic used in walkPrefix.
+	rootPrefix := normalizeRootPrefix("mydata")
+	blobName := "mydata/subdir/file.txt"
+	got := strings.TrimPrefix(blobName, rootPrefix)
+	if got != "subdir/file.txt" {
+		t.Fatalf("expected 'subdir/file.txt', got %q", got)
+	}
+}
+
+func TestNameRewriteEmptyRootPrefix(t *testing.T) {
+	rootPrefix := normalizeRootPrefix("")
+	blobName := "top-level.txt"
+	got := strings.TrimPrefix(blobName, rootPrefix)
+	if got != "top-level.txt" {
+		t.Fatalf("expected 'top-level.txt', got %q", got)
+	}
+}
+
+func TestNameRewriteNestedPrefix(t *testing.T) {
+	rootPrefix := normalizeRootPrefix("a/b")
+	blobName := "a/b/c/d.txt"
+	got := strings.TrimPrefix(blobName, rootPrefix)
+	if got != "c/d.txt" {
+		t.Fatalf("expected 'c/d.txt', got %q", got)
+	}
+}

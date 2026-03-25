@@ -429,11 +429,17 @@ func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 // subdirectories concurrently, dramatically improving scan speed for deep hierarchies.
 // scanConcurrency controls how many directory prefixes are listed in parallel.
 // When scanConcurrency > 1, cb must be safe for concurrent use by multiple goroutines.
-func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int, cb func(BlobMeta) error) error {
-	rootPrefix := ap.Blob
-	if rootPrefix != "" && !strings.HasSuffix(rootPrefix, "/") {
-		rootPrefix += "/"
+// normalizeRootPrefix ensures the prefix ends with "/" for use as a
+// blob name root. An empty prefix stays empty (represents the container root).
+func normalizeRootPrefix(blob string) string {
+	if blob != "" && !strings.HasSuffix(blob, "/") {
+		return blob + "/"
 	}
+	return blob
+}
+
+func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int, cb func(BlobMeta) error) error {
+	rootPrefix := normalizeRootPrefix(ap.Blob)
 	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
 		return err
@@ -453,21 +459,22 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 	// and walk them concurrently with bounded parallelism.
 	// Callbacks are invoked directly from goroutines without serialization,
 	// so callers must provide a thread-safe cb when scanConcurrency > 1.
+
+	// Derived context: cancelled on first error so in-flight and queued
+	// API calls (NextPage, semaphore waits) stop promptly.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var (
 		firstErr error
 		errOnce  sync.Once
-		hasError atomic.Bool
 	)
 
 	setErr := func(err error) {
 		errOnce.Do(func() {
 			firstErr = err
-			hasError.Store(true)
+			cancel()
 		})
-	}
-
-	hasErr := func() bool {
-		return hasError.Load()
 	}
 
 	// Semaphore to bound concurrent listing goroutines.
@@ -488,7 +495,7 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 	walkPrefix = func(prefix string) {
 		defer wg.Done()
 
-		if ctx.Err() != nil || hasErr() {
+		if ctx.Err() != nil {
 			return
 		}
 
@@ -499,11 +506,16 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 		pager := containerClient.NewListBlobsHierarchyPager("/", opts)
 
 		for pager.More() {
-			if ctx.Err() != nil || hasErr() {
+			if ctx.Err() != nil {
 				return
 			}
 			resp, err := pager.NextPage(ctx)
 			if err != nil {
+				if ctx.Err() != nil {
+					// Context was cancelled (by setErr or caller); don't
+					// overwrite firstErr with the cancellation error.
+					return
+				}
 				var respErr *azcore.ResponseError
 				if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerNotFound" {
 					setErr(fmt.Errorf("container '%s' not found", ap.Container))
@@ -521,7 +533,7 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 				if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
 					continue
 				}
-				if hasErr() {
+				if ctx.Err() != nil {
 					return
 				}
 				if err := cb(BlobMeta{
@@ -559,6 +571,8 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 						defer func() { <-sem }()
 						walkPrefix(p)
 					}(subPrefix)
+				case <-ctx.Done():
+					wg.Done()
 				default:
 					walkPrefix(subPrefix)
 				}

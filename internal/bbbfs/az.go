@@ -218,15 +218,20 @@ func (azFS) ListFilesFlat(ctx context.Context, p string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	concurrency := ScanConcurrency(ctx)
 	var mu sync.Mutex
 	var names []string
-	if err := azblob.ListRecursiveStream(ctx, ap, ScanConcurrency(ctx), func(bm azblob.BlobMeta) error {
+	if err := azblob.ListRecursiveStream(ctx, ap, concurrency, func(bm azblob.BlobMeta) error {
 		if bm.Name == "" || strings.HasSuffix(bm.Name, "/") {
 			return nil
 		}
-		mu.Lock()
-		names = append(names, bm.Name)
-		mu.Unlock()
+		if concurrency > 1 {
+			mu.Lock()
+			names = append(names, bm.Name)
+			mu.Unlock()
+		} else {
+			names = append(names, bm.Name)
+		}
 		return nil
 	}); err != nil {
 		return nil, err
@@ -344,12 +349,17 @@ func (azFS) ListRecursiveWithSizeStream(ctx context.Context, p string, emit func
 }
 
 func (f azFS) ListRecursiveWithSize(ctx context.Context, p string) ([]Entry, error) {
+	concurrency := ScanConcurrency(ctx)
 	var mu sync.Mutex
 	var entries []Entry
 	if err := f.ListRecursiveWithSizeStream(ctx, p, func(e Entry) error {
-		mu.Lock()
-		entries = append(entries, e)
-		mu.Unlock()
+		if concurrency > 1 {
+			mu.Lock()
+			entries = append(entries, e)
+			mu.Unlock()
+		} else {
+			entries = append(entries, e)
+		}
 		return nil
 	}); err != nil {
 		return nil, err
