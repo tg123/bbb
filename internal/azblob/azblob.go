@@ -550,6 +550,9 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 				if bp == nil || bp.Name == nil {
 					continue
 				}
+				if ctx.Err() != nil {
+					return
+				}
 				subPrefix := *bp.Name
 				// Deduplicate: a prefix can appear across multiple pages.
 				prefixMu.Lock()
@@ -565,6 +568,9 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 				// Try to acquire semaphore; if full, walk inline in current goroutine.
 				// Inline walking reuses the parent goroutine's stack. Directory depth
 				// in blob storage is typically shallow, so stack growth is bounded.
+				// ctx.Done() case: context was cancelled (by setErr or caller);
+				// balance the wg.Add(1) above — the parent's defer wg.Done()
+				// handles the parent's own wg.Add, not this subdirectory's.
 				select {
 				case sem <- struct{}{}:
 					go func(p string) {

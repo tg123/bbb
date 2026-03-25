@@ -684,7 +684,7 @@ func TestNormalizeRootPrefixNestedPath(t *testing.T) {
 
 func TestListRecursiveStreamCancelledContext(t *testing.T) {
 	// ListRecursiveStream should return immediately with a cancelled context
-	// without issuing any API calls (getAzBlobClient will fail for fake accounts).
+	// without invoking the callback.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel before calling
 
@@ -693,11 +693,10 @@ func TestListRecursiveStreamCancelledContext(t *testing.T) {
 		t.Fatal("callback should never be invoked with cancelled context")
 		return nil
 	})
-	if err == nil {
-		// It's acceptable for err to be nil (early exit) or non-nil (context error)
-		// as long as the callback was never invoked.
-		return
-	}
+	// Both nil (early exit before client creation) and non-nil (context error
+	// from getAzBlobClient) are acceptable — the key invariant is that the
+	// callback was never invoked.
+	_ = err
 }
 
 // --- Name rewriting tests ---
