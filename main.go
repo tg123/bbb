@@ -721,10 +721,7 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	// Multiple expanders help when there are multiple source→destination pairs;
 	// for a single pair, only 1 expander runs (capped below by len(tasks)).
 	expanders := max(1, workers/4)
-	cpWorkers := workers - expanders
-	if cpWorkers < 1 {
-		cpWorkers = 1
-	}
+	cpWorkers := max(1, workers-expanders)
 	// Cap file-level parallelism for server-side copies: each
 	// CopyBlobServerSide spawns `concurrency` block goroutines, so
 	// uncapped cpWorkers would cause N² total goroutines and TLS
@@ -974,6 +971,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			// IsDirLike only checks path syntax. If the blob doesn't
 			// exist, the path may be a virtual directory prefix.
 			if _, statErr := bbbfs.Resolve(src).Stat(ctx, src); statErr != nil {
+				slog.Debug("source not found as blob, trying as directory", "src", src, "error", statErr)
 				dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
 				continue
 			}

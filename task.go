@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -224,6 +225,8 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 			// recursive listing.
 			if _, statErr := bbbfs.Resolve(task.src).Stat(ctx, task.src); statErr == nil {
 				return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+			} else {
+				slog.Debug("source not found as blob, trying as directory prefix", "src", task.src, "error", statErr)
 			}
 		}
 	} else {
