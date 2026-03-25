@@ -483,6 +483,8 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 
 	// flatPartition runs a flat listing for a single prefix and emits
 	// results with names relative to rootPrefix.
+	// relPrefix always ends with "/" because Azure hierarchy prefixes
+	// always end with the delimiter, so concatenation produces valid paths.
 	flatPartition := func(prefix, relPrefix string) {
 		if err := listRecursiveFlat(ctx, containerClient, ap.Container, prefix, func(bm BlobMeta) error {
 			if hasErr() {
@@ -540,6 +542,7 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 		}
 
 		// Launch parallel flat listings for each discovered prefix.
+	prefixLoop:
 		for _, bp := range resp.Segment.BlobPrefixes {
 			if bp == nil || bp.Name == nil {
 				continue
@@ -550,7 +553,7 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 			}
 			seenPrefixes[subPrefix] = struct{}{}
 
-			if hasErr() {
+			if ctx.Err() != nil || hasErr() {
 				break
 			}
 
@@ -566,6 +569,7 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 				}(subPrefix, relPrefix)
 			case <-ctx.Done():
 				wg.Done()
+				break prefixLoop
 			}
 		}
 	}
