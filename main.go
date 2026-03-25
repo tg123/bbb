@@ -395,17 +395,13 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	relFlag := c.Bool("s") || c.Bool("relative")
 
 	parentPath, pattern := splitWildcard(root)
-	var list []bbbfs.Entry
+	var count int64
+	var totalSize int64
 	for result := range bbbfs.ListRecursive(ctx, parentPath) {
 		if result.Err != nil {
 			return result.Err
 		}
-		list = append(list, result.Entry)
-	}
-	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
-	var count int64
-	var totalSize int64
-	for _, entry := range list {
+		entry := result.Entry
 		name := entry.Name
 		if name == "" || entry.IsDir {
 			continue
