@@ -485,8 +485,19 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 	}
 
 	// Semaphore to bound concurrent listing goroutines.
-	sem := make(chan struct{}, scanConcurrency)
+	// Size is scanConcurrency-1 because the root walk runs inline in
+	// the caller's goroutine, so total concurrent walks = 1 (root) +
+	// len(sem) ≤ scanConcurrency.
+	semSize := scanConcurrency - 1
+	if semSize < 1 {
+		semSize = 1
+	}
+	sem := make(chan struct{}, semSize)
 	var wg sync.WaitGroup
+
+	// Track seen prefixes to avoid walking the same subdirectory twice
+	// (a prefix can appear on multiple pages of a hierarchy listing).
+	seenPrefixes := make(map[string]struct{})
 
 	// walkPrefix lists blobs and subdirectories under the given prefix.
 	// For each subdirectory, it spawns a goroutine (bounded by sem) to walk recursively.
@@ -542,6 +553,16 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 					continue
 				}
 				subPrefix := *bp.Name
+				// Deduplicate: a prefix can appear across multiple pages.
+				mu.Lock()
+				_, already := seenPrefixes[subPrefix]
+				if !already {
+					seenPrefixes[subPrefix] = struct{}{}
+				}
+				mu.Unlock()
+				if already {
+					continue
+				}
 				wg.Add(1)
 				// Try to acquire semaphore; if full, walk inline in current goroutine.
 				// Inline walking reuses the parent goroutine's stack. Directory depth

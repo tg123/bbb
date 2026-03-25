@@ -18,7 +18,7 @@ type recursiveLister interface {
 // the context is cancelled. Callers should cancel the context if they stop
 // consuming the channel early.
 func ListRecursive(ctx context.Context, root string) <-chan ListResult {
-	ch := make(chan ListResult, 64)
+	ch := make(chan ListResult, 1024)
 	go func() {
 		defer close(ch)
 		emit := func(e Entry) error {

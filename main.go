@@ -737,9 +737,14 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	defer cancel()
 
 	var wg sync.WaitGroup
-	// Buffer taskCh larger than cpWorkers so expanders can push ahead
-	// without blocking while cp workers are busy.
-	taskCh := make(chan cpTask, cpWorkers*4)
+	// Buffer taskCh so listing can stay well ahead of copy workers.
+	// With parallel prefix walking, the scanner discovers files much faster
+	// than workers can copy them. A large buffer decouples the two phases.
+	taskBuf := concurrency * 64
+	if taskBuf < 256 {
+		taskBuf = 256
+	}
+	taskCh := make(chan cpTask, taskBuf)
 	var firstErr error
 	var firstErrMu sync.Mutex
 	var totalPending atomic.Int64
@@ -1142,13 +1147,13 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					return sendOp(ctx, pending, ssOp{name: entry.Name})
 				})
 			}, func(work ssOp) error {
+				if copyTreeProgress != nil {
+					defer copyTreeProgress.Increment()
+				}
 				srcChild := bbbfs.ChildPath(src, work.name)
 				dstChild := bbbfs.ChildPath(dst, work.name)
 				if !overwrite {
 					if exists, _ := bbbfs.ExistsAsBlob(ctx, dstChild); exists {
-						if copyTreeProgress != nil {
-							copyTreeProgress.Increment()
-						}
 						return nil
 					}
 				}
@@ -1179,9 +1184,6 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", srcChild, dstChild)
-				}
-				if copyTreeProgress != nil {
-					copyTreeProgress.Increment()
 				}
 				return nil
 			})
@@ -1712,6 +1714,9 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			return nil
 		}
 		workerErr := runOpPoolWithRetry(ctx, syncWorkers, retryCount, producer, func(f item) error {
+			if syncProgress != nil {
+				defer syncProgress.Increment()
+			}
 			sPath := f.rel
 			srcChild := bbbfs.ChildPath(src, sPath)
 			dstChild := bbbfs.ChildPath(dst, sPath)
@@ -1719,9 +1724,6 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				if dry {
 					if !quiet {
 						lockedPrintln("COPY", srcChild, "->", dstChild)
-					}
-					if syncProgress != nil {
-						syncProgress.Increment()
 					}
 					return nil
 				}
@@ -1753,18 +1755,12 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", srcChild, dstChild)
 				}
-				if syncProgress != nil {
-					syncProgress.Increment()
-				}
 				return nil
 			}
 			// Generic remote copy: bbbfs Read + bbbfs Write
 			if dry {
 				if !quiet {
 					lockedPrintln("COPY", srcChild, "->", dstChild)
-				}
-				if syncProgress != nil {
-					syncProgress.Increment()
 				}
 				return nil
 			}
@@ -1781,9 +1777,6 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", srcChild, dstChild)
-			}
-			if syncProgress != nil {
-				syncProgress.Increment()
 			}
 			return nil
 		})
