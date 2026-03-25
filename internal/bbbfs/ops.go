@@ -14,6 +14,24 @@ import (
 	"github.com/tg123/bbb/internal/hf"
 )
 
+type scanConcurrencyKey struct{}
+
+// WithScanConcurrency returns a context that carries the scan (listing)
+// concurrency hint.  Backends that support parallel prefix walking
+// (e.g. Azure) use this to bound the number of concurrent listing
+// goroutines.
+func WithScanConcurrency(ctx context.Context, n int) context.Context {
+	return context.WithValue(ctx, scanConcurrencyKey{}, n)
+}
+
+// ScanConcurrency returns the scan concurrency stored in ctx, or 1 if unset.
+func ScanConcurrency(ctx context.Context) int {
+	if v, ok := ctx.Value(scanConcurrencyKey{}).(int); ok && v > 0 {
+		return v
+	}
+	return 1
+}
+
 // IsAz returns true if the path targets an Azure Blob Storage backend.
 func IsAz(path string) bool {
 	return azProvider.Match(path)

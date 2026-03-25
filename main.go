@@ -188,21 +188,23 @@ func main() {
 				Name:      "lstree",
 				Aliases:   []string{"lsr"},
 				Usage:     "List all files recursively (files only)",
-				UsageText: "bbb lstree [-l|--long] [--machine] [-s|--relative] [path]",
+				UsageText: "bbb lstree [-l|--long] [--machine] [-s|--relative] [--concurrency N] [path]",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "l", Aliases: []string{"long"}, Usage: "List information about each file"},
 					&cli.BoolFlag{Name: "machine", Usage: "Machine-readable (tab-separated) output"},
 					&cli.BoolFlag{Name: "s", Aliases: []string{"relative"}, Usage: "Show relative paths"},
+					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent listing requests", Value: runtime.NumCPU()},
 				},
 				Action: cmdLSTree,
 			},
 			{
 				Name:      "llr",
 				Usage:     "Alias for 'lstree -l' (recursive long file list)",
-				UsageText: "bbb llr [-s|--relative] [--machine] [path]",
+				UsageText: "bbb llr [-s|--relative] [--machine] [--concurrency N] [path]",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "s", Aliases: []string{"relative"}, Usage: "Show relative paths"},
 					&cli.BoolFlag{Name: "machine", Usage: "Machine-readable (tab-separated) output"},
+					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent listing requests", Value: runtime.NumCPU()},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					return runListTree(ctx, c, true)
@@ -393,6 +395,9 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	longFlag := c.Bool("l") || c.Bool("long") || longForced
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s") || c.Bool("relative")
+	if conc := c.Int("concurrency"); conc > 0 {
+		ctx = bbbfs.WithScanConcurrency(ctx, conc)
+	}
 
 	parentPath, pattern := splitWildcard(root)
 	var count int64
@@ -641,6 +646,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	overwrite := c.Bool("f")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
+	ctx = bbbfs.WithScanConcurrency(ctx, concurrency)
 	retryCount := c.Int("retry-count")
 	taskfile := c.String("taskfile")
 	if taskfile == "" {
@@ -1354,6 +1360,7 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 	force := c.Bool("f")
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
+	ctx = bbbfs.WithScanConcurrency(ctx, concurrency)
 	retryCount := c.Int("retry-count")
 	if c.Args().Len() == 0 {
 		return fmt.Errorf("rm: need at least one path")
@@ -1407,6 +1414,7 @@ func cmdRMTree(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdRMTree called", "args", c.Args().Slice())
 	quiet := c.Bool("q") || c.Bool("quiet")
 	concurrency := c.Int("concurrency")
+	ctx = bbbfs.WithScanConcurrency(ctx, concurrency)
 	retryCount := c.Int("retry-count")
 	if c.Args().Len() != 1 {
 		return fmt.Errorf("rmtree: need directory root")
@@ -1505,6 +1513,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 	quiet := c.Bool("q") || c.Bool("quiet")
 	exclude := c.String("x")
 	concurrency := c.Int("concurrency")
+	ctx = bbbfs.WithScanConcurrency(ctx, concurrency)
 	retryCount := c.Int("retry-count")
 	taskfile := c.String("taskfile")
 	if taskfile == "" {

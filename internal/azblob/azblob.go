@@ -425,19 +425,159 @@ func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 }
 
 // ListRecursiveStream streams all blobs under path via callback (treats path as prefix root).
-// This avoids collecting all results in memory before processing.
-func ListRecursiveStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) error {
-	prefix := ap.Blob
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
+// Uses parallel prefix walking (similar to azcopy) to enumerate blobs across multiple
+// subdirectories concurrently, dramatically improving scan speed for deep hierarchies.
+// scanConcurrency controls how many directory prefixes are listed in parallel.
+func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int, cb func(BlobMeta) error) error {
+	rootPrefix := ap.Blob
+	if rootPrefix != "" && !strings.HasSuffix(rootPrefix, "/") {
+		rootPrefix += "/"
 	}
 	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
 		return err
 	}
 	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
+
+	if scanConcurrency < 1 {
+		scanConcurrency = 1
+	}
+
+	// For scanConcurrency == 1, use the simpler sequential flat pager.
+	if scanConcurrency <= 1 {
+		return listRecursiveFlat(ctx, containerClient, ap.Container, rootPrefix, cb)
+	}
+
+	// Parallel prefix walking: use hierarchy listing to discover subdirectories
+	// and walk them concurrently with bounded parallelism.
+	var (
+		mu      sync.Mutex
+		cbErr   error // first callback error
+		walkErr error // first walk error
+	)
+
+	// safeCB serializes callback invocations so callers don't need thread-safe callbacks.
+	safeCB := func(bm BlobMeta) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if cbErr != nil {
+			return cbErr
+		}
+		if err := cb(bm); err != nil {
+			cbErr = err
+			return err
+		}
+		return nil
+	}
+
+	setWalkErr := func(err error) {
+		mu.Lock()
+		if walkErr == nil {
+			walkErr = err
+		}
+		mu.Unlock()
+	}
+
+	hasErr := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return cbErr != nil || walkErr != nil
+	}
+
+	// Semaphore to bound concurrent listing goroutines.
+	sem := make(chan struct{}, scanConcurrency)
+	var wg sync.WaitGroup
+
+	// walkPrefix lists blobs and subdirectories under the given prefix.
+	// For each subdirectory, it spawns a goroutine (bounded by sem) to walk recursively.
+	var walkPrefix func(prefix string)
+	walkPrefix = func(prefix string) {
+		defer wg.Done()
+
+		if ctx.Err() != nil || hasErr() {
+			return
+		}
+
+		opts := &container.ListBlobsHierarchyOptions{}
+		if prefix != "" {
+			opts.Prefix = &prefix
+		}
+		pager := containerClient.NewListBlobsHierarchyPager("/", opts)
+
+		for pager.More() {
+			if ctx.Err() != nil || hasErr() {
+				return
+			}
+			resp, err := pager.NextPage(ctx)
+			if err != nil {
+				var respErr *azcore.ResponseError
+				if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerNotFound" {
+					setWalkErr(fmt.Errorf("container '%s' not found", ap.Container))
+				} else {
+					setWalkErr(err)
+				}
+				return
+			}
+			if resp.Segment == nil {
+				return
+			}
+
+			// Emit files at this level
+			for _, blob := range resp.Segment.BlobItems {
+				if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
+					continue
+				}
+				bm := BlobMeta{
+					Name: strings.TrimPrefix(*blob.Name, rootPrefix),
+					Size: *blob.Properties.ContentLength,
+				}
+				if err := safeCB(bm); err != nil {
+					return
+				}
+			}
+
+			// Spawn parallel walks for subdirectories
+			for _, bp := range resp.Segment.BlobPrefixes {
+				if bp == nil || bp.Name == nil {
+					continue
+				}
+				subPrefix := *bp.Name
+				wg.Add(1)
+				// Try to acquire semaphore; if full, walk inline instead.
+				select {
+				case sem <- struct{}{}:
+					go func(p string) {
+						defer func() { <-sem }()
+						walkPrefix(p)
+					}(subPrefix)
+				default:
+					// Semaphore full — walk inline in current goroutine
+					walkPrefix(subPrefix)
+				}
+			}
+		}
+	}
+
+	wg.Add(1)
+	// Root walk — acquire semaphore for it too
+	sem <- struct{}{}
+	go func() {
+		defer func() { <-sem }()
+		walkPrefix(rootPrefix)
+	}()
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if cbErr != nil {
+		return cbErr
+	}
+	return walkErr
+}
+
+// listRecursiveFlat is the sequential fallback using a flat pager.
+func listRecursiveFlat(ctx context.Context, containerClient *container.Client, containerName, prefix string, cb func(BlobMeta) error) error {
 	opts := &azblob.ListBlobsFlatOptions{}
-	// Use nil Prefix for container root; see ListStream comment.
 	if prefix != "" {
 		opts.Prefix = &prefix
 	}
@@ -447,7 +587,7 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) er
 		if err != nil {
 			var respErr *azcore.ResponseError
 			if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerNotFound" {
-				return fmt.Errorf("container '%s' not found", ap.Container)
+				return fmt.Errorf("container '%s' not found", containerName)
 			}
 			return err
 		}
@@ -469,7 +609,7 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) er
 // ListRecursive retrieves all blobs under path (treats path as prefix root)
 func ListRecursive(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 	var out []BlobMeta
-	if err := ListRecursiveStream(ctx, ap, func(bm BlobMeta) error {
+	if err := ListRecursiveStream(ctx, ap, 1, func(bm BlobMeta) error {
 		out = append(out, bm)
 		return nil
 	}); err != nil {

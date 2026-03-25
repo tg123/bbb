@@ -91,7 +91,7 @@ func (azFS) ListRecursive(ctx context.Context, target string, emit func(Entry) e
 	if err != nil {
 		return err
 	}
-	return azblob.ListRecursiveStream(ctx, ap, func(bm azblob.BlobMeta) error {
+	return azblob.ListRecursiveStream(ctx, ap, ScanConcurrency(ctx), func(bm azblob.BlobMeta) error {
 		name := bm.Name
 		if name == "" || strings.HasSuffix(name, "/") {
 			return nil
@@ -218,7 +218,7 @@ func (azFS) ListFilesFlat(ctx context.Context, p string) ([]string, error) {
 		return nil, err
 	}
 	var names []string
-	if err := azblob.ListRecursiveStream(ctx, ap, func(bm azblob.BlobMeta) error {
+	if err := azblob.ListRecursiveStream(ctx, ap, ScanConcurrency(ctx), func(bm azblob.BlobMeta) error {
 		if bm.Name == "" || strings.HasSuffix(bm.Name, "/") {
 			return nil
 		}
@@ -324,7 +324,7 @@ func (azFS) ListRecursiveWithSizeStream(ctx context.Context, p string, emit func
 	if err != nil {
 		return err
 	}
-	return azblob.ListRecursiveStream(ctx, ap, func(bm azblob.BlobMeta) error {
+	return azblob.ListRecursiveStream(ctx, ap, ScanConcurrency(ctx), func(bm azblob.BlobMeta) error {
 		name := bm.Name
 		if name == "" || strings.HasSuffix(name, "/") {
 			return nil
