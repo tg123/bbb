@@ -14,36 +14,37 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/hf"
 	"github.com/urfave/cli/v3"
 )
 
 func TestIsAzHTTPS(t *testing.T) {
-	if !isAz("https://myacct.blob.core.windows.net/container") {
+	if !bbbfs.IsAz("https://myacct.blob.core.windows.net/container") {
 		t.Fatalf("expected https blob url to be treated as az path")
 	}
-	if isAz("https://example.com/file") {
+	if bbbfs.IsAz("https://example.com/file") {
 		t.Fatalf("non-blob https url should not be treated as az path")
 	}
 }
 
 func TestIsAzHTTPEdgeCases(t *testing.T) {
-	if !isAz("http://MYACCT.blob.core.windows.net:8080/container/blob.txt?sv=2021#frag") {
+	if !bbbfs.IsAz("http://MYACCT.blob.core.windows.net:8080/container/blob.txt?sv=2021#frag") {
 		t.Fatalf("expected blob url with port/query/fragment to be az path")
 	}
-	if isAz("http://bad.blob.core.windows.net/") {
+	if bbbfs.IsAz("http://bad.blob.core.windows.net/") {
 		t.Fatalf("url missing container should not be treated as az path")
 	}
-	if isAz("ftp://acct.blob.core.windows.net/container") {
+	if bbbfs.IsAz("ftp://acct.blob.core.windows.net/container") {
 		t.Fatalf("non-http scheme should not be treated as az path")
 	}
 }
 
 func TestIsHF(t *testing.T) {
-	if !isHF("hf://openai/gpt-oss-120b") {
+	if !bbbfs.IsHF("hf://openai/gpt-oss-120b") {
 		t.Fatalf("expected hf scheme to be detected")
 	}
-	if isHF("https://example.com/model") {
+	if bbbfs.IsHF("https://example.com/model") {
 		t.Fatalf("non-hf scheme should not be detected")
 	}
 }
@@ -106,18 +107,18 @@ func TestHFPathDatasetDefaults(t *testing.T) {
 }
 
 func TestResolveDstPathAzDir(t *testing.T) {
-	dst, err := resolveDstPath("az://acct/container/prefix", true, "model.bin", true)
+	dst, err := bbbfs.ResolveDstPath("az://acct/container/prefix", "model.bin", true)
 	if err != nil {
-		t.Fatalf("resolveDstPath failed: %v", err)
+		t.Fatalf("ResolveDstPath failed: %v", err)
 	}
 	if dst != "az://acct/container/prefix/model.bin" {
 		t.Fatalf("unexpected dst: %s", dst)
 	}
 }
 
-func TestSyncHFFiles(t *testing.T) {
+func TestSyncFilterExclude(t *testing.T) {
 	files := []string{"file.txt", "dir/file2.txt", "dir/skip.txt"}
-	list := syncHFFilesFromList(files, func(name string) bool { return strings.Contains(name, "skip") })
+	list := filterExclude(files, func(name string) bool { return strings.Contains(name, "skip") })
 	if len(list) != 2 {
 		t.Fatalf("unexpected list length: %d", len(list))
 	}
@@ -1106,12 +1107,12 @@ func TestSplitWildcardGlobChars(t *testing.T) {
 	}
 }
 
-func TestWriteStreamToFile(t *testing.T) {
+func TestWriteStreamToLocal(t *testing.T) {
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "nested", "file.txt")
 	content := "stream data"
-	if err := writeStreamToFile(dst, strings.NewReader(content), 0o644); err != nil {
-		t.Fatalf("writeStreamToFile failed: %v", err)
+	if err := bbbfs.Resolve(dst).Write(context.Background(), dst, strings.NewReader(content)); err != nil {
+		t.Fatalf("write failed: %v", err)
 	}
 	data, err := os.ReadFile(dst)
 	if err != nil {

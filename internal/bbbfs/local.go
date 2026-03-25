@@ -73,6 +73,26 @@ func (localFS) Stat(ctx context.Context, path string) (Entry, error) {
 	}, nil
 }
 
+func (localFS) IsDirLike(_ context.Context, path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	return info.IsDir(), nil
+}
+
+func (localFS) ChildPath(parent, child string) string {
+	return filepath.Join(parent, child)
+}
+
+func (localFS) BaseName(path string) string {
+	return filepath.Base(path)
+}
+
+func (localFS) Delete(_ context.Context, path string) error {
+	return os.Remove(path)
+}
+
 func writeLocal(path string, r io.Reader) (err error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
