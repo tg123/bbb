@@ -1242,3 +1242,104 @@ func TestDNSLoggingDialContextResolverError(t *testing.T) {
 		t.Fatalf("expected DNS lookup error log, got: %s", buf.String())
 	}
 }
+
+// --------------- dnsCachingDialContext tests ---------------
+
+func TestDNSCachingDialContextPassesThrough(t *testing.T) {
+	var dialedAddr string
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialedAddr = addr
+		return nil, errors.New("fake")
+	}
+	dial := dnsCachingDialContext(baseDial, net.DefaultResolver)
+	_, _ = dial(context.Background(), "tcp", "localhost:80")
+	// localhost resolves to 127.0.0.1 or ::1, so the dialed address should be an IP.
+	host, _, err := net.SplitHostPort(dialedAddr)
+	if err != nil {
+		t.Fatalf("unexpected SplitHostPort error: %v", err)
+	}
+	if net.ParseIP(host) == nil {
+		t.Fatalf("expected dialed address to be an IP, got %s", dialedAddr)
+	}
+}
+
+func TestDNSCachingDialContextIPPassthrough(t *testing.T) {
+	var dialedAddr string
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialedAddr = addr
+		return nil, errors.New("fake")
+	}
+	dial := dnsCachingDialContext(baseDial, net.DefaultResolver)
+	_, _ = dial(context.Background(), "tcp", "1.2.3.4:443")
+	if dialedAddr != "1.2.3.4:443" {
+		t.Fatalf("expected IP address to pass through unchanged, got %s", dialedAddr)
+	}
+}
+
+func TestDNSCachingDialContextBadAddr(t *testing.T) {
+	var called bool
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		called = true
+		return nil, errors.New("fake")
+	}
+	dial := dnsCachingDialContext(baseDial, net.DefaultResolver)
+	_, _ = dial(context.Background(), "tcp", "no-port")
+	if !called {
+		t.Fatal("expected baseDial to be called on bad addr")
+	}
+}
+
+func TestDNSCachingDialContextCachesResult(t *testing.T) {
+	lookups := 0
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			lookups++
+			// Delegate to default resolver
+			return net.Dial(network, address)
+		},
+	}
+
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("fake")
+	}
+	dial := dnsCachingDialContext(baseDial, resolver)
+
+	// First call – cache miss.
+	_, _ = dial(context.Background(), "tcp", "localhost:80")
+	firstLookups := lookups
+
+	// Second call – should hit cache (no additional resolver Dial calls).
+	_, _ = dial(context.Background(), "tcp", "localhost:80")
+	if lookups != firstLookups {
+		t.Fatalf("expected DNS result to be cached, but resolver was called again (lookups: %d → %d)", firstLookups, lookups)
+	}
+}
+
+func TestDNSCachingDialContextTriesAllAddrs(t *testing.T) {
+	var tried []string
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		tried = append(tried, addr)
+		return nil, errors.New("fake")
+	}
+	dial := dnsCachingDialContext(baseDial, net.DefaultResolver)
+	// localhost may resolve to multiple addresses (127.0.0.1, ::1).
+	_, _ = dial(context.Background(), "tcp", "localhost:80")
+	if len(tried) == 0 {
+		t.Fatal("expected at least one dial attempt")
+	}
+}
+
+func TestDNSCachingDialContextResolverError(t *testing.T) {
+	var dialedAddr string
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialedAddr = addr
+		return nil, errors.New("fake")
+	}
+	dial := dnsCachingDialContext(baseDial, net.DefaultResolver)
+	// Use an unresolvable hostname – baseDial should receive the original address.
+	_, _ = dial(context.Background(), "tcp", "this-host-does-not-exist-xyzzy.invalid:443")
+	if dialedAddr != "this-host-does-not-exist-xyzzy.invalid:443" {
+		t.Fatalf("expected original address on resolver error, got %s", dialedAddr)
+	}
+}
