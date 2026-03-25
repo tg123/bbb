@@ -717,11 +717,11 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 		workers = 1
 	}
 	// Expanders discover files (via listing) and push them to the task channel.
-	// Listing runs as a sequential flat pager inside each expander, so expander
-	// count only matters when there are multiple source→destination pairs.
-	// Copy workers get the full concurrency budget — listing is lightweight
-	// (sequential I/O) and runs independently, so it doesn't need to share
-	// the concurrency budget with copy workers.
+	// Listing runs as a sequential flat pager, so each expander is lightweight.
+	// Multiple expanders help when there are multiple source→destination pairs;
+	// for a single pair, only 1 expander runs (capped below by len(tasks)).
+	// Copy workers get the full concurrency budget — listing is independent
+	// sequential I/O and doesn't compete with copy for network or CPU.
 	expanders := max(1, workers/4)
 	cpWorkers := workers
 	// Limit concurrent file copies so block-level parallelism (StageBlockFromURL)
