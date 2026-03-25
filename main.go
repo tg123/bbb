@@ -88,6 +88,18 @@ func dnsLoggingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dia
 func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dialContextFunc {
 	var cache sync.Map // host → []string
 
+	dialResolved := func(ctx context.Context, network, port string, addrs []string) (net.Conn, error) {
+		var lastErr error
+		for _, a := range addrs {
+			conn, dialErr := baseDial(ctx, network, net.JoinHostPort(a, port))
+			if dialErr == nil {
+				return conn, nil
+			}
+			lastErr = dialErr
+		}
+		return nil, lastErr
+	}
+
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
@@ -103,15 +115,7 @@ func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dia
 		if v, ok := cache.Load(host); ok {
 			addrs := v.([]string)
 			slog.Debug("DNS cache hit", "host", host, "addrs", addrs)
-			var lastErr error
-			for _, a := range addrs {
-				conn, dialErr := baseDial(ctx, network, net.JoinHostPort(a, port))
-				if dialErr == nil {
-					return conn, nil
-				}
-				lastErr = dialErr
-			}
-			return nil, lastErr
+			return dialResolved(ctx, network, port, addrs)
 		}
 
 		// Cache miss – resolve and store.
@@ -128,15 +132,7 @@ func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dia
 		cache.Store(host, addrs)
 		slog.Debug("DNS cache miss, resolved", "host", host, "addrs", addrs)
 
-		var lastErr error
-		for _, a := range addrs {
-			conn, dialErr := baseDial(ctx, network, net.JoinHostPort(a, port))
-			if dialErr == nil {
-				return conn, nil
-			}
-			lastErr = dialErr
-		}
-		return nil, lastErr
+		return dialResolved(ctx, network, port, addrs)
 	}
 }
 
