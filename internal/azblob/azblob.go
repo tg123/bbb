@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
@@ -419,6 +420,25 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 		cred, credErr := getDefaultCredential()
 		if credErr != nil {
 			return nil, credErr
+		}
+
+		if slog.Default().Enabled(ctx, slog.LevelDebug) {
+			tok, tokErr := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
+			if tokErr != nil {
+				return nil, tokErr
+			}
+
+			parts := strings.Split(tok.Token, ".")
+			if len(parts) == 3 {
+				payload, decErr := base64.RawURLEncoding.DecodeString(parts[1])
+				if decErr == nil {
+					slog.Debug("Decoded JWT payload", "payload", string(payload))
+				} else {
+					slog.Debug("Failed to decode JWT payload", "error", decErr)
+				}
+			} else {
+				slog.Debug("Token is not a JWT")
+			}
 		}
 
 		var clientErr error
