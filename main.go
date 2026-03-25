@@ -88,20 +88,18 @@ type dnsCacheEntry struct {
 	expiry time.Time
 }
 
-const defaultDNSCacheTTL = 5 * time.Minute
-
 // dnsCachingDialContext wraps a base dialer to cache DNS resolution results.
-// Resolved addresses are cached with a TTL (defaultDNSCacheTTL) to avoid
-// serving stale records indefinitely. When the address is already an IP
-// literal or SplitHostPort fails, the call is passed straight through to
-// baseDial.
+// When ttl is positive, cached entries expire after that duration; when ttl
+// is zero or negative the cache entries never expire (unlimited).
+// When the address is already an IP literal or SplitHostPort fails, the call
+// is passed straight through to baseDial.
 //
 // Note: because cached addresses are dialled as IP literals, Go's standard
 // Happy Eyeballs (RFC 6555) connection racing is bypassed. For bbb's primary
 // workload (Azure Blob Storage endpoints that are typically single-stack)
 // this has no practical impact.
-func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dialContextFunc {
-	return newCachingDialContext(baseDial, resolver.LookupHost, defaultDNSCacheTTL)
+func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver, ttl time.Duration) dialContextFunc {
+	return newCachingDialContext(baseDial, resolver.LookupHost, ttl)
 }
 
 // newCachingDialContext is the internal implementation used by
@@ -133,10 +131,10 @@ func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl 
 			return baseDial(ctx, network, addr)
 		}
 
-		// Try the cache first (with TTL check).
+		// Try the cache first (with TTL check when TTL > 0).
 		if v, ok := cache.Load(host); ok {
 			entry := v.(*dnsCacheEntry)
-			if time.Now().Before(entry.expiry) {
+			if ttl <= 0 || time.Now().Before(entry.expiry) {
 				slog.Debug("DNS cache hit", "host", host, "addrs", entry.addrs)
 				return dialAddrs(ctx, network, port, entry.addrs)
 			}
@@ -208,10 +206,22 @@ func main() {
 
 				switch strings.ToLower(os.Getenv("BBB_DNS_CACHE")) {
 				case "1", "true", "yes", "on":
-					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver)
+					var ttl time.Duration // 0 means unlimited
+					if raw := os.Getenv("BBB_DNS_CACHE_TTL"); raw != "" {
+						d, err := time.ParseDuration(raw)
+						if err != nil {
+							return ctx, fmt.Errorf("invalid BBB_DNS_CACHE_TTL %q: %w", raw, err)
+						}
+						ttl = d
+					}
+					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver, ttl)
+					ttlStr := "unlimited"
+					if ttl > 0 {
+						ttlStr = ttl.String()
+					}
 					slog.Info("DNS caching enabled",
 						"env", "BBB_DNS_CACHE",
-						"ttl", defaultDNSCacheTTL,
+						"ttl", ttlStr,
 					)
 				default:
 					transport.DialContext = dnsLoggingDialContext(baseDial, net.DefaultResolver)
