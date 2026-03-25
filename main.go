@@ -79,16 +79,38 @@ func dnsLoggingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dia
 	}
 }
 
-// dnsCachingDialContext wraps a base dialer to cache DNS resolution results.
-// Once a hostname is resolved, subsequent dials reuse the cached addresses
-// without performing additional DNS lookups. If the cached address fails,
-// all resolved addresses are tried before returning an error. When the
-// address is already an IP literal or SplitHostPort fails, the call is
-// passed straight through to baseDial.
-func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dialContextFunc {
-	var cache sync.Map // host → []string
+// lookupHostFunc is the signature for a DNS hostname lookup function.
+type lookupHostFunc func(ctx context.Context, host string) ([]string, error)
 
-	dialResolved := func(ctx context.Context, network, port string, addrs []string) (net.Conn, error) {
+// dnsCacheEntry stores resolved addresses with an expiry time.
+type dnsCacheEntry struct {
+	addrs  []string
+	expiry time.Time
+}
+
+const defaultDNSCacheTTL = 5 * time.Minute
+
+// dnsCachingDialContext wraps a base dialer to cache DNS resolution results.
+// Resolved addresses are cached with a TTL (defaultDNSCacheTTL) to avoid
+// serving stale records indefinitely. When the address is already an IP
+// literal or SplitHostPort fails, the call is passed straight through to
+// baseDial.
+//
+// Note: because cached addresses are dialled as IP literals, Go's standard
+// Happy Eyeballs (RFC 6555) connection racing is bypassed. For bbb's primary
+// workload (Azure Blob Storage endpoints that are typically single-stack)
+// this has no practical impact.
+func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dialContextFunc {
+	return newCachingDialContext(baseDial, resolver.LookupHost, defaultDNSCacheTTL)
+}
+
+// newCachingDialContext is the internal implementation used by
+// dnsCachingDialContext. Accepting a lookupHostFunc and explicit TTL makes
+// the function easy to test with deterministic inputs.
+func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl time.Duration) dialContextFunc {
+	var cache sync.Map // host → *dnsCacheEntry
+
+	dialAddrs := func(ctx context.Context, network, port string, addrs []string) (net.Conn, error) {
 		var lastErr error
 		for _, a := range addrs {
 			conn, dialErr := baseDial(ctx, network, net.JoinHostPort(a, port))
@@ -111,15 +133,18 @@ func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dia
 			return baseDial(ctx, network, addr)
 		}
 
-		// Try the cache first.
+		// Try the cache first (with TTL check).
 		if v, ok := cache.Load(host); ok {
-			addrs := v.([]string)
-			slog.Debug("DNS cache hit", "host", host, "addrs", addrs)
-			return dialResolved(ctx, network, port, addrs)
+			entry := v.(*dnsCacheEntry)
+			if time.Now().Before(entry.expiry) {
+				slog.Debug("DNS cache hit", "host", host, "addrs", entry.addrs)
+				return dialAddrs(ctx, network, port, entry.addrs)
+			}
+			cache.Delete(host)
 		}
 
-		// Cache miss – resolve and store.
-		addrs, lookupErr := resolver.LookupHost(ctx, host)
+		// Cache miss or expired – resolve and store.
+		addrs, lookupErr := lookup(ctx, host)
 		if lookupErr != nil {
 			slog.Debug("DNS lookup error", "host", host, "error", lookupErr)
 			return baseDial(ctx, network, addr)
@@ -129,10 +154,13 @@ func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dia
 			return baseDial(ctx, network, addr)
 		}
 
-		cache.Store(host, addrs)
+		cache.Store(host, &dnsCacheEntry{
+			addrs:  addrs,
+			expiry: time.Now().Add(ttl),
+		})
 		slog.Debug("DNS cache miss, resolved", "host", host, "addrs", addrs)
 
-		return dialResolved(ctx, network, port, addrs)
+		return dialAddrs(ctx, network, port, addrs)
 	}
 }
 
@@ -181,7 +209,10 @@ func main() {
 				switch strings.ToLower(os.Getenv("BBB_DNS_CACHE")) {
 				case "1", "true", "yes", "on":
 					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver)
-					slog.Debug("DNS caching enabled")
+					slog.Info("DNS caching enabled",
+						"env", "BBB_DNS_CACHE",
+						"ttl", defaultDNSCacheTTL,
+					)
 				default:
 					transport.DialContext = dnsLoggingDialContext(baseDial, net.DefaultResolver)
 				}
