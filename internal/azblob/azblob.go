@@ -543,7 +543,9 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 				}
 				subPrefix := *bp.Name
 				wg.Add(1)
-				// Try to acquire semaphore; if full, walk inline instead.
+				// Try to acquire semaphore; if full, walk inline in current goroutine.
+				// Inline walking reuses the parent goroutine's stack. Directory depth
+				// in blob storage is typically shallow, so stack growth is bounded.
 				select {
 				case sem <- struct{}{}:
 					go func(p string) {
@@ -551,20 +553,17 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int,
 						walkPrefix(p)
 					}(subPrefix)
 				default:
-					// Semaphore full — walk inline in current goroutine
 					walkPrefix(subPrefix)
 				}
 			}
 		}
 	}
 
+	// Start root walk. Run inline (no goroutine) — the caller already
+	// blocks until wg.Wait() completes, so there's no benefit to a goroutine
+	// for root, and starting inline avoids consuming a semaphore slot.
 	wg.Add(1)
-	// Root walk — acquire semaphore for it too
-	sem <- struct{}{}
-	go func() {
-		defer func() { <-sem }()
-		walkPrefix(rootPrefix)
-	}()
+	walkPrefix(rootPrefix)
 	wg.Wait()
 
 	mu.Lock()
