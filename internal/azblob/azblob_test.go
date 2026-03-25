@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 )
 
 func TestParseHTTPSBlobURL(t *testing.T) {
@@ -486,5 +487,169 @@ func TestExtractFirstLevelEmptyPrefix(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("expected 2 entries, got %d: %+v", len(got), got)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+func TestProcessHierarchySegmentPrefixesAndItems(t *testing.T) {
+	seg := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{
+			{Name: strPtr("prefix/dir/")},
+		},
+		BlobItems: []*container.BlobItem{
+			{Name: strPtr("prefix/file.txt"), Properties: &container.BlobProperties{ContentLength: int64Ptr(42)}},
+		},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	err := processHierarchySegment(seg, "prefix/", seen, func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "dir/" || got[0].Size != 0 {
+		t.Fatalf("expected dir/ with size 0, got %+v", got[0])
+	}
+	if got[1].Name != "file.txt" || got[1].Size != 42 {
+		t.Fatalf("expected file.txt with size 42, got %+v", got[1])
+	}
+}
+
+func TestProcessHierarchySegmentDedup(t *testing.T) {
+	// A directory-marker blob "dir/" appears as both a BlobPrefix and BlobItem.
+	seg := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{
+			{Name: strPtr("dir/")},
+		},
+		BlobItems: []*container.BlobItem{
+			// directory-marker blob with nil ContentLength — should be skipped
+			{Name: strPtr("dir/"), Properties: nil},
+		},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	err := processHierarchySegment(seg, "", seen, func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry (deduped), got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "dir/" {
+		t.Fatalf("expected 'dir/', got %q", got[0].Name)
+	}
+}
+
+func TestProcessHierarchySegmentDedupAcrossCalls(t *testing.T) {
+	// Simulate two pages returning the same prefix
+	seg1 := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{
+			{Name: strPtr("prefix/subdir/")},
+		},
+	}
+	seg2 := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{
+			{Name: strPtr("prefix/subdir/")},
+		},
+		BlobItems: []*container.BlobItem{
+			{Name: strPtr("prefix/new.txt"), Properties: &container.BlobProperties{ContentLength: int64Ptr(10)}},
+		},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	cb := func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	}
+	if err := processHierarchySegment(seg1, "prefix/", seen, cb); err != nil {
+		t.Fatal(err)
+	}
+	if err := processHierarchySegment(seg2, "prefix/", seen, cb); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries (subdir/ + new.txt), got %d: %+v", len(got), got)
+	}
+}
+
+func TestProcessHierarchySegmentSkipsNilContentLength(t *testing.T) {
+	seg := &container.BlobHierarchyListSegment{
+		BlobItems: []*container.BlobItem{
+			{Name: strPtr("marker"), Properties: nil},
+			{Name: strPtr("file.txt"), Properties: &container.BlobProperties{ContentLength: int64Ptr(100)}},
+			{Name: strPtr("nosize"), Properties: &container.BlobProperties{ContentLength: nil}},
+		},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	err := processHierarchySegment(seg, "", seen, func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry (only file.txt), got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "file.txt" || got[0].Size != 100 {
+		t.Fatalf("expected file.txt with size 100, got %+v", got[0])
+	}
+}
+
+func TestProcessHierarchySegmentSkipsNilEntries(t *testing.T) {
+	seg := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{nil, {Name: nil}, {Name: strPtr("dir/")}},
+		BlobItems:    []*container.BlobItem{nil, {Name: nil}, {Name: strPtr("f"), Properties: &container.BlobProperties{ContentLength: int64Ptr(1)}}},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	err := processHierarchySegment(seg, "", seen, func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d: %+v", len(got), got)
+	}
+}
+
+func TestProcessHierarchySegmentPrefixTrimming(t *testing.T) {
+	seg := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{
+			{Name: strPtr("root/sub/")},
+		},
+		BlobItems: []*container.BlobItem{
+			{Name: strPtr("root/data.bin"), Properties: &container.BlobProperties{ContentLength: int64Ptr(50)}},
+		},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	err := processHierarchySegment(seg, "root/", seen, func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "sub/" {
+		t.Fatalf("expected prefix trimmed to 'sub/', got %q", got[0].Name)
+	}
+	if got[1].Name != "data.bin" {
+		t.Fatalf("expected prefix trimmed to 'data.bin', got %q", got[1].Name)
 	}
 }

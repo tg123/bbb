@@ -314,6 +314,7 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 		opts.Prefix = &prefix
 	}
 	pager := containerClient.NewListBlobsHierarchyPager("/", opts)
+	seen := make(map[string]bool)
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
@@ -322,35 +323,52 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 		if resp.Segment == nil {
 			return nil
 		}
-		// Emit virtual directories (blob prefixes)
-		for _, bp := range resp.Segment.BlobPrefixes {
-			if bp == nil || bp.Name == nil {
-				continue
-			}
-			dirName := strings.TrimPrefix(*bp.Name, prefix)
-			if dirName == "" {
-				continue
-			}
-			if err := cb(BlobMeta{Name: dirName, Size: 0}); err != nil {
-				return err
-			}
+		if err := processHierarchySegment(resp.Segment, prefix, seen, cb); err != nil {
+			return err
 		}
-		// Emit files at this level
-		for _, blob := range resp.Segment.BlobItems {
-			if blob == nil || blob.Name == nil {
-				continue
-			}
-			var size int64
-			if blob.Properties != nil && blob.Properties.ContentLength != nil {
-				size = *blob.Properties.ContentLength
-			}
-			name := strings.TrimPrefix(*blob.Name, prefix)
-			if name == "" {
-				continue
-			}
-			if err := cb(BlobMeta{Name: name, Size: size}); err != nil {
-				return err
-			}
+	}
+	return nil
+}
+
+// processHierarchySegment emits BlobMeta entries from a hierarchy listing
+// segment, de-duplicating across prefixes and items. Directory-marker blobs
+// (nil ContentLength) are skipped.
+func processHierarchySegment(seg *container.BlobHierarchyListSegment, prefix string, seen map[string]bool, cb func(BlobMeta) error) error {
+	// Emit virtual directories (blob prefixes)
+	for _, bp := range seg.BlobPrefixes {
+		if bp == nil || bp.Name == nil {
+			continue
+		}
+		dirName := strings.TrimPrefix(*bp.Name, prefix)
+		if dirName == "" {
+			continue
+		}
+		if seen[dirName] {
+			continue
+		}
+		seen[dirName] = true
+		if err := cb(BlobMeta{Name: dirName, Size: 0}); err != nil {
+			return err
+		}
+	}
+	// Emit files at this level (skip directory-marker blobs with nil ContentLength)
+	for _, blob := range seg.BlobItems {
+		if blob == nil || blob.Name == nil {
+			continue
+		}
+		if blob.Properties == nil || blob.Properties.ContentLength == nil {
+			continue
+		}
+		name := strings.TrimPrefix(*blob.Name, prefix)
+		if name == "" {
+			continue
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		if err := cb(BlobMeta{Name: name, Size: *blob.Properties.ContentLength}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -427,13 +445,13 @@ func ListRecursiveStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) er
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
-			return err
-		}
-		if resp.Segment == nil {
 			var respErr *azcore.ResponseError
 			if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerNotFound" {
 				return fmt.Errorf("container '%s' not found", ap.Container)
 			}
+			return err
+		}
+		if resp.Segment == nil {
 			return nil
 		}
 		for _, blob := range resp.Segment.BlobItems {

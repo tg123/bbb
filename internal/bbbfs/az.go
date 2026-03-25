@@ -92,8 +92,8 @@ func (azFS) ListRecursive(ctx context.Context, target string, emit func(Entry) e
 		return err
 	}
 	return azblob.ListRecursiveStream(ctx, ap, func(bm azblob.BlobMeta) error {
-		name := strings.TrimSuffix(bm.Name, "/")
-		if name == "" {
+		name := bm.Name
+		if name == "" || strings.HasSuffix(name, "/") {
 			return nil
 		}
 		return emit(Entry{
@@ -299,8 +299,8 @@ func (azFS) ListRecursiveWithSize(ctx context.Context, p string) ([]Entry, error
 	}
 	var entries []Entry
 	if err := azblob.ListRecursiveStream(ctx, ap, func(bm azblob.BlobMeta) error {
-		name := strings.TrimSuffix(bm.Name, "/")
-		if name == "" {
+		name := bm.Name
+		if name == "" || strings.HasSuffix(name, "/") {
 			return nil
 		}
 		entries = append(entries, Entry{
