@@ -90,7 +90,8 @@ type dnsCacheEntry struct {
 
 // dnsCachingDialContext wraps a base dialer to cache DNS resolution results.
 // When ttl is positive, cached entries expire after that duration; when ttl
-// is zero or negative the cache entries never expire (unlimited).
+// is zero or less the cache entries never expire (unlimited). Callers that
+// derive ttl from BBB_DNS_CACHE_TTL must ensure it is >= 0.
 // When the address is already an IP literal or SplitHostPort fails, the call
 // is passed straight through to baseDial.
 //
@@ -218,13 +219,10 @@ func main() {
 						ttl = d
 					}
 					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver, ttl)
-					ttlStr := "unlimited"
-					if ttl > 0 {
-						ttlStr = ttl.String()
-					}
 					slog.Info("DNS caching enabled",
 						"env", "BBB_DNS_CACHE",
-						"ttl", ttlStr,
+						"ttl", ttl,
+						"ttl_unlimited", ttl <= 0,
 					)
 				default:
 					transport.DialContext = dnsLoggingDialContext(baseDial, net.DefaultResolver)

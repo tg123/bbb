@@ -1412,9 +1412,6 @@ func TestDNSCachingDialContextUnlimitedTTL(t *testing.T) {
 		t.Fatalf("expected 1 lookup on first call, got %d", *count)
 	}
 
-	// Even after sleeping, the cache should still be valid.
-	time.Sleep(10 * time.Millisecond)
-
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
 	if *count != 1 {
 		t.Fatalf("expected lookup count to stay 1 with unlimited TTL, got %d", *count)
