@@ -219,10 +219,13 @@ func main() {
 						ttl = d
 					}
 					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver, ttl)
+					ttlStr := "unlimited"
+					if ttl > 0 {
+						ttlStr = ttl.String()
+					}
 					slog.Info("DNS caching enabled",
 						"env", "BBB_DNS_CACHE",
-						"ttl", ttl,
-						"ttl_unlimited", ttl <= 0,
+						"ttl", ttlStr,
 					)
 				default:
 					transport.DialContext = dnsLoggingDialContext(baseDial, net.DefaultResolver)
