@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tg123/bbb/internal/azblob"
@@ -176,7 +177,7 @@ func (azFS) MkDir(ctx context.Context, p string) error {
 	return azblob.MkContainer(ctx, ap.Account, ap.Container)
 }
 
-func (azFS) CopyServerSide(ctx context.Context, src, dst string, concurrency int, onProgress CopyProgress) error {
+func (azFS) CopyServerSide(ctx context.Context, src, dst string, concurrency int, sizeHint int64, onProgress CopyProgress) error {
 	srcAP, err := azblob.Parse(src)
 	if err != nil {
 		return err
@@ -185,7 +186,7 @@ func (azFS) CopyServerSide(ctx context.Context, src, dst string, concurrency int
 	if err != nil {
 		return err
 	}
-	return azblob.CopyBlobServerSide(ctx, srcAP, dstAP, concurrency, onProgress)
+	return azblob.CopyBlobServerSide(ctx, srcAP, dstAP, concurrency, sizeHint, onProgress)
 }
 
 func (azFS) ListStream(ctx context.Context, p string, fn func(Entry) error) error {
@@ -217,12 +218,20 @@ func (azFS) ListFilesFlat(ctx context.Context, p string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	concurrency := ScanConcurrency(ctx)
+	var mu sync.Mutex
 	var names []string
-	if err := azblob.ListRecursiveStream(ctx, ap, ScanConcurrency(ctx), func(bm azblob.BlobMeta) error {
+	if err := azblob.ListRecursiveStream(ctx, ap, concurrency, func(bm azblob.BlobMeta) error {
 		if bm.Name == "" || strings.HasSuffix(bm.Name, "/") {
 			return nil
 		}
-		names = append(names, bm.Name)
+		if concurrency > 1 {
+			mu.Lock()
+			names = append(names, bm.Name)
+			mu.Unlock()
+		} else {
+			names = append(names, bm.Name)
+		}
 		return nil
 	}); err != nil {
 		return nil, err
@@ -340,9 +349,17 @@ func (azFS) ListRecursiveWithSizeStream(ctx context.Context, p string, emit func
 }
 
 func (f azFS) ListRecursiveWithSize(ctx context.Context, p string) ([]Entry, error) {
+	concurrency := ScanConcurrency(ctx)
+	var mu sync.Mutex
 	var entries []Entry
 	if err := f.ListRecursiveWithSizeStream(ctx, p, func(e Entry) error {
-		entries = append(entries, e)
+		if concurrency > 1 {
+			mu.Lock()
+			entries = append(entries, e)
+			mu.Unlock()
+		} else {
+			entries = append(entries, e)
+		}
 		return nil
 	}); err != nil {
 		return nil, err

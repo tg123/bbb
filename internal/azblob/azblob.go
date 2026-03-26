@@ -30,6 +30,19 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
 
+// --- Cached credentials and clients ---
+// These are safe for concurrent use and amortize the cost of credential
+// acquisition across all API calls in the process lifetime.
+
+var (
+	cachedDefaultCred     *azidentity.DefaultAzureCredential
+	cachedDefaultCredOnce sync.Once
+	cachedDefaultCredErr  error
+
+	// Per-account blob client cache (thread-safe via sync.Map).
+	blobClientCache sync.Map // map[string]*azblob.Client
+)
+
 // MkContainer creates a new Azure Blob container
 func MkContainer(ctx context.Context, account, container string) error {
 	client, err := getAzBlobClient(ctx, account)
@@ -68,6 +81,7 @@ var validBlobSuffixes = []string{
 
 const (
 	defaultCopySASExpiry     = time.Hour
+	clockSkewTolerance       = 5 * time.Minute   // backdate SAS start to tolerate clock differences
 	copyBlockSize            = 256 * 1024 * 1024 // 256 MiB per block for StageBlockFromURL
 	copyPollInitialDelay     = 100 * time.Millisecond
 	copyPollMaxDelay         = 2 * time.Second
@@ -374,41 +388,67 @@ func processHierarchySegment(seg *container.BlobHierarchyListSegment, prefix str
 	return nil
 }
 
+// getDefaultCredential returns a process-wide cached DefaultAzureCredential.
+// The credential is thread-safe and handles token refresh internally.
+func getDefaultCredential() (*azidentity.DefaultAzureCredential, error) {
+	cachedDefaultCredOnce.Do(func() {
+		cachedDefaultCred, cachedDefaultCredErr = azidentity.NewDefaultAzureCredential(nil)
+		if cachedDefaultCredErr == nil && slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+			tok, tokErr := cachedDefaultCred.GetToken(context.Background(), policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
+			if tokErr == nil {
+				parts := strings.Split(tok.Token, ".")
+				if len(parts) == 3 {
+					payload, decErr := base64.RawURLEncoding.DecodeString(parts[1])
+					if decErr == nil {
+						slog.Debug("Decoded JWT payload", "payload", string(payload))
+					} else {
+						slog.Debug("Failed to decode JWT payload", "error", decErr)
+					}
+				} else {
+					slog.Debug("Token is not a JWT")
+				}
+			} else {
+				slog.Debug("Failed to get token for JWT debug logging", "error", tokErr)
+			}
+		}
+	})
+	return cachedDefaultCred, cachedDefaultCredErr
+}
+
 // getAzBlobClient returns an Azure Blob client for the given account using either a shared key
 // from BBB_AZBLOB_ACCOUNTKEY or the default Azure credential.
+// Clients are cached per account for the process lifetime.
 func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
+	// Check cache first.
+	if cached, ok := blobClientCache.Load(account); ok {
+		return cached.(*azblob.Client), nil
+	}
 	endpoint := getEndpoint(account)
+	var client *azblob.Client
 	if key := os.Getenv("BBB_AZBLOB_ACCOUNTKEY"); key != "" {
 		cred, err := azblob.NewSharedKeyCredential(account, key)
 		if err != nil {
 			return nil, err
 		}
-		return azblob.NewClientWithSharedKeyCredential(endpoint, cred, nil)
-	}
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if slog.Default().Enabled(ctx, slog.LevelDebug) {
-		tok, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
+		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, cred, nil)
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		cred, credErr := getDefaultCredential()
+		if credErr != nil {
+			return nil, credErr
+		}
 
-		parts := strings.Split(tok.Token, ".")
-		if len(parts) == 3 {
-			payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-			if err == nil {
-				slog.Debug("Decoded JWT payload", "payload", string(payload))
-			} else {
-				slog.Debug("Failed to decode JWT payload", "error", err)
-			}
-		} else {
-			slog.Debug("Token is not a JWT")
+		var clientErr error
+		client, clientErr = azblob.NewClient(endpoint, cred, nil)
+		if clientErr != nil {
+			return nil, clientErr
 		}
 	}
-	return azblob.NewClient(endpoint, cred, nil)
+	// Store-or-load: if another goroutine raced and stored first, use theirs.
+	actual, _ := blobClientCache.LoadOrStore(account, client)
+	return actual.(*azblob.Client), nil
 }
 
 // List lists immediate children (non-recursive). If dir-like path provided, lists under it.
@@ -428,171 +468,32 @@ func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 // Uses parallel prefix walking (similar to azcopy) to enumerate blobs across multiple
 // subdirectories concurrently, dramatically improving scan speed for deep hierarchies.
 // scanConcurrency controls how many directory prefixes are listed in parallel.
-func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int, cb func(BlobMeta) error) error {
-	rootPrefix := ap.Blob
-	if rootPrefix != "" && !strings.HasSuffix(rootPrefix, "/") {
-		rootPrefix += "/"
+// When scanConcurrency > 1, cb must be safe for concurrent use by multiple goroutines.
+// normalizeRootPrefix ensures the prefix ends with "/" for use as a
+// blob name root. An empty prefix stays empty (represents the container root).
+func normalizeRootPrefix(blob string) string {
+	if blob != "" && !strings.HasSuffix(blob, "/") {
+		return blob + "/"
 	}
+	return blob
+}
+
+func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int, cb func(BlobMeta) error) error {
+	rootPrefix := normalizeRootPrefix(ap.Blob)
 	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
 		return err
 	}
 	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
 
-	if scanConcurrency < 1 {
-		scanConcurrency = 1
-	}
-
-	// For scanConcurrency == 1, use the simpler sequential flat pager.
-	if scanConcurrency <= 1 {
-		return listRecursiveFlat(ctx, containerClient, ap.Container, rootPrefix, cb)
-	}
-
-	// Parallel prefix walking: use hierarchy listing to discover subdirectories
-	// and walk them concurrently with bounded parallelism.
-	var (
-		mu      sync.Mutex
-		cbErr   error // first callback error
-		walkErr error // first walk error
-	)
-
-	// safeCB serializes callback invocations so callers don't need thread-safe callbacks.
-	safeCB := func(bm BlobMeta) error {
-		mu.Lock()
-		defer mu.Unlock()
-		if cbErr != nil {
-			return cbErr
-		}
-		if err := cb(bm); err != nil {
-			cbErr = err
-			return err
-		}
-		return nil
-	}
-
-	setWalkErr := func(err error) {
-		mu.Lock()
-		if walkErr == nil {
-			walkErr = err
-		}
-		mu.Unlock()
-	}
-
-	hasErr := func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return cbErr != nil || walkErr != nil
-	}
-
-	// Semaphore to bound concurrent listing goroutines.
-	// Size is scanConcurrency-1 because the root walk runs inline in
-	// the caller's goroutine, so total concurrent walks = 1 (root) +
-	// len(sem) ≤ scanConcurrency.
-	semSize := scanConcurrency - 1
-	if semSize < 1 {
-		semSize = 1
-	}
-	sem := make(chan struct{}, semSize)
-	var wg sync.WaitGroup
-
-	// Track seen prefixes to avoid walking the same subdirectory twice
-	// (a prefix can appear on multiple pages of a hierarchy listing).
-	seenPrefixes := make(map[string]struct{})
-
-	// walkPrefix lists blobs and subdirectories under the given prefix.
-	// For each subdirectory, it spawns a goroutine (bounded by sem) to walk recursively.
-	var walkPrefix func(prefix string)
-	walkPrefix = func(prefix string) {
-		defer wg.Done()
-
-		if ctx.Err() != nil || hasErr() {
-			return
-		}
-
-		opts := &container.ListBlobsHierarchyOptions{}
-		if prefix != "" {
-			opts.Prefix = &prefix
-		}
-		pager := containerClient.NewListBlobsHierarchyPager("/", opts)
-
-		for pager.More() {
-			if ctx.Err() != nil || hasErr() {
-				return
-			}
-			resp, err := pager.NextPage(ctx)
-			if err != nil {
-				var respErr *azcore.ResponseError
-				if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerNotFound" {
-					setWalkErr(fmt.Errorf("container '%s' not found", ap.Container))
-				} else {
-					setWalkErr(err)
-				}
-				return
-			}
-			if resp.Segment == nil {
-				return
-			}
-
-			// Emit files at this level
-			for _, blob := range resp.Segment.BlobItems {
-				if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
-					continue
-				}
-				bm := BlobMeta{
-					Name: strings.TrimPrefix(*blob.Name, rootPrefix),
-					Size: *blob.Properties.ContentLength,
-				}
-				if err := safeCB(bm); err != nil {
-					return
-				}
-			}
-
-			// Spawn parallel walks for subdirectories
-			for _, bp := range resp.Segment.BlobPrefixes {
-				if bp == nil || bp.Name == nil {
-					continue
-				}
-				subPrefix := *bp.Name
-				// Deduplicate: a prefix can appear across multiple pages.
-				mu.Lock()
-				_, already := seenPrefixes[subPrefix]
-				if !already {
-					seenPrefixes[subPrefix] = struct{}{}
-				}
-				mu.Unlock()
-				if already {
-					continue
-				}
-				wg.Add(1)
-				// Try to acquire semaphore; if full, walk inline in current goroutine.
-				// Inline walking reuses the parent goroutine's stack. Directory depth
-				// in blob storage is typically shallow, so stack growth is bounded.
-				select {
-				case sem <- struct{}{}:
-					go func(p string) {
-						defer func() { <-sem }()
-						walkPrefix(p)
-					}(subPrefix)
-				default:
-					walkPrefix(subPrefix)
-				}
-			}
-		}
-	}
-
-	// Start root walk. Run inline (no goroutine) — the caller already
-	// blocks until wg.Wait() completes, so there's no benefit to a goroutine
-	// for root, and starting inline avoids consuming a semaphore slot.
-	wg.Add(1)
-	walkPrefix(rootPrefix)
-	wg.Wait()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if cbErr != nil {
-		return cbErr
-	}
-	return walkErr
+	// Always use flat listing — a single sequential pager that returns all
+	// blobs under the prefix. This is faster than hierarchy walking (which
+	// must discover directories level-by-level) for typical container sizes
+	// because it avoids per-directory round-trips and synchronization
+	// overhead. The flat pager returns up to 5000 items per page, so even
+	// millions of blobs only require hundreds of sequential API calls —
+	// much faster than tree-shaped hierarchy walks with fanout at each level.
+	return listRecursiveFlat(ctx, containerClient, ap.Container, rootPrefix, cb)
 }
 
 // listRecursiveFlat is the sequential fallback using a flat pager.
@@ -885,7 +786,7 @@ func planBlocks(totalSize int64, defaultBlockSize int64, maxBlocks int64) (block
 // bytes copied so far and the total size in bytes.
 type CopyProgress func(copied, total int64)
 
-func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concurrency int, onProgress CopyProgress) error {
+func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concurrency int, sizeHint int64, onProgress CopyProgress) error {
 	if src.Blob == "" || strings.HasSuffix(src.Blob, "/") {
 		return errors.New("source path is directory-like")
 	}
@@ -904,10 +805,13 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 		return err
 	}
 
-	// Get source size for block splitting.
-	totalSize, err := HeadBlob(ctx, src)
-	if err != nil {
-		return fmt.Errorf("failed to get source properties: %w", err)
+	// Use provided size when available to avoid a HeadBlob round-trip.
+	totalSize := sizeHint
+	if totalSize <= 0 {
+		totalSize, err = HeadBlob(ctx, src)
+		if err != nil {
+			return fmt.Errorf("failed to get source properties: %w", err)
+		}
 	}
 
 	err = copyBlobBlocks(ctx, client, dst, copySource, totalSize, concurrency, onProgress)
@@ -1104,6 +1008,106 @@ func parseCopyProgress(s string) (copied, total int64, ok bool) {
 	return c, t, true
 }
 
+// --- Cached User Delegation Credential for SAS URL generation ---
+
+// udcCacheEntry caches a User Delegation Credential for an account.
+// The UDK is valid from start to expiry; we refresh when the current time
+// exceeds refreshAt (50% of the remaining validity).
+type udcCacheEntry struct {
+	udc       *service.UserDelegationCredential
+	svcClient *service.Client
+	start     time.Time
+	expiry    time.Time
+	refreshAt time.Time
+}
+
+var (
+	udcCacheMu  sync.Mutex
+	udcCache    = make(map[string]*udcCacheEntry) // keyed by account
+	udcInflight = make(map[string]chan struct{})  // per-account in-flight guard
+)
+
+// getUDC returns a cached User Delegation Credential for the account,
+// refreshing it when necessary. Thread-safe. Concurrent refresh requests
+// for the same account are deduped: the first goroutine performs the
+// network call while others wait for it to finish.
+func getUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
+	for {
+		udcCacheMu.Lock()
+		entry, ok := udcCache[account]
+		if ok && time.Now().UTC().Before(entry.refreshAt) {
+			udcCacheMu.Unlock()
+			return entry.udc, entry.svcClient, entry.start, entry.expiry, nil
+		}
+		// Check if another goroutine is already refreshing this account.
+		if ch, inflight := udcInflight[account]; inflight {
+			udcCacheMu.Unlock()
+			// Wait for the in-flight refresh to complete, then retry.
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return nil, nil, time.Time{}, time.Time{}, ctx.Err()
+			}
+			continue
+		}
+		// Claim the refresh slot for this account.
+		ch := make(chan struct{})
+		udcInflight[account] = ch
+		udcCacheMu.Unlock()
+
+		udc, svcClient, start, expiry, err := refreshUDC(ctx, account)
+
+		udcCacheMu.Lock()
+		delete(udcInflight, account)
+		close(ch)
+		udcCacheMu.Unlock()
+
+		return udc, svcClient, start, expiry, err
+	}
+}
+
+// refreshUDC performs the actual UDC refresh (network call). Called at most
+// once per account at a time, guarded by udcInflight.
+func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
+	cred, err := getDefaultCredential()
+	if err != nil {
+		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("default credential: %w", err)
+	}
+	endpoint := getEndpoint(account)
+	svcClient, err := service.NewClient(endpoint, cred, nil)
+	if err != nil {
+		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("service client: %w", err)
+	}
+	now := time.Now().UTC().Add(-clockSkewTolerance)
+	expiry := now.Add(copySASDuration())
+	startStr := now.Format(sas.TimeFormat)
+	expiryStr := expiry.Format(sas.TimeFormat)
+	udc, err := svcClient.GetUserDelegationCredential(ctx, service.KeyInfo{
+		Start:  &startStr,
+		Expiry: &expiryStr,
+	}, nil)
+	if err != nil {
+		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("get user delegation credential: %w", err)
+	}
+
+	// Refresh at 50% of the key's validity window so we never use an
+	// about-to-expire key. Use the same time base (now) for consistency.
+	refreshAt := now.Add(copySASDuration() / 2)
+
+	newEntry := &udcCacheEntry{
+		udc:       udc,
+		svcClient: svcClient,
+		start:     now,
+		expiry:    expiry,
+		refreshAt: refreshAt,
+	}
+	udcCacheMu.Lock()
+	udcCache[account] = newEntry
+	udcCacheMu.Unlock()
+
+	return udc, svcClient, now, expiry, nil
+}
+
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
 	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") != "" {
 		client, err := getAzBlobClient(ctx, ap.Account)
@@ -1120,32 +1124,18 @@ func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
 	return blobDelegationSASURL(ctx, ap)
 }
 
-// blobDelegationSASURL generates a SAS URL using a User Delegation Key obtained
-// via OAuth. This enables cross-account server-side copy within the same tenant.
+// blobDelegationSASURL generates a SAS URL using a cached User Delegation Key
+// obtained via OAuth. This enables cross-account server-side copy within the
+// same tenant. The UDK is cached per account and refreshed at 50% of its
+// validity period.
 func blobDelegationSASURL(ctx context.Context, ap AzurePath) (string, error) {
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	udc, svcClient, start, expiry, err := getUDC(ctx, ap.Account)
 	if err != nil {
-		return "", fmt.Errorf("default credential: %w", err)
-	}
-	endpoint := getEndpoint(ap.Account)
-	svcClient, err := service.NewClient(endpoint, cred, nil)
-	if err != nil {
-		return "", fmt.Errorf("service client: %w", err)
-	}
-	now := time.Now().UTC().Add(-5 * time.Minute) // backdate to tolerate clock skew
-	expiry := now.Add(copySASDuration())
-	startStr := now.Format(sas.TimeFormat)
-	expiryStr := expiry.Format(sas.TimeFormat)
-	udc, err := svcClient.GetUserDelegationCredential(ctx, service.KeyInfo{
-		Start:  &startStr,
-		Expiry: &expiryStr,
-	}, nil)
-	if err != nil {
-		return "", fmt.Errorf("get user delegation credential: %w", err)
+		return "", err
 	}
 	sasValues := sas.BlobSignatureValues{
 		Protocol:      sas.ProtocolHTTPS,
-		StartTime:     now,
+		StartTime:     start,
 		ExpiryTime:    expiry,
 		Permissions:   (&sas.BlobPermissions{Read: true}).String(),
 		ContainerName: ap.Container,
