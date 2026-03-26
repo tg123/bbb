@@ -62,20 +62,20 @@ func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 	ctx := context.Background()
 	src := AzurePath{Account: "acct", Container: "container"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
-	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil); err == nil {
 		t.Fatal("expected error for dir-like source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil); err == nil {
 		t.Fatal("expected error for trailing slash source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst = AzurePath{Account: "acct", Container: "container"}
-	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil); err == nil {
 		t.Fatal("expected error for dir-like destination")
 	}
 	dst = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil); err == nil {
 		t.Fatal("expected error for trailing slash destination")
 	}
 }
@@ -86,7 +86,7 @@ func TestCopyBlobServerSideCrossAccountRequiresCredentials(t *testing.T) {
 	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
-	err := CopyBlobServerSide(ctx, src, dst, 4, nil)
+	err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil)
 	if err == nil {
 		t.Fatal("expected error for cross-account copy without credentials")
 	}
@@ -98,7 +98,7 @@ func TestCopyBlobServerSideFallsBackToUserDelegation(t *testing.T) {
 	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "other.txt"}
-	err := CopyBlobServerSide(ctx, src, dst, 4, nil)
+	err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil)
 	// Without real Azure credentials the user delegation path will fail,
 	// but it must NOT be a MissingSharedKeyCredential error since we now
 	// attempt the delegation path instead.
@@ -651,5 +651,81 @@ func TestProcessHierarchySegmentPrefixTrimming(t *testing.T) {
 	}
 	if got[1].Name != "data.bin" {
 		t.Fatalf("expected prefix trimmed to 'data.bin', got %q", got[1].Name)
+	}
+}
+
+// --- normalizeRootPrefix tests ---
+
+func TestNormalizeRootPrefixEmpty(t *testing.T) {
+	if got := normalizeRootPrefix(""); got != "" {
+		t.Fatalf("expected empty, got %q", got)
+	}
+}
+
+func TestNormalizeRootPrefixNoSlash(t *testing.T) {
+	if got := normalizeRootPrefix("data"); got != "data/" {
+		t.Fatalf("expected 'data/', got %q", got)
+	}
+}
+
+func TestNormalizeRootPrefixAlreadySlash(t *testing.T) {
+	if got := normalizeRootPrefix("data/"); got != "data/" {
+		t.Fatalf("expected 'data/', got %q", got)
+	}
+}
+
+func TestNormalizeRootPrefixNestedPath(t *testing.T) {
+	if got := normalizeRootPrefix("a/b/c"); got != "a/b/c/" {
+		t.Fatalf("expected 'a/b/c/', got %q", got)
+	}
+}
+
+// --- ListRecursiveStream context cancellation test ---
+
+func TestListRecursiveStreamCancelledContext(t *testing.T) {
+	// ListRecursiveStream should return immediately with a cancelled context
+	// without invoking the callback.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before calling
+
+	ap := AzurePath{Account: "fakeaccount", Container: "fakecontainer", Blob: "prefix"}
+	err := ListRecursiveStream(ctx, ap, 4, func(bm BlobMeta) error {
+		t.Fatal("callback should never be invoked with cancelled context")
+		return nil
+	})
+	// Both nil (early exit before client creation) and non-nil (context error
+	// from getAzBlobClient) are acceptable — the key invariant is that the
+	// callback was never invoked.
+	_ = err
+}
+
+// --- Name rewriting tests ---
+
+func TestNameRewriteWithRootPrefix(t *testing.T) {
+	// Verify that blob names are correctly trimmed relative to rootPrefix.
+	// This tests the inline TrimPrefix logic used in walkPrefix.
+	rootPrefix := normalizeRootPrefix("mydata")
+	blobName := "mydata/subdir/file.txt"
+	got := strings.TrimPrefix(blobName, rootPrefix)
+	if got != "subdir/file.txt" {
+		t.Fatalf("expected 'subdir/file.txt', got %q", got)
+	}
+}
+
+func TestNameRewriteEmptyRootPrefix(t *testing.T) {
+	rootPrefix := normalizeRootPrefix("")
+	blobName := "top-level.txt"
+	got := strings.TrimPrefix(blobName, rootPrefix)
+	if got != "top-level.txt" {
+		t.Fatalf("expected 'top-level.txt', got %q", got)
+	}
+}
+
+func TestNameRewriteNestedPrefix(t *testing.T) {
+	rootPrefix := normalizeRootPrefix("a/b")
+	blobName := "a/b/c/d.txt"
+	got := strings.TrimPrefix(blobName, rootPrefix)
+	if got != "c/d.txt" {
+		t.Fatalf("expected 'c/d.txt', got %q", got)
 	}
 }

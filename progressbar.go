@@ -208,7 +208,7 @@ type progressBar struct {
 
 const (
 	progressUninitialized = int64(-1)
-	renderMinInterval     = 50 * time.Millisecond // throttle renders from parallel goroutines
+	renderMinInterval     = 500 * time.Millisecond // throttle renders from parallel goroutines
 
 	ansiReset = "\033[0m"
 	ansiBold  = "\033[1m"
