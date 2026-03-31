@@ -32,7 +32,7 @@ func (azFS) Write(ctx context.Context, path string, r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	return azblob.UploadStream(ctx, ap, r)
+	return azblob.UploadStream(ctx, ap, r, UploadConcurrency(ctx))
 }
 
 func (azFS) List(ctx context.Context, path string) ([]Entry, error) {
@@ -279,6 +279,32 @@ func AzAccountContainer(p string) (account, container string, err error) {
 		return "", "", err
 	}
 	return ap.Account, ap.Container, nil
+}
+
+// PreAuthenticateAz eagerly authenticates to the storage accounts referenced
+// by the given az:// paths. Call this before spawning parallel workers so
+// that any interactive login popups happen sequentially.
+func PreAuthenticateAz(ctx context.Context, paths ...string) error {
+	seen := make(map[string]struct{})
+	var accounts []string
+	for _, p := range paths {
+		if !IsAz(p) {
+			continue
+		}
+		ap, err := azblob.Parse(p)
+		if err != nil {
+			continue
+		}
+		if _, ok := seen[ap.Account]; ok {
+			continue
+		}
+		seen[ap.Account] = struct{}{}
+		accounts = append(accounts, ap.Account)
+	}
+	if len(accounts) == 0 {
+		return nil
+	}
+	return azblob.PreAuthenticate(ctx, accounts...)
 }
 
 // ListRecursiveWithSize lists all entries recursively with their sizes.

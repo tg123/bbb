@@ -32,6 +32,22 @@ func ScanConcurrency(ctx context.Context) int {
 	return 1
 }
 
+type uploadConcurrencyKey struct{}
+
+// WithUploadConcurrency returns a context that carries the upload
+// concurrency hint for streaming uploads.
+func WithUploadConcurrency(ctx context.Context, n int) context.Context {
+	return context.WithValue(ctx, uploadConcurrencyKey{}, n)
+}
+
+// UploadConcurrency returns the upload concurrency stored in ctx, or 1 if unset.
+func UploadConcurrency(ctx context.Context) int {
+	if v, ok := ctx.Value(uploadConcurrencyKey{}).(int); ok && v > 0 {
+		return v
+	}
+	return 1
+}
+
 // IsAz returns true if the path targets an Azure Blob Storage backend.
 func IsAz(path string) bool {
 	return azProvider.Match(path)
