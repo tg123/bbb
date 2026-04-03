@@ -396,14 +396,14 @@ func processHierarchySegment(seg *container.BlobHierarchyListSegment, prefix str
 // accountTenantID returns the tenant ID for a storage account. It first
 // checks the BBB_AZ_TENANT_<ACCOUNT> environment variable, then falls back
 // to auto-discovery by probing the storage endpoint's WWW-Authenticate header.
-func accountTenantID(account string) string {
+func accountTenantID(ctx context.Context, account string) string {
 	if tid := os.Getenv("BBB_AZ_TENANT_" + strings.ToUpper(account)); tid != "" {
 		return tid
 	}
 	if tid := os.Getenv("BBB_AZ_TENANT_" + account); tid != "" {
 		return tid
 	}
-	return discoverTenantID(account)
+	return discoverTenantID(ctx, account)
 }
 
 // tenantCache caches discovered tenant IDs per storage account.
@@ -412,13 +412,13 @@ var tenantCache sync.Map // map[string]string
 // discoverTenantID makes an unauthenticated request to the storage account
 // endpoint and extracts the tenant ID from the WWW-Authenticate challenge
 // header. Returns "" if discovery fails.
-func discoverTenantID(account string) string {
+func discoverTenantID(ctx context.Context, account string) string {
 	if cached, ok := tenantCache.Load(account); ok {
 		return cached.(string)
 	}
 	endpoint := getEndpoint(account) + "/?comp=list&restype=container"
 	slog.Debug("tenant discovery: probing endpoint", "account", account, "url", endpoint)
-	req, err := http.NewRequest("GET", endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		slog.Debug("tenant discovery: request creation failed", "account", account, "error", err)
 		return ""
@@ -426,10 +426,10 @@ func discoverTenantID(account string) string {
 	req.Header.Set("x-ms-version", "2020-08-04")
 	resp, err := defaultHTTPClient().Do(req)
 	if err != nil {
-		slog.Debug("tenant discovery: HEAD failed", "account", account, "error", err)
+		slog.Debug("tenant discovery: GET failed", "account", account, "error", err)
 		return ""
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// WWW-Authenticate: Bearer authorization_uri=https://login.microsoftonline.com/<tenant-id>/oauth2/authorize ...
 	auth := resp.Header.Get("Www-Authenticate")
@@ -467,7 +467,8 @@ func defaultHTTPClient() *http.Client {
 // PreAuthenticate eagerly authenticates to the given storage accounts
 // sequentially. This ensures any interactive login popups happen one at a
 // time before parallel workers start. It also pre-warms the blob client
-// and UDK caches so that no credential acquisition happens during copy.
+// and UDC (User Delegation Credential) caches so that no credential
+// acquisition happens during copy.
 func PreAuthenticate(ctx context.Context, accounts ...string) error {
 	for _, account := range accounts {
 		// Trigger tenant discovery + credential acquisition.
@@ -475,11 +476,11 @@ func PreAuthenticate(ctx context.Context, accounts ...string) error {
 		if err != nil {
 			return fmt.Errorf("pre-authenticate %s: %w", account, err)
 		}
-		// Pre-warm the UDK cache so SAS generation doesn't trigger
+		// Pre-warm the UDC cache so SAS generation doesn't trigger
 		// a second credential acquisition later.
 		_, _, _, _, err = getUDC(ctx, account)
 		if err != nil {
-			slog.Debug("pre-authenticate: UDK warm-up failed (non-fatal)", "account", account, "error", err)
+			slog.Debug("pre-authenticate: UDC warm-up failed (non-fatal)", "account", account, "error", err)
 		}
 	}
 	return nil
@@ -493,8 +494,8 @@ func PreAuthenticate(ctx context.Context, accounts ...string) error {
 //
 // Only one browser popup is opened per tenant; concurrent callers wait for
 // the first to complete.
-func getCredentialForAccount(account string) (azcore.TokenCredential, error) {
-	tid := accountTenantID(account)
+func getCredentialForAccount(ctx context.Context, account string) (azcore.TokenCredential, error) {
+	tid := accountTenantID(ctx, account)
 	if tid == "" {
 		return getDefaultCredential()
 	}
@@ -524,7 +525,7 @@ func getCredentialForAccount(account string) (azcore.TokenCredential, error) {
 	})
 	if err == nil {
 		// Test if CLI credential actually works for this tenant.
-		_, tokenErr := cliCred.GetToken(context.Background(), policy.TokenRequestOptions{
+		_, tokenErr := cliCred.GetToken(ctx, policy.TokenRequestOptions{
 			Scopes: []string{"https://storage.azure.com/.default"},
 		})
 		if tokenErr == nil {
@@ -550,7 +551,7 @@ func getCredentialForAccount(account string) (azcore.TokenCredential, error) {
 	// before any parallel goroutines need the credential. EnableCAE ensures
 	// the cached token includes the CP1 claims that the SDK pipeline will
 	// request later, preventing a second browser popup.
-	_, err = browserCred.GetToken(context.Background(), policy.TokenRequestOptions{
+	_, err = browserCred.GetToken(ctx, policy.TokenRequestOptions{
 		Scopes:    []string{"https://storage.azure.com/.default"},
 		EnableCAE: true,
 	})
@@ -566,9 +567,11 @@ func getCredentialForAccount(account string) (azcore.TokenCredential, error) {
 // The credential is thread-safe and handles token refresh internally.
 func getDefaultCredential() (*azidentity.DefaultAzureCredential, error) {
 	cachedDefaultCredOnce.Do(func() {
-		cachedDefaultCred, cachedDefaultCredErr = azidentity.NewDefaultAzureCredential(&azidentity.DefaultAzureCredentialOptions{
-			AdditionallyAllowedTenants: []string{"*"},
-		})
+		opts := &azidentity.DefaultAzureCredentialOptions{}
+		if strings.EqualFold(os.Getenv("BBB_AZURE_ALLOW_ANY_TENANT"), "true") {
+			opts.AdditionallyAllowedTenants = []string{"*"}
+		}
+		cachedDefaultCred, cachedDefaultCredErr = azidentity.NewDefaultAzureCredential(opts)
 		if cachedDefaultCredErr == nil && slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 			tok, tokErr := cachedDefaultCred.GetToken(context.Background(), policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
 			if tokErr == nil {
@@ -611,7 +614,7 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 			return nil, err
 		}
 	} else {
-		cred, credErr := getCredentialForAccount(account)
+		cred, credErr := getCredentialForAccount(ctx, account)
 		if credErr != nil {
 			return nil, credErr
 		}
@@ -1249,7 +1252,7 @@ func getUDC(ctx context.Context, account string) (*service.UserDelegationCredent
 // refreshUDC performs the actual UDC refresh (network call). Called at most
 // once per account at a time, guarded by udcInflight.
 func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
-	cred, err := getCredentialForAccount(account)
+	cred, err := getCredentialForAccount(ctx, account)
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("credential for %s: %w", account, err)
 	}

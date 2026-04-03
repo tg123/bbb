@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -1206,8 +1207,19 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				// Server-side copy failed — fall back to client-side streaming.
 				// This handles cross-tenant copies where the destination cannot
 				// pull from the source even with a SAS URL.
+				logSrc, logDst := op.src, op.dst
+				if u, err := url.Parse(logSrc); err == nil && u.RawQuery != "" {
+					u.RawQuery = ""
+					u.Fragment = ""
+					logSrc = u.String()
+				}
+				if u, err := url.Parse(logDst); err == nil && u.RawQuery != "" {
+					u.RawQuery = ""
+					u.Fragment = ""
+					logDst = u.String()
+				}
 				slog.Info("server-side copy failed, falling back to client-side streaming",
-					"src", op.src, "dst", op.dst, "error", err)
+					"src", logSrc, "dst", logDst, "error", err)
 
 				// Re-create progress bar for client-side streaming.
 				if showCopyBar {
@@ -1263,7 +1275,10 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				if !quiet {
 					lockedPrintf("Copied %s -> %s (client-side)\n", op.src, op.dst)
 				}
-				return size, nil
+				if size > 0 {
+					return size, nil
+				}
+				return streamCopied.Load(), nil
 			}
 			if copyBar != nil {
 				copyBar.Finish()
