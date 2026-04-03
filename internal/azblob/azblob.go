@@ -568,6 +568,9 @@ func getCredentialForAccount(ctx context.Context, account string) (azcore.TokenC
 func getDefaultCredential() (*azidentity.DefaultAzureCredential, error) {
 	cachedDefaultCredOnce.Do(func() {
 		opts := &azidentity.DefaultAzureCredentialOptions{}
+		// BBB_AZURE_ALLOW_ANY_TENANT=true permits the default credential to
+		// acquire tokens for any tenant. Without this, cross-tenant requests
+		// may fail. This is opt-in to limit the trust boundary by default.
 		if strings.EqualFold(os.Getenv("BBB_AZURE_ALLOW_ANY_TENANT"), "true") {
 			opts.AdditionallyAllowedTenants = []string{"*"}
 		}
