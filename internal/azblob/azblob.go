@@ -589,21 +589,21 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	originals := make(map[string]string, len(roleEnvVars))
 	for _, v := range roleEnvVars {
 		originals[v] = os.Getenv(v)
-		os.Unsetenv(v)
+		_ = os.Unsetenv(v)
 	}
 	// Set only the role-prefixed values.
 	for _, v := range roleEnvVars {
 		if prefixed := os.Getenv(role + "_" + v); prefixed != "" {
-			os.Setenv(v, prefixed)
+			_ = os.Setenv(v, prefixed)
 		}
 	}
 	// Restore originals after creating the credential.
 	defer func() {
 		for _, v := range roleEnvVars {
 			if originals[v] == "" {
-				os.Unsetenv(v)
+				_ = os.Unsetenv(v)
 			} else {
-				os.Setenv(v, originals[v])
+				_ = os.Setenv(v, originals[v])
 			}
 		}
 	}()
