@@ -1398,6 +1398,58 @@ func TestDNSCachingDialContextResolverError(t *testing.T) {
 	}
 }
 
+func TestDNSCachingDialContextLogsDNSLookupOnMiss(t *testing.T) {
+	orig := slog.Default()
+	var buf strings.Builder
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	slog.SetDefault(slog.New(handler))
+	defer slog.SetDefault(orig)
+
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("fake")
+	}
+	lookup, _ := fakeLookup([]string{"10.0.0.1"}, nil)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute)
+	_, _ = dial(context.Background(), "tcp", "example.com:80")
+
+	out := buf.String()
+	if !strings.Contains(out, `msg="DNS lookup"`) {
+		t.Fatalf("expected 'DNS lookup' log on cache miss, got: %s", out)
+	}
+	if !strings.Contains(out, "host=example.com") {
+		t.Fatalf("expected host=example.com in DNS lookup log, got: %s", out)
+	}
+}
+
+func TestDNSCachingDialContextNoDNSLookupOnHit(t *testing.T) {
+	orig := slog.Default()
+	var buf strings.Builder
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	slog.SetDefault(slog.New(handler))
+	defer slog.SetDefault(orig)
+
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("fake")
+	}
+	lookup, _ := fakeLookup([]string{"10.0.0.1"}, nil)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute)
+
+	// First call – populates cache.
+	_, _ = dial(context.Background(), "tcp", "example.com:80")
+	buf.Reset()
+
+	// Second call – should be a cache hit, no "DNS lookup" log.
+	_, _ = dial(context.Background(), "tcp", "example.com:80")
+
+	out := buf.String()
+	if strings.Contains(out, `msg="DNS lookup"`) {
+		t.Fatalf("expected no 'DNS lookup' log on cache hit, got: %s", out)
+	}
+	if !strings.Contains(out, `msg="DNS cache hit"`) {
+		t.Fatalf("expected 'DNS cache hit' log, got: %s", out)
+	}
+}
+
 func TestDNSCachingDialContextUnlimitedTTL(t *testing.T) {
 	lookup, count := fakeLookup([]string{"10.0.0.1"}, nil)
 

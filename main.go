@@ -154,6 +154,7 @@ func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl 
 			return baseDial(ctx, network, addr)
 		}
 
+		slog.Debug("DNS lookup", "host", host, "addrs", addrs)
 		cache.Store(host, &dnsCacheEntry{
 			addrs:  addrs,
 			expiry: time.Now().Add(ttl),
