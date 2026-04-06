@@ -917,21 +917,21 @@ func TestAccountKeyNoEnvReturnsEmpty(t *testing.T) {
 
 func TestRoleEnvVarsCoversAllExpectedVars(t *testing.T) {
 	expected := map[string]bool{
-		"AZURE_CLIENT_ID":                  false,
-		"AZURE_TENANT_ID":                  false,
-		"AZURE_CLIENT_SECRET":              false,
-		"AZURE_CLIENT_CERTIFICATE_PATH":    false,
-		"AZURE_CLIENT_CERTIFICATE_PASSWORD": false,
+		"AZURE_CLIENT_ID":                     false,
+		"AZURE_TENANT_ID":                     false,
+		"AZURE_CLIENT_SECRET":                 false,
+		"AZURE_CLIENT_CERTIFICATE_PATH":       false,
+		"AZURE_CLIENT_CERTIFICATE_PASSWORD":   false,
 		"AZURE_CLIENT_SEND_CERTIFICATE_CHAIN": false,
-		"AZURE_FEDERATED_TOKEN_FILE":       false,
-		"IDENTITY_ENDPOINT":                false,
-		"IDENTITY_HEADER":                  false,
-		"MSI_ENDPOINT":                     false,
-		"MSI_SECRET":                       false,
-		"IMDS_ENDPOINT":                    false,
-		"AZURE_AUTHORITY_HOST":             false,
-		"AZURE_USERNAME":                   false,
-		"AZURE_CONFIG_DIR":                 false,
+		"AZURE_FEDERATED_TOKEN_FILE":          false,
+		"IDENTITY_ENDPOINT":                   false,
+		"IDENTITY_HEADER":                     false,
+		"MSI_ENDPOINT":                        false,
+		"MSI_SECRET":                          false,
+		"IMDS_ENDPOINT":                       false,
+		"AZURE_AUTHORITY_HOST":                false,
+		"AZURE_USERNAME":                      false,
+		"AZURE_CONFIG_DIR":                    false,
 	}
 	for _, v := range roleEnvVars {
 		if _, ok := expected[v]; !ok {
