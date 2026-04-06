@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -727,5 +728,146 @@ func TestNameRewriteNestedPrefix(t *testing.T) {
 	got := strings.TrimPrefix(blobName, rootPrefix)
 	if got != "c/d.txt" {
 		t.Fatalf("expected 'c/d.txt', got %q", got)
+	}
+}
+
+// --- Tenant discovery / challenge parsing tests ---
+
+func TestParseTenantFromChallengeValid(t *testing.T) {
+	header := `Bearer authorization_uri="https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47/oauth2/authorize" resource_id="https://storage.azure.com"`
+	tid := parseTenantFromChallenge(header)
+	if tid != "72f988bf-86f1-41af-91ab-2d7cd011db47" {
+		t.Fatalf("expected tenant ID '72f988bf-86f1-41af-91ab-2d7cd011db47', got %q", tid)
+	}
+}
+
+func TestParseTenantFromChallengeNoQuotes(t *testing.T) {
+	header := `Bearer authorization_uri=https://login.microsoftonline.com/abcdef01-2345-6789-abcd-ef0123456789/oauth2/authorize`
+	tid := parseTenantFromChallenge(header)
+	if tid != "abcdef01-2345-6789-abcd-ef0123456789" {
+		t.Fatalf("expected tenant ID 'abcdef01-2345-6789-abcd-ef0123456789', got %q", tid)
+	}
+}
+
+func TestParseTenantFromChallengeEmpty(t *testing.T) {
+	if tid := parseTenantFromChallenge(""); tid != "" {
+		t.Fatalf("expected empty tenant ID, got %q", tid)
+	}
+}
+
+func TestParseTenantFromChallengeNoMatch(t *testing.T) {
+	if tid := parseTenantFromChallenge("Bearer realm=example.com"); tid != "" {
+		t.Fatalf("expected empty tenant ID, got %q", tid)
+	}
+}
+
+func TestParseTenantFromChallengeMalformedUUID(t *testing.T) {
+	// 35 chars instead of 36 — should not match.
+	header := `Bearer authorization_uri="https://login.microsoftonline.com/short-uuid/oauth2/authorize"`
+	if tid := parseTenantFromChallenge(header); tid != "" {
+		t.Fatalf("expected empty tenant ID for short UUID, got %q", tid)
+	}
+}
+
+func TestAccountTenantIDEnvUpperCase(t *testing.T) {
+	t.Setenv("BBB_AZ_TENANT_MYACCOUNT", "env-tenant-upper")
+	tid := accountTenantID(context.Background(), "myaccount")
+	if tid != "env-tenant-upper" {
+		t.Fatalf("expected 'env-tenant-upper', got %q", tid)
+	}
+}
+
+func TestAccountTenantIDEnvExactCase(t *testing.T) {
+	t.Setenv("BBB_AZ_TENANT_myMixed", "env-tenant-exact")
+	tid := accountTenantID(context.Background(), "myMixed")
+	if tid != "env-tenant-exact" {
+		t.Fatalf("expected 'env-tenant-exact', got %q", tid)
+	}
+}
+
+func TestAccountTenantIDEnvUpperPrecedence(t *testing.T) {
+	t.Setenv("BBB_AZ_TENANT_MYACCT", "upper-wins")
+	t.Setenv("BBB_AZ_TENANT_myacct", "exact-loses")
+	tid := accountTenantID(context.Background(), "myacct")
+	if tid != "upper-wins" {
+		t.Fatalf("expected upper-case env to take precedence, got %q", tid)
+	}
+}
+
+func TestAccountTenantIDFallsBackToDiscovery(t *testing.T) {
+	// Pre-populate the tenant cache to avoid real HTTP calls.
+	tenantCache.Store("cachedacct", "cached-tenant-id")
+	defer tenantCache.Delete("cachedacct")
+	tid := accountTenantID(context.Background(), "cachedacct")
+	if tid != "cached-tenant-id" {
+		t.Fatalf("expected 'cached-tenant-id', got %q", tid)
+	}
+}
+
+func TestDiscoverTenantIDUsesCache(t *testing.T) {
+	tenantCache.Store("testacct", "from-cache")
+	defer tenantCache.Delete("testacct")
+	tid := discoverTenantID(context.Background(), "testacct")
+	if tid != "from-cache" {
+		t.Fatalf("expected 'from-cache', got %q", tid)
+	}
+}
+
+// roundTripFunc implements http.RoundTripper for test stubbing.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestDiscoverTenantIDFromHTTP(t *testing.T) {
+	// Replace the default HTTP client with a stubbed transport.
+	origClient := defaultHTTPClientVal
+	defaultHTTPClientOnce.Do(func() {}) // ensure Once is done
+	defaultHTTPClientVal = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: 401,
+				Header: http.Header{
+					"Www-Authenticate": []string{
+						`Bearer authorization_uri="https://login.microsoftonline.com/aabbccdd-1122-3344-5566-778899001122/oauth2/authorize"`,
+					},
+				},
+				Body: io.NopCloser(strings.NewReader("")),
+			}, nil
+		}),
+	}
+	defer func() { defaultHTTPClientVal = origClient }()
+
+	// Clear any cached value for this account.
+	tenantCache.Delete("stubacct")
+	defer tenantCache.Delete("stubacct")
+
+	tid := discoverTenantID(context.Background(), "stubacct")
+	if tid != "aabbccdd-1122-3344-5566-778899001122" {
+		t.Fatalf("expected discovered tenant 'aabbccdd-1122-3344-5566-778899001122', got %q", tid)
+	}
+
+	// Verify it was cached.
+	cached, ok := tenantCache.Load("stubacct")
+	if !ok || cached.(string) != "aabbccdd-1122-3344-5566-778899001122" {
+		t.Fatal("expected tenant ID to be cached after discovery")
+	}
+}
+
+func TestDiscoverTenantIDHTTPError(t *testing.T) {
+	origClient := defaultHTTPClientVal
+	defaultHTTPClientOnce.Do(func() {})
+	defaultHTTPClientVal = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, errors.New("network error")
+		}),
+	}
+	defer func() { defaultHTTPClientVal = origClient }()
+
+	tenantCache.Delete("erroracct")
+	tid := discoverTenantID(context.Background(), "erroracct")
+	if tid != "" {
+		t.Fatalf("expected empty tenant ID on HTTP error, got %q", tid)
 	}
 }

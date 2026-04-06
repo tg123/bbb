@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -790,6 +791,18 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 // their inputs to []taskPair and call this function, ensuring a single code
 // path for state tracking, progress bars, and concurrency control.
 func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, concurrency, retryCount int, stateFile string) error {
+	// Pre-authenticate all Azure accounts before spawning parallel workers.
+	// This ensures interactive login popups happen sequentially, one per tenant.
+	{
+		var paths []string
+		for _, t := range tasks {
+			paths = append(paths, t.src, t.dst)
+		}
+		if err := bbbfs.PreAuthenticateAz(ctx, paths...); err != nil {
+			return err
+		}
+	}
+
 	state, taskCheckpoints, err := loadTaskState(stateFile)
 	if err != nil {
 		return err
@@ -1191,7 +1204,81 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				if copyBar != nil {
 					copyBar.Finish()
 				}
-				return 0, err
+				// Server-side copy failed — fall back to client-side streaming.
+				// This handles cross-tenant copies where the destination cannot
+				// pull from the source even with a SAS URL.
+				logSrc, logDst := op.src, op.dst
+				if u, err := url.Parse(logSrc); err == nil && u.RawQuery != "" {
+					u.RawQuery = ""
+					u.Fragment = ""
+					logSrc = u.String()
+				}
+				if u, err := url.Parse(logDst); err == nil && u.RawQuery != "" {
+					u.RawQuery = ""
+					u.Fragment = ""
+					logDst = u.String()
+				}
+				slog.Info("server-side copy failed, falling back to client-side streaming",
+					"src", logSrc, "dst", logDst, "error", err)
+
+				// Re-create progress bar for client-side streaming.
+				if showCopyBar {
+					copyBar = newStreamingProgressBar(path.Base(op.src)+" (client)", false, true)
+					if copyBar != nil {
+						copyBar.byteSized = true
+						if size > 0 {
+							copyBar.SetTotal(size)
+						}
+					}
+				}
+
+				reader, readErr := bbbfs.Resolve(op.src).Read(ctx, op.src)
+				if readErr != nil {
+					if copyBar != nil {
+						copyBar.Finish()
+					}
+					return 0, fmt.Errorf("cp: client-side fallback read: %w", readErr)
+				}
+				uploadCtx := bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
+				var streamCopied atomic.Int64
+				writeErr := withReadCloser(reader, func(r io.Reader) error {
+					pr := io.TeeReader(r, &progressWriter{
+						onWrite: func(n int) {
+							copied := streamCopied.Add(int64(n))
+							if onBytes != nil {
+								for {
+									prev := lastReported.Load()
+									if copied <= prev {
+										break
+									}
+									if lastReported.CompareAndSwap(prev, copied) {
+										onBytes(copied - prev)
+										break
+									}
+								}
+							}
+							if copyBar != nil {
+								atomicMax(&copyBar.bytesDone, copied)
+								atomicMax(&copyBar.done, copied)
+								copyBar.render(copied)
+							}
+						},
+					})
+					return bbbfs.Resolve(op.dst).Write(uploadCtx, op.dst, pr)
+				})
+				if copyBar != nil {
+					copyBar.Finish()
+				}
+				if writeErr != nil {
+					return 0, fmt.Errorf("cp: client-side fallback write: %w", writeErr)
+				}
+				if !quiet {
+					lockedPrintf("Copied %s -> %s (client-side)\n", op.src, op.dst)
+				}
+				if size > 0 {
+					return size, nil
+				}
+				return streamCopied.Load(), nil
 			}
 			if copyBar != nil {
 				copyBar.Finish()
@@ -1441,6 +1528,22 @@ func withReadCloser(reader io.ReadCloser, fn func(io.Reader) error) error {
 	}()
 	return fn(reader)
 }
+
+// progressWriter is an io.Writer that calls onWrite with the number of bytes
+// written on each Write call. Used to attach progress reporting to streaming
+// copies.
+type progressWriter struct {
+	onWrite func(n int)
+}
+
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	if pw.onWrite != nil {
+		pw.onWrite(n)
+	}
+	return n, nil
+}
+
 func cmdEdit(ctx context.Context, c *cli.Command) error {
 	slog.Debug("cmdEdit called", "args", c.Args().Slice())
 	if c.Args().Len() != 1 {
