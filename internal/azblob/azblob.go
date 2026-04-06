@@ -521,7 +521,7 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s client secret credential: %w", role, err)
 	}
-	slog.Debug("Using env credential for role", "role", role, "tenantID", tenantID, "clientID", clientID)
+	slog.Debug("Using env credential for role", "role", role)
 	actual, _ := roleCredCache.LoadOrStore(role, cred)
 	return actual.(azcore.TokenCredential), nil
 }
