@@ -46,6 +46,13 @@ var (
 	// Per-tenant credential cache (thread-safe via sync.Map).
 	tenantCredCache    sync.Map // map[string]azcore.TokenCredential
 	tenantCredInflight sync.Map // map[string]*sync.Mutex — serializes credential acquisition per tenant
+
+	// Per-account role mapping for multi-tenant env var support.
+	// Maps account name → role ("SRC" or "DST").
+	accountRoles sync.Map // map[string]string
+
+	// Per-role credential cache for SRC_AZURE_* / DST_AZURE_* env vars.
+	roleCredCache sync.Map // map[string]azcore.TokenCredential
 )
 
 // MkContainer creates a new Azure Blob container
@@ -486,15 +493,157 @@ func PreAuthenticate(ctx context.Context, accounts ...string) error {
 	return nil
 }
 
+// RegisterAccountRole tags the given storage account with a role ("SRC" or
+// "DST"). When role-prefixed Azure identity environment variables are set
+// (e.g. SRC_AZURE_TENANT_ID, DST_AZURE_CLIENT_ID, etc.), accounts tagged
+// with the matching role will use those credentials instead of AzureCLI or
+// interactive browser login. This makes authentication machine-friendly for
+// CI/CD and multi-tenant environments.
+func RegisterAccountRole(account, role string) {
+	accountRoles.Store(account, strings.ToUpper(role))
+}
+
+// AccountRole returns the role ("SRC" or "DST") registered for the given
+// account, and a boolean indicating whether a role was registered.
+func AccountRole(account string) (string, bool) {
+	v, ok := accountRoles.Load(account)
+	if !ok {
+		return "", false
+	}
+	return v.(string), true
+}
+
+// ClearAccountRole removes the role registration for the given account.
+// This is used in tests to reset state between subtests.
+func ClearAccountRole(account string) {
+	accountRoles.Delete(account)
+}
+
+// roleEnvVars lists all Azure identity environment variables that are
+// remapped from {role}_ prefixed variants (e.g. SRC_AZURE_CLIENT_ID)
+// to standard names when creating a role-specific credential.
+var roleEnvVars = []string{
+	// Core identity
+	"AZURE_CLIENT_ID",
+	"AZURE_TENANT_ID",
+	// Service Principal (secret)
+	"AZURE_CLIENT_SECRET",
+	// Service Principal (certificate)
+	"AZURE_CLIENT_CERTIFICATE_PATH",
+	"AZURE_CLIENT_CERTIFICATE_PASSWORD",
+	"AZURE_CLIENT_SEND_CERTIFICATE_CHAIN",
+	// Workload Identity (OIDC / AKS)
+	"AZURE_FEDERATED_TOKEN_FILE",
+	// Managed Identity (advanced / injected by Azure)
+	"IDENTITY_ENDPOINT",
+	"IDENTITY_HEADER",
+	"MSI_ENDPOINT",
+	"MSI_SECRET",
+	"IMDS_ENDPOINT",
+	// Cloud / authority
+	"AZURE_AUTHORITY_HOST",
+	// Developer cache hint
+	"AZURE_USERNAME",
+	// Azure CLI integration
+	"AZURE_CONFIG_DIR",
+}
+
+// roleCredMu serializes env var swapping for role-specific credential
+// creation. os.Setenv is process-global, so concurrent credential creation
+// for different roles must not interleave env var mutations.
+var roleCredMu sync.Mutex
+
+// getCredentialForRole returns a DefaultAzureCredential built from
+// {role}_AZURE_* (and {role}_MSI_*, {role}_IDENTITY_*, etc.) environment
+// variables. The role-prefixed env vars are temporarily mapped to their
+// standard names so the Azure SDK picks them up. Returns (nil, nil) when
+// no role-prefixed env vars are set.
+func getCredentialForRole(role string) (azcore.TokenCredential, error) {
+	if cached, ok := roleCredCache.Load(role); ok {
+		return cached.(azcore.TokenCredential), nil
+	}
+
+	// Check if any role-prefixed env var is set.
+	hasAny := false
+	for _, v := range roleEnvVars {
+		if os.Getenv(role+"_"+v) != "" {
+			hasAny = true
+			break
+		}
+	}
+	if !hasAny {
+		return nil, nil // not configured
+	}
+
+	// Temporarily swap env vars to create the credential.
+	// os.Setenv is process-global, so serialize with a mutex.
+	roleCredMu.Lock()
+	defer roleCredMu.Unlock()
+
+	// Double-check cache after acquiring the lock.
+	if cached, ok := roleCredCache.Load(role); ok {
+		return cached.(azcore.TokenCredential), nil
+	}
+
+	// Save originals and clear all identity vars to avoid cross-contamination.
+	originals := make(map[string]string, len(roleEnvVars))
+	for _, v := range roleEnvVars {
+		originals[v] = os.Getenv(v)
+		_ = os.Unsetenv(v)
+	}
+	// Set only the role-prefixed values.
+	for _, v := range roleEnvVars {
+		if prefixed := os.Getenv(role + "_" + v); prefixed != "" {
+			_ = os.Setenv(v, prefixed)
+		}
+	}
+	// Restore originals after creating the credential.
+	defer func() {
+		for _, v := range roleEnvVars {
+			if originals[v] == "" {
+				_ = os.Unsetenv(v)
+			} else {
+				_ = os.Setenv(v, originals[v])
+			}
+		}
+	}()
+
+	opts := &azidentity.DefaultAzureCredentialOptions{}
+	if strings.EqualFold(os.Getenv("BBB_AZURE_ALLOW_ANY_TENANT"), "true") {
+		opts.AdditionallyAllowedTenants = []string{"*"}
+	}
+	cred, err := azidentity.NewDefaultAzureCredential(opts)
+	if err != nil {
+		return nil, fmt.Errorf("%s credential: %w", role, err)
+	}
+	slog.Debug("Using env credential for role", "role", role)
+	actual, _ := roleCredCache.LoadOrStore(role, cred)
+	return actual.(azcore.TokenCredential), nil
+}
+
 // getCredentialForAccount returns a TokenCredential appropriate for the given
-// storage account. The tenant is auto-discovered from the storage endpoint's
-// challenge header (or overridden via BBB_AZ_TENANT_<ACCOUNT> env var).
+// storage account. It first checks for role-specific environment credentials
+// (SRC_AZURE_* / DST_AZURE_*), then auto-discovers the tenant from the
+// storage endpoint's challenge header (or BBB_AZ_TENANT_<ACCOUNT> env var).
 // When a tenant is found, it tries AzureCLICredential first, then falls back
 // to InteractiveBrowserCredential (popup login).
 //
 // Only one browser popup is opened per tenant; concurrent callers wait for
 // the first to complete.
 func getCredentialForAccount(ctx context.Context, account string) (azcore.TokenCredential, error) {
+	// Check for role-specific environment credentials (SRC_AZURE_* / DST_AZURE_*).
+	if roleVal, ok := accountRoles.Load(account); ok {
+		role := roleVal.(string)
+		cred, err := getCredentialForRole(role)
+		if err != nil {
+			return nil, err
+		}
+		if cred != nil {
+			return cred, nil
+		}
+		// Role env vars not set — fall through to normal credential flow.
+	}
+
 	tid := accountTenantID(ctx, account)
 	if tid == "" {
 		return getDefaultCredential()
@@ -597,8 +746,20 @@ func getDefaultCredential() (*azidentity.DefaultAzureCredential, error) {
 	return cachedDefaultCred, cachedDefaultCredErr
 }
 
+// accountKey returns the shared account key for the given storage account.
+// It checks for a role-prefixed key first (e.g. SRC_BBB_AZBLOB_ACCOUNTKEY),
+// then falls back to the global BBB_AZBLOB_ACCOUNTKEY.
+func accountKey(account string) string {
+	if roleVal, ok := accountRoles.Load(account); ok {
+		if k := os.Getenv(roleVal.(string) + "_BBB_AZBLOB_ACCOUNTKEY"); k != "" {
+			return k
+		}
+	}
+	return os.Getenv("BBB_AZBLOB_ACCOUNTKEY")
+}
+
 // getAzBlobClient returns an Azure Blob client for the given account using either a shared key
-// from BBB_AZBLOB_ACCOUNTKEY or the default Azure credential.
+// from BBB_AZBLOB_ACCOUNTKEY (or role-prefixed SRC_/DST_ variant) or the default Azure credential.
 // Clients are cached per account for the process lifetime.
 func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
 	// Check cache first.
@@ -607,7 +768,7 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 	}
 	endpoint := getEndpoint(account)
 	var client *azblob.Client
-	if key := os.Getenv("BBB_AZBLOB_ACCOUNTKEY"); key != "" {
+	if key := accountKey(account); key != "" {
 		cred, err := azblob.NewSharedKeyCredential(account, key)
 		if err != nil {
 			return nil, err
@@ -1295,7 +1456,7 @@ func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCre
 }
 
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
-	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") != "" {
+	if accountKey(ap.Account) != "" {
 		client, err := getAzBlobClient(ctx, ap.Account)
 		if err != nil {
 			return "", err

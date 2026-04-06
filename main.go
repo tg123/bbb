@@ -792,6 +792,15 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 // their inputs to []taskPair and call this function, ensuring a single code
 // path for state tracking, progress bars, and concurrency control.
 func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, concurrency, retryCount int, stateFile string) error {
+	// Register account roles for multi-tenant env var support (SRC_AZURE_* / DST_AZURE_*).
+	{
+		var srcPaths, dstPaths []string
+		for _, t := range tasks {
+			srcPaths = append(srcPaths, t.src)
+			dstPaths = append(dstPaths, t.dst)
+		}
+		bbbfs.RegisterAzAccountRoles(srcPaths, dstPaths)
+	}
 	// Pre-authenticate all Azure accounts before spawning parallel workers.
 	// This ensures interactive login popups happen sequentially, one per tenant.
 	{
@@ -1832,6 +1841,9 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 }
 
 func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, concurrency, retryCount int, src, dst string) error {
+	// Register account roles for multi-tenant env var support (SRC_AZURE_* / DST_AZURE_*).
+	bbbfs.RegisterAzAccountRoles([]string{src}, []string{dst})
+
 	if bbbfs.IsHF(dst) {
 		return fmt.Errorf("sync: hf:// only supported as source")
 	}

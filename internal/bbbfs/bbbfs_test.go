@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/tg123/bbb/internal/azblob"
 )
 
 func TestResolveReadLocal(t *testing.T) {
@@ -74,5 +76,52 @@ func TestProvidersImplementRecursiveLister(t *testing.T) {
 	}
 	if _, ok := any(hfFS{}).(recursiveLister); !ok {
 		t.Fatalf("hfFS should implement recursiveLister")
+	}
+}
+
+func TestRegisterAzAccountRolesDistinctAccounts(t *testing.T) {
+	defer azblob.ClearAccountRole("srcacct")
+	defer azblob.ClearAccountRole("dstacct")
+
+	RegisterAzAccountRoles(
+		[]string{"az://srcacct/c/"},
+		[]string{"az://dstacct/c/"},
+	)
+
+	role, ok := azblob.AccountRole("srcacct")
+	if !ok || role != "SRC" {
+		t.Fatalf("expected SRC for srcacct, got %q (ok=%v)", role, ok)
+	}
+	role, ok = azblob.AccountRole("dstacct")
+	if !ok || role != "DST" {
+		t.Fatalf("expected DST for dstacct, got %q (ok=%v)", role, ok)
+	}
+}
+
+func TestRegisterAzAccountRolesOverlapSkipped(t *testing.T) {
+	defer azblob.ClearAccountRole("shared")
+
+	RegisterAzAccountRoles(
+		[]string{"az://shared/c/"},
+		[]string{"az://shared/c/"},
+	)
+
+	_, ok := azblob.AccountRole("shared")
+	if ok {
+		t.Fatal("account appearing in both src and dst should not be tagged")
+	}
+}
+
+func TestRegisterAzAccountRolesNonAzIgnored(t *testing.T) {
+	defer azblob.ClearAccountRole("myacct")
+
+	RegisterAzAccountRoles(
+		[]string{"/local/path", "az://myacct/c/"},
+		[]string{"hf://org/repo/file"},
+	)
+
+	role, ok := azblob.AccountRole("myacct")
+	if !ok || role != "SRC" {
+		t.Fatalf("expected SRC for myacct, got %q (ok=%v)", role, ok)
 	}
 }

@@ -52,6 +52,68 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 |----------|---------|-------------|
 | `BBB_LOG_LEVEL` | `info` | Same as `--loglevel` flag |
 | `BBB_DNS_CACHE` | *(off)* | Set to `1`, `true`, `yes`, or `on` to enable process-local DNS caching |
+| `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
+| `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
+| `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
+
+### Multi-Tenant / Multi-Account Authentication (`SRC_` / `DST_` Env Vars)
+
+When copying or syncing between Azure Storage accounts in **different tenants** (or using different credentials), prefix any standard Azure identity environment variable with `SRC_` or `DST_` to scope it to source or destination accounts respectively.
+
+bbb uses `DefaultAzureCredential` under the hood, so all credential types are supported: service principal (secret or certificate), workload identity (OIDC / AKS), managed identity, and Azure CLI.
+
+**Supported env vars** — prefix with `SRC_` or `DST_`:
+
+| Variable | Category |
+|----------|----------|
+| `AZURE_CLIENT_ID` | Core identity |
+| `AZURE_TENANT_ID` | Core identity |
+| `AZURE_CLIENT_SECRET` | Service principal (secret) |
+| `AZURE_CLIENT_CERTIFICATE_PATH` | Service principal (certificate) |
+| `AZURE_CLIENT_CERTIFICATE_PASSWORD` | Service principal (certificate) |
+| `AZURE_CLIENT_SEND_CERTIFICATE_CHAIN` | Service principal (certificate) |
+| `AZURE_FEDERATED_TOKEN_FILE` | Workload identity (OIDC / AKS) |
+| `IDENTITY_ENDPOINT` | Managed identity |
+| `IDENTITY_HEADER` | Managed identity |
+| `MSI_ENDPOINT` | Managed identity |
+| `MSI_SECRET` | Managed identity |
+| `IMDS_ENDPOINT` | Managed identity |
+| `AZURE_AUTHORITY_HOST` | Cloud / authority |
+| `AZURE_USERNAME` | Developer cache hint |
+| `AZURE_CONFIG_DIR` | Azure CLI integration |
+| `BBB_AZBLOB_ACCOUNTKEY` | Shared key (bbb-specific) |
+
+**Example — service principal per tenant:**
+
+```bash
+# Source tenant credentials
+export SRC_AZURE_TENANT_ID=<tenant-a>
+export SRC_AZURE_CLIENT_ID=<sp-a-id>
+export SRC_AZURE_CLIENT_SECRET=<sp-a-secret>
+
+# Destination tenant credentials
+export DST_AZURE_TENANT_ID=<tenant-b>
+export DST_AZURE_CLIENT_ID=<sp-b-id>
+export DST_AZURE_CLIENT_SECRET=<sp-b-secret>
+
+bbb cp az://src-account/container/ az://dst-account/container/
+```
+
+**Example — shared key per account:**
+
+```bash
+export SRC_BBB_AZBLOB_ACCOUNTKEY=<key-for-source>
+export DST_BBB_AZBLOB_ACCOUNTKEY=<key-for-destination>
+
+bbb sync az://src-account/data/ az://dst-account/data/
+```
+
+**Credential resolution order** (first match wins):
+
+1. Shared key (`SRC_BBB_AZBLOB_ACCOUNTKEY` / `DST_BBB_AZBLOB_ACCOUNTKEY`, or `BBB_AZBLOB_ACCOUNTKEY`)
+2. Role-specific env credential (`SRC_AZURE_*` / `DST_AZURE_*`) via `DefaultAzureCredential`
+3. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
+4. Interactive browser login (fallback)
 
 ### `BBB_DNS_CACHE`
 
