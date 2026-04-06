@@ -726,8 +726,20 @@ func getDefaultCredential() (*azidentity.DefaultAzureCredential, error) {
 	return cachedDefaultCred, cachedDefaultCredErr
 }
 
+// accountKey returns the shared account key for the given storage account.
+// It checks for a role-prefixed key first (e.g. SRC_BBB_AZBLOB_ACCOUNTKEY),
+// then falls back to the global BBB_AZBLOB_ACCOUNTKEY.
+func accountKey(account string) string {
+	if roleVal, ok := accountRoles.Load(account); ok {
+		if k := os.Getenv(roleVal.(string) + "_BBB_AZBLOB_ACCOUNTKEY"); k != "" {
+			return k
+		}
+	}
+	return os.Getenv("BBB_AZBLOB_ACCOUNTKEY")
+}
+
 // getAzBlobClient returns an Azure Blob client for the given account using either a shared key
-// from BBB_AZBLOB_ACCOUNTKEY or the default Azure credential.
+// from BBB_AZBLOB_ACCOUNTKEY (or role-prefixed SRC_/DST_ variant) or the default Azure credential.
 // Clients are cached per account for the process lifetime.
 func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
 	// Check cache first.
@@ -736,7 +748,7 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 	}
 	endpoint := getEndpoint(account)
 	var client *azblob.Client
-	if key := os.Getenv("BBB_AZBLOB_ACCOUNTKEY"); key != "" {
+	if key := accountKey(account); key != "" {
 		cred, err := azblob.NewSharedKeyCredential(account, key)
 		if err != nil {
 			return nil, err
@@ -1424,7 +1436,7 @@ func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCre
 }
 
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
-	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") != "" {
+	if accountKey(ap.Account) != "" {
 		client, err := getAzBlobClient(ctx, ap.Account)
 		if err != nil {
 			return "", err

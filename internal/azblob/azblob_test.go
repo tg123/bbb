@@ -871,3 +871,179 @@ func TestDiscoverTenantIDHTTPError(t *testing.T) {
 		t.Fatalf("expected empty tenant ID on HTTP error, got %q", tid)
 	}
 }
+
+func TestRegisterAccountRoleStoresUpperCase(t *testing.T) {
+	defer accountRoles.Delete("testacct")
+	RegisterAccountRole("testacct", "src")
+	v, ok := accountRoles.Load("testacct")
+	if !ok || v.(string) != "SRC" {
+		t.Fatalf("expected SRC, got %v", v)
+	}
+}
+
+func TestAccountKeyRolePrefixedTakesPrecedence(t *testing.T) {
+	defer accountRoles.Delete("acctkey1")
+	RegisterAccountRole("acctkey1", "SRC")
+	t.Setenv("SRC_BBB_AZBLOB_ACCOUNTKEY", "src-key-123")
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "global-key")
+	if got := accountKey("acctkey1"); got != "src-key-123" {
+		t.Fatalf("expected role-prefixed key, got %q", got)
+	}
+}
+
+func TestAccountKeyFallsBackToGlobal(t *testing.T) {
+	defer accountRoles.Delete("acctkey2")
+	RegisterAccountRole("acctkey2", "DST")
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "global-key")
+	// No DST_BBB_AZBLOB_ACCOUNTKEY set
+	if got := accountKey("acctkey2"); got != "global-key" {
+		t.Fatalf("expected global key fallback, got %q", got)
+	}
+}
+
+func TestAccountKeyNoRoleUsesGlobal(t *testing.T) {
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "global-only")
+	if got := accountKey("noroleacct"); got != "global-only" {
+		t.Fatalf("expected global key, got %q", got)
+	}
+}
+
+func TestAccountKeyNoEnvReturnsEmpty(t *testing.T) {
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
+	if got := accountKey("emptyacct"); got != "" {
+		t.Fatalf("expected empty, got %q", got)
+	}
+}
+
+func TestRoleEnvVarsCoversAllExpectedVars(t *testing.T) {
+	expected := map[string]bool{
+		"AZURE_CLIENT_ID":                  false,
+		"AZURE_TENANT_ID":                  false,
+		"AZURE_CLIENT_SECRET":              false,
+		"AZURE_CLIENT_CERTIFICATE_PATH":    false,
+		"AZURE_CLIENT_CERTIFICATE_PASSWORD": false,
+		"AZURE_CLIENT_SEND_CERTIFICATE_CHAIN": false,
+		"AZURE_FEDERATED_TOKEN_FILE":       false,
+		"IDENTITY_ENDPOINT":                false,
+		"IDENTITY_HEADER":                  false,
+		"MSI_ENDPOINT":                     false,
+		"MSI_SECRET":                       false,
+		"IMDS_ENDPOINT":                    false,
+		"AZURE_AUTHORITY_HOST":             false,
+		"AZURE_USERNAME":                   false,
+		"AZURE_CONFIG_DIR":                 false,
+	}
+	for _, v := range roleEnvVars {
+		if _, ok := expected[v]; !ok {
+			t.Errorf("unexpected var in roleEnvVars: %s", v)
+		}
+		expected[v] = true
+	}
+	for k, found := range expected {
+		if !found {
+			t.Errorf("missing var in roleEnvVars: %s", k)
+		}
+	}
+}
+
+func TestGetCredentialForRoleReturnsNilWhenNoEnvSet(t *testing.T) {
+	// Clear any cached credential for "TESTROLE".
+	roleCredCache.Delete("TESTROLE")
+	// Ensure no TESTROLE_ env vars are set.
+	for _, v := range roleEnvVars {
+		t.Setenv("TESTROLE_"+v, "")
+	}
+	cred, err := getCredentialForRole("TESTROLE")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cred != nil {
+		t.Fatal("expected nil credential when no env vars set")
+	}
+}
+
+func TestGetCredentialForRoleRemapsEnvVars(t *testing.T) {
+	// Clear cached credential.
+	roleCredCache.Delete("REMAP")
+
+	// Set role-prefixed env vars for a client-secret credential.
+	t.Setenv("REMAP_AZURE_TENANT_ID", "test-tenant")
+	t.Setenv("REMAP_AZURE_CLIENT_ID", "test-client")
+	t.Setenv("REMAP_AZURE_CLIENT_SECRET", "test-secret")
+
+	// Clear any global env vars that could interfere.
+	for _, v := range roleEnvVars {
+		t.Setenv(v, "")
+	}
+
+	cred, err := getCredentialForRole("REMAP")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cred == nil {
+		t.Fatal("expected non-nil credential")
+	}
+
+	// Verify env vars were restored (cleared).
+	for _, v := range roleEnvVars {
+		if got := os.Getenv(v); got != "" {
+			t.Errorf("env var %s not restored, got %q", v, got)
+		}
+	}
+}
+
+func TestGetCredentialForRoleRestoresOriginalEnv(t *testing.T) {
+	roleCredCache.Delete("RESTORE")
+
+	// Set original values.
+	t.Setenv("AZURE_TENANT_ID", "original-tenant")
+	t.Setenv("AZURE_CLIENT_ID", "original-client")
+	t.Setenv("AZURE_CLIENT_SECRET", "original-secret")
+
+	// Set role-prefixed values.
+	t.Setenv("RESTORE_AZURE_TENANT_ID", "role-tenant")
+	t.Setenv("RESTORE_AZURE_CLIENT_ID", "role-client")
+	t.Setenv("RESTORE_AZURE_CLIENT_SECRET", "role-secret")
+
+	_, err := getCredentialForRole("RESTORE")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify originals are restored.
+	if got := os.Getenv("AZURE_TENANT_ID"); got != "original-tenant" {
+		t.Errorf("AZURE_TENANT_ID not restored, got %q", got)
+	}
+	if got := os.Getenv("AZURE_CLIENT_ID"); got != "original-client" {
+		t.Errorf("AZURE_CLIENT_ID not restored, got %q", got)
+	}
+	if got := os.Getenv("AZURE_CLIENT_SECRET"); got != "original-secret" {
+		t.Errorf("AZURE_CLIENT_SECRET not restored, got %q", got)
+	}
+}
+
+func TestGetCredentialForRoleCachesResult(t *testing.T) {
+	roleCredCache.Delete("CACHED")
+
+	t.Setenv("CACHED_AZURE_TENANT_ID", "t")
+	t.Setenv("CACHED_AZURE_CLIENT_ID", "c")
+	t.Setenv("CACHED_AZURE_CLIENT_SECRET", "s")
+	for _, v := range roleEnvVars {
+		t.Setenv(v, "")
+	}
+
+	cred1, err := getCredentialForRole("CACHED")
+	if err != nil {
+		t.Fatalf("first call error: %v", err)
+	}
+
+	cred2, err := getCredentialForRole("CACHED")
+	if err != nil {
+		t.Fatalf("second call error: %v", err)
+	}
+
+	// Both calls should return the same cached instance.
+	if cred1 != cred2 {
+		t.Error("expected cached credential to be reused")
+	}
+}
