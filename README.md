@@ -110,8 +110,8 @@ bbb sync az://src-account/data/ az://dst-account/data/
 
 **Credential resolution order** (first match wins):
 
-1. Role-specific env credential (`SRC_AZURE_*` / `DST_AZURE_*`) via `DefaultAzureCredential`
-2. Shared key (`SRC_BBB_AZBLOB_ACCOUNTKEY` / `DST_BBB_AZBLOB_ACCOUNTKEY`, or `BBB_AZBLOB_ACCOUNTKEY`)
+1. Shared key (`SRC_BBB_AZBLOB_ACCOUNTKEY` / `DST_BBB_AZBLOB_ACCOUNTKEY`, or `BBB_AZBLOB_ACCOUNTKEY`)
+2. Role-specific env credential (`SRC_AZURE_*` / `DST_AZURE_*`) via `DefaultAzureCredential`
 3. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
 4. Interactive browser login (fallback)
 

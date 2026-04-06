@@ -503,6 +503,22 @@ func RegisterAccountRole(account, role string) {
 	accountRoles.Store(account, strings.ToUpper(role))
 }
 
+// AccountRole returns the role ("SRC" or "DST") registered for the given
+// account, and a boolean indicating whether a role was registered.
+func AccountRole(account string) (string, bool) {
+	v, ok := accountRoles.Load(account)
+	if !ok {
+		return "", false
+	}
+	return v.(string), true
+}
+
+// ClearAccountRole removes the role registration for the given account.
+// This is used in tests to reset state between subtests.
+func ClearAccountRole(account string) {
+	accountRoles.Delete(account)
+}
+
 // roleEnvVars lists all Azure identity environment variables that are
 // remapped from {role}_ prefixed variants (e.g. SRC_AZURE_CLIENT_ID)
 // to standard names when creating a role-specific credential.
@@ -592,7 +608,11 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 		}
 	}()
 
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	opts := &azidentity.DefaultAzureCredentialOptions{}
+	if strings.EqualFold(os.Getenv("BBB_AZURE_ALLOW_ANY_TENANT"), "true") {
+		opts.AdditionallyAllowedTenants = []string{"*"}
+	}
+	cred, err := azidentity.NewDefaultAzureCredential(opts)
 	if err != nil {
 		return nil, fmt.Errorf("%s credential: %w", role, err)
 	}
