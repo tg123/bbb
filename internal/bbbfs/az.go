@@ -281,6 +281,32 @@ func AzAccountContainer(p string) (account, container string, err error) {
 	return ap.Account, ap.Container, nil
 }
 
+// RegisterAzAccountRoles tags source and destination storage accounts with
+// their roles so that SRC_AZURE_* / DST_AZURE_* environment variables are
+// used for authentication in multi-tenant environments.
+func RegisterAzAccountRoles(srcPaths, dstPaths []string) {
+	for _, p := range srcPaths {
+		if !IsAz(p) {
+			continue
+		}
+		ap, err := azblob.Parse(p)
+		if err != nil || ap.Account == "" {
+			continue
+		}
+		azblob.RegisterAccountRole(ap.Account, "SRC")
+	}
+	for _, p := range dstPaths {
+		if !IsAz(p) {
+			continue
+		}
+		ap, err := azblob.Parse(p)
+		if err != nil || ap.Account == "" {
+			continue
+		}
+		azblob.RegisterAccountRole(ap.Account, "DST")
+	}
+}
+
 // PreAuthenticateAz eagerly authenticates to the storage accounts referenced
 // by the given az:// paths. Call this before spawning parallel workers so
 // that any interactive login popups happen sequentially.

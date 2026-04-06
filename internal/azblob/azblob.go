@@ -46,6 +46,13 @@ var (
 	// Per-tenant credential cache (thread-safe via sync.Map).
 	tenantCredCache    sync.Map // map[string]azcore.TokenCredential
 	tenantCredInflight sync.Map // map[string]*sync.Mutex — serializes credential acquisition per tenant
+
+	// Per-account role mapping for multi-tenant env var support.
+	// Maps account name → role ("SRC" or "DST").
+	accountRoles sync.Map // map[string]string
+
+	// Per-role credential cache for SRC_AZURE_* / DST_AZURE_* env vars.
+	roleCredCache sync.Map // map[string]azcore.TokenCredential
 )
 
 // MkContainer creates a new Azure Blob container
@@ -486,15 +493,62 @@ func PreAuthenticate(ctx context.Context, accounts ...string) error {
 	return nil
 }
 
+// RegisterAccountRole tags the given storage account with a role ("SRC" or
+// "DST"). When SRC_AZURE_TENANT_ID / SRC_AZURE_CLIENT_ID /
+// SRC_AZURE_CLIENT_SECRET (or the DST_ variants) environment variables are
+// set, accounts tagged with the matching role will use those credentials
+// instead of AzureCLI or interactive browser login. This makes authentication
+// machine-friendly for CI/CD and multi-tenant environments.
+func RegisterAccountRole(account, role string) {
+	accountRoles.Store(account, strings.ToUpper(role))
+}
+
+// getCredentialForRole returns a ClientSecretCredential built from
+// {role}_AZURE_TENANT_ID, {role}_AZURE_CLIENT_ID, and
+// {role}_AZURE_CLIENT_SECRET environment variables. Returns (nil, nil) when
+// the env vars are not fully configured.
+func getCredentialForRole(role string) (azcore.TokenCredential, error) {
+	if cached, ok := roleCredCache.Load(role); ok {
+		return cached.(azcore.TokenCredential), nil
+	}
+	tenantID := os.Getenv(role + "_AZURE_TENANT_ID")
+	clientID := os.Getenv(role + "_AZURE_CLIENT_ID")
+	clientSecret := os.Getenv(role + "_AZURE_CLIENT_SECRET")
+	if tenantID == "" || clientID == "" || clientSecret == "" {
+		return nil, nil // not configured
+	}
+	cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%s client secret credential: %w", role, err)
+	}
+	slog.Debug("Using env credential for role", "role", role, "tenantID", tenantID, "clientID", clientID)
+	actual, _ := roleCredCache.LoadOrStore(role, cred)
+	return actual.(azcore.TokenCredential), nil
+}
+
 // getCredentialForAccount returns a TokenCredential appropriate for the given
-// storage account. The tenant is auto-discovered from the storage endpoint's
-// challenge header (or overridden via BBB_AZ_TENANT_<ACCOUNT> env var).
+// storage account. It first checks for role-specific environment credentials
+// (SRC_AZURE_* / DST_AZURE_*), then auto-discovers the tenant from the
+// storage endpoint's challenge header (or BBB_AZ_TENANT_<ACCOUNT> env var).
 // When a tenant is found, it tries AzureCLICredential first, then falls back
 // to InteractiveBrowserCredential (popup login).
 //
 // Only one browser popup is opened per tenant; concurrent callers wait for
 // the first to complete.
 func getCredentialForAccount(ctx context.Context, account string) (azcore.TokenCredential, error) {
+	// Check for role-specific environment credentials (SRC_AZURE_* / DST_AZURE_*).
+	if roleVal, ok := accountRoles.Load(account); ok {
+		role := roleVal.(string)
+		cred, err := getCredentialForRole(role)
+		if err != nil {
+			return nil, err
+		}
+		if cred != nil {
+			return cred, nil
+		}
+		// Role env vars not set — fall through to normal credential flow.
+	}
+
 	tid := accountTenantID(ctx, account)
 	if tid == "" {
 		return getDefaultCredential()
