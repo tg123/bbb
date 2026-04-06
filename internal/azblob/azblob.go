@@ -494,32 +494,107 @@ func PreAuthenticate(ctx context.Context, accounts ...string) error {
 }
 
 // RegisterAccountRole tags the given storage account with a role ("SRC" or
-// "DST"). When SRC_AZURE_TENANT_ID / SRC_AZURE_CLIENT_ID /
-// SRC_AZURE_CLIENT_SECRET (or the DST_ variants) environment variables are
-// set, accounts tagged with the matching role will use those credentials
-// instead of AzureCLI or interactive browser login. This makes authentication
-// machine-friendly for CI/CD and multi-tenant environments.
+// "DST"). When role-prefixed Azure identity environment variables are set
+// (e.g. SRC_AZURE_TENANT_ID, DST_AZURE_CLIENT_ID, etc.), accounts tagged
+// with the matching role will use those credentials instead of AzureCLI or
+// interactive browser login. This makes authentication machine-friendly for
+// CI/CD and multi-tenant environments.
 func RegisterAccountRole(account, role string) {
 	accountRoles.Store(account, strings.ToUpper(role))
 }
 
-// getCredentialForRole returns a ClientSecretCredential built from
-// {role}_AZURE_TENANT_ID, {role}_AZURE_CLIENT_ID, and
-// {role}_AZURE_CLIENT_SECRET environment variables. Returns (nil, nil) when
-// the env vars are not fully configured.
+// roleEnvVars lists all Azure identity environment variables that are
+// remapped from {role}_ prefixed variants (e.g. SRC_AZURE_CLIENT_ID)
+// to standard names when creating a role-specific credential.
+var roleEnvVars = []string{
+	// Core identity
+	"AZURE_CLIENT_ID",
+	"AZURE_TENANT_ID",
+	// Service Principal (secret)
+	"AZURE_CLIENT_SECRET",
+	// Service Principal (certificate)
+	"AZURE_CLIENT_CERTIFICATE_PATH",
+	"AZURE_CLIENT_CERTIFICATE_PASSWORD",
+	"AZURE_CLIENT_SEND_CERTIFICATE_CHAIN",
+	// Workload Identity (OIDC / AKS)
+	"AZURE_FEDERATED_TOKEN_FILE",
+	// Managed Identity (advanced / injected by Azure)
+	"IDENTITY_ENDPOINT",
+	"IDENTITY_HEADER",
+	"MSI_ENDPOINT",
+	"MSI_SECRET",
+	"IMDS_ENDPOINT",
+	// Cloud / authority
+	"AZURE_AUTHORITY_HOST",
+	// Developer cache hint
+	"AZURE_USERNAME",
+	// Azure CLI integration
+	"AZURE_CONFIG_DIR",
+}
+
+// roleCredMu serializes env var swapping for role-specific credential
+// creation. os.Setenv is process-global, so concurrent credential creation
+// for different roles must not interleave env var mutations.
+var roleCredMu sync.Mutex
+
+// getCredentialForRole returns a DefaultAzureCredential built from
+// {role}_AZURE_* (and {role}_MSI_*, {role}_IDENTITY_*, etc.) environment
+// variables. The role-prefixed env vars are temporarily mapped to their
+// standard names so the Azure SDK picks them up. Returns (nil, nil) when
+// no role-prefixed env vars are set.
 func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	if cached, ok := roleCredCache.Load(role); ok {
 		return cached.(azcore.TokenCredential), nil
 	}
-	tenantID := os.Getenv(role + "_AZURE_TENANT_ID")
-	clientID := os.Getenv(role + "_AZURE_CLIENT_ID")
-	clientSecret := os.Getenv(role + "_AZURE_CLIENT_SECRET")
-	if tenantID == "" || clientID == "" || clientSecret == "" {
+
+	// Check if any role-prefixed env var is set.
+	hasAny := false
+	for _, v := range roleEnvVars {
+		if os.Getenv(role+"_"+v) != "" {
+			hasAny = true
+			break
+		}
+	}
+	if !hasAny {
 		return nil, nil // not configured
 	}
-	cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, nil)
+
+	// Temporarily swap env vars to create the credential.
+	// os.Setenv is process-global, so serialize with a mutex.
+	roleCredMu.Lock()
+	defer roleCredMu.Unlock()
+
+	// Double-check cache after acquiring the lock.
+	if cached, ok := roleCredCache.Load(role); ok {
+		return cached.(azcore.TokenCredential), nil
+	}
+
+	// Save originals and clear all identity vars to avoid cross-contamination.
+	originals := make(map[string]string, len(roleEnvVars))
+	for _, v := range roleEnvVars {
+		originals[v] = os.Getenv(v)
+		os.Unsetenv(v)
+	}
+	// Set only the role-prefixed values.
+	for _, v := range roleEnvVars {
+		if prefixed := os.Getenv(role + "_" + v); prefixed != "" {
+			os.Setenv(v, prefixed)
+		}
+	}
+	// Restore originals after creating the credential.
+	defer func() {
+		for _, v := range roleEnvVars {
+			if originals[v] == "" {
+				os.Unsetenv(v)
+			} else {
+				os.Setenv(v, originals[v])
+			}
+		}
+	}()
+
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
-		return nil, fmt.Errorf("%s client secret credential: %w", role, err)
+		return nil, fmt.Errorf("%s credential: %w", role, err)
 	}
 	slog.Debug("Using env credential for role", "role", role)
 	actual, _ := roleCredCache.LoadOrStore(role, cred)
