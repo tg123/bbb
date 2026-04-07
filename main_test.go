@@ -1476,17 +1476,43 @@ func TestDNSPinUsesFirstAddress(t *testing.T) {
 	var tried []string
 	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		tried = append(tried, addr)
-		return nil, errors.New("fake")
+		// First address is unreachable, second succeeds.
+		if addr == "10.0.0.2:80" {
+			return nil, nil
+		}
+		return nil, errors.New("unreachable")
 	}
 	lookup, _ := fakeLookup([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil)
 	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, true)
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
-	// With pin=true, only the first address should be tried.
-	if len(tried) != 1 {
-		t.Fatalf("expected 1 dial attempt with pin, got %d: %v", len(tried), tried)
+	// With pin=true, addresses are tried in order until one succeeds.
+	want := []string{"10.0.0.1:80", "10.0.0.2:80"}
+	if len(tried) != len(want) {
+		t.Fatalf("expected %d dial attempts with pin, got %d: %v", len(want), len(tried), tried)
 	}
-	if tried[0] != "10.0.0.1:80" {
-		t.Fatalf("expected pinned address 10.0.0.1:80, got %s", tried[0])
+	for i, w := range want {
+		if tried[i] != w {
+			t.Fatalf("dial attempt %d: expected %s, got %s", i, w, tried[i])
+		}
+	}
+}
+
+func TestDNSPinFirstAddressReachable(t *testing.T) {
+	var tried []string
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		tried = append(tried, addr)
+		// First address succeeds immediately.
+		if addr == "10.0.0.1:80" {
+			return nil, nil
+		}
+		return nil, errors.New("unreachable")
+	}
+	lookup, _ := fakeLookup([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, true)
+	_, _ = dial(context.Background(), "tcp", "example.com:80")
+	// Only the first address should be tried since it succeeded.
+	if len(tried) != 1 || tried[0] != "10.0.0.1:80" {
+		t.Fatalf("expected only 10.0.0.1:80 tried, got %v", tried)
 	}
 }
 
@@ -1494,7 +1520,7 @@ func TestDNSPinSingleAddress(t *testing.T) {
 	var tried []string
 	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		tried = append(tried, addr)
-		return nil, errors.New("fake")
+		return nil, nil // success
 	}
 	lookup, _ := fakeLookup([]string{"10.0.0.1"}, nil)
 	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, true)
@@ -1508,12 +1534,12 @@ func TestDNSPinCacheReturnsSameIP(t *testing.T) {
 	var tried []string
 	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		tried = append(tried, addr)
-		return nil, errors.New("fake")
+		return nil, nil // all succeed
 	}
 	lookup, count := fakeLookup([]string{"10.0.0.1", "10.0.0.2"}, nil)
 	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, true)
 
-	// First call – resolves and pins.
+	// First call – resolves and pins to first reachable.
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
 	// Second call – should use cached pinned address.
 	_, _ = dial(context.Background(), "tcp", "example.com:80")

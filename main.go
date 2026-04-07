@@ -154,14 +154,29 @@ func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl 
 			return baseDial(ctx, network, addr)
 		}
 
-		// When pinning, keep only the first address so every
-		// connection for this host goes to the same IP.
-		if pin && len(addrs) > 1 {
-			slog.Debug("DNS pin: using first address only", "host", host, "selected", addrs[0], "all", addrs)
-			addrs = addrs[:1]
+		slog.Debug("DNS lookup", "host", host, "addrs", addrs)
+
+		// When pinning, try addresses in order and pin to the first
+		// one that successfully connects. This avoids permanently
+		// pinning to an unreachable address (e.g. an AAAA record in
+		// an IPv4-only environment).
+		if pin {
+			var lastErr error
+			for _, a := range addrs {
+				conn, dialErr := baseDial(ctx, network, net.JoinHostPort(a, port))
+				if dialErr == nil {
+					slog.Debug("DNS pin: pinned to first reachable address", "host", host, "selected", a, "all", addrs)
+					cache.Store(host, &dnsCacheEntry{
+						addrs:  []string{a},
+						expiry: time.Now().Add(ttl),
+					})
+					return conn, nil
+				}
+				lastErr = dialErr
+			}
+			return nil, lastErr
 		}
 
-		slog.Debug("DNS lookup", "host", host, "addrs", addrs)
 		cache.Store(host, &dnsCacheEntry{
 			addrs:  addrs,
 			expiry: time.Now().Add(ttl),
@@ -247,8 +262,12 @@ func main() {
 					if ttl > 0 {
 						ttlStr = ttl.String()
 					}
+					cacheEnv := "BBB_DNS_CACHE"
+					if dnsPin {
+						cacheEnv = "BBB_DNS_PIN"
+					}
 					slog.Info("DNS caching enabled",
-						"env", "BBB_DNS_CACHE",
+						"env", cacheEnv,
 						"ttl", ttlStr,
 						"pin", dnsPin,
 					)
