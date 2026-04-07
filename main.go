@@ -100,14 +100,14 @@ type dnsCacheEntry struct {
 // Happy Eyeballs (RFC 6555) connection racing is bypassed. For bbb's primary
 // workload (Azure Blob Storage endpoints that are typically single-stack)
 // this has no practical impact.
-func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver, ttl time.Duration) dialContextFunc {
-	return newCachingDialContext(baseDial, resolver.LookupHost, ttl)
+func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver, ttl time.Duration, pin bool) dialContextFunc {
+	return newCachingDialContext(baseDial, resolver.LookupHost, ttl, pin)
 }
 
 // newCachingDialContext is the internal implementation used by
 // dnsCachingDialContext. Accepting a lookupHostFunc and explicit TTL makes
 // the function easy to test with deterministic inputs.
-func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl time.Duration) dialContextFunc {
+func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl time.Duration, pin bool) dialContextFunc {
 	var cache sync.Map // host → *dnsCacheEntry
 
 	dialAddrs := func(ctx context.Context, network, port string, addrs []string) (net.Conn, error) {
@@ -152,6 +152,13 @@ func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl 
 		if len(addrs) == 0 {
 			slog.Debug("DNS lookup returned no addresses", "host", host)
 			return baseDial(ctx, network, addr)
+		}
+
+		// When pinning, keep only the first address so every
+		// connection for this host goes to the same IP.
+		if pin && len(addrs) > 1 {
+			slog.Debug("DNS pin: using first address only", "host", host, "selected", addrs[0], "all", addrs)
+			addrs = addrs[:1]
 		}
 
 		slog.Debug("DNS lookup", "host", host, "addrs", addrs)
@@ -207,8 +214,21 @@ func main() {
 					KeepAlive: 30 * time.Second,
 				}).DialContext
 
-				switch strings.ToLower(os.Getenv("BBB_DNS_CACHE")) {
+				var dnsPin bool
+				switch strings.ToLower(os.Getenv("BBB_DNS_PIN")) {
 				case "1", "true", "yes", "on":
+					dnsPin = true
+				}
+
+				dnsCache := dnsPin // BBB_DNS_PIN implies caching
+				if !dnsCache {
+					switch strings.ToLower(os.Getenv("BBB_DNS_CACHE")) {
+					case "1", "true", "yes", "on":
+						dnsCache = true
+					}
+				}
+
+				if dnsCache {
 					var ttl time.Duration // 0 means unlimited
 					if raw := os.Getenv("BBB_DNS_CACHE_TTL"); raw != "" {
 						d, err := time.ParseDuration(raw)
@@ -220,7 +240,7 @@ func main() {
 						}
 						ttl = d
 					}
-					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver, ttl)
+					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver, ttl, dnsPin)
 					ttlStr := "unlimited"
 					if ttl > 0 {
 						ttlStr = ttl.String()
@@ -228,8 +248,9 @@ func main() {
 					slog.Info("DNS caching enabled",
 						"env", "BBB_DNS_CACHE",
 						"ttl", ttlStr,
+						"pin", dnsPin,
 					)
-				default:
+				} else {
 					transport.DialContext = dnsLoggingDialContext(baseDial, net.DefaultResolver)
 				}
 

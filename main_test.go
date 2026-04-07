@@ -1262,7 +1262,7 @@ func TestDNSCachingDialContextPassesThrough(t *testing.T) {
 		return nil, errors.New("fake")
 	}
 	lookup, _ := fakeLookup([]string{"10.0.0.1"}, nil)
-	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, false)
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
 	if dialedAddr != "10.0.0.1:80" {
 		t.Fatalf("expected dialed address to be resolved IP, got %s", dialedAddr)
@@ -1276,7 +1276,7 @@ func TestDNSCachingDialContextIPPassthrough(t *testing.T) {
 		return nil, errors.New("fake")
 	}
 	lookup, count := fakeLookup(nil, nil)
-	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, false)
 	_, _ = dial(context.Background(), "tcp", "1.2.3.4:443")
 	if dialedAddr != "1.2.3.4:443" {
 		t.Fatalf("expected IP address to pass through unchanged, got %s", dialedAddr)
@@ -1293,7 +1293,7 @@ func TestDNSCachingDialContextBadAddr(t *testing.T) {
 		return nil, errors.New("fake")
 	}
 	lookup, _ := fakeLookup(nil, nil)
-	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, false)
 	_, _ = dial(context.Background(), "tcp", "no-port")
 	if !called {
 		t.Fatal("expected baseDial to be called on bad addr")
@@ -1306,7 +1306,7 @@ func TestDNSCachingDialContextCachesResult(t *testing.T) {
 	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return nil, errors.New("fake")
 	}
-	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, false)
 
 	// First call – cache miss, lookup should be called.
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
@@ -1328,7 +1328,7 @@ func TestDNSCachingDialContextTTLExpiry(t *testing.T) {
 		return nil, errors.New("fake")
 	}
 	// Use a very short TTL so it expires immediately.
-	dial := newCachingDialContext(baseDial, lookup, 1*time.Nanosecond)
+	dial := newCachingDialContext(baseDial, lookup, 1*time.Nanosecond, false)
 
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
 	if *count != 1 {
@@ -1352,7 +1352,7 @@ func TestDNSCachingDialContextTriesAllAddrs(t *testing.T) {
 		return nil, errors.New("fake")
 	}
 	lookup, _ := fakeLookup([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil)
-	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, false)
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
 	want := []string{"10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80"}
 	if len(tried) != len(want) {
@@ -1376,7 +1376,7 @@ func TestDNSCachingDialContextStopsOnSuccess(t *testing.T) {
 		return nil, errors.New("fake")
 	}
 	lookup, _ := fakeLookup([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil)
-	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, false)
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
 	want := []string{"10.0.0.1:80", "10.0.0.2:80"}
 	if len(tried) != len(want) {
@@ -1391,7 +1391,7 @@ func TestDNSCachingDialContextResolverError(t *testing.T) {
 		return nil, errors.New("fake")
 	}
 	lookup, _ := fakeLookup(nil, errors.New("no such host"))
-	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, false)
 	_, _ = dial(context.Background(), "tcp", "bad.invalid:443")
 	if dialedAddr != "bad.invalid:443" {
 		t.Fatalf("expected original address on resolver error, got %s", dialedAddr)
@@ -1409,7 +1409,7 @@ func TestDNSCachingDialContextLogsDNSLookupOnMiss(t *testing.T) {
 		return nil, errors.New("fake")
 	}
 	lookup, _ := fakeLookup([]string{"10.0.0.1"}, nil)
-	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, false)
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
 
 	out := buf.String()
@@ -1432,7 +1432,7 @@ func TestDNSCachingDialContextNoDNSLookupOnHit(t *testing.T) {
 		return nil, errors.New("fake")
 	}
 	lookup, _ := fakeLookup([]string{"10.0.0.1"}, nil)
-	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, false)
 
 	// First call – populates cache.
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
@@ -1457,7 +1457,7 @@ func TestDNSCachingDialContextUnlimitedTTL(t *testing.T) {
 		return nil, errors.New("fake")
 	}
 	// TTL 0 means unlimited – entries never expire.
-	dial := newCachingDialContext(baseDial, lookup, 0)
+	dial := newCachingDialContext(baseDial, lookup, 0, false)
 
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
 	if *count != 1 {
@@ -1467,5 +1467,66 @@ func TestDNSCachingDialContextUnlimitedTTL(t *testing.T) {
 	_, _ = dial(context.Background(), "tcp", "example.com:80")
 	if *count != 1 {
 		t.Fatalf("expected lookup count to stay 1 with unlimited TTL, got %d", *count)
+	}
+}
+
+// --------------- DNS pin tests ---------------
+
+func TestDNSPinUsesFirstAddress(t *testing.T) {
+	var tried []string
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		tried = append(tried, addr)
+		return nil, errors.New("fake")
+	}
+	lookup, _ := fakeLookup([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, true)
+	_, _ = dial(context.Background(), "tcp", "example.com:80")
+	// With pin=true, only the first address should be tried.
+	if len(tried) != 1 {
+		t.Fatalf("expected 1 dial attempt with pin, got %d: %v", len(tried), tried)
+	}
+	if tried[0] != "10.0.0.1:80" {
+		t.Fatalf("expected pinned address 10.0.0.1:80, got %s", tried[0])
+	}
+}
+
+func TestDNSPinSingleAddress(t *testing.T) {
+	var tried []string
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		tried = append(tried, addr)
+		return nil, errors.New("fake")
+	}
+	lookup, _ := fakeLookup([]string{"10.0.0.1"}, nil)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, true)
+	_, _ = dial(context.Background(), "tcp", "example.com:80")
+	if len(tried) != 1 || tried[0] != "10.0.0.1:80" {
+		t.Fatalf("expected single address 10.0.0.1:80, got %v", tried)
+	}
+}
+
+func TestDNSPinCacheReturnsSameIP(t *testing.T) {
+	var tried []string
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		tried = append(tried, addr)
+		return nil, errors.New("fake")
+	}
+	lookup, count := fakeLookup([]string{"10.0.0.1", "10.0.0.2"}, nil)
+	dial := newCachingDialContext(baseDial, lookup, 5*time.Minute, true)
+
+	// First call – resolves and pins.
+	_, _ = dial(context.Background(), "tcp", "example.com:80")
+	// Second call – should use cached pinned address.
+	_, _ = dial(context.Background(), "tcp", "example.com:80")
+
+	if *count != 1 {
+		t.Fatalf("expected 1 lookup (cached), got %d", *count)
+	}
+	if len(tried) != 2 {
+		t.Fatalf("expected 2 dial attempts total, got %d", len(tried))
+	}
+	for i, addr := range tried {
+		if addr != "10.0.0.1:80" {
+			t.Fatalf("dial attempt %d: expected pinned 10.0.0.1:80, got %s", i, addr)
+		}
 	}
 }
