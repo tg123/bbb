@@ -200,9 +200,6 @@ func (azFS) ListStream(ctx context.Context, p string, fn func(Entry) error) erro
 			return nil
 		}
 		fullpath := azChildPath(ap, name)
-		if ap.Container == "" {
-			fullpath = fmt.Sprintf("az://%s/%s", ap.Account, name)
-		}
 		return fn(Entry{
 			Name:    name,
 			Path:    fullpath,
