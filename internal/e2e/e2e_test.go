@@ -73,7 +73,7 @@ func waitForEndpointReadyWithTimeout(addr string, timeout time.Duration) bool {
 	}
 }
 
-func runCmd(cmd string, args ...string) (*exec.Cmd, io.Writer, io.Reader, <-chan struct{}, error) {
+func runCmd(cmd string, args ...string) (*exec.Cmd, *os.File, io.Reader, <-chan struct{}, error) {
 	newargs := append([]string{cmd}, args...)
 	newargs = append([]string{"-i0", "-o0", "-e0"}, newargs...)
 	c := exec.Command("stdbuf", newargs...)
@@ -97,16 +97,17 @@ func runCmd(cmd string, args ...string) (*exec.Cmd, io.Writer, io.Reader, <-chan
 }
 
 func runAndGetStdout(cmd string, args ...string) ([]byte, error) {
-	c, _, stdout, done, err := runCmd(cmd, args...)
+	c, ptyFile, stdout, done, err := runCmd(cmd, args...)
 	if err != nil {
 		return nil, err
 	}
+	defer ptyFile.Close()
 
-	if err := c.Wait(); err != nil {
-		return nil, err
+	waitErr := c.Wait()
+	<-done // always wait for pty goroutine to finish writing to buffer
+	if waitErr != nil {
+		return nil, waitErr
 	}
-
-	<-done // wait for pty goroutine to finish writing to buffer
 
 	return io.ReadAll(stdout)
 }
