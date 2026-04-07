@@ -25,13 +25,9 @@ go install github.com/tg123/bbb@latest
 
 ## Global Flags
 
-These flags can be provided before or after the subcommand:
-
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--loglevel` | `info` | Log level: `debug`, `info`, `warn`, `error` (env: `BBB_LOG_LEVEL`) |
-| `--taskfile FILE` | | Batch task file with one `src dst` pair per line; use `-` for stdin (available for `cp` and `sync`) |
-| `--state FILE` | | State file for crash recovery / resuming interrupted operations (available for `cp` and `sync`) |
 
 **Debug logging example** — use `--loglevel debug` to inspect DNS resolution and the Azure AD token issuer (`iss`), which is useful for diagnosing connectivity or authentication problems:
 
@@ -49,6 +45,102 @@ time=... level=DEBUG msg="Decoded JWT payload" payload="{\"aud\":\"https://stora
 The `DNS lookup` line shows the resolved IP addresses for the storage account, and the `Decoded JWT payload` line contains the full token claims including `iss` (the token issuer) and `aud` (audience), letting you verify the correct identity and tenant are being used.
 
 > **Warning:** Debug output may include personally identifiable information such as tenant IDs, object IDs, and other token claims. Do not share debug logs publicly or paste them into tickets without redacting sensitive fields.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BBB_LOG_LEVEL` | `info` | Same as `--loglevel` flag |
+| `BBB_DNS_CACHE` | *(off)* | Set to `1`, `true`, `yes`, or `on` to enable process-local DNS caching |
+| `BBB_DNS_PIN` | *(off)* | Set to `1`, `true`, `yes`, or `on` to pin DNS to a single IP (implies `BBB_DNS_CACHE=1`) |
+| `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
+| `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
+| `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
+
+### Multi-Tenant / Multi-Account Authentication (`SRC_` / `DST_` Env Vars)
+
+When copying or syncing between Azure Storage accounts in **different tenants** (or using different credentials), prefix any standard Azure identity environment variable with `SRC_` or `DST_` to scope it to source or destination accounts respectively.
+
+bbb uses `DefaultAzureCredential` under the hood, so all credential types are supported: service principal (secret or certificate), workload identity (OIDC / AKS), managed identity, and Azure CLI.
+
+**Supported env vars** — prefix with `SRC_` or `DST_`:
+
+| Variable | Category |
+|----------|----------|
+| `AZURE_CLIENT_ID` | Core identity |
+| `AZURE_TENANT_ID` | Core identity |
+| `AZURE_CLIENT_SECRET` | Service principal (secret) |
+| `AZURE_CLIENT_CERTIFICATE_PATH` | Service principal (certificate) |
+| `AZURE_CLIENT_CERTIFICATE_PASSWORD` | Service principal (certificate) |
+| `AZURE_CLIENT_SEND_CERTIFICATE_CHAIN` | Service principal (certificate) |
+| `AZURE_FEDERATED_TOKEN_FILE` | Workload identity (OIDC / AKS) |
+| `IDENTITY_ENDPOINT` | Managed identity |
+| `IDENTITY_HEADER` | Managed identity |
+| `MSI_ENDPOINT` | Managed identity |
+| `MSI_SECRET` | Managed identity |
+| `IMDS_ENDPOINT` | Managed identity |
+| `AZURE_AUTHORITY_HOST` | Cloud / authority |
+| `AZURE_USERNAME` | Developer cache hint |
+| `AZURE_CONFIG_DIR` | Azure CLI integration |
+| `BBB_AZBLOB_ACCOUNTKEY` | Shared key (bbb-specific) |
+
+**Example — service principal per tenant:**
+
+```bash
+# Source tenant credentials
+export SRC_AZURE_TENANT_ID=<tenant-a>
+export SRC_AZURE_CLIENT_ID=<sp-a-id>
+export SRC_AZURE_CLIENT_SECRET=<sp-a-secret>
+
+# Destination tenant credentials
+export DST_AZURE_TENANT_ID=<tenant-b>
+export DST_AZURE_CLIENT_ID=<sp-b-id>
+export DST_AZURE_CLIENT_SECRET=<sp-b-secret>
+
+bbb cp az://src-account/container/ az://dst-account/container/
+```
+
+**Example — shared key per account:**
+
+```bash
+export SRC_BBB_AZBLOB_ACCOUNTKEY=<key-for-source>
+export DST_BBB_AZBLOB_ACCOUNTKEY=<key-for-destination>
+
+bbb sync az://src-account/data/ az://dst-account/data/
+```
+
+**Credential resolution order** (first match wins):
+
+1. Shared key (`SRC_BBB_AZBLOB_ACCOUNTKEY` / `DST_BBB_AZBLOB_ACCOUNTKEY`, or `BBB_AZBLOB_ACCOUNTKEY`)
+2. Role-specific env credential (`SRC_AZURE_*` / `DST_AZURE_*`) via `DefaultAzureCredential`
+3. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
+4. Interactive browser login (fallback)
+
+### `BBB_DNS_CACHE`
+
+When enabled, bbb caches DNS resolution results in memory so that repeated connections to the same hostname (e.g. an Azure Storage endpoint) skip the DNS lookup. Cached entries expire after 5 minutes.
+
+```bash
+BBB_DNS_CACHE=1 bbb cp ./data/ az://myaccount/mycontainer/data/
+```
+
+**Caveats:**
+
+- DNS records that change during the TTL window (e.g. IP rotations) will not be picked up until the cached entry expires.
+- Because cached addresses are dialled as IP literals, Go's standard Happy Eyeballs (RFC 6555) connection racing is bypassed. For Azure Blob Storage endpoints (typically single-stack) this has no practical impact.
+
+### `BBB_DNS_PIN`
+
+When enabled, bbb pins every hostname to a single IP address. If DNS returns multiple addresses, only the first *reachable* address is used for all connections to that host. This implicitly enables `BBB_DNS_CACHE` with unlimited TTL (`BBB_DNS_CACHE_TTL` is ignored). Pinning can help avoid 403 errors from services that tie authentication tokens to a specific endpoint IP.
+
+```bash
+BBB_DNS_PIN=1 bbb cp ./data/ az://myaccount/mycontainer/data/
+```
+
+**Caveats:**
+
+- Pinned entries never refresh. Long-lived processes will not pick up DNS or IP rotations and may require a restart (or disabling pinning) to recover if the pinned IP becomes unreachable.
+- If the first resolved address is unreachable (e.g. an IPv6 address in an IPv4-only environment), bbb will try the remaining addresses and pin to the first one that successfully connects.
 
 ### Taskfile
 
@@ -68,13 +160,13 @@ Use `--taskfile` to pass the file to `cp` or `sync`. Use `-` to read from stdin:
 
 ```bash
 # Copy all pairs listed in the taskfile
-bbb --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt
 
 # Sync all pairs listed in the taskfile
-bbb --taskfile tasks.txt sync
+bbb sync --taskfile tasks.txt
 
 # Pipe pairs from another command
-find ./models -name '*.bin' | awk '{print $0, "az://myaccount/mycontainer/"$0}' | bbb --taskfile - cp
+find ./models -name '*.bin' | awk '{print $0, "az://myaccount/mycontainer/"$0}' | bbb cp --taskfile -
 ```
 
 ### State file
@@ -83,17 +175,17 @@ A state file tracks completed work so interrupted operations can be resumed. Pas
 
 ```bash
 # Start a large copy with crash recovery
-bbb --state copy.state --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt --state copy.state
 
 # If the process is interrupted, re-run the exact same command.
 # Completed files are skipped; only remaining work is executed.
-bbb --state copy.state --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt --state copy.state
 ```
 
 `--state` also works without `--taskfile`:
 
 ```bash
-bbb --state copy.state cp ./huge-dataset/ az://myaccount/mycontainer/dataset/
+bbb cp --state copy.state ./huge-dataset/ az://myaccount/mycontainer/dataset/
 ```
 
 The state file is a plain-text append-only log. Each successfully copied **file** is recorded as `src -> dst`, and when all files in a taskfile pair are finished the pair is marked complete with a `TASK\t` prefix so the entire pair can be skipped on resume:
@@ -260,6 +352,8 @@ bbb cp [flags] src [src ...] dst
 
 | Flag | Description |
 |------|-------------|
+| `--taskfile FILE` | Batch task file with one `src dst` pair per line; use `-` for stdin |
+| `--state FILE` | State file for crash recovery / resuming interrupted operations |
 | `-f` | Force overwrite existing files |
 | `-q`, `--quiet` | Suppress output |
 | `--concurrency N` | Number of concurrent transfers (default: CPU cores) |
@@ -296,10 +390,10 @@ Use `--taskfile` to provide a file of `src dst` pairs (one per line). See [Taskf
 
 ```bash
 # From a file
-bbb --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt
 
 # From stdin (pipe)
-echo "local.txt az://myaccount/c/remote.txt" | bbb --taskfile - cp
+echo "local.txt az://myaccount/c/remote.txt" | bbb cp --taskfile -
 ```
 
 #### Crash Recovery with State File
@@ -308,10 +402,10 @@ Use `--state` to resume interrupted copies. See [State file](#state-file) for de
 
 ```bash
 # First run — starts copying and records progress
-bbb --state copy.state --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt --state copy.state
 
 # If interrupted, re-run the same command — already-copied files are skipped
-bbb --state copy.state --taskfile tasks.txt cp
+bbb cp --taskfile tasks.txt --state copy.state
 ```
 
 ---
@@ -382,6 +476,8 @@ bbb sync [flags] src dst
 
 | Flag | Description |
 |------|-------------|
+| `--taskfile FILE` | Batch task file with one `src dst` pair per line; use `-` for stdin |
+| `--state FILE` | State file for crash recovery / resuming interrupted operations |
 | `--dry-run` | Show what would be done without making changes |
 | `--delete` | Delete destination files that don't exist in source |
 | `-x`, `--exclude PATTERN` | Exclude files matching this regex pattern |
@@ -408,7 +504,7 @@ bbb sync --dry-run ./data/ az://myaccount/mycontainer/data/
 bbb sync --exclude '\.tmp$' ./project/ az://myaccount/mycontainer/project/
 
 # Sync with taskfile and crash recovery (see Taskfile and State file sections above)
-bbb --taskfile tasks.txt --state sync.state sync
+bbb sync --taskfile tasks.txt --state sync.state
 ```
 
 ---

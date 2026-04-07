@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -25,8 +26,33 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
+)
+
+// --- Cached credentials and clients ---
+// These are safe for concurrent use and amortize the cost of credential
+// acquisition across all API calls in the process lifetime.
+
+var (
+	cachedDefaultCred     *azidentity.DefaultAzureCredential
+	cachedDefaultCredOnce sync.Once
+	cachedDefaultCredErr  error
+
+	// Per-account blob client cache (thread-safe via sync.Map).
+	blobClientCache sync.Map // map[string]*azblob.Client
+
+	// Per-tenant credential cache (thread-safe via sync.Map).
+	tenantCredCache    sync.Map // map[string]azcore.TokenCredential
+	tenantCredInflight sync.Map // map[string]*sync.Mutex — serializes credential acquisition per tenant
+
+	// Per-account role mapping for multi-tenant env var support.
+	// Maps account name → role ("SRC" or "DST").
+	accountRoles sync.Map // map[string]string
+
+	// Per-role credential cache for SRC_AZURE_* / DST_AZURE_* env vars.
+	roleCredCache sync.Map // map[string]azcore.TokenCredential
 )
 
 // MkContainer creates a new Azure Blob container
@@ -67,6 +93,7 @@ var validBlobSuffixes = []string{
 
 const (
 	defaultCopySASExpiry     = time.Hour
+	clockSkewTolerance       = 5 * time.Minute   // backdate SAS start to tolerate clock differences
 	copyBlockSize            = 256 * 1024 * 1024 // 256 MiB per block for StageBlockFromURL
 	copyPollInitialDelay     = 100 * time.Millisecond
 	copyPollMaxDelay         = 2 * time.Second
@@ -306,16 +333,14 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 		return err
 	}
 	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
-	opts := &azblob.ListBlobsFlatOptions{
-		Include: azblob.ListBlobsInclude{Metadata: true},
-	}
+	opts := &container.ListBlobsHierarchyOptions{}
 	// Use nil Prefix (omit query param) for container root instead of &""
 	// to avoid potential Azure SDK/API differences with empty string prefix.
 	if prefix != "" {
 		opts.Prefix = &prefix
 	}
-	pager := containerClient.NewListBlobsFlatPager(opts)
-	seen := make(map[string]struct{})
+	pager := containerClient.NewListBlobsHierarchyPager("/", opts)
+	seen := make(map[string]bool)
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
@@ -324,65 +349,449 @@ func ListStream(ctx context.Context, ap AzurePath, cb func(BlobMeta) error) erro
 		if resp.Segment == nil {
 			return nil
 		}
-		var batch []flatBlobEntry
-		for _, blob := range resp.Segment.BlobItems {
-			if blob == nil || blob.Name == nil {
-				continue
-			}
-			var size *int64
-			if blob.Properties != nil {
-				size = blob.Properties.ContentLength
-			}
-			batch = append(batch, flatBlobEntry{Name: *blob.Name, Size: size})
-		}
-		if err := extractFirstLevel(batch, prefix, func(bm BlobMeta) error {
-			if _, exists := seen[bm.Name]; exists {
-				return nil
-			}
-			seen[bm.Name] = struct{}{}
-			return cb(bm)
-		}); err != nil {
+		if err := processHierarchySegment(resp.Segment, prefix, seen, cb); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// processHierarchySegment emits BlobMeta entries from a hierarchy listing
+// segment, de-duplicating across prefixes and items. Directory-marker blobs
+// (nil ContentLength) are skipped.
+func processHierarchySegment(seg *container.BlobHierarchyListSegment, prefix string, seen map[string]bool, cb func(BlobMeta) error) error {
+	// Emit virtual directories (blob prefixes)
+	for _, bp := range seg.BlobPrefixes {
+		if bp == nil || bp.Name == nil {
+			continue
+		}
+		dirName := strings.TrimPrefix(*bp.Name, prefix)
+		if dirName == "" {
+			continue
+		}
+		if seen[dirName] {
+			continue
+		}
+		seen[dirName] = true
+		if err := cb(BlobMeta{Name: dirName, Size: 0}); err != nil {
+			return err
+		}
+	}
+	// Emit files at this level (skip directory-marker blobs with nil ContentLength)
+	for _, blob := range seg.BlobItems {
+		if blob == nil || blob.Name == nil {
+			continue
+		}
+		if blob.Properties == nil || blob.Properties.ContentLength == nil {
+			continue
+		}
+		name := strings.TrimPrefix(*blob.Name, prefix)
+		if name == "" {
+			continue
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		if err := cb(BlobMeta{Name: name, Size: *blob.Properties.ContentLength}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// accountTenantID returns the tenant ID for a storage account. It first
+// checks the BBB_AZ_TENANT_<ACCOUNT> environment variable, then falls back
+// to auto-discovery by probing the storage endpoint's WWW-Authenticate header.
+func accountTenantID(ctx context.Context, account string) string {
+	if tid := os.Getenv("BBB_AZ_TENANT_" + strings.ToUpper(account)); tid != "" {
+		return tid
+	}
+	if tid := os.Getenv("BBB_AZ_TENANT_" + account); tid != "" {
+		return tid
+	}
+	return discoverTenantID(ctx, account)
+}
+
+// tenantCache caches discovered tenant IDs per storage account.
+var tenantCache sync.Map // map[string]string
+
+// discoverTenantID makes an unauthenticated request to the storage account
+// endpoint and extracts the tenant ID from the WWW-Authenticate challenge
+// header. Returns "" if discovery fails.
+func discoverTenantID(ctx context.Context, account string) string {
+	if cached, ok := tenantCache.Load(account); ok {
+		return cached.(string)
+	}
+	endpoint := getEndpoint(account) + "/?comp=list&restype=container"
+	slog.Debug("tenant discovery: probing endpoint", "account", account, "url", endpoint)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err != nil {
+		slog.Debug("tenant discovery: request creation failed", "account", account, "error", err)
+		return ""
+	}
+	req.Header.Set("x-ms-version", "2020-08-04")
+	resp, err := defaultHTTPClient().Do(req)
+	if err != nil {
+		slog.Debug("tenant discovery: GET failed", "account", account, "error", err)
+		return ""
+	}
+	_ = resp.Body.Close()
+
+	// WWW-Authenticate: Bearer authorization_uri=https://login.microsoftonline.com/<tenant-id>/oauth2/authorize ...
+	auth := resp.Header.Get("Www-Authenticate")
+	slog.Debug("tenant discovery: response", "account", account, "status", resp.StatusCode, "www-authenticate", auth)
+	tid := parseTenantFromChallenge(auth)
+	if tid != "" {
+		slog.Debug("Discovered tenant for storage account", "account", account, "tenant", tid)
+		tenantCache.Store(account, tid)
+	}
+	return tid
+}
+
+// challengeTenantRe extracts the tenant GUID from the authorization_uri in a
+// WWW-Authenticate: Bearer challenge response.
+var challengeTenantRe = regexp.MustCompile(`authorization_uri="?https://login\.microsoftonline\.com/([0-9a-f-]{36})/`)
+
+func parseTenantFromChallenge(header string) string {
+	m := challengeTenantRe.FindStringSubmatch(header)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+var defaultHTTPClientOnce sync.Once
+var defaultHTTPClientVal *http.Client
+
+func defaultHTTPClient() *http.Client {
+	defaultHTTPClientOnce.Do(func() {
+		defaultHTTPClientVal = &http.Client{Timeout: 10 * time.Second}
+	})
+	return defaultHTTPClientVal
+}
+
+// PreAuthenticate eagerly authenticates to the given storage accounts
+// sequentially. This ensures any interactive login popups happen one at a
+// time before parallel workers start. It also pre-warms the blob client
+// and UDC (User Delegation Credential) caches so that no credential
+// acquisition happens during copy.
+func PreAuthenticate(ctx context.Context, accounts ...string) error {
+	for _, account := range accounts {
+		// Trigger tenant discovery + credential acquisition.
+		_, err := getAzBlobClient(ctx, account)
+		if err != nil {
+			return fmt.Errorf("pre-authenticate %s: %w", account, err)
+		}
+		// Pre-warm the UDC cache so SAS generation doesn't trigger
+		// a second credential acquisition later.
+		_, _, _, _, err = getUDC(ctx, account)
+		if err != nil {
+			slog.Debug("pre-authenticate: UDC warm-up failed (non-fatal)", "account", account, "error", err)
+		}
+	}
+	return nil
+}
+
+// RegisterAccountRole tags the given storage account with a role ("SRC" or
+// "DST"). When role-prefixed Azure identity environment variables are set
+// (e.g. SRC_AZURE_TENANT_ID, DST_AZURE_CLIENT_ID, etc.), accounts tagged
+// with the matching role will use those credentials instead of AzureCLI or
+// interactive browser login. This makes authentication machine-friendly for
+// CI/CD and multi-tenant environments.
+func RegisterAccountRole(account, role string) {
+	accountRoles.Store(account, strings.ToUpper(role))
+}
+
+// AccountRole returns the role ("SRC" or "DST") registered for the given
+// account, and a boolean indicating whether a role was registered.
+func AccountRole(account string) (string, bool) {
+	v, ok := accountRoles.Load(account)
+	if !ok {
+		return "", false
+	}
+	return v.(string), true
+}
+
+// ClearAccountRole removes the role registration for the given account.
+// This is used in tests to reset state between subtests.
+func ClearAccountRole(account string) {
+	accountRoles.Delete(account)
+}
+
+// roleEnvVars lists all Azure identity environment variables that are
+// remapped from {role}_ prefixed variants (e.g. SRC_AZURE_CLIENT_ID)
+// to standard names when creating a role-specific credential.
+var roleEnvVars = []string{
+	// Core identity
+	"AZURE_CLIENT_ID",
+	"AZURE_TENANT_ID",
+	// Service Principal (secret)
+	"AZURE_CLIENT_SECRET",
+	// Service Principal (certificate)
+	"AZURE_CLIENT_CERTIFICATE_PATH",
+	"AZURE_CLIENT_CERTIFICATE_PASSWORD",
+	"AZURE_CLIENT_SEND_CERTIFICATE_CHAIN",
+	// Workload Identity (OIDC / AKS)
+	"AZURE_FEDERATED_TOKEN_FILE",
+	// Managed Identity (advanced / injected by Azure)
+	"IDENTITY_ENDPOINT",
+	"IDENTITY_HEADER",
+	"MSI_ENDPOINT",
+	"MSI_SECRET",
+	"IMDS_ENDPOINT",
+	// Cloud / authority
+	"AZURE_AUTHORITY_HOST",
+	// Developer cache hint
+	"AZURE_USERNAME",
+	// Azure CLI integration
+	"AZURE_CONFIG_DIR",
+}
+
+// roleCredMu serializes env var swapping for role-specific credential
+// creation. os.Setenv is process-global, so concurrent credential creation
+// for different roles must not interleave env var mutations.
+var roleCredMu sync.Mutex
+
+// getCredentialForRole returns a DefaultAzureCredential built from
+// {role}_AZURE_* (and {role}_MSI_*, {role}_IDENTITY_*, etc.) environment
+// variables. The role-prefixed env vars are temporarily mapped to their
+// standard names so the Azure SDK picks them up. Returns (nil, nil) when
+// no role-prefixed env vars are set.
+func getCredentialForRole(role string) (azcore.TokenCredential, error) {
+	if cached, ok := roleCredCache.Load(role); ok {
+		return cached.(azcore.TokenCredential), nil
+	}
+
+	// Check if any role-prefixed env var is set.
+	hasAny := false
+	for _, v := range roleEnvVars {
+		if os.Getenv(role+"_"+v) != "" {
+			hasAny = true
+			break
+		}
+	}
+	if !hasAny {
+		return nil, nil // not configured
+	}
+
+	// Temporarily swap env vars to create the credential.
+	// os.Setenv is process-global, so serialize with a mutex.
+	roleCredMu.Lock()
+	defer roleCredMu.Unlock()
+
+	// Double-check cache after acquiring the lock.
+	if cached, ok := roleCredCache.Load(role); ok {
+		return cached.(azcore.TokenCredential), nil
+	}
+
+	// Save originals and clear all identity vars to avoid cross-contamination.
+	originals := make(map[string]string, len(roleEnvVars))
+	for _, v := range roleEnvVars {
+		originals[v] = os.Getenv(v)
+		_ = os.Unsetenv(v)
+	}
+	// Set only the role-prefixed values.
+	for _, v := range roleEnvVars {
+		if prefixed := os.Getenv(role + "_" + v); prefixed != "" {
+			_ = os.Setenv(v, prefixed)
+		}
+	}
+	// Restore originals after creating the credential.
+	defer func() {
+		for _, v := range roleEnvVars {
+			if originals[v] == "" {
+				_ = os.Unsetenv(v)
+			} else {
+				_ = os.Setenv(v, originals[v])
+			}
+		}
+	}()
+
+	opts := &azidentity.DefaultAzureCredentialOptions{}
+	if strings.EqualFold(os.Getenv("BBB_AZURE_ALLOW_ANY_TENANT"), "true") {
+		opts.AdditionallyAllowedTenants = []string{"*"}
+	}
+	cred, err := azidentity.NewDefaultAzureCredential(opts)
+	if err != nil {
+		return nil, fmt.Errorf("%s credential: %w", role, err)
+	}
+	slog.Debug("Using env credential for role", "role", role)
+	actual, _ := roleCredCache.LoadOrStore(role, cred)
+	return actual.(azcore.TokenCredential), nil
+}
+
+// getCredentialForAccount returns a TokenCredential appropriate for the given
+// storage account. It first checks for role-specific environment credentials
+// (SRC_AZURE_* / DST_AZURE_*), then auto-discovers the tenant from the
+// storage endpoint's challenge header (or BBB_AZ_TENANT_<ACCOUNT> env var).
+// When a tenant is found, it tries AzureCLICredential first, then falls back
+// to InteractiveBrowserCredential (popup login).
+//
+// Only one browser popup is opened per tenant; concurrent callers wait for
+// the first to complete.
+func getCredentialForAccount(ctx context.Context, account string) (azcore.TokenCredential, error) {
+	// Check for role-specific environment credentials (SRC_AZURE_* / DST_AZURE_*).
+	if roleVal, ok := accountRoles.Load(account); ok {
+		role := roleVal.(string)
+		cred, err := getCredentialForRole(role)
+		if err != nil {
+			return nil, err
+		}
+		if cred != nil {
+			return cred, nil
+		}
+		// Role env vars not set — fall through to normal credential flow.
+	}
+
+	tid := accountTenantID(ctx, account)
+	if tid == "" {
+		return getDefaultCredential()
+	}
+	slog.Debug("Using tenant-specific credential", "account", account, "tenant", tid)
+
+	// Return cached credential for this tenant if available.
+	if cached, ok := tenantCredCache.Load(tid); ok {
+		return cached.(azcore.TokenCredential), nil
+	}
+
+	// Serialize credential acquisition per tenant so only one browser
+	// popup is shown, even when multiple goroutines race.
+	inflightVal, _ := tenantCredInflight.LoadOrStore(tid, &sync.Mutex{})
+	mu := inflightVal.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Double-check cache after acquiring the lock.
+	if cached, ok := tenantCredCache.Load(tid); ok {
+		return cached.(azcore.TokenCredential), nil
+	}
+
+	// Try AzureCLICredential first — works if the user has `az login`'d
+	// to this tenant. If GetToken fails, fall back to interactive browser.
+	cliCred, err := azidentity.NewAzureCLICredential(&azidentity.AzureCLICredentialOptions{
+		TenantID: tid,
+	})
+	if err == nil {
+		// Test if CLI credential actually works for this tenant.
+		_, tokenErr := cliCred.GetToken(ctx, policy.TokenRequestOptions{
+			Scopes: []string{"https://storage.azure.com/.default"},
+		})
+		if tokenErr == nil {
+			slog.Debug("Using AzureCLICredential for tenant", "tenant", tid)
+			tenantCredCache.Store(tid, cliCred)
+			return cliCred, nil
+		}
+		slog.Debug("AzureCLICredential failed for tenant, falling back to interactive login",
+			"tenant", tid, "error", tokenErr)
+	}
+
+	// Fall back to interactive browser login for the discovered tenant.
+	slog.Info("CLI credential failed for tenant, opening browser login", "account", account, "tenant", tid)
+	fmt.Fprintf(os.Stderr, "\n  Storage account %q requires authentication to tenant %s.\n  Opening browser...\n", account, tid)
+	browserCred, err := azidentity.NewInteractiveBrowserCredential(&azidentity.InteractiveBrowserCredentialOptions{
+		TenantID: tid,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("interactive credential for tenant %s: %w", tid, err)
+	}
+
+	// Eagerly acquire a CAE-capable token to trigger the browser popup now,
+	// before any parallel goroutines need the credential. EnableCAE ensures
+	// the cached token includes the CP1 claims that the SDK pipeline will
+	// request later, preventing a second browser popup.
+	_, err = browserCred.GetToken(ctx, policy.TokenRequestOptions{
+		Scopes:    []string{"https://storage.azure.com/.default"},
+		EnableCAE: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("interactive login for tenant %s: %w", tid, err)
+	}
+
+	tenantCredCache.Store(tid, browserCred)
+	return browserCred, nil
+}
+
+// getDefaultCredential returns a process-wide cached DefaultAzureCredential.
+// The credential is thread-safe and handles token refresh internally.
+func getDefaultCredential() (*azidentity.DefaultAzureCredential, error) {
+	cachedDefaultCredOnce.Do(func() {
+		opts := &azidentity.DefaultAzureCredentialOptions{}
+		// BBB_AZURE_ALLOW_ANY_TENANT=true permits the default credential to
+		// acquire tokens for any tenant. Without this, cross-tenant requests
+		// may fail. This is opt-in to limit the trust boundary by default.
+		if strings.EqualFold(os.Getenv("BBB_AZURE_ALLOW_ANY_TENANT"), "true") {
+			opts.AdditionallyAllowedTenants = []string{"*"}
+		}
+		cachedDefaultCred, cachedDefaultCredErr = azidentity.NewDefaultAzureCredential(opts)
+		if cachedDefaultCredErr == nil && slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+			tok, tokErr := cachedDefaultCred.GetToken(context.Background(), policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
+			if tokErr == nil {
+				parts := strings.Split(tok.Token, ".")
+				if len(parts) == 3 {
+					payload, decErr := base64.RawURLEncoding.DecodeString(parts[1])
+					if decErr == nil {
+						slog.Debug("Decoded JWT payload", "payload", string(payload))
+					} else {
+						slog.Debug("Failed to decode JWT payload", "error", decErr)
+					}
+				} else {
+					slog.Debug("Token is not a JWT")
+				}
+			} else {
+				slog.Debug("Failed to get token for JWT debug logging", "error", tokErr)
+			}
+		}
+	})
+	return cachedDefaultCred, cachedDefaultCredErr
+}
+
+// accountKey returns the shared account key for the given storage account.
+// It checks for a role-prefixed key first (e.g. SRC_BBB_AZBLOB_ACCOUNTKEY),
+// then falls back to the global BBB_AZBLOB_ACCOUNTKEY.
+func accountKey(account string) string {
+	if roleVal, ok := accountRoles.Load(account); ok {
+		if k := os.Getenv(roleVal.(string) + "_BBB_AZBLOB_ACCOUNTKEY"); k != "" {
+			return k
+		}
+	}
+	return os.Getenv("BBB_AZBLOB_ACCOUNTKEY")
+}
+
 // getAzBlobClient returns an Azure Blob client for the given account using either a shared key
-// from BBB_AZBLOB_ACCOUNTKEY or the default Azure credential.
+// from BBB_AZBLOB_ACCOUNTKEY (or role-prefixed SRC_/DST_ variant) or the default Azure credential.
+// Clients are cached per account for the process lifetime.
 func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
+	// Check cache first.
+	if cached, ok := blobClientCache.Load(account); ok {
+		return cached.(*azblob.Client), nil
+	}
 	endpoint := getEndpoint(account)
-	if key := os.Getenv("BBB_AZBLOB_ACCOUNTKEY"); key != "" {
+	var client *azblob.Client
+	if key := accountKey(account); key != "" {
 		cred, err := azblob.NewSharedKeyCredential(account, key)
 		if err != nil {
 			return nil, err
 		}
-		return azblob.NewClientWithSharedKeyCredential(endpoint, cred, nil)
-	}
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if slog.Default().Enabled(ctx, slog.LevelDebug) {
-		tok, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
+		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, cred, nil)
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		cred, credErr := getCredentialForAccount(ctx, account)
+		if credErr != nil {
+			return nil, credErr
+		}
 
-		parts := strings.Split(tok.Token, ".")
-		if len(parts) == 3 {
-			payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-			if err == nil {
-				slog.Debug("Decoded JWT payload", "payload", string(payload))
-			} else {
-				slog.Debug("Failed to decode JWT payload", "error", err)
-			}
-		} else {
-			slog.Debug("Token is not a JWT")
+		var clientErr error
+		client, clientErr = azblob.NewClient(endpoint, cred, nil)
+		if clientErr != nil {
+			return nil, clientErr
 		}
 	}
-	return azblob.NewClient(endpoint, cred, nil)
+	// Store-or-load: if another goroutine raced and stored first, use theirs.
+	actual, _ := blobClientCache.LoadOrStore(account, client)
+	return actual.(*azblob.Client), nil
 }
 
 // List lists immediate children (non-recursive). If dir-like path provided, lists under it.
@@ -398,46 +807,77 @@ func List(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
 	return out, nil
 }
 
-// ListRecursive retrieves all blobs under path (treats path as prefix root)
-func ListRecursive(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
-	prefix := ap.Blob
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
+// ListRecursiveStream streams all blobs under path via callback (treats path as prefix root).
+// Uses parallel prefix walking (similar to azcopy) to enumerate blobs across multiple
+// subdirectories concurrently, dramatically improving scan speed for deep hierarchies.
+// scanConcurrency controls how many directory prefixes are listed in parallel.
+// When scanConcurrency > 1, cb must be safe for concurrent use by multiple goroutines.
+// normalizeRootPrefix ensures the prefix ends with "/" for use as a
+// blob name root. An empty prefix stays empty (represents the container root).
+func normalizeRootPrefix(blob string) string {
+	if blob != "" && !strings.HasSuffix(blob, "/") {
+		return blob + "/"
 	}
+	return blob
+}
+
+func ListRecursiveStream(ctx context.Context, ap AzurePath, scanConcurrency int, cb func(BlobMeta) error) error {
+	rootPrefix := normalizeRootPrefix(ap.Blob)
 	client, err := getAzBlobClient(ctx, ap.Account)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	containerClient := client.ServiceClient().NewContainerClient(ap.Container)
-	opts := &azblob.ListBlobsFlatOptions{
-		Include: azblob.ListBlobsInclude{Metadata: true},
-	}
-	// Use nil Prefix for container root; see ListStream comment.
+
+	// Always use flat listing — a single sequential pager that returns all
+	// blobs under the prefix. This is faster than hierarchy walking (which
+	// must discover directories level-by-level) for typical container sizes
+	// because it avoids per-directory round-trips and synchronization
+	// overhead. The flat pager returns up to 5000 items per page, so even
+	// millions of blobs only require hundreds of sequential API calls —
+	// much faster than tree-shaped hierarchy walks with fanout at each level.
+	return listRecursiveFlat(ctx, containerClient, ap.Container, rootPrefix, cb)
+}
+
+// listRecursiveFlat is the sequential fallback using a flat pager.
+func listRecursiveFlat(ctx context.Context, containerClient *container.Client, containerName, prefix string, cb func(BlobMeta) error) error {
+	opts := &azblob.ListBlobsFlatOptions{}
 	if prefix != "" {
 		opts.Prefix = &prefix
 	}
 	pager := containerClient.NewListBlobsFlatPager(opts)
-	var out []BlobMeta
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
-			return nil, err
-		}
-		if resp.Segment == nil {
-			// Check if error is due to missing container
 			var respErr *azcore.ResponseError
 			if errors.As(err, &respErr) && respErr.ErrorCode == "ContainerNotFound" {
-				return nil, fmt.Errorf("container '%s' not found", ap.Container)
+				return fmt.Errorf("container '%s' not found", containerName)
 			}
-			// If Segment is nil but no error, treat as empty container
-			return []BlobMeta{}, nil
+			return err
+		}
+		if resp.Segment == nil {
+			return nil
 		}
 		for _, blob := range resp.Segment.BlobItems {
 			if blob == nil || blob.Name == nil || blob.Properties == nil || blob.Properties.ContentLength == nil {
 				continue
 			}
-			out = append(out, BlobMeta{Name: strings.TrimPrefix(*blob.Name, prefix), Size: *blob.Properties.ContentLength})
+			if err := cb(BlobMeta{Name: strings.TrimPrefix(*blob.Name, prefix), Size: *blob.Properties.ContentLength}); err != nil {
+				return err
+			}
 		}
+	}
+	return nil
+}
+
+// ListRecursive retrieves all blobs under path (treats path as prefix root)
+func ListRecursive(ctx context.Context, ap AzurePath) ([]BlobMeta, error) {
+	var out []BlobMeta
+	if err := ListRecursiveStream(ctx, ap, 1, func(bm BlobMeta) error {
+		out = append(out, bm)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -617,7 +1057,7 @@ func readerSize(reader io.Reader) int64 {
 }
 
 // UploadStream writes blob content from a reader (overwrite).
-func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
+func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader, concurrency int) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return errors.New("cannot upload to directory-like path")
 	}
@@ -635,8 +1075,12 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader) error {
 			return fmt.Errorf("put failed: stream size %d exceeds %d", size, maxSize)
 		}
 	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
 	_, err = blobClient.UploadStream(ctx, reader, &azblob.UploadStreamOptions{
-		BlockSize: blockSize,
+		BlockSize:   blockSize,
+		Concurrency: concurrency,
 	})
 	if err != nil {
 		return fmt.Errorf("put failed: %v", err)
@@ -689,7 +1133,7 @@ func planBlocks(totalSize int64, defaultBlockSize int64, maxBlocks int64) (block
 // bytes copied so far and the total size in bytes.
 type CopyProgress func(copied, total int64)
 
-func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concurrency int, onProgress CopyProgress) error {
+func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concurrency int, sizeHint int64, onProgress CopyProgress) error {
 	if src.Blob == "" || strings.HasSuffix(src.Blob, "/") {
 		return errors.New("source path is directory-like")
 	}
@@ -708,10 +1152,13 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 		return err
 	}
 
-	// Get source size for block splitting.
-	totalSize, err := HeadBlob(ctx, src)
-	if err != nil {
-		return fmt.Errorf("failed to get source properties: %w", err)
+	// Use provided size when available to avoid a HeadBlob round-trip.
+	totalSize := sizeHint
+	if totalSize <= 0 {
+		totalSize, err = HeadBlob(ctx, src)
+		if err != nil {
+			return fmt.Errorf("failed to get source properties: %w", err)
+		}
 	}
 
 	err = copyBlobBlocks(ctx, client, dst, copySource, totalSize, concurrency, onProgress)
@@ -908,8 +1355,108 @@ func parseCopyProgress(s string) (copied, total int64, ok bool) {
 	return c, t, true
 }
 
+// --- Cached User Delegation Credential for SAS URL generation ---
+
+// udcCacheEntry caches a User Delegation Credential for an account.
+// The UDK is valid from start to expiry; we refresh when the current time
+// exceeds refreshAt (50% of the remaining validity).
+type udcCacheEntry struct {
+	udc       *service.UserDelegationCredential
+	svcClient *service.Client
+	start     time.Time
+	expiry    time.Time
+	refreshAt time.Time
+}
+
+var (
+	udcCacheMu  sync.Mutex
+	udcCache    = make(map[string]*udcCacheEntry) // keyed by account
+	udcInflight = make(map[string]chan struct{})  // per-account in-flight guard
+)
+
+// getUDC returns a cached User Delegation Credential for the account,
+// refreshing it when necessary. Thread-safe. Concurrent refresh requests
+// for the same account are deduped: the first goroutine performs the
+// network call while others wait for it to finish.
+func getUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
+	for {
+		udcCacheMu.Lock()
+		entry, ok := udcCache[account]
+		if ok && time.Now().UTC().Before(entry.refreshAt) {
+			udcCacheMu.Unlock()
+			return entry.udc, entry.svcClient, entry.start, entry.expiry, nil
+		}
+		// Check if another goroutine is already refreshing this account.
+		if ch, inflight := udcInflight[account]; inflight {
+			udcCacheMu.Unlock()
+			// Wait for the in-flight refresh to complete, then retry.
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return nil, nil, time.Time{}, time.Time{}, ctx.Err()
+			}
+			continue
+		}
+		// Claim the refresh slot for this account.
+		ch := make(chan struct{})
+		udcInflight[account] = ch
+		udcCacheMu.Unlock()
+
+		udc, svcClient, start, expiry, err := refreshUDC(ctx, account)
+
+		udcCacheMu.Lock()
+		delete(udcInflight, account)
+		close(ch)
+		udcCacheMu.Unlock()
+
+		return udc, svcClient, start, expiry, err
+	}
+}
+
+// refreshUDC performs the actual UDC refresh (network call). Called at most
+// once per account at a time, guarded by udcInflight.
+func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
+	cred, err := getCredentialForAccount(ctx, account)
+	if err != nil {
+		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("credential for %s: %w", account, err)
+	}
+	endpoint := getEndpoint(account)
+	svcClient, err := service.NewClient(endpoint, cred, nil)
+	if err != nil {
+		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("service client: %w", err)
+	}
+	now := time.Now().UTC().Add(-clockSkewTolerance)
+	expiry := now.Add(copySASDuration())
+	startStr := now.Format(sas.TimeFormat)
+	expiryStr := expiry.Format(sas.TimeFormat)
+	udc, err := svcClient.GetUserDelegationCredential(ctx, service.KeyInfo{
+		Start:  &startStr,
+		Expiry: &expiryStr,
+	}, nil)
+	if err != nil {
+		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("get user delegation credential: %w", err)
+	}
+
+	// Refresh at 50% of the key's validity window so we never use an
+	// about-to-expire key. Use the same time base (now) for consistency.
+	refreshAt := now.Add(copySASDuration() / 2)
+
+	newEntry := &udcCacheEntry{
+		udc:       udc,
+		svcClient: svcClient,
+		start:     now,
+		expiry:    expiry,
+		refreshAt: refreshAt,
+	}
+	udcCacheMu.Lock()
+	udcCache[account] = newEntry
+	udcCacheMu.Unlock()
+
+	return udc, svcClient, now, expiry, nil
+}
+
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
-	if os.Getenv("BBB_AZBLOB_ACCOUNTKEY") != "" {
+	if accountKey(ap.Account) != "" {
 		client, err := getAzBlobClient(ctx, ap.Account)
 		if err != nil {
 			return "", err
@@ -924,32 +1471,18 @@ func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
 	return blobDelegationSASURL(ctx, ap)
 }
 
-// blobDelegationSASURL generates a SAS URL using a User Delegation Key obtained
-// via OAuth. This enables cross-account server-side copy within the same tenant.
+// blobDelegationSASURL generates a SAS URL using a cached User Delegation Key
+// obtained via OAuth. This enables cross-account server-side copy within the
+// same tenant. The UDK is cached per account and refreshed at 50% of its
+// validity period.
 func blobDelegationSASURL(ctx context.Context, ap AzurePath) (string, error) {
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	udc, svcClient, start, expiry, err := getUDC(ctx, ap.Account)
 	if err != nil {
-		return "", fmt.Errorf("default credential: %w", err)
-	}
-	endpoint := getEndpoint(ap.Account)
-	svcClient, err := service.NewClient(endpoint, cred, nil)
-	if err != nil {
-		return "", fmt.Errorf("service client: %w", err)
-	}
-	now := time.Now().UTC().Add(-5 * time.Minute) // backdate to tolerate clock skew
-	expiry := now.Add(copySASDuration())
-	startStr := now.Format(sas.TimeFormat)
-	expiryStr := expiry.Format(sas.TimeFormat)
-	udc, err := svcClient.GetUserDelegationCredential(ctx, service.KeyInfo{
-		Start:  &startStr,
-		Expiry: &expiryStr,
-	}, nil)
-	if err != nil {
-		return "", fmt.Errorf("get user delegation credential: %w", err)
+		return "", err
 	}
 	sasValues := sas.BlobSignatureValues{
 		Protocol:      sas.ProtocolHTTPS,
-		StartTime:     now,
+		StartTime:     start,
 		ExpiryTime:    expiry,
 		Permissions:   (&sas.BlobPermissions{Read: true}).String(),
 		ContainerName: ap.Container,

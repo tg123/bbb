@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 )
 
 func TestParseHTTPSBlobURL(t *testing.T) {
@@ -61,20 +63,20 @@ func TestCopyBlobServerSideRejectsDirLike(t *testing.T) {
 	ctx := context.Background()
 	src := AzurePath{Account: "acct", Container: "container"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
-	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil); err == nil {
 		t.Fatal("expected error for dir-like source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil); err == nil {
 		t.Fatal("expected error for trailing slash source")
 	}
 	src = AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst = AzurePath{Account: "acct", Container: "container"}
-	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil); err == nil {
 		t.Fatal("expected error for dir-like destination")
 	}
 	dst = AzurePath{Account: "acct", Container: "container", Blob: "dir/"}
-	if err := CopyBlobServerSide(ctx, src, dst, 4, nil); err == nil {
+	if err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil); err == nil {
 		t.Fatal("expected error for trailing slash destination")
 	}
 }
@@ -85,7 +87,7 @@ func TestCopyBlobServerSideCrossAccountRequiresCredentials(t *testing.T) {
 	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct1", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct2", Container: "container", Blob: "file.txt"}
-	err := CopyBlobServerSide(ctx, src, dst, 4, nil)
+	err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil)
 	if err == nil {
 		t.Fatal("expected error for cross-account copy without credentials")
 	}
@@ -97,7 +99,7 @@ func TestCopyBlobServerSideFallsBackToUserDelegation(t *testing.T) {
 	cancel() // cancel immediately to prevent real HTTP calls
 	src := AzurePath{Account: "acct", Container: "container", Blob: "file.txt"}
 	dst := AzurePath{Account: "acct", Container: "container", Blob: "other.txt"}
-	err := CopyBlobServerSide(ctx, src, dst, 4, nil)
+	err := CopyBlobServerSide(ctx, src, dst, 4, 0, nil)
 	// Without real Azure credentials the user delegation path will fail,
 	// but it must NOT be a MissingSharedKeyCredential error since we now
 	// attempt the delegation path instead.
@@ -486,5 +488,562 @@ func TestExtractFirstLevelEmptyPrefix(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("expected 2 entries, got %d: %+v", len(got), got)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+func TestProcessHierarchySegmentPrefixesAndItems(t *testing.T) {
+	seg := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{
+			{Name: strPtr("prefix/dir/")},
+		},
+		BlobItems: []*container.BlobItem{
+			{Name: strPtr("prefix/file.txt"), Properties: &container.BlobProperties{ContentLength: int64Ptr(42)}},
+		},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	err := processHierarchySegment(seg, "prefix/", seen, func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "dir/" || got[0].Size != 0 {
+		t.Fatalf("expected dir/ with size 0, got %+v", got[0])
+	}
+	if got[1].Name != "file.txt" || got[1].Size != 42 {
+		t.Fatalf("expected file.txt with size 42, got %+v", got[1])
+	}
+}
+
+func TestProcessHierarchySegmentDedup(t *testing.T) {
+	// A directory-marker blob "dir/" appears as both a BlobPrefix and BlobItem.
+	seg := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{
+			{Name: strPtr("dir/")},
+		},
+		BlobItems: []*container.BlobItem{
+			// directory-marker blob with nil ContentLength — should be skipped
+			{Name: strPtr("dir/"), Properties: nil},
+		},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	err := processHierarchySegment(seg, "", seen, func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry (deduped), got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "dir/" {
+		t.Fatalf("expected 'dir/', got %q", got[0].Name)
+	}
+}
+
+func TestProcessHierarchySegmentDedupAcrossCalls(t *testing.T) {
+	// Simulate two pages returning the same prefix
+	seg1 := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{
+			{Name: strPtr("prefix/subdir/")},
+		},
+	}
+	seg2 := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{
+			{Name: strPtr("prefix/subdir/")},
+		},
+		BlobItems: []*container.BlobItem{
+			{Name: strPtr("prefix/new.txt"), Properties: &container.BlobProperties{ContentLength: int64Ptr(10)}},
+		},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	cb := func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	}
+	if err := processHierarchySegment(seg1, "prefix/", seen, cb); err != nil {
+		t.Fatal(err)
+	}
+	if err := processHierarchySegment(seg2, "prefix/", seen, cb); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries (subdir/ + new.txt), got %d: %+v", len(got), got)
+	}
+}
+
+func TestProcessHierarchySegmentSkipsNilContentLength(t *testing.T) {
+	seg := &container.BlobHierarchyListSegment{
+		BlobItems: []*container.BlobItem{
+			{Name: strPtr("marker"), Properties: nil},
+			{Name: strPtr("file.txt"), Properties: &container.BlobProperties{ContentLength: int64Ptr(100)}},
+			{Name: strPtr("nosize"), Properties: &container.BlobProperties{ContentLength: nil}},
+		},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	err := processHierarchySegment(seg, "", seen, func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry (only file.txt), got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "file.txt" || got[0].Size != 100 {
+		t.Fatalf("expected file.txt with size 100, got %+v", got[0])
+	}
+}
+
+func TestProcessHierarchySegmentSkipsNilEntries(t *testing.T) {
+	seg := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{nil, {Name: nil}, {Name: strPtr("dir/")}},
+		BlobItems:    []*container.BlobItem{nil, {Name: nil}, {Name: strPtr("f"), Properties: &container.BlobProperties{ContentLength: int64Ptr(1)}}},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	err := processHierarchySegment(seg, "", seen, func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d: %+v", len(got), got)
+	}
+}
+
+func TestProcessHierarchySegmentPrefixTrimming(t *testing.T) {
+	seg := &container.BlobHierarchyListSegment{
+		BlobPrefixes: []*container.BlobPrefix{
+			{Name: strPtr("root/sub/")},
+		},
+		BlobItems: []*container.BlobItem{
+			{Name: strPtr("root/data.bin"), Properties: &container.BlobProperties{ContentLength: int64Ptr(50)}},
+		},
+	}
+	seen := make(map[string]bool)
+	var got []BlobMeta
+	err := processHierarchySegment(seg, "root/", seen, func(bm BlobMeta) error {
+		got = append(got, bm)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "sub/" {
+		t.Fatalf("expected prefix trimmed to 'sub/', got %q", got[0].Name)
+	}
+	if got[1].Name != "data.bin" {
+		t.Fatalf("expected prefix trimmed to 'data.bin', got %q", got[1].Name)
+	}
+}
+
+// --- normalizeRootPrefix tests ---
+
+func TestNormalizeRootPrefixEmpty(t *testing.T) {
+	if got := normalizeRootPrefix(""); got != "" {
+		t.Fatalf("expected empty, got %q", got)
+	}
+}
+
+func TestNormalizeRootPrefixNoSlash(t *testing.T) {
+	if got := normalizeRootPrefix("data"); got != "data/" {
+		t.Fatalf("expected 'data/', got %q", got)
+	}
+}
+
+func TestNormalizeRootPrefixAlreadySlash(t *testing.T) {
+	if got := normalizeRootPrefix("data/"); got != "data/" {
+		t.Fatalf("expected 'data/', got %q", got)
+	}
+}
+
+func TestNormalizeRootPrefixNestedPath(t *testing.T) {
+	if got := normalizeRootPrefix("a/b/c"); got != "a/b/c/" {
+		t.Fatalf("expected 'a/b/c/', got %q", got)
+	}
+}
+
+// --- ListRecursiveStream context cancellation test ---
+
+func TestListRecursiveStreamCancelledContext(t *testing.T) {
+	// ListRecursiveStream should return immediately with a cancelled context
+	// without invoking the callback.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before calling
+
+	ap := AzurePath{Account: "fakeaccount", Container: "fakecontainer", Blob: "prefix"}
+	err := ListRecursiveStream(ctx, ap, 4, func(bm BlobMeta) error {
+		t.Fatal("callback should never be invoked with cancelled context")
+		return nil
+	})
+	// Both nil (early exit before client creation) and non-nil (context error
+	// from getAzBlobClient) are acceptable — the key invariant is that the
+	// callback was never invoked.
+	_ = err
+}
+
+// --- Name rewriting tests ---
+
+func TestNameRewriteWithRootPrefix(t *testing.T) {
+	// Verify that blob names are correctly trimmed relative to rootPrefix.
+	// This tests the inline TrimPrefix logic used in walkPrefix.
+	rootPrefix := normalizeRootPrefix("mydata")
+	blobName := "mydata/subdir/file.txt"
+	got := strings.TrimPrefix(blobName, rootPrefix)
+	if got != "subdir/file.txt" {
+		t.Fatalf("expected 'subdir/file.txt', got %q", got)
+	}
+}
+
+func TestNameRewriteEmptyRootPrefix(t *testing.T) {
+	rootPrefix := normalizeRootPrefix("")
+	blobName := "top-level.txt"
+	got := strings.TrimPrefix(blobName, rootPrefix)
+	if got != "top-level.txt" {
+		t.Fatalf("expected 'top-level.txt', got %q", got)
+	}
+}
+
+func TestNameRewriteNestedPrefix(t *testing.T) {
+	rootPrefix := normalizeRootPrefix("a/b")
+	blobName := "a/b/c/d.txt"
+	got := strings.TrimPrefix(blobName, rootPrefix)
+	if got != "c/d.txt" {
+		t.Fatalf("expected 'c/d.txt', got %q", got)
+	}
+}
+
+// --- Tenant discovery / challenge parsing tests ---
+
+func TestParseTenantFromChallengeValid(t *testing.T) {
+	header := `Bearer authorization_uri="https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47/oauth2/authorize" resource_id="https://storage.azure.com"`
+	tid := parseTenantFromChallenge(header)
+	if tid != "72f988bf-86f1-41af-91ab-2d7cd011db47" {
+		t.Fatalf("expected tenant ID '72f988bf-86f1-41af-91ab-2d7cd011db47', got %q", tid)
+	}
+}
+
+func TestParseTenantFromChallengeNoQuotes(t *testing.T) {
+	header := `Bearer authorization_uri=https://login.microsoftonline.com/abcdef01-2345-6789-abcd-ef0123456789/oauth2/authorize`
+	tid := parseTenantFromChallenge(header)
+	if tid != "abcdef01-2345-6789-abcd-ef0123456789" {
+		t.Fatalf("expected tenant ID 'abcdef01-2345-6789-abcd-ef0123456789', got %q", tid)
+	}
+}
+
+func TestParseTenantFromChallengeEmpty(t *testing.T) {
+	if tid := parseTenantFromChallenge(""); tid != "" {
+		t.Fatalf("expected empty tenant ID, got %q", tid)
+	}
+}
+
+func TestParseTenantFromChallengeNoMatch(t *testing.T) {
+	if tid := parseTenantFromChallenge("Bearer realm=example.com"); tid != "" {
+		t.Fatalf("expected empty tenant ID, got %q", tid)
+	}
+}
+
+func TestParseTenantFromChallengeMalformedUUID(t *testing.T) {
+	// 35 chars instead of 36 — should not match.
+	header := `Bearer authorization_uri="https://login.microsoftonline.com/short-uuid/oauth2/authorize"`
+	if tid := parseTenantFromChallenge(header); tid != "" {
+		t.Fatalf("expected empty tenant ID for short UUID, got %q", tid)
+	}
+}
+
+func TestAccountTenantIDEnvUpperCase(t *testing.T) {
+	t.Setenv("BBB_AZ_TENANT_MYACCOUNT", "env-tenant-upper")
+	tid := accountTenantID(context.Background(), "myaccount")
+	if tid != "env-tenant-upper" {
+		t.Fatalf("expected 'env-tenant-upper', got %q", tid)
+	}
+}
+
+func TestAccountTenantIDEnvExactCase(t *testing.T) {
+	t.Setenv("BBB_AZ_TENANT_myMixed", "env-tenant-exact")
+	tid := accountTenantID(context.Background(), "myMixed")
+	if tid != "env-tenant-exact" {
+		t.Fatalf("expected 'env-tenant-exact', got %q", tid)
+	}
+}
+
+func TestAccountTenantIDEnvUpperPrecedence(t *testing.T) {
+	t.Setenv("BBB_AZ_TENANT_MYACCT", "upper-wins")
+	t.Setenv("BBB_AZ_TENANT_myacct", "exact-loses")
+	tid := accountTenantID(context.Background(), "myacct")
+	if tid != "upper-wins" {
+		t.Fatalf("expected upper-case env to take precedence, got %q", tid)
+	}
+}
+
+func TestAccountTenantIDFallsBackToDiscovery(t *testing.T) {
+	// Pre-populate the tenant cache to avoid real HTTP calls.
+	tenantCache.Store("cachedacct", "cached-tenant-id")
+	defer tenantCache.Delete("cachedacct")
+	tid := accountTenantID(context.Background(), "cachedacct")
+	if tid != "cached-tenant-id" {
+		t.Fatalf("expected 'cached-tenant-id', got %q", tid)
+	}
+}
+
+func TestDiscoverTenantIDUsesCache(t *testing.T) {
+	tenantCache.Store("testacct", "from-cache")
+	defer tenantCache.Delete("testacct")
+	tid := discoverTenantID(context.Background(), "testacct")
+	if tid != "from-cache" {
+		t.Fatalf("expected 'from-cache', got %q", tid)
+	}
+}
+
+// roundTripFunc implements http.RoundTripper for test stubbing.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestDiscoverTenantIDFromHTTP(t *testing.T) {
+	// Replace the default HTTP client with a stubbed transport.
+	origClient := defaultHTTPClientVal
+	defaultHTTPClientOnce.Do(func() {}) // ensure Once is done
+	defaultHTTPClientVal = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: 401,
+				Header: http.Header{
+					"Www-Authenticate": []string{
+						`Bearer authorization_uri="https://login.microsoftonline.com/aabbccdd-1122-3344-5566-778899001122/oauth2/authorize"`,
+					},
+				},
+				Body: io.NopCloser(strings.NewReader("")),
+			}, nil
+		}),
+	}
+	defer func() { defaultHTTPClientVal = origClient }()
+
+	// Clear any cached value for this account.
+	tenantCache.Delete("stubacct")
+	defer tenantCache.Delete("stubacct")
+
+	tid := discoverTenantID(context.Background(), "stubacct")
+	if tid != "aabbccdd-1122-3344-5566-778899001122" {
+		t.Fatalf("expected discovered tenant 'aabbccdd-1122-3344-5566-778899001122', got %q", tid)
+	}
+
+	// Verify it was cached.
+	cached, ok := tenantCache.Load("stubacct")
+	if !ok || cached.(string) != "aabbccdd-1122-3344-5566-778899001122" {
+		t.Fatal("expected tenant ID to be cached after discovery")
+	}
+}
+
+func TestDiscoverTenantIDHTTPError(t *testing.T) {
+	origClient := defaultHTTPClientVal
+	defaultHTTPClientOnce.Do(func() {})
+	defaultHTTPClientVal = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, errors.New("network error")
+		}),
+	}
+	defer func() { defaultHTTPClientVal = origClient }()
+
+	tenantCache.Delete("erroracct")
+	tid := discoverTenantID(context.Background(), "erroracct")
+	if tid != "" {
+		t.Fatalf("expected empty tenant ID on HTTP error, got %q", tid)
+	}
+}
+
+func TestRegisterAccountRoleStoresUpperCase(t *testing.T) {
+	defer accountRoles.Delete("testacct")
+	RegisterAccountRole("testacct", "src")
+	v, ok := accountRoles.Load("testacct")
+	if !ok || v.(string) != "SRC" {
+		t.Fatalf("expected SRC, got %v", v)
+	}
+}
+
+func TestAccountKeyRolePrefixedTakesPrecedence(t *testing.T) {
+	defer accountRoles.Delete("acctkey1")
+	RegisterAccountRole("acctkey1", "SRC")
+	t.Setenv("SRC_BBB_AZBLOB_ACCOUNTKEY", "src-key-123")
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "global-key")
+	if got := accountKey("acctkey1"); got != "src-key-123" {
+		t.Fatalf("expected role-prefixed key, got %q", got)
+	}
+}
+
+func TestAccountKeyFallsBackToGlobal(t *testing.T) {
+	defer accountRoles.Delete("acctkey2")
+	RegisterAccountRole("acctkey2", "DST")
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "global-key")
+	// No DST_BBB_AZBLOB_ACCOUNTKEY set
+	if got := accountKey("acctkey2"); got != "global-key" {
+		t.Fatalf("expected global key fallback, got %q", got)
+	}
+}
+
+func TestAccountKeyNoRoleUsesGlobal(t *testing.T) {
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "global-only")
+	if got := accountKey("noroleacct"); got != "global-only" {
+		t.Fatalf("expected global key, got %q", got)
+	}
+}
+
+func TestAccountKeyNoEnvReturnsEmpty(t *testing.T) {
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "")
+	if got := accountKey("emptyacct"); got != "" {
+		t.Fatalf("expected empty, got %q", got)
+	}
+}
+
+func TestRoleEnvVarsCoversAllExpectedVars(t *testing.T) {
+	expected := map[string]bool{
+		"AZURE_CLIENT_ID":                     false,
+		"AZURE_TENANT_ID":                     false,
+		"AZURE_CLIENT_SECRET":                 false,
+		"AZURE_CLIENT_CERTIFICATE_PATH":       false,
+		"AZURE_CLIENT_CERTIFICATE_PASSWORD":   false,
+		"AZURE_CLIENT_SEND_CERTIFICATE_CHAIN": false,
+		"AZURE_FEDERATED_TOKEN_FILE":          false,
+		"IDENTITY_ENDPOINT":                   false,
+		"IDENTITY_HEADER":                     false,
+		"MSI_ENDPOINT":                        false,
+		"MSI_SECRET":                          false,
+		"IMDS_ENDPOINT":                       false,
+		"AZURE_AUTHORITY_HOST":                false,
+		"AZURE_USERNAME":                      false,
+		"AZURE_CONFIG_DIR":                    false,
+	}
+	for _, v := range roleEnvVars {
+		if _, ok := expected[v]; !ok {
+			t.Errorf("unexpected var in roleEnvVars: %s", v)
+		}
+		expected[v] = true
+	}
+	for k, found := range expected {
+		if !found {
+			t.Errorf("missing var in roleEnvVars: %s", k)
+		}
+	}
+}
+
+func TestGetCredentialForRoleReturnsNilWhenNoEnvSet(t *testing.T) {
+	// Clear any cached credential for "TESTROLE".
+	roleCredCache.Delete("TESTROLE")
+	// Ensure no TESTROLE_ env vars are set.
+	for _, v := range roleEnvVars {
+		t.Setenv("TESTROLE_"+v, "")
+	}
+	cred, err := getCredentialForRole("TESTROLE")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cred != nil {
+		t.Fatal("expected nil credential when no env vars set")
+	}
+}
+
+func TestGetCredentialForRoleRemapsEnvVars(t *testing.T) {
+	// Clear cached credential.
+	roleCredCache.Delete("REMAP")
+
+	// Set role-prefixed env vars for a client-secret credential.
+	t.Setenv("REMAP_AZURE_TENANT_ID", "test-tenant")
+	t.Setenv("REMAP_AZURE_CLIENT_ID", "test-client")
+	t.Setenv("REMAP_AZURE_CLIENT_SECRET", "test-secret")
+
+	// Clear any global env vars that could interfere.
+	for _, v := range roleEnvVars {
+		t.Setenv(v, "")
+	}
+
+	cred, err := getCredentialForRole("REMAP")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cred == nil {
+		t.Fatal("expected non-nil credential")
+	}
+
+	// Verify env vars were restored (cleared).
+	for _, v := range roleEnvVars {
+		if got := os.Getenv(v); got != "" {
+			t.Errorf("env var %s not restored, got %q", v, got)
+		}
+	}
+}
+
+func TestGetCredentialForRoleRestoresOriginalEnv(t *testing.T) {
+	roleCredCache.Delete("RESTORE")
+
+	// Set original values.
+	t.Setenv("AZURE_TENANT_ID", "original-tenant")
+	t.Setenv("AZURE_CLIENT_ID", "original-client")
+	t.Setenv("AZURE_CLIENT_SECRET", "original-secret")
+
+	// Set role-prefixed values.
+	t.Setenv("RESTORE_AZURE_TENANT_ID", "role-tenant")
+	t.Setenv("RESTORE_AZURE_CLIENT_ID", "role-client")
+	t.Setenv("RESTORE_AZURE_CLIENT_SECRET", "role-secret")
+
+	_, err := getCredentialForRole("RESTORE")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify originals are restored.
+	if got := os.Getenv("AZURE_TENANT_ID"); got != "original-tenant" {
+		t.Errorf("AZURE_TENANT_ID not restored, got %q", got)
+	}
+	if got := os.Getenv("AZURE_CLIENT_ID"); got != "original-client" {
+		t.Errorf("AZURE_CLIENT_ID not restored, got %q", got)
+	}
+	if got := os.Getenv("AZURE_CLIENT_SECRET"); got != "original-secret" {
+		t.Errorf("AZURE_CLIENT_SECRET not restored, got %q", got)
+	}
+}
+
+func TestGetCredentialForRoleCachesResult(t *testing.T) {
+	roleCredCache.Delete("CACHED")
+
+	t.Setenv("CACHED_AZURE_TENANT_ID", "t")
+	t.Setenv("CACHED_AZURE_CLIENT_ID", "c")
+	t.Setenv("CACHED_AZURE_CLIENT_SECRET", "s")
+	for _, v := range roleEnvVars {
+		t.Setenv(v, "")
+	}
+
+	cred1, err := getCredentialForRole("CACHED")
+	if err != nil {
+		t.Fatalf("first call error: %v", err)
+	}
+
+	cred2, err := getCredentialForRole("CACHED")
+	if err != nil {
+		t.Fatalf("second call error: %v", err)
+	}
+
+	// Both calls should return the same cached instance.
+	if cred1 != cred2 {
+		t.Error("expected cached credential to be reused")
 	}
 }
