@@ -230,15 +230,17 @@ func main() {
 
 				if dnsCache {
 					var ttl time.Duration // 0 means unlimited
-					if raw := os.Getenv("BBB_DNS_CACHE_TTL"); raw != "" {
-						d, err := time.ParseDuration(raw)
-						if err != nil {
-							return ctx, fmt.Errorf("invalid BBB_DNS_CACHE_TTL %q: %w", raw, err)
+					if !dnsPin {
+						if raw := os.Getenv("BBB_DNS_CACHE_TTL"); raw != "" {
+							d, err := time.ParseDuration(raw)
+							if err != nil {
+								return ctx, fmt.Errorf("invalid BBB_DNS_CACHE_TTL %q: %w", raw, err)
+							}
+							if d < 0 {
+								return ctx, fmt.Errorf("invalid BBB_DNS_CACHE_TTL %q: must be non-negative", raw)
+							}
+							ttl = d
 						}
-						if d < 0 {
-							return ctx, fmt.Errorf("invalid BBB_DNS_CACHE_TTL %q: must be non-negative", raw)
-						}
-						ttl = d
 					}
 					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver, ttl, dnsPin)
 					ttlStr := "unlimited"

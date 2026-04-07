@@ -131,7 +131,7 @@ BBB_DNS_CACHE=1 bbb cp ./data/ az://myaccount/mycontainer/data/
 
 ### `BBB_DNS_PIN`
 
-When enabled, bbb pins every hostname to a single IP address. If DNS returns multiple addresses, only the first is used for all connections to that host. This implicitly enables `BBB_DNS_CACHE`. Pinning can help avoid 403 errors from services that tie authentication tokens to a specific endpoint IP.
+When enabled, bbb pins every hostname to a single IP address. If DNS returns multiple addresses, only the first is used for all connections to that host. This implicitly enables `BBB_DNS_CACHE` with unlimited TTL (`BBB_DNS_CACHE_TTL` is ignored). Pinning can help avoid 403 errors from services that tie authentication tokens to a specific endpoint IP.
 
 ```bash
 BBB_DNS_PIN=1 bbb cp ./data/ az://myaccount/mycontainer/data/
