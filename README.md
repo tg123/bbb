@@ -52,6 +52,7 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 |----------|---------|-------------|
 | `BBB_LOG_LEVEL` | `info` | Same as `--loglevel` flag |
 | `BBB_DNS_CACHE` | *(off)* | Set to `1`, `true`, `yes`, or `on` to enable process-local DNS caching |
+| `BBB_DNS_PIN` | *(off)* | Set to `1`, `true`, `yes`, or `on` to pin DNS to a single IP (implies `BBB_DNS_CACHE=1`) |
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
@@ -127,6 +128,19 @@ BBB_DNS_CACHE=1 bbb cp ./data/ az://myaccount/mycontainer/data/
 
 - DNS records that change during the TTL window (e.g. IP rotations) will not be picked up until the cached entry expires.
 - Because cached addresses are dialled as IP literals, Go's standard Happy Eyeballs (RFC 6555) connection racing is bypassed. For Azure Blob Storage endpoints (typically single-stack) this has no practical impact.
+
+### `BBB_DNS_PIN`
+
+When enabled, bbb pins every hostname to a single IP address. If DNS returns multiple addresses, only the first *reachable* address is used for all connections to that host. This implicitly enables `BBB_DNS_CACHE` with unlimited TTL (`BBB_DNS_CACHE_TTL` is ignored). Pinning can help avoid 403 errors from services that tie authentication tokens to a specific endpoint IP.
+
+```bash
+BBB_DNS_PIN=1 bbb cp ./data/ az://myaccount/mycontainer/data/
+```
+
+**Caveats:**
+
+- Pinned entries never refresh. Long-lived processes will not pick up DNS or IP rotations and may require a restart (or disabling pinning) to recover if the pinned IP becomes unreachable.
+- If the first resolved address is unreachable (e.g. an IPv6 address in an IPv4-only environment), bbb will try the remaining addresses and pin to the first one that successfully connects.
 
 ### Taskfile
 

@@ -100,14 +100,14 @@ type dnsCacheEntry struct {
 // Happy Eyeballs (RFC 6555) connection racing is bypassed. For bbb's primary
 // workload (Azure Blob Storage endpoints that are typically single-stack)
 // this has no practical impact.
-func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver, ttl time.Duration) dialContextFunc {
-	return newCachingDialContext(baseDial, resolver.LookupHost, ttl)
+func dnsCachingDialContext(baseDial dialContextFunc, resolver *net.Resolver, ttl time.Duration, pin bool) dialContextFunc {
+	return newCachingDialContext(baseDial, resolver.LookupHost, ttl, pin)
 }
 
 // newCachingDialContext is the internal implementation used by
 // dnsCachingDialContext. Accepting a lookupHostFunc and explicit TTL makes
 // the function easy to test with deterministic inputs.
-func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl time.Duration) dialContextFunc {
+func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl time.Duration, pin bool) dialContextFunc {
 	var cache sync.Map // host → *dnsCacheEntry
 
 	dialAddrs := func(ctx context.Context, network, port string, addrs []string) (net.Conn, error) {
@@ -155,6 +155,28 @@ func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl 
 		}
 
 		slog.Debug("DNS lookup", "host", host, "addrs", addrs)
+
+		// When pinning, try addresses in order and pin to the first
+		// one that successfully connects. This avoids permanently
+		// pinning to an unreachable address (e.g. an AAAA record in
+		// an IPv4-only environment).
+		if pin {
+			var lastErr error
+			for _, a := range addrs {
+				conn, dialErr := baseDial(ctx, network, net.JoinHostPort(a, port))
+				if dialErr == nil {
+					slog.Debug("DNS pin: pinned to first reachable address", "host", host, "selected", a, "all", addrs)
+					cache.Store(host, &dnsCacheEntry{
+						addrs:  []string{a},
+						expiry: time.Now().Add(ttl),
+					})
+					return conn, nil
+				}
+				lastErr = dialErr
+			}
+			return nil, lastErr
+		}
+
 		cache.Store(host, &dnsCacheEntry{
 			addrs:  addrs,
 			expiry: time.Now().Add(ttl),
@@ -207,29 +229,49 @@ func main() {
 					KeepAlive: 30 * time.Second,
 				}).DialContext
 
-				switch strings.ToLower(os.Getenv("BBB_DNS_CACHE")) {
+				var dnsPin bool
+				switch strings.ToLower(os.Getenv("BBB_DNS_PIN")) {
 				case "1", "true", "yes", "on":
-					var ttl time.Duration // 0 means unlimited
-					if raw := os.Getenv("BBB_DNS_CACHE_TTL"); raw != "" {
-						d, err := time.ParseDuration(raw)
-						if err != nil {
-							return ctx, fmt.Errorf("invalid BBB_DNS_CACHE_TTL %q: %w", raw, err)
-						}
-						if d < 0 {
-							return ctx, fmt.Errorf("invalid BBB_DNS_CACHE_TTL %q: must be non-negative", raw)
-						}
-						ttl = d
+					dnsPin = true
+				}
+
+				dnsCache := dnsPin // BBB_DNS_PIN implies caching
+				if !dnsCache {
+					switch strings.ToLower(os.Getenv("BBB_DNS_CACHE")) {
+					case "1", "true", "yes", "on":
+						dnsCache = true
 					}
-					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver, ttl)
+				}
+
+				if dnsCache {
+					var ttl time.Duration // 0 means unlimited
+					if !dnsPin {
+						if raw := os.Getenv("BBB_DNS_CACHE_TTL"); raw != "" {
+							d, err := time.ParseDuration(raw)
+							if err != nil {
+								return ctx, fmt.Errorf("invalid BBB_DNS_CACHE_TTL %q: %w", raw, err)
+							}
+							if d < 0 {
+								return ctx, fmt.Errorf("invalid BBB_DNS_CACHE_TTL %q: must be non-negative", raw)
+							}
+							ttl = d
+						}
+					}
+					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver, ttl, dnsPin)
 					ttlStr := "unlimited"
 					if ttl > 0 {
 						ttlStr = ttl.String()
 					}
+					cacheEnv := "BBB_DNS_CACHE"
+					if dnsPin {
+						cacheEnv = "BBB_DNS_PIN"
+					}
 					slog.Info("DNS caching enabled",
-						"env", "BBB_DNS_CACHE",
+						"env", cacheEnv,
 						"ttl", ttlStr,
+						"pin", dnsPin,
 					)
-				default:
+				} else {
 					transport.DialContext = dnsLoggingDialContext(baseDial, net.DefaultResolver)
 				}
 
