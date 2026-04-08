@@ -101,7 +101,7 @@ func runAndGetStdout(cmd string, args ...string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer ptyFile.Close()
+	defer func() { _ = ptyFile.Close() }()
 
 	waitErr := c.Wait()
 	<-done // always wait for pty goroutine to finish writing to buffer
