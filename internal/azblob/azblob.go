@@ -464,9 +464,21 @@ func parseTenantFromChallenge(header string) string {
 var defaultHTTPClientOnce sync.Once
 var defaultHTTPClientVal *http.Client
 
+// defaultHTTPClient returns the process-wide HTTP client used for
+// non-SDK calls (e.g. tenant discovery probes). It honors the shared
+// transport configured via SetHTTPTransport when one has been installed;
+// otherwise it falls back to http.DefaultTransport (which bbb's main
+// already mutates for DNS caching/pinning).
 func defaultHTTPClient() *http.Client {
 	defaultHTTPClientOnce.Do(func() {
-		defaultHTTPClientVal = &http.Client{Timeout: 10 * time.Second}
+		rt := http.RoundTripper(http.DefaultTransport)
+		if t := getSharedTransporter(); t != nil {
+			// Unwrap the *http.Client we stored to get its RoundTripper.
+			if c, ok := t.(*http.Client); ok && c.Transport != nil {
+				rt = c.Transport
+			}
+		}
+		defaultHTTPClientVal = &http.Client{Timeout: 10 * time.Second, Transport: rt}
 	})
 	return defaultHTTPClientVal
 }
@@ -612,6 +624,7 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	if strings.EqualFold(os.Getenv("BBB_AZURE_ALLOW_ANY_TENANT"), "true") {
 		opts.AdditionallyAllowedTenants = []string{"*"}
 	}
+	applyTransportToIdentityOptions(&opts.ClientOptions)
 	cred, err := azidentity.NewDefaultAzureCredential(opts)
 	if err != nil {
 		return nil, fmt.Errorf("%s credential: %w", role, err)
@@ -689,9 +702,11 @@ func getCredentialForAccount(ctx context.Context, account string) (azcore.TokenC
 	// Fall back to interactive browser login for the discovered tenant.
 	slog.Info("CLI credential failed for tenant, opening browser login", "account", account, "tenant", tid)
 	fmt.Fprintf(os.Stderr, "\n  Storage account %q requires authentication to tenant %s.\n  Opening browser...\n", account, tid)
-	browserCred, err := azidentity.NewInteractiveBrowserCredential(&azidentity.InteractiveBrowserCredentialOptions{
+	browserOpts := &azidentity.InteractiveBrowserCredentialOptions{
 		TenantID: tid,
-	})
+	}
+	applyTransportToIdentityOptions(&browserOpts.ClientOptions)
+	browserCred, err := azidentity.NewInteractiveBrowserCredential(browserOpts)
 	if err != nil {
 		return nil, fmt.Errorf("interactive credential for tenant %s: %w", tid, err)
 	}
@@ -723,6 +738,7 @@ func getDefaultCredential() (*azidentity.DefaultAzureCredential, error) {
 		if strings.EqualFold(os.Getenv("BBB_AZURE_ALLOW_ANY_TENANT"), "true") {
 			opts.AdditionallyAllowedTenants = []string{"*"}
 		}
+		applyTransportToIdentityOptions(&opts.ClientOptions)
 		cachedDefaultCred, cachedDefaultCredErr = azidentity.NewDefaultAzureCredential(opts)
 		if cachedDefaultCredErr == nil && slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 			tok, tokErr := cachedDefaultCred.GetToken(context.Background(), policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
@@ -773,7 +789,7 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 		if err != nil {
 			return nil, err
 		}
-		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, cred, nil)
+		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, cred, azblobClientOptions())
 		if err != nil {
 			return nil, err
 		}
@@ -784,7 +800,7 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 		}
 
 		var clientErr error
-		client, clientErr = azblob.NewClient(endpoint, cred, nil)
+		client, clientErr = azblob.NewClient(endpoint, cred, azblobClientOptions())
 		if clientErr != nil {
 			return nil, clientErr
 		}
@@ -1421,7 +1437,7 @@ func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCre
 		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("credential for %s: %w", account, err)
 	}
 	endpoint := getEndpoint(account)
-	svcClient, err := service.NewClient(endpoint, cred, nil)
+	svcClient, err := service.NewClient(endpoint, cred, serviceClientOptions())
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("service client: %w", err)
 	}

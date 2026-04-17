@@ -26,8 +26,10 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/tg123/bbb/internal/azblob"
 	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/fsops"
+	"github.com/tg123/bbb/internal/hf"
 )
 
 var mainver string = "(devel)"
@@ -266,7 +268,7 @@ func main() {
 					if dnsPin {
 						cacheEnv = "BBB_DNS_PIN"
 					}
-					slog.Info("DNS caching enabled",
+					slog.Info("DNS caching enabled (applies to Azure SDK and Hugging Face traffic)",
 						"env", cacheEnv,
 						"ttl", ttlStr,
 						"pin", dnsPin,
@@ -276,6 +278,19 @@ func main() {
 				}
 
 				http.DefaultTransport = transport
+
+				// Publish the wrapped transport to internal packages that
+				// build their own HTTP clients (Azure SDK, Hugging Face).
+				// Without this the custom DialContext only applies to
+				// stdlib callers, leaving BBB_DNS_PIN ineffective for SDK
+				// traffic (token acquisition, data plane, UDC).
+				//
+				// Ordering: this runs in the cli Before: hook, which fires
+				// before any command Action — i.e. before any SDK client
+				// is constructed — so setting the shared transport here is
+				// early enough.
+				azblob.SetHTTPTransport(transport)
+				hf.SetHTTPClient(&http.Client{Transport: transport})
 			}
 
 			return ctx, nil
