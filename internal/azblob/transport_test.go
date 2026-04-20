@@ -54,10 +54,10 @@ func TestSharedTransportPropagatesToSDKClient(t *testing.T) {
 	// and consume one page — ListBlobsFlat returns a pager that does
 	// the network call on NextPage.
 	pager := cli.NewListContainersPager(nil)
-	if _, err := pager.NextPage(context.Background()); err != nil {
-		// Our stub returns an empty-but-200 body which the XML parser
-		// may reject; we only care that the transport was invoked.
-	}
+	// Our stub returns an empty-but-200 body which the XML parser may
+	// reject; we only care that the transport was invoked, so any
+	// resulting error is intentionally ignored here.
+	_, _ = pager.NextPage(context.Background())
 
 	if atomic.LoadInt64(&count) == 0 {
 		t.Fatal("shared transport was not invoked by SDK client — BBB_DNS_PIN would not apply to Azure SDK traffic")
