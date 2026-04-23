@@ -124,10 +124,13 @@ When enabled, bbb caches DNS resolution results in memory so that repeated conne
 BBB_DNS_CACHE=1 bbb cp ./data/ az://myaccount/mycontainer/data/
 ```
 
+The cache is installed on the shared HTTP transport used by **all** outbound traffic in the process, including the Azure SDK (data-plane requests, user-delegation-key / UDC acquisition, and OAuth token calls to `login.microsoftonline.com`) and Hugging Face API calls.
+
 **Caveats:**
 
 - DNS records that change during the TTL window (e.g. IP rotations) will not be picked up until the cached entry expires.
 - Because cached addresses are dialled as IP literals, Go's standard Happy Eyeballs (RFC 6555) connection racing is bypassed. For Azure Blob Storage endpoints (typically single-stack) this has no practical impact.
+- `az login` (when falling back to `AzureCLICredential`) shells out to the `az` binary; DNS resolution for that subprocess happens in the child and is not affected by these variables.
 
 ### `BBB_DNS_PIN`
 
@@ -137,10 +140,13 @@ When enabled, bbb pins every hostname to a single IP address. If DNS returns mul
 BBB_DNS_PIN=1 bbb cp ./data/ az://myaccount/mycontainer/data/
 ```
 
+The pin applies to **all** outbound HTTP traffic in the process, including Azure SDK data-plane requests, UDC acquisition, and OAuth token calls, as well as Hugging Face API calls. This matches the semantics of a `/etc/hosts` override but limited to the bbb process.
+
 **Caveats:**
 
 - Pinned entries never refresh. Long-lived processes will not pick up DNS or IP rotations and may require a restart (or disabling pinning) to recover if the pinned IP becomes unreachable.
 - If the first resolved address is unreachable (e.g. an IPv6 address in an IPv4-only environment), bbb will try the remaining addresses and pin to the first one that successfully connects.
+- `AzureCLICredential` shells out to the `az` binary; its DNS resolution runs in the child process and is not covered by the pin. MSAL-cached tokens on disk are also unaffected — occasional re-authentication may still occur.
 
 ### Taskfile
 
