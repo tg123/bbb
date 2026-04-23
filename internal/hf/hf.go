@@ -13,11 +13,11 @@ import (
 	"sync/atomic"
 )
 
-// sharedTransport holds an optional *http.Client used by the hf package.
+// sharedClient holds an optional *http.Client used by the hf package.
 // When set via SetHTTPClient it overrides http.DefaultClient for all
 // requests, ensuring features like DNS pinning/caching configured at
 // program startup apply to Hugging Face traffic too.
-var sharedClient atomic.Value // *http.Client
+var sharedClient atomic.Pointer[http.Client]
 
 // SetHTTPClient installs a process-wide HTTP client used for all requests
 // issued by this package. Passing nil clears the override and restores
@@ -26,18 +26,12 @@ var sharedClient atomic.Value // *http.Client
 // This must be called before any request is issued, e.g. from main's
 // Before: hook, so that all callers observe the override.
 func SetHTTPClient(c *http.Client) {
-	if c == nil {
-		sharedClient.Store((*http.Client)(nil))
-		return
-	}
 	sharedClient.Store(c)
 }
 
 var doRequest = func(req *http.Request) (*http.Response, error) {
-	if v := sharedClient.Load(); v != nil {
-		if c, _ := v.(*http.Client); c != nil {
-			return c.Do(req)
-		}
+	if c := sharedClient.Load(); c != nil {
+		return c.Do(req)
 	}
 	return http.DefaultClient.Do(req)
 }
