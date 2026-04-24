@@ -73,35 +73,40 @@ func waitForEndpointReadyWithTimeout(addr string, timeout time.Duration) bool {
 	}
 }
 
-func runCmd(cmd string, args ...string) (*exec.Cmd, io.Writer, io.Reader, error) {
+func runCmd(cmd string, args ...string) (*exec.Cmd, *os.File, io.Reader, <-chan struct{}, error) {
 	newargs := append([]string{cmd}, args...)
 	newargs = append([]string{"-i0", "-o0", "-e0"}, newargs...)
 	c := exec.Command("stdbuf", newargs...)
 	c.Env = os.Environ()
 	f, err := pty.Start(c)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	var buf bytes.Buffer
 	r := io.TeeReader(f, &buf)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		_, _ = io.Copy(os.Stdout, r)
 	}()
 
 	log.Printf("starting %v", c.Args)
 
-	return c, f, &buf, nil
+	return c, f, &buf, done, nil
 }
 
 func runAndGetStdout(cmd string, args ...string) ([]byte, error) {
-	c, _, stdout, err := runCmd(cmd, args...)
+	c, ptyFile, stdout, done, err := runCmd(cmd, args...)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = ptyFile.Close() }()
 
-	if err := c.Wait(); err != nil {
-		return nil, err
+	waitErr := c.Wait()
+	<-done // always wait for pty goroutine to finish writing to buffer
+	if waitErr != nil {
+		return nil, waitErr
 	}
 
 	return io.ReadAll(stdout)
@@ -243,6 +248,29 @@ func TestBasic(t *testing.T) {
 
 		if output != "az://"+azuriteAccount+"/test" {
 			t.Errorf("unexpected ls output: %s", output)
+		}
+	}
+
+	// ll containers (ListStream path, verifies no trailing slash - PR #78)
+	{
+		files, err := bbbLL("az://" + azuriteAccount + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{"az://" + azuriteAccount + "/test"}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll containers: got %v, want %v", files, expected)
+		}
+	}
+
+	{
+		files, err := bbbLL("az://" + azuriteAccount)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{"az://" + azuriteAccount + "/test"}
+		if !slices.Equal(files, expected) {
+			t.Errorf("ll containers (no trailing slash): got %v, want %v", files, expected)
 		}
 	}
 
