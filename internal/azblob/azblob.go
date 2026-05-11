@@ -3,6 +3,7 @@ package azblob
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -634,6 +635,29 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	return actual.(azcore.TokenCredential), nil
 }
 
+// tenantIDFromAccessToken returns the "tid" claim from a JWT access token,
+// or "" when the token is not a JWT, can't be decoded, or has no tid claim.
+// Used to detect tenant mismatches between a token issued by AzureCLICredential
+// and the tenant we expect (e.g. the one discovered from the storage account
+// challenge), so we can trigger an interactive auto-login when they differ.
+func tenantIDFromAccessToken(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Tid string `json:"tid"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.Tid
+}
+
 // getCredentialForAccount returns a TokenCredential appropriate for the given
 // storage account. It first checks for role-specific environment credentials
 // (SRC_AZURE_* / DST_AZURE_*), then auto-discovers the tenant from the
@@ -681,22 +705,34 @@ func getCredentialForAccount(ctx context.Context, account string) (azcore.TokenC
 	}
 
 	// Try AzureCLICredential first — works if the user has `az login`'d
-	// to this tenant. If GetToken fails, fall back to interactive browser.
+	// to this tenant. If GetToken fails, or if the returned token is for a
+	// different tenant than we expect (e.g. the user's `az` cache only holds
+	// a token for their home tenant), fall back to interactive browser login.
 	cliCred, err := azidentity.NewAzureCLICredential(&azidentity.AzureCLICredentialOptions{
 		TenantID: tid,
 	})
 	if err == nil {
 		// Test if CLI credential actually works for this tenant.
-		_, tokenErr := cliCred.GetToken(ctx, policy.TokenRequestOptions{
+		tok, tokenErr := cliCred.GetToken(ctx, policy.TokenRequestOptions{
 			Scopes: []string{"https://storage.azure.com/.default"},
 		})
 		if tokenErr == nil {
-			slog.Debug("Using AzureCLICredential for tenant", "tenant", tid)
-			tenantCredCache.Store(tid, cliCred)
-			return cliCred, nil
+			// Verify the returned token is actually for the expected tenant.
+			// If `az` returned a token for a different tenant (cache mismatch),
+			// treat it as a failure so we trigger an interactive login below.
+			tokTid := tenantIDFromAccessToken(tok.Token)
+			if tokTid != "" && !strings.EqualFold(tokTid, tid) {
+				slog.Debug("AzureCLICredential returned token for wrong tenant, falling back to interactive login",
+					"expected", tid, "got", tokTid)
+			} else {
+				slog.Debug("Using AzureCLICredential for tenant", "tenant", tid)
+				tenantCredCache.Store(tid, cliCred)
+				return cliCred, nil
+			}
+		} else {
+			slog.Debug("AzureCLICredential failed for tenant, falling back to interactive login",
+				"tenant", tid, "error", tokenErr)
 		}
-		slog.Debug("AzureCLICredential failed for tenant, falling back to interactive login",
-			"tenant", tid, "error", tokenErr)
 	}
 
 	// Fall back to interactive browser login for the discovered tenant.
@@ -747,7 +783,7 @@ func getDefaultCredential() (*azidentity.DefaultAzureCredential, error) {
 				if len(parts) == 3 {
 					payload, decErr := base64.RawURLEncoding.DecodeString(parts[1])
 					if decErr == nil {
-						slog.Debug("Decoded JWT payload", "payload", string(payload))
+						slog.Debug("Decoded JWT payload", "payload", string(payload), "tid", tenantIDFromAccessToken(tok.Token))
 					} else {
 						slog.Debug("Failed to decode JWT payload", "error", decErr)
 					}

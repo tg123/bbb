@@ -2,6 +2,8 @@ package azblob
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -12,6 +14,59 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 )
+
+// makeJWT builds a minimal unsigned JWT-shaped string with the given payload
+// claims, used to test tenantIDFromAccessToken. It is NOT a valid signed
+// token — only the header.payload.signature shape is required.
+func makeJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payloadBytes, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	return header + "." + payload + ".sig"
+}
+
+func TestTenantIDFromAccessToken(t *testing.T) {
+	tok := makeJWT(t, map[string]any{"tid": "11111111-2222-3333-4444-555555555555", "aud": "https://storage.azure.com"})
+	if got := tenantIDFromAccessToken(tok); got != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("expected tid from JWT, got %q", got)
+	}
+}
+
+func TestTenantIDFromAccessTokenNoTid(t *testing.T) {
+	tok := makeJWT(t, map[string]any{"aud": "https://storage.azure.com"})
+	if got := tenantIDFromAccessToken(tok); got != "" {
+		t.Fatalf("expected empty tid when claim missing, got %q", got)
+	}
+}
+
+func TestTenantIDFromAccessTokenNotJWT(t *testing.T) {
+	if got := tenantIDFromAccessToken("opaque-token-not-a-jwt"); got != "" {
+		t.Fatalf("expected empty tid for non-JWT, got %q", got)
+	}
+	if got := tenantIDFromAccessToken("a.b"); got != "" {
+		t.Fatalf("expected empty tid for 2-part token, got %q", got)
+	}
+}
+
+func TestTenantIDFromAccessTokenBadBase64(t *testing.T) {
+	// Middle segment not valid base64-url.
+	if got := tenantIDFromAccessToken("aaa.!!!.bbb"); got != "" {
+		t.Fatalf("expected empty tid for bad base64 payload, got %q", got)
+	}
+}
+
+func TestTenantIDFromAccessTokenBadJSON(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte("not-json"))
+	tok := header + "." + payload + ".sig"
+	if got := tenantIDFromAccessToken(tok); got != "" {
+		t.Fatalf("expected empty tid for non-JSON payload, got %q", got)
+	}
+}
 
 func TestParseHTTPSBlobURL(t *testing.T) {
 	ap, err := Parse("https://myacct.blob.core.windows.net/container/path/to/blob.txt")
