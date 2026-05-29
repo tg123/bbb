@@ -561,6 +561,36 @@ var roleEnvVars = []string{
 	"AZURE_CONFIG_DIR",
 }
 
+func roleCredentialEnvConfigured(role string) bool {
+	has := func(name string) bool {
+		v, ok := os.LookupEnv(name)
+		return ok && v != ""
+	}
+	hasRole := func(name string) bool {
+		return has(role + "_" + name)
+	}
+	hasEffective := func(name string) bool {
+		return hasRole(name) || has(name)
+	}
+
+	if hasEffective("AZURE_CLIENT_ID") &&
+		hasEffective("AZURE_TENANT_ID") &&
+		(hasEffective("AZURE_CLIENT_SECRET") ||
+			hasEffective("AZURE_CLIENT_CERTIFICATE_PATH") ||
+			hasEffective("AZURE_FEDERATED_TOKEN_FILE")) {
+		return true
+	}
+
+	if hasEffective("IDENTITY_ENDPOINT") || hasEffective("MSI_ENDPOINT") || hasEffective("IMDS_ENDPOINT") {
+		return true
+	}
+
+	// A role-scoped client ID alone can be a valid user-assigned managed identity
+	// configuration (with IMDS discovery), while an unprefixed AZURE_CLIENT_ID
+	// alone should not force this path.
+	return hasRole("AZURE_CLIENT_ID")
+}
+
 // roleCredMu serializes env var swapping for role-specific credential
 // creation. os.Setenv is process-global, so concurrent credential creation
 // for different roles must not interleave env var mutations.
@@ -569,23 +599,16 @@ var roleCredMu sync.Mutex
 // getCredentialForRole returns a DefaultAzureCredential built from
 // {role}_AZURE_* (and {role}_MSI_*, {role}_IDENTITY_*, etc.) environment
 // variables. The role-prefixed env vars are temporarily mapped to their
-// standard names so the Azure SDK picks them up. Returns (nil, nil) when
-// no role-prefixed env vars are set.
+// standard names so the Azure SDK picks them up.
+//
+// Unprefixed AZURE_* variables act as defaults shared by both roles: a plain
+// AZURE_xxx is interpreted as if it were set for both SRC_AZURE_xxx and
+// DST_AZURE_xxx, with the role-prefixed variant overriding it when present.
+// Returns (nil, nil) when neither role-prefixed nor unprefixed env vars are
+// set.
 func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	if cached, ok := roleCredCache.Load(role); ok {
 		return cached.(azcore.TokenCredential), nil
-	}
-
-	// Check if any role-prefixed env var is set.
-	hasAny := false
-	for _, v := range roleEnvVars {
-		if os.Getenv(role+"_"+v) != "" {
-			hasAny = true
-			break
-		}
-	}
-	if !hasAny {
-		return nil, nil // not configured
 	}
 
 	// Temporarily swap env vars to create the credential.
@@ -598,13 +621,26 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 		return cached.(azcore.TokenCredential), nil
 	}
 
-	// Save originals and clear all identity vars to avoid cross-contamination.
-	originals := make(map[string]string, len(roleEnvVars))
-	for _, v := range roleEnvVars {
-		originals[v] = os.Getenv(v)
-		_ = os.Unsetenv(v)
+	// Only credential-bearing env vars should activate the DefaultAzureCredential
+	// path. Helper vars like AZURE_CONFIG_DIR / AZURE_USERNAME are still
+	// inherited, but only after some real credential config is present.
+	if !roleCredentialEnvConfigured(role) {
+		return nil, nil // not configured
 	}
-	// Set only the role-prefixed values.
+
+	// Save originals so they can be restored by the deferred cleanup below.
+	// Unprefixed values are kept in place to act as defaults; role-prefixed
+	// values temporarily override them while the credential is created.
+	type envEntry struct {
+		value string
+		set   bool
+	}
+	originals := make(map[string]envEntry, len(roleEnvVars))
+	for _, v := range roleEnvVars {
+		val, ok := os.LookupEnv(v)
+		originals[v] = envEntry{value: val, set: ok}
+	}
+	// Override with the role-prefixed values where present.
 	for _, v := range roleEnvVars {
 		if prefixed := os.Getenv(role + "_" + v); prefixed != "" {
 			_ = os.Setenv(v, prefixed)
@@ -613,10 +649,10 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	// Restore originals after creating the credential.
 	defer func() {
 		for _, v := range roleEnvVars {
-			if originals[v] == "" {
+			if !originals[v].set {
 				_ = os.Unsetenv(v)
 			} else {
-				_ = os.Setenv(v, originals[v])
+				_ = os.Setenv(v, originals[v].value)
 			}
 		}
 	}()
@@ -668,17 +704,22 @@ func tenantIDFromAccessToken(token string) string {
 // Only one browser popup is opened per tenant; concurrent callers wait for
 // the first to complete.
 func getCredentialForAccount(ctx context.Context, account string) (azcore.TokenCredential, error) {
-	// Check for role-specific environment credentials (SRC_AZURE_* / DST_AZURE_*).
+	// Resolve the role for this account. Accounts tagged during cp/sync use
+	// their SRC/DST role; accounts without an explicit role (single-endpoint
+	// commands like ls/cat/rm) reuse the SRC role, so SRC_AZURE_* and the
+	// unprefixed AZURE_* defaults are honored for them too. When the relevant
+	// env vars are unset, getCredentialForRole returns nil and we fall through
+	// to tenant discovery and the interactive CLI/browser flow.
+	role := "SRC"
 	if roleVal, ok := accountRoles.Load(account); ok {
-		role := roleVal.(string)
-		cred, err := getCredentialForRole(role)
-		if err != nil {
-			return nil, err
-		}
-		if cred != nil {
-			return cred, nil
-		}
-		// Role env vars not set — fall through to normal credential flow.
+		role = roleVal.(string)
+	}
+	cred, err := getCredentialForRole(role)
+	if err != nil {
+		return nil, err
+	}
+	if cred != nil {
+		return cred, nil
 	}
 
 	tid := accountTenantID(ctx, account)
