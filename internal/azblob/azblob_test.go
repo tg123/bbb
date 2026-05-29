@@ -1160,21 +1160,7 @@ func TestGetCredentialForRoleCachesResult(t *testing.T) {
 	}
 }
 
-func TestEnvFlagEnabled(t *testing.T) {
-	cases := map[string]bool{
-		"1": true, "true": true, "TRUE": true, "Yes": true, "on": true,
-		"0": false, "false": false, "": false, "no": false, "off": false,
-	}
-	for val, want := range cases {
-		t.Setenv("BBB_TEST_FLAG", val)
-		if got := envFlagEnabled("BBB_TEST_FLAG"); got != want {
-			t.Errorf("envFlagEnabled(%q) = %v, want %v", val, got, want)
-		}
-	}
-}
-
 func TestCredentialFromEnvReturnsNilWhenUnset(t *testing.T) {
-	t.Setenv("AZURE_USE_IDENTITY", "")
 	t.Setenv("AZURE_TENANT_ID", "")
 	t.Setenv("AZURE_CLIENT_ID", "")
 	t.Setenv("AZURE_CLIENT_SECRET", "")
@@ -1189,7 +1175,6 @@ func TestCredentialFromEnvReturnsNilWhenUnset(t *testing.T) {
 }
 
 func TestCredentialFromEnvServicePrincipal(t *testing.T) {
-	t.Setenv("AZURE_USE_IDENTITY", "")
 	t.Setenv("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000")
 	t.Setenv("AZURE_CLIENT_ID", "11111111-1111-1111-1111-111111111111")
 	t.Setenv("AZURE_CLIENT_SECRET", "secret")
@@ -1201,10 +1186,12 @@ func TestCredentialFromEnvServicePrincipal(t *testing.T) {
 	if cred == nil {
 		t.Fatal("expected non-nil service principal credential")
 	}
+	if _, ok := cred.(*azidentity.ClientSecretCredential); !ok {
+		t.Fatalf("expected *azidentity.ClientSecretCredential, got %T", cred)
+	}
 }
 
 func TestCredentialFromEnvIncompleteServicePrincipal(t *testing.T) {
-	t.Setenv("AZURE_USE_IDENTITY", "")
 	t.Setenv("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000")
 	t.Setenv("AZURE_CLIENT_ID", "11111111-1111-1111-1111-111111111111")
 	// AZURE_CLIENT_SECRET intentionally unset.
@@ -1216,64 +1203,5 @@ func TestCredentialFromEnvIncompleteServicePrincipal(t *testing.T) {
 	}
 	if cred != nil {
 		t.Fatal("expected nil credential when service principal config is incomplete")
-	}
-}
-
-func TestCredentialFromEnvManagedIdentity(t *testing.T) {
-	t.Setenv("AZURE_USE_IDENTITY", "1")
-	// No service principal vars needed for managed identity.
-	t.Setenv("AZURE_TENANT_ID", "")
-	t.Setenv("AZURE_CLIENT_ID", "")
-	t.Setenv("AZURE_CLIENT_SECRET", "")
-
-	cred, err := credentialFromEnv()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cred == nil {
-		t.Fatal("expected non-nil managed identity credential")
-	}
-	if _, ok := cred.(*azidentity.ManagedIdentityCredential); !ok {
-		t.Fatalf("expected *azidentity.ManagedIdentityCredential, got %T", cred)
-	}
-}
-
-func TestCredentialFromEnvManagedIdentityUserAssigned(t *testing.T) {
-	t.Setenv("AZURE_USE_IDENTITY", "true")
-	t.Setenv("AZURE_CLIENT_ID", "11111111-1111-1111-1111-111111111111")
-	t.Setenv("AZURE_CLIENT_SECRET", "")
-	t.Setenv("AZURE_TENANT_ID", "")
-
-	cred, err := credentialFromEnv()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cred == nil {
-		t.Fatal("expected non-nil user-assigned managed identity credential")
-	}
-	if _, ok := cred.(*azidentity.ManagedIdentityCredential); !ok {
-		t.Fatalf("expected *azidentity.ManagedIdentityCredential, got %T", cred)
-	}
-}
-
-func TestCredentialFromEnvServicePrincipalTakesPrecedence(t *testing.T) {
-	// When a full service principal config is present, it is used even if
-	// AZURE_USE_IDENTITY is also set. AZURE_CLIENT_ID identifies the service
-	// principal, so it must not be misused as a user-assigned managed-identity
-	// ID (which would make IMDS reject the request).
-	t.Setenv("AZURE_USE_IDENTITY", "1")
-	t.Setenv("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000")
-	t.Setenv("AZURE_CLIENT_ID", "11111111-1111-1111-1111-111111111111")
-	t.Setenv("AZURE_CLIENT_SECRET", "secret")
-
-	cred, err := credentialFromEnv()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cred == nil {
-		t.Fatal("expected non-nil credential")
-	}
-	if _, ok := cred.(*azidentity.ClientSecretCredential); !ok {
-		t.Fatalf("expected *azidentity.ClientSecretCredential, got %T", cred)
 	}
 }

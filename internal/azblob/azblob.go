@@ -642,33 +642,14 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	return actual.(azcore.TokenCredential), nil
 }
 
-// envFlagEnabled reports whether the named environment variable is set to a
-// truthy value ("1", "true", "yes", or "on", case-insensitive).
-func envFlagEnabled(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
-	case "1", "true", "yes", "on":
-		return true
-	}
-	return false
-}
-
 // credentialFromEnv builds a non-interactive credential from the standard
 // AZURE_* environment variables when they are configured. It returns
 // (nil, nil) when no such configuration is present, signalling the caller to
 // fall back to the interactive (Azure CLI / browser) flow.
 //
-// Honored variables (in precedence order):
+// Honored variables:
 //   - AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET →
-//     ClientSecretCredential (service principal). An explicit service
-//     principal is unambiguous and takes precedence over managed identity:
-//     this mirrors Azure's own DefaultAzureCredential, which tries the
-//     environment service principal before managed identity. It also avoids
-//     misusing AZURE_CLIENT_ID — which identifies the service principal — as
-//     a user-assigned managed-identity ID, which would make IMDS reject the
-//     request with "the requested identity isn't assigned to this resource".
-//   - AZURE_USE_IDENTITY (truthy) → ManagedIdentityCredential. When
-//     AZURE_CLIENT_ID is also set it selects that user-assigned identity;
-//     otherwise the system-assigned identity is used.
+//     ClientSecretCredential (service principal).
 //
 // AZURE_SUBSCRIPTION_ID is not required for Blob Storage data-plane
 // authentication and is intentionally ignored here.
@@ -687,20 +668,6 @@ func credentialFromEnv() (azcore.TokenCredential, error) {
 			return nil, fmt.Errorf("client secret credential: %w", err)
 		}
 		slog.Debug("Using service principal credential (AZURE_* env vars)", "tenant", tenantID, "client", clientID)
-		return cred, nil
-	}
-
-	if envFlagEnabled("AZURE_USE_IDENTITY") {
-		opts := &azidentity.ManagedIdentityCredentialOptions{}
-		if clientID != "" {
-			opts.ID = azidentity.ClientID(clientID)
-		}
-		applyTransportToIdentityOptions(&opts.ClientOptions)
-		cred, err := azidentity.NewManagedIdentityCredential(opts)
-		if err != nil {
-			return nil, fmt.Errorf("managed identity credential: %w", err)
-		}
-		slog.Debug("Using managed identity credential (AZURE_USE_IDENTITY)")
 		return cred, nil
 	}
 
@@ -754,8 +721,8 @@ func getCredentialForAccount(ctx context.Context, account string) (azcore.TokenC
 	}
 
 	// Honor explicit credentials configured via the standard AZURE_* env vars
-	// (service principal) or AZURE_USE_IDENTITY (managed identity) before
-	// falling back to tenant discovery and interactive CLI/browser login.
+	// (service principal) before falling back to tenant discovery and
+	// interactive CLI/browser login.
 	if cred, err := credentialFromEnv(); err != nil {
 		return nil, err
 	} else if cred != nil {
