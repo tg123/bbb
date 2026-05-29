@@ -1232,6 +1232,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			break
 		}
 	}
+	// For a single file there is only one active worker, so give the full
+	// concurrency budget to block-level parallelism. Otherwise the per-file
+	// pipeline ends up with only blockConcurrency in-flight blocks, which
+	// caps throughput well below what the network can sustain.
+	if len(fileOps) == 1 {
+		cpPoolSize = 1
+		blockConcurrency = concurrency
+	}
 	if err := runOpPoolWithRetryProgressBytes(ctx, cpPoolSize, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
 			if err := sendOp(ctx, pending, op); err != nil {
