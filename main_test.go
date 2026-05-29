@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1120,6 +1121,76 @@ func TestWriteStreamToLocal(t *testing.T) {
 	}
 	if string(data) != content {
 		t.Fatalf("unexpected content: %s", data)
+	}
+}
+
+func TestProgressWriterReportsByteCount(t *testing.T) {
+	var got int
+	pw := &progressWriter{onWrite: func(n int) { got += n }}
+	n, err := pw.Write([]byte("hello"))
+	if err != nil {
+		t.Fatalf("write returned error: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("Write returned %d, want 5", n)
+	}
+	if got != 5 {
+		t.Fatalf("onWrite saw %d bytes, want 5", got)
+	}
+}
+
+func TestProgressWriterNilCallback(t *testing.T) {
+	pw := &progressWriter{}
+	n, err := pw.Write([]byte("data"))
+	if err != nil {
+		t.Fatalf("write returned error: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("Write returned %d, want 4", n)
+	}
+}
+
+// TestProgressWriterTeeReaderAccumulates verifies the streaming-copy pattern
+// added for remote↔local cp: piping a reader through io.TeeReader into a
+// progressWriter must report exactly the total number of bytes streamed,
+// matching the size of the data copied to the destination.
+func TestProgressWriterTeeReaderAccumulates(t *testing.T) {
+	content := strings.Repeat("abcdefgh", 10000) // 80000 bytes
+	var streamCopied atomic.Int64
+	var lastReported atomic.Int64
+	var reported atomic.Int64
+	pr := io.TeeReader(strings.NewReader(content), &progressWriter{
+		onWrite: func(n int) {
+			copied := streamCopied.Add(int64(n))
+			// Mirror the CAS-guarded incremental reporting used in cmdCPPaths.
+			for {
+				prev := lastReported.Load()
+				if copied <= prev {
+					break
+				}
+				if lastReported.CompareAndSwap(prev, copied) {
+					reported.Add(copied - prev)
+					break
+				}
+			}
+		},
+	})
+	var dst strings.Builder
+	written, err := io.Copy(&dst, pr)
+	if err != nil {
+		t.Fatalf("copy failed: %v", err)
+	}
+	if written != int64(len(content)) {
+		t.Fatalf("copied %d bytes, want %d", written, len(content))
+	}
+	if dst.String() != content {
+		t.Fatalf("destination content mismatch")
+	}
+	if streamCopied.Load() != int64(len(content)) {
+		t.Fatalf("streamCopied = %d, want %d", streamCopied.Load(), len(content))
+	}
+	if reported.Load() != int64(len(content)) {
+		t.Fatalf("reported bytes = %d, want %d", reported.Load(), len(content))
 	}
 }
 
