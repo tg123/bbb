@@ -1047,9 +1047,10 @@ func downloadBlockSizeBytes() int64 {
 }
 
 // uploadBlockSize is the per-block size used for parallel file uploads.
-// It mirrors azcopy's default chunking so a single file is staged via many
-// concurrent ranged StageBlock requests rather than a serial read pipeline.
-const uploadBlockSize = 8 * 1024 * 1024 // 8 MiB
+// It mirrors azcopy's chunked upload model. A larger-than-azcopy default keeps
+// per-block HTTP overhead amortized so we close the gap to azcopy without
+// requiring the user to bump --concurrency.
+const uploadBlockSize = 64 * 1024 * 1024 // 64 MiB
 
 const uploadBlockSizeEnv = "BBB_AZBLOB_UPLOAD_BLOCK_MIB"
 
