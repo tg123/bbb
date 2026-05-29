@@ -633,12 +633,12 @@ emulator is not enough). Configure these repository secrets to enable it:
 | `BENCH_AZURE_STORAGE_KEY` | Storage account shared key |
 | `BENCH_AZURE_STORAGE_CONTAINER` | *(optional)* container to use (default `bbb-benchmark`) |
 
-The workflow runs weekly and on demand via **Run workflow**
-(`workflow_dispatch`), where you can set the test-file size, the number of runs,
-and an optional `fail_factor` that fails the job when `bbb` is slower than the
-fastest other tool by more than that factor. Results are written to the job
-summary as a table. It is skipped automatically when the secrets are absent
-(for example on forks).
+The workflow runs on every pull request, on pushes to `main`, weekly, and on
+demand via **Run workflow** (`workflow_dispatch`), where you can set the
+test-file size, the number of runs, and an optional `fail_factor` that fails the
+job when `bbb` is slower than the fastest other tool by more than that factor.
+Results are written to the job summary as a table. It is skipped automatically
+when the secrets are absent (for example on pull requests from forks).
 
 The benchmark itself lives in
 [`internal/benchmark/benchmark.sh`](internal/benchmark/benchmark.sh) and can be

@@ -5,13 +5,17 @@ name: Benchmark
 # this needs a real storage account supplied via repository secrets:
 #   BENCH_AZURE_STORAGE_ACCOUNT  storage account name
 #   BENCH_AZURE_STORAGE_KEY      storage account shared key
-# It is therefore not run on pull requests from forks; trigger it manually or
-# on the weekly schedule.
+# Runs on every pull request and on pushes to main, plus on demand and on a
+# weekly schedule. The job is gated on the secrets above and skips with a
+# summary note when they are absent (for example on pull requests from forks).
 
 permissions:
   contents: read
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
   workflow_dispatch:
     inputs:
       size_mb:
