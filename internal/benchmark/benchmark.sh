@@ -112,6 +112,8 @@ dd if=/dev/urandom of="${SRC_FILE}" bs=1M count="${BENCH_SIZE_MB}" status=none
 bbb_upload()    { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "${SRC_FILE}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin"; }
 bbb_download()  { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "${WORKDIR}/dl-bbb.bin"; }
 
+# ${PYBBB} is intentionally left unquoted so that multi-word commands such as
+# the default "python -m boostedblob" word-split into separate arguments.
 pybbb_upload()   { ${PYBBB} cp "${SRC_FILE}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-pybbb.bin"; }
 pybbb_download() { ${PYBBB} cp "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-pybbb.bin" "${WORKDIR}/dl-pybbb.bin"; }
 
@@ -162,12 +164,12 @@ done
 # ---------------------------------------------------------------------------
 if [ -n "${BENCH_FAIL_FACTOR:-}" ]; then
   fail=0
-  for dir in UP DOWN; do
-    declare -n times="${dir}"
+  for direction in UP DOWN; do
+    declare -n times="${direction}"
     others_best="$(awk -v a="${times[pybbb]}" -v b="${times[azcopy]}" 'BEGIN { print (a < b ? a : b) }')"
     if awk -v bbb="${times[bbb]}" -v other="${others_best}" -v f="${BENCH_FAIL_FACTOR}" \
         'BEGIN { exit !(bbb > other * f) }'; then
-      log "REGRESSION: bbb ${dir} ${times[bbb]}s is slower than ${others_best}s * ${BENCH_FAIL_FACTOR}"
+      log "REGRESSION: bbb ${direction} ${times[bbb]}s is slower than ${others_best}s * ${BENCH_FAIL_FACTOR}"
       fail=1
     fi
   done
