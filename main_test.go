@@ -1158,7 +1158,7 @@ func TestProgressWriterTeeReaderAccumulates(t *testing.T) {
 	content := strings.Repeat("abcdefgh", 10000) // 80000 bytes
 	var streamCopied atomic.Int64
 	var lastReported atomic.Int64
-	var reported int64
+	var reported atomic.Int64
 	pr := io.TeeReader(strings.NewReader(content), &progressWriter{
 		onWrite: func(n int) {
 			copied := streamCopied.Add(int64(n))
@@ -1169,7 +1169,7 @@ func TestProgressWriterTeeReaderAccumulates(t *testing.T) {
 					break
 				}
 				if lastReported.CompareAndSwap(prev, copied) {
-					reported += copied - prev
+					reported.Add(copied - prev)
 					break
 				}
 			}
@@ -1189,8 +1189,8 @@ func TestProgressWriterTeeReaderAccumulates(t *testing.T) {
 	if streamCopied.Load() != int64(len(content)) {
 		t.Fatalf("streamCopied = %d, want %d", streamCopied.Load(), len(content))
 	}
-	if reported != int64(len(content)) {
-		t.Fatalf("reported bytes = %d, want %d", reported, len(content))
+	if reported.Load() != int64(len(content)) {
+		t.Fatalf("reported bytes = %d, want %d", reported.Load(), len(content))
 	}
 }
 
