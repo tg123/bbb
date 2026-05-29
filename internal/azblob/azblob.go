@@ -604,8 +604,9 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 		return cached.(azcore.TokenCredential), nil
 	}
 
-	// Save originals so they can be restored afterwards. Unprefixed values are
-	// left in place as defaults; role-prefixed values override them below.
+	// Save originals so they can be restored by the deferred cleanup below.
+	// Unprefixed values are kept in place to act as defaults; role-prefixed
+	// values temporarily override them while the credential is created.
 	originals := make(map[string]string, len(roleEnvVars))
 	for _, v := range roleEnvVars {
 		originals[v] = os.Getenv(v)
