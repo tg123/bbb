@@ -48,22 +48,6 @@ func UploadConcurrency(ctx context.Context) int {
 	return 1
 }
 
-type downloadConcurrencyKey struct{}
-
-// WithDownloadConcurrency returns a context that carries the download
-// concurrency hint for parallel ranged downloads.
-func WithDownloadConcurrency(ctx context.Context, n int) context.Context {
-	return context.WithValue(ctx, downloadConcurrencyKey{}, n)
-}
-
-// DownloadConcurrency returns the download concurrency stored in ctx, or 1 if unset.
-func DownloadConcurrency(ctx context.Context) int {
-	if v, ok := ctx.Value(downloadConcurrencyKey{}).(int); ok && v > 0 {
-		return v
-	}
-	return 1
-}
-
 // fileDownloader is an optional FS extension for downloading a remote file to
 // a local path using a backend-optimized (e.g. parallel ranged) transfer.
 type fileDownloader interface {
