@@ -1038,6 +1038,42 @@ func TestGetCredentialForRoleIgnoresHelperOnlyEnv(t *testing.T) {
 	}
 }
 
+func TestGetCredentialForRoleIgnoresUnprefixedClientIDOnly(t *testing.T) {
+	roleCredCache.Delete("CLIENTIDONLY")
+	for _, v := range roleEnvVars {
+		t.Setenv("CLIENTIDONLY_"+v, "")
+		t.Setenv(v, "")
+	}
+
+	t.Setenv("AZURE_CLIENT_ID", "client-id-only")
+
+	cred, err := getCredentialForRole("CLIENTIDONLY")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cred != nil {
+		t.Fatal("expected nil credential when only unprefixed AZURE_CLIENT_ID is set")
+	}
+}
+
+func TestGetCredentialForRoleAcceptsRolePrefixedClientIDOnly(t *testing.T) {
+	roleCredCache.Delete("USERASSIGNED")
+	for _, v := range roleEnvVars {
+		t.Setenv("USERASSIGNED_"+v, "")
+		t.Setenv(v, "")
+	}
+
+	t.Setenv("USERASSIGNED_AZURE_CLIENT_ID", "user-assigned-client-id")
+
+	cred, err := getCredentialForRole("USERASSIGNED")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cred == nil {
+		t.Fatal("expected credential when role-prefixed AZURE_CLIENT_ID is set")
+	}
+}
+
 func TestGetCredentialForRoleRemapsEnvVars(t *testing.T) {
 	// Clear cached credential.
 	roleCredCache.Delete("REMAP")
