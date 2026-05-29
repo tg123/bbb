@@ -1,46 +1,47 @@
 #!/usr/bin/env bash
 #
 # benchmark.sh — compare bbb (this repo) upload/download throughput against
-# azcopy and boostedblob (py-bbb) using a real Azure Blob Storage account.
+# azcopy and boostedblob (py-bbb) using the Azurite emulator.
 #
-# py-bbb (https://github.com/hauntsaninja/boostedblob) only talks to the real
-# `*.blob.core.windows.net` endpoint, so this benchmark cannot run against the
-# Azurite emulator — a real storage account is required.
+# The emulator must already be running and reachable at
+# `https://${BENCH_ACCOUNT}.blob.core.windows.net` (port 443) — see
+# setup-emulator.sh, which arranges the TLS cert, /etc/hosts entry and the
+# Azurite process. py-bbb (boostedblob) hardcodes that host, so all three tools
+# are pointed at it for an apples-to-apples comparison.
 #
-# Required environment variables:
-#   BENCH_ACCOUNT    Azure storage account name
-#   BENCH_KEY        Azure storage account shared key
-#   BENCH_CONTAINER  Container to use (created if missing)
-#
-# Optional environment variables:
-#   BENCH_SIZE_MB      Test file size in MiB                (default: 1024)
-#   BENCH_RUNS         Timed runs per tool/direction        (default: 3)
-#   BENCH_CONCURRENCY  Concurrency passed to bbb/azcopy     (default: nproc)
-#   BBB_BIN            Path to the bbb binary under test    (default: bbb on PATH)
-#   PYBBB              Command to invoke py-bbb              (default: python -m boostedblob)
-#   AZCOPY_BIN         Path to azcopy                       (default: azcopy on PATH)
+# Environment:
+#   BENCH_ACCOUNT      Storage account name             (default: devstoreaccount1)
+#   BENCH_KEY          Shared key for the account
+#                      (default: the well-known Azurite key)
+#   BENCH_CONTAINER    Container to use, created if missing (default: bench)
+#   BENCH_SIZE_MB      Test file size in MiB             (default: 256)
+#   BENCH_RUNS         Timed runs per tool/direction     (default: 3)
+#   BENCH_CONCURRENCY  Concurrency passed to bbb/azcopy  (default: nproc)
+#   BBB_BIN            Path to the bbb binary under test (default: bbb on PATH)
+#   PYBBB              Command to invoke py-bbb           (default: python -m boostedblob)
+#   AZCOPY_BIN         Path to azcopy                    (default: azcopy on PATH)
 #   BENCH_FAIL_FACTOR  If set, fail when bbb is slower than the fastest other
 #                      tool by more than this factor (e.g. 1.5). Unset = report only.
 #   GITHUB_STEP_SUMMARY  When set, the results table is appended to it.
 #
 set -euo pipefail
 
-: "${BENCH_ACCOUNT:?BENCH_ACCOUNT is required}"
-: "${BENCH_KEY:?BENCH_KEY is required}"
-: "${BENCH_CONTAINER:?BENCH_CONTAINER is required}"
-
-BENCH_SIZE_MB="${BENCH_SIZE_MB:-1024}"
+BENCH_ACCOUNT="${BENCH_ACCOUNT:-devstoreaccount1}"
+BENCH_KEY="${BENCH_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}"
+BENCH_CONTAINER="${BENCH_CONTAINER:-bench}"
+BENCH_SIZE_MB="${BENCH_SIZE_MB:-256}"
 BENCH_RUNS="${BENCH_RUNS:-3}"
 BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-$(nproc)}"
 BBB_BIN="${BBB_BIN:-bbb}"
 PYBBB="${PYBBB:-python -m boostedblob}"
 AZCOPY_BIN="${AZCOPY_BIN:-azcopy}"
 
+HOST="${BENCH_ACCOUNT}.blob.core.windows.net"
+BLOB_HOST="https://${HOST}"
+
 WORKDIR="$(mktemp -d)"
 SRC_FILE="${WORKDIR}/testfile.bin"
 trap 'rm -rf "${WORKDIR}"' EXIT
-
-BLOB_HOST="https://${BENCH_ACCOUNT}.blob.core.windows.net"
 
 log() { printf '>>> %s\n' "$*" >&2; }
 
@@ -71,35 +72,35 @@ mbps() { # seconds -> MB/s for BENCH_SIZE_MB
 }
 
 # ---------------------------------------------------------------------------
-# Setup: account-key env for each tool, container, SAS token, source file.
+# Per-tool auth.
 # ---------------------------------------------------------------------------
 
-# bbb (this repo) uses BBB_AZBLOB_ACCOUNTKEY.
+# bbb (this repo) talks to the production-style host via BBB_AZBLOB_ENDPOINT and
+# authenticates with the shared key.
+export BBB_AZBLOB_ENDPOINT="https://%s.blob.core.windows.net/"
 export BBB_AZBLOB_ACCOUNTKEY="${BENCH_KEY}"
 
-# py-bbb (boostedblob) uses AZURE_STORAGE_ACCOUNT(+_KEY).
+# py-bbb (boostedblob) uses AZURE_STORAGE_ACCOUNT(+_KEY) and the hardcoded host.
 export AZURE_STORAGE_ACCOUNT="${BENCH_ACCOUNT}"
 export AZURE_STORAGE_ACCOUNT_KEY="${BENCH_KEY}"
 
-log "Ensuring container ${BENCH_CONTAINER} exists"
-az storage container create \
-  --account-name "${BENCH_ACCOUNT}" \
-  --account-key "${BENCH_KEY}" \
-  --name "${BENCH_CONTAINER}" \
-  --only-show-errors >/dev/null
+# azcopy authenticates with a container SAS generated from the emulator
+# connection string.
+CONN="DefaultEndpointsProtocol=https;AccountName=${BENCH_ACCOUNT};AccountKey=${BENCH_KEY};BlobEndpoint=${BLOB_HOST};"
+export AZCOPY_LOG_LEVEL=ERROR
 
-# azcopy authenticates with a short-lived container SAS computed locally.
+log "Ensuring container ${BENCH_CONTAINER} exists"
+"${BBB_BIN}" az mkcontainer "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}" >/dev/null 2>&1 || true
+
 SAS_EXPIRY="$(date -u -d '+2 hours' '+%Y-%m-%dT%H:%MZ')"
 SAS="$(az storage container generate-sas \
-  --account-name "${BENCH_ACCOUNT}" \
-  --account-key "${BENCH_KEY}" \
+  --connection-string "${CONN}" \
   --name "${BENCH_CONTAINER}" \
   --permissions racwdl \
   --expiry "${SAS_EXPIRY}" \
   --https-only \
   --only-show-errors \
   --output tsv)"
-export AZCOPY_LOG_LEVEL=ERROR
 
 log "Generating ${BENCH_SIZE_MB} MiB test file"
 dd if=/dev/urandom of="${SRC_FILE}" bs=1M count="${BENCH_SIZE_MB}" status=none
@@ -143,13 +144,15 @@ done
 # ---------------------------------------------------------------------------
 emit() { printf '%s\n' "$1"; if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then printf '%s\n' "$1" >>"${GITHUB_STEP_SUMMARY}"; fi; }
 
-emit "### Transfer benchmark — ${BENCH_SIZE_MB} MiB, best of ${BENCH_RUNS}, concurrency ${BENCH_CONCURRENCY}"
+emit "### Transfer benchmark (Azurite emulator) — ${BENCH_SIZE_MB} MiB, best of ${BENCH_RUNS}, concurrency ${BENCH_CONCURRENCY}"
 emit ""
 emit "| Tool | Upload (s) | Upload MB/s | Download (s) | Download MB/s |"
 emit "|------|-----------:|------------:|-------------:|--------------:|"
 emit "| bbb (this repo) | ${UP[bbb]} | $(mbps "${UP[bbb]}") | ${DOWN[bbb]} | $(mbps "${DOWN[bbb]}") |"
 emit "| py-bbb (boostedblob) | ${UP[pybbb]} | $(mbps "${UP[pybbb]}") | ${DOWN[pybbb]} | $(mbps "${DOWN[pybbb]}") |"
 emit "| azcopy | ${UP[azcopy]} | $(mbps "${UP[azcopy]}") | ${DOWN[azcopy]} | $(mbps "${DOWN[azcopy]}") |"
+emit ""
+emit "> The Azurite emulator is CPU/loopback-bound, so absolute numbers measure client-side overhead rather than real network throughput."
 
 # ---------------------------------------------------------------------------
 # Cleanup blobs.

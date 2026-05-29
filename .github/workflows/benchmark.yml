@@ -1,13 +1,11 @@
 name: Benchmark
 
 # Compares bbb (this repo) upload/download throughput against azcopy and
-# boostedblob (py-bbb). boostedblob only talks to the real Azure endpoint, so
-# this needs a real storage account supplied via repository secrets:
-#   BENCH_AZURE_STORAGE_ACCOUNT  storage account name
-#   BENCH_AZURE_STORAGE_KEY      storage account shared key
-# Runs on every pull request and on pushes to main, plus on demand and on a
-# weekly schedule. The job is gated on the secrets above and skips with a
-# summary note when they are absent (for example on pull requests from forks).
+# boostedblob (py-bbb) using the Azurite emulator, so it needs no secrets and
+# runs on every pull request and push to main (plus on demand and weekly).
+#
+# py-bbb hardcodes https://{account}.blob.core.windows.net, so setup-emulator.sh
+# serves Azurite at that host over TLS on port 443 (see internal/benchmark).
 
 permissions:
   contents: read
@@ -20,7 +18,7 @@ on:
     inputs:
       size_mb:
         description: Test file size in MiB
-        default: "1024"
+        default: "256"
         required: false
       runs:
         description: Timed runs per tool/direction
@@ -40,55 +38,40 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Check secrets are configured
-        id: guard
-        env:
-          BENCH_AZURE_STORAGE_ACCOUNT: ${{ secrets.BENCH_AZURE_STORAGE_ACCOUNT }}
-          BENCH_AZURE_STORAGE_KEY: ${{ secrets.BENCH_AZURE_STORAGE_KEY }}
-        run: |
-          if [ -z "${BENCH_AZURE_STORAGE_ACCOUNT}" ] || [ -z "${BENCH_AZURE_STORAGE_KEY}" ]; then
-            echo "Benchmark secrets are not configured; skipping." >> "${GITHUB_STEP_SUMMARY}"
-            echo "configured=false" >> "${GITHUB_OUTPUT}"
-          else
-            echo "configured=true" >> "${GITHUB_OUTPUT}"
-          fi
-
       - name: Set up Go
-        if: steps.guard.outputs.configured == 'true'
         uses: actions/setup-go@v6
         with:
           go-version: 'stable'
           cache: true
 
       - name: Build bbb
-        if: steps.guard.outputs.configured == 'true'
         run: go build -o "${RUNNER_TEMP}/bbb" .
 
       - name: Set up Python
-        if: steps.guard.outputs.configured == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
       - name: Install py-bbb (boostedblob)
-        if: steps.guard.outputs.configured == 'true'
         run: pip install boostedblob
 
       - name: Install azcopy
-        if: steps.guard.outputs.configured == 'true'
         run: |
           curl -sSL -o /tmp/azcopy.tar.gz https://aka.ms/downloadazcopy-v10-linux
           tar -xzf /tmp/azcopy.tar.gz -C /tmp
           sudo cp /tmp/azcopy_linux_amd64_*/azcopy /usr/local/bin/azcopy
           azcopy --version
 
+      - name: Install Azurite
+        run: npm install -g azurite
+
+      - name: Start Azurite emulator
+        run: |
+          BENCH_STATE_DIR="${RUNNER_TEMP}/azurite" bash internal/benchmark/setup-emulator.sh
+
       - name: Run benchmark
-        if: steps.guard.outputs.configured == 'true'
         env:
-          BENCH_ACCOUNT: ${{ secrets.BENCH_AZURE_STORAGE_ACCOUNT }}
-          BENCH_KEY: ${{ secrets.BENCH_AZURE_STORAGE_KEY }}
-          BENCH_CONTAINER: ${{ secrets.BENCH_AZURE_STORAGE_CONTAINER || 'bbb-benchmark' }}
-          BENCH_SIZE_MB: ${{ github.event.inputs.size_mb || '1024' }}
+          BENCH_SIZE_MB: ${{ github.event.inputs.size_mb || '256' }}
           BENCH_RUNS: ${{ github.event.inputs.runs || '3' }}
           BENCH_FAIL_FACTOR: ${{ github.event.inputs.fail_factor || '' }}
           BBB_BIN: ${{ runner.temp }}/bbb

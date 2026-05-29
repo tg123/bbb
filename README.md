@@ -623,26 +623,32 @@ Python `bbb`, referred to as *py-bbb*). It guards the parallel transfer paths
 introduced in [#87](https://github.com/tg123/bbb/pull/87) and
 [#89](https://github.com/tg123/bbb/pull/89) against regressions.
 
-Because `boostedblob` only talks to the real `*.blob.core.windows.net`
-endpoint, the benchmark needs a real Azure Storage account (the Azurite
-emulator is not enough). Configure these repository secrets to enable it:
-
-| Secret | Description |
-|--------|-------------|
-| `BENCH_AZURE_STORAGE_ACCOUNT` | Storage account name |
-| `BENCH_AZURE_STORAGE_KEY` | Storage account shared key |
-| `BENCH_AZURE_STORAGE_CONTAINER` | *(optional)* container to use (default `bbb-benchmark`) |
+Because `boostedblob` hardcodes the `https://{account}.blob.core.windows.net`
+endpoint (no port or host override), the benchmark serves the
+[Azurite](https://github.com/Azure/Azurite) emulator at that exact host:
+[`internal/benchmark/setup-emulator.sh`](internal/benchmark/setup-emulator.sh)
+generates a local CA (trusted system-wide), points
+`{account}.blob.core.windows.net` at `127.0.0.1`, and starts Azurite over TLS on
+port 443. All three tools then hit the same emulator, so **no secrets or real
+Azure account are required** and the benchmark runs on every pull request.
 
 The workflow runs on every pull request, on pushes to `main`, weekly, and on
 demand via **Run workflow** (`workflow_dispatch`), where you can set the
 test-file size, the number of runs, and an optional `fail_factor` that fails the
 job when `bbb` is slower than the fastest other tool by more than that factor.
-Results are written to the job summary as a table. It is skipped automatically
-when the secrets are absent (for example on pull requests from forks).
+Results are written to the job summary as a table.
 
-The benchmark itself lives in
-[`internal/benchmark/benchmark.sh`](internal/benchmark/benchmark.sh) and can be
-run locally against any account with the same environment variables.
+> The emulator is CPU/loopback-bound, so the numbers reflect client-side
+> overhead rather than real network throughput; `fail_factor` is off by default.
+
+To run it locally (needs `sudo` for port 443, `/etc/hosts` and the trust store):
+
+```bash
+npm install -g azurite
+BENCH_STATE_DIR=/tmp/azurite bash internal/benchmark/setup-emulator.sh
+go build -o /tmp/bbb .
+BBB_BIN=/tmp/bbb bash internal/benchmark/benchmark.sh
+```
 
 ## License
 
