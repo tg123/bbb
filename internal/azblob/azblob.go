@@ -561,6 +561,31 @@ var roleEnvVars = []string{
 	"AZURE_CONFIG_DIR",
 }
 
+var roleCredentialTriggerEnvVars = map[string]struct{}{
+	"AZURE_CLIENT_ID":               {},
+	"AZURE_TENANT_ID":               {},
+	"AZURE_CLIENT_SECRET":           {},
+	"AZURE_CLIENT_CERTIFICATE_PATH": {},
+	"AZURE_FEDERATED_TOKEN_FILE":    {},
+	"IDENTITY_ENDPOINT":             {},
+	"IDENTITY_HEADER":               {},
+	"MSI_ENDPOINT":                  {},
+	"MSI_SECRET":                    {},
+	"IMDS_ENDPOINT":                 {},
+}
+
+func roleCredentialEnvConfigured(role string) bool {
+	for _, v := range roleEnvVars {
+		if _, ok := roleCredentialTriggerEnvVars[v]; !ok {
+			continue
+		}
+		if os.Getenv(role+"_"+v) != "" || os.Getenv(v) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // roleCredMu serializes env var swapping for role-specific credential
 // creation. os.Setenv is process-global, so concurrent credential creation
 // for different roles must not interleave env var mutations.
@@ -581,16 +606,10 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 		return cached.(azcore.TokenCredential), nil
 	}
 
-	// Check if any role-prefixed env var is set, or any unprefixed default
-	// that the role should inherit.
-	hasAny := false
-	for _, v := range roleEnvVars {
-		if os.Getenv(role+"_"+v) != "" || os.Getenv(v) != "" {
-			hasAny = true
-			break
-		}
-	}
-	if !hasAny {
+	// Only credential-bearing env vars should activate the DefaultAzureCredential
+	// path. Helper vars like AZURE_CONFIG_DIR / AZURE_USERNAME are still
+	// inherited, but only after some real credential config is present.
+	if !roleCredentialEnvConfigured(role) {
 		return nil, nil // not configured
 	}
 

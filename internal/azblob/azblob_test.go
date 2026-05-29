@@ -1019,6 +1019,25 @@ func TestGetCredentialForRoleReturnsNilWhenNoEnvSet(t *testing.T) {
 	}
 }
 
+func TestGetCredentialForRoleIgnoresHelperOnlyEnv(t *testing.T) {
+	roleCredCache.Delete("HELPERONLY")
+	for _, v := range roleEnvVars {
+		t.Setenv("HELPERONLY_"+v, "")
+		t.Setenv(v, "")
+	}
+
+	t.Setenv("AZURE_CONFIG_DIR", "/tmp/fake-azure-config")
+	t.Setenv("HELPERONLY_AZURE_USERNAME", "user@example.com")
+
+	cred, err := getCredentialForRole("HELPERONLY")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cred != nil {
+		t.Fatal("expected nil credential when only helper env vars are set")
+	}
+}
+
 func TestGetCredentialForRoleRemapsEnvVars(t *testing.T) {
 	// Clear cached credential.
 	roleCredCache.Delete("REMAP")
