@@ -1362,19 +1362,71 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			}
 		}
 		if bbbfs.IsRemote(op.src) || bbbfs.IsRemote(op.dst) {
+			var copyBar *progressBar
+			if showCopyBar {
+				copyBar = newStreamingProgressBar(path.Base(op.src), false, true)
+				if copyBar != nil {
+					copyBar.byteSized = true
+					if size > 0 {
+						copyBar.SetTotal(size)
+					}
+				}
+			}
 			reader, err := bbbfs.Resolve(op.src).Read(ctx, op.src)
 			if err != nil {
+				if copyBar != nil {
+					copyBar.Finish()
+				}
 				return 0, err
 			}
+			var streamCopied atomic.Int64
+			var lastReported atomic.Int64
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return bbbfs.Resolve(op.dst).Write(ctx, op.dst, r)
+				pr := io.TeeReader(r, &progressWriter{
+					onWrite: func(n int) {
+						copied := streamCopied.Add(int64(n))
+						// Report incremental bytes to the overall taskbar.
+						// Use CAS loop because callbacks may arrive from
+						// parallel goroutines within a single Write.
+						if onBytes != nil {
+							for {
+								prev := lastReported.Load()
+								if copied <= prev {
+									break
+								}
+								if lastReported.CompareAndSwap(prev, copied) {
+									onBytes(copied - prev)
+									break
+								}
+							}
+						}
+						if copyBar != nil {
+							atomicMax(&copyBar.bytesDone, copied)
+							atomicMax(&copyBar.done, copied)
+							copyBar.render(copied)
+						}
+					},
+				})
+				return bbbfs.Resolve(op.dst).Write(ctx, op.dst, pr)
 			}); err != nil {
+				if copyBar != nil {
+					copyBar.Finish()
+				}
 				return 0, err
 			}
-		} else {
-			if err := fsops.CopyFile(op.src, op.dst, overwrite); err != nil {
-				return 0, fmt.Errorf("cp: %w", err)
+			if copyBar != nil {
+				copyBar.Finish()
 			}
+			if !quiet {
+				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
+			}
+			if size > 0 {
+				return size, nil
+			}
+			return streamCopied.Load(), nil
+		}
+		if err := fsops.CopyFile(op.src, op.dst, overwrite); err != nil {
+			return 0, fmt.Errorf("cp: %w", err)
 		}
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
@@ -1523,16 +1575,47 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					return nil
 				}
 			}
+			var copyBar *progressBar
+			if !quiet {
+				copyBar = newStreamingProgressBar(path.Base(work.name), false, true)
+				if copyBar != nil {
+					copyBar.byteSized = true
+					if info, statErr := bbbfs.Resolve(srcPath).Stat(ctx, srcPath); statErr == nil && info.Size > 0 {
+						copyBar.SetTotal(info.Size)
+					}
+				}
+			}
 			reader, err := bbbfs.Resolve(srcPath).Read(ctx, srcPath)
 			if err != nil {
+				if copyBar != nil {
+					copyBar.Finish()
+				}
 				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 				return err
 			}
+			var streamCopied atomic.Int64
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
+				pr := io.TeeReader(r, &progressWriter{
+					onWrite: func(n int) {
+						if copyBar == nil {
+							return
+						}
+						copied := streamCopied.Add(int64(n))
+						atomicMax(&copyBar.bytesDone, copied)
+						atomicMax(&copyBar.done, copied)
+						copyBar.render(copied)
+					},
+				})
+				return bbbfs.Resolve(dstPath).Write(ctx, dstPath, pr)
 			}); err != nil {
+				if copyBar != nil {
+					copyBar.Finish()
+				}
 				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 				return err
+			}
+			if copyBar != nil {
+				copyBar.Finish()
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", srcPath, dstPath)
