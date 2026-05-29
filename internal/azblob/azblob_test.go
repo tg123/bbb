@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 )
@@ -1157,51 +1156,5 @@ func TestGetCredentialForRoleCachesResult(t *testing.T) {
 	// Both calls should return the same cached instance.
 	if cred1 != cred2 {
 		t.Error("expected cached credential to be reused")
-	}
-}
-
-func TestCredentialFromEnvReturnsNilWhenUnset(t *testing.T) {
-	t.Setenv("AZURE_TENANT_ID", "")
-	t.Setenv("AZURE_CLIENT_ID", "")
-	t.Setenv("AZURE_CLIENT_SECRET", "")
-
-	cred, err := credentialFromEnv()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cred != nil {
-		t.Fatal("expected nil credential when no env vars set")
-	}
-}
-
-func TestCredentialFromEnvServicePrincipal(t *testing.T) {
-	t.Setenv("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000")
-	t.Setenv("AZURE_CLIENT_ID", "11111111-1111-1111-1111-111111111111")
-	t.Setenv("AZURE_CLIENT_SECRET", "secret")
-
-	cred, err := credentialFromEnv()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cred == nil {
-		t.Fatal("expected non-nil service principal credential")
-	}
-	if _, ok := cred.(*azidentity.ClientSecretCredential); !ok {
-		t.Fatalf("expected *azidentity.ClientSecretCredential, got %T", cred)
-	}
-}
-
-func TestCredentialFromEnvIncompleteServicePrincipal(t *testing.T) {
-	t.Setenv("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000")
-	t.Setenv("AZURE_CLIENT_ID", "11111111-1111-1111-1111-111111111111")
-	// AZURE_CLIENT_SECRET intentionally unset.
-	t.Setenv("AZURE_CLIENT_SECRET", "")
-
-	cred, err := credentialFromEnv()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cred != nil {
-		t.Fatal("expected nil credential when service principal config is incomplete")
 	}
 }

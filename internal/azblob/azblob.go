@@ -642,38 +642,6 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	return actual.(azcore.TokenCredential), nil
 }
 
-// credentialFromEnv builds a non-interactive credential from the standard
-// AZURE_* environment variables when they are configured. It returns
-// (nil, nil) when no such configuration is present, signalling the caller to
-// fall back to the interactive (Azure CLI / browser) flow.
-//
-// Honored variables:
-//   - AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET →
-//     ClientSecretCredential (service principal).
-//
-// AZURE_SUBSCRIPTION_ID is not required for Blob Storage data-plane
-// authentication and is intentionally ignored here.
-func credentialFromEnv() (azcore.TokenCredential, error) {
-	tenantID := os.Getenv("AZURE_TENANT_ID")
-	clientID := os.Getenv("AZURE_CLIENT_ID")
-	clientSecret := os.Getenv("AZURE_CLIENT_SECRET")
-	if tenantID != "" && clientID != "" && clientSecret != "" {
-		opts := &azidentity.ClientSecretCredentialOptions{}
-		if strings.EqualFold(os.Getenv("BBB_AZURE_ALLOW_ANY_TENANT"), "true") {
-			opts.AdditionallyAllowedTenants = []string{"*"}
-		}
-		applyTransportToIdentityOptions(&opts.ClientOptions)
-		cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, opts)
-		if err != nil {
-			return nil, fmt.Errorf("client secret credential: %w", err)
-		}
-		slog.Debug("Using service principal credential (AZURE_* env vars)", "tenant", tenantID, "client", clientID)
-		return cred, nil
-	}
-
-	return nil, nil
-}
-
 // tenantIDFromAccessToken returns the "tid" claim from a JWT access token,
 // or "" when the token is not a JWT, can't be decoded, or has no tid claim.
 // Used to detect tenant mismatches between a token issued by AzureCLICredential
@@ -707,25 +675,21 @@ func tenantIDFromAccessToken(token string) string {
 // Only one browser popup is opened per tenant; concurrent callers wait for
 // the first to complete.
 func getCredentialForAccount(ctx context.Context, account string) (azcore.TokenCredential, error) {
-	// Check for role-specific environment credentials (SRC_AZURE_* / DST_AZURE_*).
+	// Resolve the role for this account. Accounts tagged during cp/sync use
+	// their SRC/DST role; accounts without an explicit role (single-endpoint
+	// commands like ls/cat/rm) reuse the SRC role, so SRC_AZURE_* and the
+	// unprefixed AZURE_* defaults are honored for them too. When the relevant
+	// env vars are unset, getCredentialForRole returns nil and we fall through
+	// to tenant discovery and the interactive CLI/browser flow.
+	role := "SRC"
 	if roleVal, ok := accountRoles.Load(account); ok {
-		role := roleVal.(string)
-		cred, err := getCredentialForRole(role)
-		if err != nil {
-			return nil, err
-		}
-		if cred != nil {
-			return cred, nil
-		}
-		// Role env vars not set — fall through to normal credential flow.
+		role = roleVal.(string)
 	}
-
-	// Honor explicit credentials configured via the standard AZURE_* env vars
-	// (service principal) before falling back to tenant discovery and
-	// interactive CLI/browser login.
-	if cred, err := credentialFromEnv(); err != nil {
+	cred, err := getCredentialForRole(role)
+	if err != nil {
 		return nil, err
-	} else if cred != nil {
+	}
+	if cred != nil {
 		return cred, nil
 	}
 

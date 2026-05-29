@@ -70,7 +70,7 @@ By default, when bbb cannot find shared keys or role-specific credentials it dis
 - When `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` are all set, bbb uses a **service principal** credential.
 - `AZURE_SUBSCRIPTION_ID` is not required for Blob Storage data-plane authentication and is ignored.
 
-These take effect before the interactive CLI/browser flow, so no browser popup is opened when they are configured. For per-account scoping across tenants, use the `SRC_` / `DST_` prefixed variables described below.
+These take effect before the interactive CLI/browser flow, so no browser popup is opened when they are configured. Single-endpoint commands (`ls`, `cat`, `rm`, etc.) reuse the `SRC` role internally, so the unprefixed `AZURE_*` vars (and `SRC_AZURE_*`) are honored for them too. For per-account scoping across tenants, use the `SRC_` / `DST_` prefixed variables described below.
 
 ### Multi-Tenant / Multi-Account Authentication (`SRC_` / `DST_` Env Vars)
 
@@ -129,10 +129,9 @@ bbb sync az://src-account/data/ az://dst-account/data/
 **Credential resolution order** (first match wins):
 
 1. Shared key (`SRC_BBB_AZBLOB_ACCOUNTKEY` / `DST_BBB_AZBLOB_ACCOUNTKEY`, or `BBB_AZBLOB_ACCOUNTKEY`)
-2. Role-specific env credential (`SRC_AZURE_*` / `DST_AZURE_*`, falling back to unprefixed `AZURE_*` defaults) via `DefaultAzureCredential`
-3. Non-interactive env credential for accounts without a role (`AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` service principal)
-4. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
-5. Interactive browser login (fallback)
+2. Role env credential via `DefaultAzureCredential` — `SRC_AZURE_*` / `DST_AZURE_*`, falling back to unprefixed `AZURE_*` defaults. Accounts without an explicit role (single-endpoint commands like `ls`/`cat`/`rm`) reuse the `SRC` role, so unprefixed `AZURE_*` (and `SRC_AZURE_*`) are honored for them.
+3. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
+4. Interactive browser login (fallback)
 
 ### `BBB_DNS_CACHE`
 
