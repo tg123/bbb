@@ -1149,10 +1149,20 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 	var firstErr error
 
 	for i, blockID := range blockIDs {
-		if ctx.Err() != nil {
+		if err := ctx.Err(); err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
 			break
 		}
 		if err := sem.Acquire(ctx); err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
 			break
 		}
 		offset := int64(i) * blockSize

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tg123/bbb/internal/azblob"
@@ -71,19 +72,22 @@ func (azFS) UploadFromFile(ctx context.Context, localPath, dst string, concurren
 		return 0, err
 	}
 	defer func() { _ = f.Close() }()
-	var uploaded int64
+	var uploaded atomic.Int64
 	tracker := func(n int64) {
-		if n > uploaded {
-			uploaded = n
+		for {
+			cur := uploaded.Load()
+			if n <= cur || uploaded.CompareAndSwap(cur, n) {
+				break
+			}
 		}
 		if onProgress != nil {
 			onProgress(n)
 		}
 	}
 	if err := azblob.UploadFile(ctx, ap, f, concurrency, tracker); err != nil {
-		return uploaded, err
+		return uploaded.Load(), err
 	}
-	return uploaded, nil
+	return uploaded.Load(), nil
 }
 
 func (azFS) List(ctx context.Context, path string) ([]Entry, error) {
