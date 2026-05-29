@@ -1315,7 +1315,7 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 				wg.Done()
 			}()
 			resp, err := blobClient.DownloadStream(ctx, &blob.DownloadStreamOptions{
-				Range:       blob.HTTPRange{Offset: offset, Count: count},
+				Range: blob.HTTPRange{Offset: offset, Count: count},
 				AccessConditions: &blob.AccessConditions{
 					ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfMatch: etag},
 				},
