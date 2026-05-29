@@ -1214,6 +1214,19 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 	return nil
 }
 
+// downloadCopyBufferSize is the per-range io.CopyBuffer size. The default
+// io.Copy buffer is 32 KiB; with 16 MiB ranges that's 512 read/write syscalls
+// per range and quickly becomes CPU-bound on multi-GiB downloads. 1 MiB keeps
+// the syscall count low without ballooning memory (peak ≈ concurrency × 1 MiB).
+const downloadCopyBufferSize = 1 * 1024 * 1024
+
+var downloadCopyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, downloadCopyBufferSize)
+		return &buf
+	},
+}
+
 // DownloadFile downloads a blob to a local file using parallel ranged GETs.
 // concurrency is the initial parallelism (and floor); an adaptive controller
 // probes higher concurrency while throughput keeps improving, up to
@@ -1330,7 +1343,9 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 				return
 			}
 			body := resp.NewRetryReader(ctx, nil)
-			n, copyErr := io.Copy(io.NewOffsetWriter(file, offset), body)
+			bufPtr := downloadCopyBufPool.Get().(*[]byte)
+			n, copyErr := io.CopyBuffer(io.NewOffsetWriter(file, offset), body, *bufPtr)
+			downloadCopyBufPool.Put(bufPtr)
 			closeErr := body.Close()
 			if copyErr == nil && n != count {
 				copyErr = fmt.Errorf("short download for range [%d,%d): got %d bytes", offset, offset+count, n)
