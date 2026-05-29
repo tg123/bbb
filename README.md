@@ -56,6 +56,12 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
+| `BBB_PARALLEL_DOWNLOAD` | `1` (on) | Set to `0`, `false`, `no`, or `off` to disable parallel ranged Azure→local single-file downloads and fall back to a single streaming connection |
+| `BBB_PARALLEL_UPLOAD` | `1` (on) | Set to `0`, `false`, `no`, or `off` to disable parallel ranged local→Azure single-file uploads and fall back to the streaming `UploadStream` path |
+| `BBB_AZBLOB_DOWNLOAD_BLOCK_MIB` | `4` | Chunk size in MiB used by the parallel Azure→local download path |
+| `BBB_AZBLOB_UPLOAD_BLOCK_MIB` | `64` | Chunk size in MiB used by the parallel local→Azure upload path (clamped so the total block count stays within Azure's per-blob limit) |
+| `BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX` | *(auto)* | Hard upper bound on in-flight upload blocks for the adaptive concurrency controller (default cap 512) |
+| `BBB_AZBLOB_COPY_CONCURRENCY_MAX` | *(auto)* | Hard upper bound on in-flight blocks for Azure→Azure server-side block copies (default cap 256) |
 
 ### Non-Interactive Authentication (`AZURE_*` Env Vars)
 

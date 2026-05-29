@@ -71,14 +71,19 @@ func (azFS) UploadFromFile(ctx context.Context, localPath, dst string, concurren
 		return 0, err
 	}
 	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil {
-		return 0, err
+	var uploaded int64
+	tracker := func(n int64) {
+		if n > uploaded {
+			uploaded = n
+		}
+		if onProgress != nil {
+			onProgress(n)
+		}
 	}
-	if err := azblob.UploadFile(ctx, ap, f, concurrency, onProgress); err != nil {
-		return 0, err
+	if err := azblob.UploadFile(ctx, ap, f, concurrency, tracker); err != nil {
+		return uploaded, err
 	}
-	return info.Size(), nil
+	return uploaded, nil
 }
 
 func (azFS) List(ctx context.Context, path string) ([]Entry, error) {
