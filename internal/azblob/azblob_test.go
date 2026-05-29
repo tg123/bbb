@@ -1446,3 +1446,13 @@ func TestAdaptiveBoundsEnvOverrideWithinCap(t *testing.T) {
 		t.Fatalf("expected env override to set maxC=64, got %d", maxC)
 	}
 }
+
+func TestAdaptiveBoundsEnvOverrideClampsCallerDown(t *testing.T) {
+	// --concurrency 64 with env max 8 must produce a semaphore capped at 8
+	// (env var is documented as a hard upper bound).
+	t.Setenv("TEST_ADAPTIVE_MAX_ENV", "8")
+	initial, minC, maxC, _ := adaptiveBounds(64, 512, "TEST_ADAPTIVE_MAX_ENV")
+	if initial != 8 || minC != 8 || maxC != 8 {
+		t.Fatalf("expected env override to clamp all bounds to 8, got initial=%d min=%d max=%d", initial, minC, maxC)
+	}
+}

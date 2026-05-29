@@ -225,8 +225,10 @@ func envMaxConcurrency(name string, fallback int) int {
 // (and minimum) capacity so existing tuning is preserved; the controller is
 // only allowed to grow upward. Both the caller value and the env override are
 // clamped to hardCap so neither path can spawn more in-flight work than the
-// documented ceiling (each in-flight slot owns a block-sized buffer, so an
-// unbounded value risks OOM).
+// documented ceiling. The env var is documented as a hard upper bound, so
+// when it is lower than the caller-supplied concurrency it also clamps
+// initial/minC down — otherwise --concurrency 64 with env max 8 would still
+// run 64 in-flight slots.
 func adaptiveBounds(concurrency, hardCap int, envMaxName string) (initial, minC, maxC, step int) {
 	if concurrency < 1 {
 		concurrency = 1
@@ -234,19 +236,30 @@ func adaptiveBounds(concurrency, hardCap int, envMaxName string) (initial, minC,
 	if hardCap > 0 && concurrency > hardCap {
 		concurrency = hardCap
 	}
+	// Resolve the effective ceiling first so we can clamp the caller value
+	// down to it when the env override is more restrictive than --concurrency.
+	envCap := 0
+	if envMaxName != "" {
+		envCap = envMaxConcurrency(envMaxName, 0)
+		if hardCap > 0 && envCap > hardCap {
+			envCap = hardCap
+		}
+		if envCap > 0 && concurrency > envCap {
+			concurrency = envCap
+		}
+	}
 	initial = concurrency
 	minC = concurrency
-	// Default ceiling: 4× initial, clamped to hardCap, with a floor so very
-	// small initial values still have room to grow.
-	maxC = concurrency * 4
-	if maxC < 32 {
-		maxC = 32
-	}
-	if hardCap > 0 && maxC > hardCap {
-		maxC = hardCap
-	}
-	if envMaxName != "" {
-		maxC = envMaxConcurrency(envMaxName, maxC)
+	if envCap > 0 {
+		// Explicit env override defines the ceiling exactly.
+		maxC = envCap
+	} else {
+		// Default ceiling: 4× initial, with a floor so very small initial
+		// values still have room to grow, clamped to hardCap.
+		maxC = concurrency * 4
+		if maxC < 32 {
+			maxC = 32
+		}
 		if hardCap > 0 && maxC > hardCap {
 			maxC = hardCap
 		}
