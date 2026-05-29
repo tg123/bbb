@@ -1523,7 +1523,12 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 	var firstErr error
 
 	for i, blockID := range blockIDs {
-		if ctx.Err() != nil {
+		if err := ctx.Err(); err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
 			break
 		}
 
@@ -1531,6 +1536,11 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 		count := min(blkSize, totalSize-offset)
 
 		if err := sem.Acquire(ctx); err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
 			break
 		}
 		wg.Add(1)
