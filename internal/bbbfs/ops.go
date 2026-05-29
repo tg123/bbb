@@ -48,6 +48,48 @@ func UploadConcurrency(ctx context.Context) int {
 	return 1
 }
 
+type downloadConcurrencyKey struct{}
+
+// WithDownloadConcurrency returns a context that carries the download
+// concurrency hint for parallel ranged downloads.
+func WithDownloadConcurrency(ctx context.Context, n int) context.Context {
+	return context.WithValue(ctx, downloadConcurrencyKey{}, n)
+}
+
+// DownloadConcurrency returns the download concurrency stored in ctx, or 1 if unset.
+func DownloadConcurrency(ctx context.Context) int {
+	if v, ok := ctx.Value(downloadConcurrencyKey{}).(int); ok && v > 0 {
+		return v
+	}
+	return 1
+}
+
+// fileDownloader is an optional FS extension for downloading a remote file to
+// a local path using a backend-optimized (e.g. parallel ranged) transfer.
+type fileDownloader interface {
+	DownloadToFile(ctx context.Context, src, localPath string, concurrency int, onProgress func(int64)) (int64, error)
+}
+
+// CanDownloadToFile reports whether src's backend supports an optimized
+// download-to-local-file path.
+func CanDownloadToFile(src string) bool {
+	_, ok := Resolve(src).(fileDownloader)
+	return ok
+}
+
+// DownloadToFile downloads the remote file at src into localPath using a
+// backend-optimized transfer (parallel ranged GETs for Azure). onProgress, when
+// non-nil, receives the cumulative number of bytes written. Returns the number
+// of bytes downloaded.
+func DownloadToFile(ctx context.Context, src, localPath string, concurrency int, onProgress func(int64)) (int64, error) {
+	fs := Resolve(src)
+	fd, ok := fs.(fileDownloader)
+	if !ok {
+		return 0, fmt.Errorf("parallel download not supported for %s", src)
+	}
+	return fd.DownloadToFile(ctx, src, localPath, concurrency, onProgress)
+}
+
 // IsAz returns true if the path targets an Azure Blob Storage backend.
 func IsAz(path string) bool {
 	return azProvider.Match(path)

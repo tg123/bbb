@@ -987,6 +987,58 @@ func DownloadStream(ctx context.Context, ap AzurePath) (io.ReadCloser, error) {
 	return downloadResp.Body, nil
 }
 
+// downloadBlockSize is the per-range block size used for parallel downloads.
+// It mirrors azcopy's default chunking so a single blob is fetched over many
+// concurrent ranged GETs rather than one sequential stream.
+const downloadBlockSize = 4 * 1024 * 1024 // 4 MiB
+
+const downloadBlockSizeEnv = "BBB_AZBLOB_DOWNLOAD_BLOCK_MIB"
+
+// downloadBlockSizeBytes returns the configured download block size in bytes,
+// honoring BBB_AZBLOB_DOWNLOAD_BLOCK_MIB when set to a positive integer.
+func downloadBlockSizeBytes() int64 {
+	if v := os.Getenv(downloadBlockSizeEnv); v != "" {
+		if mib, err := strconv.ParseInt(v, 10, 64); err == nil && mib > 0 && mib <= math.MaxInt64/(1024*1024) {
+			return mib * 1024 * 1024
+		}
+	}
+	return downloadBlockSize
+}
+
+// DownloadFile downloads a blob to a local file using parallel ranged GETs.
+// concurrency controls how many ranges are fetched in parallel (>=1). The
+// optional onProgress callback receives the cumulative number of bytes written.
+// Returns the number of bytes downloaded.
+func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) (int64, error) {
+	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
+		return 0, errors.New("cannot download directory")
+	}
+	client, err := getAzBlobClient(ctx, ap.Account)
+	if err != nil {
+		return 0, err
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > math.MaxUint16 {
+		concurrency = math.MaxUint16
+	}
+	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
+	n, err := blobClient.DownloadFile(ctx, file, &blob.DownloadFileOptions{
+		BlockSize:   downloadBlockSizeBytes(),
+		Concurrency: uint16(concurrency),
+		Progress:    onProgress,
+	})
+	if err != nil {
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.ErrorCode == "BlobNotFound" {
+			return 0, osNotExist(ap.String())
+		}
+		return 0, err
+	}
+	return n, nil
+}
+
 // Upload writes blob (overwrite)
 func Upload(ctx context.Context, ap AzurePath, data []byte) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {

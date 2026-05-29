@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,28 @@ func (azFS) Write(ctx context.Context, path string, r io.Reader) error {
 		return err
 	}
 	return azblob.UploadStream(ctx, ap, r, UploadConcurrency(ctx))
+}
+
+// DownloadToFile downloads the blob at src into localPath using parallel ranged
+// GETs, mirroring azcopy's chunked download for higher single-file throughput.
+func (azFS) DownloadToFile(ctx context.Context, src, localPath string, concurrency int, onProgress func(int64)) (int64, error) {
+	ap, err := azblob.Parse(src)
+	if err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		return 0, err
+	}
+	f, err := os.OpenFile(localPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	n, downloadErr := azblob.DownloadFile(ctx, ap, f, concurrency, onProgress)
+	closeErr := f.Close()
+	if downloadErr != nil {
+		return n, downloadErr
+	}
+	return n, closeErr
 }
 
 func (azFS) List(ctx context.Context, path string) ([]Entry, error) {
