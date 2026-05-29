@@ -1227,6 +1227,28 @@ var downloadCopyBufPool = sync.Pool{
 	},
 }
 
+// monotonicProgress wraps onProgress so it is invoked with strictly
+// increasing cumulative byte counts. DownloadFile fans out concurrent ranged
+// GETs; while the atomic counter is monotonic, two goroutines can race to
+// call onProgress with their captured value out of order. The mutex
+// serializes delivery and drops stale values so callers (and UIs that don't
+// already dedupe) never observe the cumulative total going backwards.
+func monotonicProgress(last *atomic.Int64, onProgress func(int64)) func(int64) {
+	if onProgress == nil {
+		return func(int64) {}
+	}
+	var mu sync.Mutex
+	return func(cur int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		if cur <= last.Load() {
+			return
+		}
+		last.Store(cur)
+		onProgress(cur)
+	}
+}
+
 // DownloadFile downloads a blob to a local file using parallel ranged GETs.
 // concurrency is the initial parallelism (and floor); an adaptive controller
 // probes higher concurrency while throughput keeps improving, up to
@@ -1284,6 +1306,13 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 	}
 	sem := newAdaptiveSem(initial, maxC)
 	var written atomic.Int64
+	// lastReported guards onProgress to deliver monotonically increasing
+	// cumulative byte counts. written.Add returns a monotonic value, but two
+	// goroutines may race to invoke onProgress with their captured value in
+	// any order. monotonicProgress filters out stale callbacks so callers
+	// never see the cumulative total go backwards.
+	var lastReported atomic.Int64
+	emitProgress := monotonicProgress(&lastReported, onProgress)
 	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
 	defer ctrlCancel()
 	done := make(chan struct{})
@@ -1369,9 +1398,7 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 				return
 			}
 			cur := written.Add(n)
-			if onProgress != nil {
-				onProgress(cur)
-			}
+			emitProgress(cur)
 		}(offset, count)
 	}
 
@@ -1381,9 +1408,7 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 	if firstErr != nil {
 		return 0, firstErr
 	}
-	if onProgress != nil {
-		onProgress(size)
-	}
+	emitProgress(size)
 	return size, nil
 }
 

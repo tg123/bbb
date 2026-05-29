@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
@@ -1211,5 +1213,92 @@ func TestGetCredentialForRoleCachesResult(t *testing.T) {
 	// Both calls should return the same cached instance.
 	if cred1 != cred2 {
 		t.Error("expected cached credential to be reused")
+	}
+}
+
+func TestMonotonicProgressNilCallback(t *testing.T) {
+	var last atomic.Int64
+	emit := monotonicProgress(&last, nil)
+	emit(100)
+	emit(50)
+	if got := last.Load(); got != 0 {
+		t.Fatalf("expected last to remain 0 when onProgress nil, got %d", got)
+	}
+}
+
+func TestMonotonicProgressFiltersStale(t *testing.T) {
+	var last atomic.Int64
+	var calls []int64
+	var mu sync.Mutex
+	emit := monotonicProgress(&last, func(v int64) {
+		mu.Lock()
+		calls = append(calls, v)
+		mu.Unlock()
+	})
+
+	emit(10)
+	emit(5)  // stale: must be dropped
+	emit(10) // duplicate: must be dropped
+	emit(20)
+	emit(15) // stale relative to 20: dropped
+	emit(30)
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []int64{10, 20, 30}
+	if len(calls) != len(want) {
+		t.Fatalf("expected %v, got %v", want, calls)
+	}
+	for i, v := range want {
+		if calls[i] != v {
+			t.Fatalf("call %d: want %d got %d", i, v, calls[i])
+		}
+	}
+	if got := last.Load(); got != 30 {
+		t.Fatalf("expected last=30, got %d", got)
+	}
+}
+
+func TestMonotonicProgressConcurrent(t *testing.T) {
+	var last atomic.Int64
+	var maxSeen atomic.Int64
+	var ordered atomic.Bool
+	ordered.Store(true)
+
+	emit := monotonicProgress(&last, func(v int64) {
+		for {
+			prev := maxSeen.Load()
+			if v <= prev {
+				ordered.Store(false)
+				return
+			}
+			if maxSeen.CompareAndSwap(prev, v) {
+				return
+			}
+		}
+	})
+
+	const goroutines = 32
+	const perG = 100
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(base int64) {
+			defer wg.Done()
+			for i := 1; i <= perG; i++ {
+				// each goroutine emits values from disjoint ranges,
+				// mimicking concurrent ranged-GETs producing increasing
+				// cumulative totals out of order.
+				emit(base*int64(perG) + int64(i))
+			}
+		}(int64(g))
+	}
+	wg.Wait()
+
+	if !ordered.Load() {
+		t.Fatal("onProgress observed a non-monotonic cumulative value")
+	}
+	if got := last.Load(); got != goroutines*perG {
+		t.Fatalf("expected high water %d, got %d", goroutines*perG, got)
 	}
 }
