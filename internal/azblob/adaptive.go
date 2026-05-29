@@ -223,10 +223,16 @@ func envMaxConcurrency(name string, fallback int) int {
 // adaptiveBounds derives (initial, min, max, step) for the controller from the
 // caller-supplied concurrency. The supplied value is treated as the initial
 // (and minimum) capacity so existing tuning is preserved; the controller is
-// only allowed to grow upward.
+// only allowed to grow upward. Both the caller value and the env override are
+// clamped to hardCap so neither path can spawn more in-flight work than the
+// documented ceiling (each in-flight slot owns a block-sized buffer, so an
+// unbounded value risks OOM).
 func adaptiveBounds(concurrency, hardCap int, envMaxName string) (initial, minC, maxC, step int) {
 	if concurrency < 1 {
 		concurrency = 1
+	}
+	if hardCap > 0 && concurrency > hardCap {
+		concurrency = hardCap
 	}
 	initial = concurrency
 	minC = concurrency
@@ -236,11 +242,14 @@ func adaptiveBounds(concurrency, hardCap int, envMaxName string) (initial, minC,
 	if maxC < 32 {
 		maxC = 32
 	}
-	if maxC > hardCap {
+	if hardCap > 0 && maxC > hardCap {
 		maxC = hardCap
 	}
 	if envMaxName != "" {
 		maxC = envMaxConcurrency(envMaxName, maxC)
+		if hardCap > 0 && maxC > hardCap {
+			maxC = hardCap
+		}
 	}
 	if maxC < minC {
 		maxC = minC

@@ -1305,16 +1305,25 @@ func TestMonotonicProgressConcurrent(t *testing.T) {
 }
 
 type errReader struct {
-	data []byte
-	n    int
-	err  error
+	data    []byte
+	n       int
+	err     error
+	maxRead int // if >0, cap each Read at this many bytes (simulates TLS records)
 }
 
 func (r *errReader) Read(p []byte) (int, error) {
 	if r.n >= len(r.data) {
 		return 0, r.err
 	}
-	n := copy(p, r.data[r.n:])
+	want := len(p)
+	if r.maxRead > 0 && want > r.maxRead {
+		want = r.maxRead
+	}
+	avail := len(r.data) - r.n
+	if want > avail {
+		want = avail
+	}
+	n := copy(p[:want], r.data[r.n:r.n+want])
 	r.n += n
 	if r.n >= len(r.data) {
 		return n, r.err
@@ -1324,13 +1333,15 @@ func (r *errReader) Read(p []byte) (int, error) {
 
 func TestCopyRangeToOffsetBatchesWrites(t *testing.T) {
 	// Simulate small TLS-record-sized reads: 17 chunks of 16 KiB = ~272 KiB.
+	// maxRead caps each Read at 16 KiB so io.ReadFull must loop to fill the
+	// 1 MiB buffer — exercising the very batching the test asserts about.
 	const chunk = 16 * 1024
 	const chunks = 17
 	src := make([]byte, chunk*chunks)
 	for i := range src {
 		src[i] = byte(i)
 	}
-	r := &errReader{data: src, err: io.EOF}
+	r := &errReader{data: src, err: io.EOF, maxRead: chunk}
 
 	dst := &countingWriterAt{}
 	buf := make([]byte, 1*1024*1024)
@@ -1356,12 +1367,15 @@ func TestCopyRangeToOffsetBatchesWrites(t *testing.T) {
 
 func TestCopyRangeToOffsetMultipleBufferLoads(t *testing.T) {
 	// 2.5x buffer size → should produce 3 writes (full, full, partial).
+	// Cap per-read at 100 B so io.ReadFull is forced to loop within each
+	// buffer fill, ensuring the test exercises real batching behavior
+	// regardless of how the underlying reader chunks its output.
 	buf := make([]byte, 1024)
 	src := make([]byte, 2560)
 	for i := range src {
 		src[i] = byte(i * 31)
 	}
-	r := &errReader{data: src, err: io.EOF}
+	r := &errReader{data: src, err: io.EOF, maxRead: 100}
 	dst := &countingWriterAt{}
 	n, err := copyRangeToOffset(dst, 0, r, buf)
 	if err != nil {
@@ -1400,4 +1414,35 @@ func (w *countingWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	w.calls++
 	w.bytes = append(w.bytes, p...)
 	return len(p), nil
+}
+
+func TestAdaptiveBoundsClampsCallerToHardCap(t *testing.T) {
+	// Caller supplies 1000 but hardCap is 512 — neither initial, min, nor
+	// max should exceed 512.
+	initial, minC, maxC, _ := adaptiveBounds(1000, 512, "")
+	if initial > 512 || minC > 512 || maxC > 512 {
+		t.Fatalf("expected all bounds <= 512, got initial=%d min=%d max=%d", initial, minC, maxC)
+	}
+	if initial != 512 || minC != 512 || maxC != 512 {
+		t.Fatalf("expected all bounds clamped to 512, got initial=%d min=%d max=%d", initial, minC, maxC)
+	}
+}
+
+func TestAdaptiveBoundsClampsEnvOverrideToHardCap(t *testing.T) {
+	t.Setenv("TEST_ADAPTIVE_MAX_ENV", "9999")
+	_, _, maxC, _ := adaptiveBounds(8, 512, "TEST_ADAPTIVE_MAX_ENV")
+	if maxC > 512 {
+		t.Fatalf("expected maxC <= hardCap=512, got %d", maxC)
+	}
+	if maxC != 512 {
+		t.Fatalf("expected maxC clamped to 512, got %d", maxC)
+	}
+}
+
+func TestAdaptiveBoundsEnvOverrideWithinCap(t *testing.T) {
+	t.Setenv("TEST_ADAPTIVE_MAX_ENV", "64")
+	_, _, maxC, _ := adaptiveBounds(8, 512, "TEST_ADAPTIVE_MAX_ENV")
+	if maxC != 64 {
+		t.Fatalf("expected env override to set maxC=64, got %d", maxC)
+	}
 }
