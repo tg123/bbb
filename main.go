@@ -1190,11 +1190,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		}
 	}
 	// Distribute concurrency between file-level and block-level parallelism
-	// for az→az server-side copies: total goroutines = cpPoolSize × blockConcurrency ≤ concurrency.
+	// for az→az server-side copies and uploads to Azure: total goroutines =
+	// cpPoolSize × blockConcurrency ≤ concurrency. Without this, an upload of a
+	// single (large) file would run with block concurrency 1 and stage blocks
+	// serially, which is far slower than parallel block uploads.
 	cpPoolSize := concurrency
 	blockConcurrency := concurrency
 	for _, op := range fileOps {
-		if op.srcAz && op.dstAz {
+		if op.dstAz {
 			if concurrency >= 2 {
 				cpPoolSize = max(2, concurrency/4)
 				if cpPoolSize > concurrency {
@@ -1366,8 +1369,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			if err != nil {
 				return 0, err
 			}
+			// Parallelize block uploads when writing to Azure so a single
+			// large file is not staged one block at a time.
+			writeCtx := ctx
+			if op.dstAz {
+				writeCtx = bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
+			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return bbbfs.Resolve(op.dst).Write(ctx, op.dst, r)
+				return bbbfs.Resolve(op.dst).Write(writeCtx, op.dst, r)
 			}); err != nil {
 				return 0, err
 			}
@@ -1508,7 +1517,24 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		if walkIssues {
 			walkIssueErr = fmt.Errorf("%s: one or more files failed to copy", errPrefix)
 		}
-		err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(ops), quiet, errPrefix, func(pending chan<- remoteCopyOp) error {
+		// Distribute concurrency between file-level and block-level parallelism
+		// when uploading to Azure: total goroutines = fileWorkers ×
+		// blockConcurrency ≤ concurrency. Without this, each uploaded file would
+		// stage blocks serially (block concurrency 1).
+		fileWorkers := concurrency
+		blockConcurrency := concurrency
+		if dstAz {
+			if concurrency >= 2 {
+				fileWorkers = max(2, concurrency/4)
+				if fileWorkers > concurrency {
+					fileWorkers = concurrency
+				}
+			} else {
+				fileWorkers = 1
+			}
+			blockConcurrency = max(1, concurrency/fileWorkers)
+		}
+		err := runOpPoolWithRetryProgress(ctx, fileWorkers, retryCount, len(ops), quiet, errPrefix, func(pending chan<- remoteCopyOp) error {
 			for _, op := range ops {
 				if err := sendOp(ctx, pending, op); err != nil {
 					return err
@@ -1528,8 +1554,12 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 				return err
 			}
+			writeCtx := ctx
+			if dstAz {
+				writeCtx = bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
+			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
+				return bbbfs.Resolve(dstPath).Write(writeCtx, dstPath, r)
 			}); err != nil {
 				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 				return err
@@ -1937,10 +1967,12 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			size int64
 		}
 		// Distribute concurrency between file-level and block-level parallelism
-		// for Az→Az server-side copies: total goroutines = syncWorkers × blockConcurrency ≤ concurrency.
+		// for Az→Az server-side copies and uploads to Azure: total goroutines =
+		// syncWorkers × blockConcurrency ≤ concurrency. Without this, uploads
+		// would stage blocks serially (block concurrency 1).
 		syncWorkers := concurrency
 		blockConcurrency := concurrency
-		if srcAz && dstAz {
+		if dstAz {
 			if concurrency < 2 {
 				syncWorkers = 1
 				blockConcurrency = 1
@@ -2071,8 +2103,12 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 				return fmt.Errorf("sync: %s: %w", sPath, err)
 			}
+			writeCtx := ctx
+			if dstAz {
+				writeCtx = bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
+			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return bbbfs.Resolve(dstChild).Write(ctx, dstChild, r)
+				return bbbfs.Resolve(dstChild).Write(writeCtx, dstChild, r)
 			}); err != nil {
 				lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 				return fmt.Errorf("sync: %s: %w", sPath, err)
