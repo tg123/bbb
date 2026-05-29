@@ -707,6 +707,17 @@ func parallelDownloadEnabled() bool {
 	return true
 }
 
+// parallelUploadEnabled reports whether local→Az copies should use parallel
+// StageBlock uploads. Enabled by default; set BBB_PARALLEL_UPLOAD to a falsey
+// value (0/false/no/off) to fall back to the streaming upload path.
+func parallelUploadEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("BBB_PARALLEL_UPLOAD"))) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
 func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<- T) error, worker func(T) error) error {
 	if concurrency < 1 {
 		concurrency = 1
@@ -1376,6 +1387,55 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			}
 		}
 		if bbbfs.IsRemote(op.src) || bbbfs.IsRemote(op.dst) {
+			// local→Az single-file: use parallel ranged uploads for higher
+			// throughput (mirrors azcopy's chunked upload). Opt out with
+			// BBB_PARALLEL_UPLOAD=0 to fall back to the streaming path.
+			if !op.srcAz && op.dstAz && !bbbfs.IsRemote(op.src) &&
+				parallelUploadEnabled() && bbbfs.CanUploadFromFile(op.dst) {
+				var copyBar *progressBar
+				if showCopyBar {
+					copyBar = newStreamingProgressBar(path.Base(op.src), false, true)
+					if copyBar != nil {
+						copyBar.byteSized = true
+						if size > 0 {
+							copyBar.SetTotal(size)
+						}
+					}
+				}
+				var lastReported atomic.Int64
+				n, err := bbbfs.UploadFromFile(ctx, op.src, op.dst, blockConcurrency, func(copied int64) {
+					if onBytes != nil {
+						for {
+							prev := lastReported.Load()
+							if copied <= prev {
+								break
+							}
+							if lastReported.CompareAndSwap(prev, copied) {
+								onBytes(copied - prev)
+								break
+							}
+						}
+					}
+					if copyBar != nil {
+						atomicMax(&copyBar.bytesDone, copied)
+						atomicMax(&copyBar.done, copied)
+						copyBar.render(copied)
+					}
+				})
+				if copyBar != nil {
+					copyBar.Finish()
+				}
+				if err != nil {
+					return 0, err
+				}
+				if !quiet {
+					lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
+				}
+				if size > 0 {
+					return size, nil
+				}
+				return n, nil
+			}
 			// Az→local single-file: use parallel ranged download for higher
 			// throughput (mirrors azcopy's chunked download). Opt out with
 			// BBB_PARALLEL_DOWNLOAD=0 to fall back to the single-stream path.

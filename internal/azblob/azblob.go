@@ -1046,6 +1046,70 @@ func downloadBlockSizeBytes() int64 {
 	return downloadBlockSize
 }
 
+// uploadBlockSize is the per-block size used for parallel file uploads.
+// It mirrors azcopy's default chunking so a single file is staged via many
+// concurrent ranged StageBlock requests rather than a serial read pipeline.
+const uploadBlockSize = 8 * 1024 * 1024 // 8 MiB
+
+const uploadBlockSizeEnv = "BBB_AZBLOB_UPLOAD_BLOCK_MIB"
+
+// uploadBlockSizeBytes returns the configured upload block size in bytes,
+// honoring BBB_AZBLOB_UPLOAD_BLOCK_MIB when set to a positive integer.
+// For very large files the block size is grown so the total block count
+// stays under Azure's per-blob block limit.
+func uploadBlockSizeBytes(size int64) int64 {
+	block := int64(uploadBlockSize)
+	if v := os.Getenv(uploadBlockSizeEnv); v != "" {
+		if mib, err := strconv.ParseInt(v, 10, 64); err == nil && mib > 0 && mib <= math.MaxInt64/(1024*1024) {
+			block = mib * 1024 * 1024
+		}
+	}
+	if size > 0 {
+		// Azure block blobs are limited to MaxBlocks=50,000 blocks; grow the
+		// block size if a small block would exceed that.
+		minBlock := (size + int64(blockblob.MaxBlocks) - 1) / int64(blockblob.MaxBlocks)
+		if block < minBlock {
+			block = minBlock
+		}
+	}
+	return block
+}
+
+// UploadFile uploads a local file to a block blob using parallel ranged reads
+// and StageBlock requests, mirroring azcopy's chunked upload for higher
+// single-file throughput. concurrency controls how many blocks are uploaded in
+// parallel (>=1). The optional onProgress callback receives the cumulative
+// number of bytes staged.
+func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) error {
+	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
+		return errors.New("cannot upload to directory-like path")
+	}
+	client, err := getAzBlobClient(ctx, ap.Account)
+	if err != nil {
+		return err
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > math.MaxUint16 {
+		concurrency = math.MaxUint16
+	}
+	size := int64(-1)
+	if info, statErr := file.Stat(); statErr == nil {
+		size = info.Size()
+	}
+	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
+	_, err = blobClient.UploadFile(ctx, file, &blockblob.UploadFileOptions{
+		BlockSize:   uploadBlockSizeBytes(size),
+		Concurrency: uint16(concurrency),
+		Progress:    onProgress,
+	})
+	if err != nil {
+		return fmt.Errorf("put failed: %v", err)
+	}
+	return nil
+}
+
 // DownloadFile downloads a blob to a local file using parallel ranged GETs.
 // concurrency controls how many ranges are fetched in parallel (>=1). The
 // optional onProgress callback receives the cumulative number of bytes written.

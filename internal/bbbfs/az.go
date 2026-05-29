@@ -58,6 +58,29 @@ func (azFS) DownloadToFile(ctx context.Context, src, localPath string, concurren
 	return n, closeErr
 }
 
+// UploadFromFile uploads localPath to the blob at dst using parallel ranged
+// reads + StageBlock, mirroring azcopy's chunked upload for higher single-file
+// throughput.
+func (azFS) UploadFromFile(ctx context.Context, localPath, dst string, concurrency int, onProgress func(int64)) (int64, error) {
+	ap, err := azblob.Parse(dst)
+	if err != nil {
+		return 0, err
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if err := azblob.UploadFile(ctx, ap, f, concurrency, onProgress); err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
 func (azFS) List(ctx context.Context, path string) ([]Entry, error) {
 	ap, err := azblob.Parse(path)
 	if err != nil {
