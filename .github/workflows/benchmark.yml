@@ -1,0 +1,91 @@
+name: Benchmark
+
+# Compares bbb (this repo) upload/download throughput against azcopy and
+# boostedblob (py-bbb). boostedblob only talks to the real Azure endpoint, so
+# this needs a real storage account supplied via repository secrets:
+#   BENCH_AZURE_STORAGE_ACCOUNT  storage account name
+#   BENCH_AZURE_STORAGE_KEY      storage account shared key
+# It is therefore not run on pull requests from forks; trigger it manually or
+# on the weekly schedule.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_mb:
+        description: Test file size in MiB
+        default: "1024"
+        required: false
+      runs:
+        description: Timed runs per tool/direction
+        default: "3"
+        required: false
+      fail_factor:
+        description: Fail if bbb is slower than the fastest other tool by this factor (blank = report only)
+        default: ""
+        required: false
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check secrets are configured
+        id: guard
+        env:
+          BENCH_AZURE_STORAGE_ACCOUNT: ${{ secrets.BENCH_AZURE_STORAGE_ACCOUNT }}
+          BENCH_AZURE_STORAGE_KEY: ${{ secrets.BENCH_AZURE_STORAGE_KEY }}
+        run: |
+          if [ -z "${BENCH_AZURE_STORAGE_ACCOUNT}" ] || [ -z "${BENCH_AZURE_STORAGE_KEY}" ]; then
+            echo "Benchmark secrets are not configured; skipping." >> "${GITHUB_STEP_SUMMARY}"
+            echo "configured=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "configured=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Set up Go
+        if: steps.guard.outputs.configured == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Build bbb
+        if: steps.guard.outputs.configured == 'true'
+        run: go build -o "${RUNNER_TEMP}/bbb" .
+
+      - name: Set up Python
+        if: steps.guard.outputs.configured == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install py-bbb (boostedblob)
+        if: steps.guard.outputs.configured == 'true'
+        run: pip install boostedblob
+
+      - name: Install azcopy
+        if: steps.guard.outputs.configured == 'true'
+        run: |
+          curl -sSL -o /tmp/azcopy.tar.gz https://aka.ms/downloadazcopy-v10-linux
+          tar -xzf /tmp/azcopy.tar.gz -C /tmp
+          sudo cp /tmp/azcopy_linux_amd64_*/azcopy /usr/local/bin/azcopy
+          azcopy --version
+
+      - name: Run benchmark
+        if: steps.guard.outputs.configured == 'true'
+        env:
+          BENCH_ACCOUNT: ${{ secrets.BENCH_AZURE_STORAGE_ACCOUNT }}
+          BENCH_KEY: ${{ secrets.BENCH_AZURE_STORAGE_KEY }}
+          BENCH_CONTAINER: ${{ secrets.BENCH_AZURE_STORAGE_CONTAINER || 'bbb-benchmark' }}
+          BENCH_SIZE_MB: ${{ github.event.inputs.size_mb || '1024' }}
+          BENCH_RUNS: ${{ github.event.inputs.runs || '3' }}
+          BENCH_FAIL_FACTOR: ${{ github.event.inputs.fail_factor || '' }}
+          BBB_BIN: ${{ runner.temp }}/bbb
+        run: bash internal/benchmark/benchmark.sh

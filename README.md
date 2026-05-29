@@ -612,6 +612,37 @@ bbb az mkcontainer az://account/container
 bbb az mkcontainer az://myaccount/newcontainer
 ```
 
+## Benchmark
+
+The [`Benchmark`](.github/workflows/benchmark.yml) workflow compares `bbb`'s
+single-file upload and download throughput against
+[`azcopy`](https://learn.microsoft.com/azure/storage/common/storage-use-azcopy-v10)
+and [`boostedblob`](https://github.com/hauntsaninja/boostedblob) (the upstream
+Python `bbb`, referred to as *py-bbb*). It guards the parallel transfer paths
+introduced in [#87](https://github.com/tg123/bbb/pull/87) and
+[#89](https://github.com/tg123/bbb/pull/89) against regressions.
+
+Because `boostedblob` only talks to the real `*.blob.core.windows.net`
+endpoint, the benchmark needs a real Azure Storage account (the Azurite
+emulator is not enough). Configure these repository secrets to enable it:
+
+| Secret | Description |
+|--------|-------------|
+| `BENCH_AZURE_STORAGE_ACCOUNT` | Storage account name |
+| `BENCH_AZURE_STORAGE_KEY` | Storage account shared key |
+| `BENCH_AZURE_STORAGE_CONTAINER` | *(optional)* container to use (default `bbb-benchmark`) |
+
+The workflow runs weekly and on demand via **Run workflow**
+(`workflow_dispatch`), where you can set the test-file size, the number of runs,
+and an optional `fail_factor` that fails the job when `bbb` is slower than the
+fastest other tool by more than that factor. Results are written to the job
+summary as a table. It is skipped automatically when the secrets are absent
+(for example on forks).
+
+The benchmark itself lives in
+[`internal/benchmark/benchmark.sh`](internal/benchmark/benchmark.sh) and can be
+run locally against any account with the same environment variables.
+
 ## License
 
 See [LICENSE](LICENSE) for details.
