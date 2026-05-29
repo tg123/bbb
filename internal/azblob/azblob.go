@@ -1030,11 +1030,20 @@ func DownloadStream(ctx context.Context, ap AzurePath) (io.ReadCloser, error) {
 }
 
 // downloadBlockSize is the per-range block size used for parallel downloads.
-// It mirrors azcopy's default chunking so a single blob is fetched over many
-// concurrent ranged GETs rather than one sequential stream.
-const downloadBlockSize = 4 * 1024 * 1024 // 4 MiB
+// 16 MiB amortizes per-request HTTP overhead so we can saturate the link with
+// a modest number of in-flight ranges; benchmarking against azcopy shows the
+// throughput plateaus around this size.
+const downloadBlockSize = 16 * 1024 * 1024 // 16 MiB
 
 const downloadBlockSizeEnv = "BBB_AZBLOB_DOWNLOAD_BLOCK_MIB"
+
+// downloadMaxConcurrencyEnv overrides the upper bound the adaptive
+// concurrency controller may grow the per-download parallelism to.
+const downloadMaxConcurrencyEnv = "BBB_AZBLOB_DOWNLOAD_CONCURRENCY_MAX"
+
+// downloadHardConcurrencyCap caps the download adaptive controller's upper
+// bound regardless of caller input. Same rationale as the upload cap.
+const downloadHardConcurrencyCap = 512
 
 // downloadBlockSizeBytes returns the configured download block size in bytes,
 // honoring BBB_AZBLOB_DOWNLOAD_BLOCK_MIB when set to a positive integer.
@@ -1205,10 +1214,76 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 	return nil
 }
 
+// downloadCopyBufferSize is the per-range io.CopyBuffer size. The default
+// io.Copy buffer is 32 KiB; with 16 MiB ranges that's 512 read/write syscalls
+// per range and quickly becomes CPU-bound on multi-GiB downloads. 1 MiB keeps
+// the syscall count low without ballooning memory (peak ≈ concurrency × 1 MiB).
+const downloadCopyBufferSize = 1 * 1024 * 1024
+
+var downloadCopyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, downloadCopyBufferSize)
+		return &buf
+	},
+}
+
+// copyRangeToOffset streams src into dst at the given offset, accumulating
+// reads into buf before issuing a single pwrite per full buffer. io.CopyBuffer
+// performs one write per read, but HTTP/TLS reads typically return a single
+// TLS record (~16 KiB), which made the old implementation issue one 16 KiB
+// pwrite per chunk — ~656k pwrites per 10 GiB blob vs azcopy's ~15k. Batching
+// up to len(buf) bytes (1 MiB by default) before writing cuts pwrite count
+// ~64× and substantially reduces kernel sys time without changing memory use
+// (each in-flight range already owns one pooled buffer).
+func copyRangeToOffset(dst io.WriterAt, offset int64, src io.Reader, buf []byte) (int64, error) {
+	var total int64
+	for {
+		n, rerr := io.ReadFull(src, buf)
+		if n > 0 {
+			if _, werr := dst.WriteAt(buf[:n], offset+total); werr != nil {
+				return total, werr
+			}
+			total += int64(n)
+		}
+		switch rerr {
+		case nil:
+			continue
+		case io.EOF, io.ErrUnexpectedEOF:
+			return total, nil
+		default:
+			return total, rerr
+		}
+	}
+}
+
+// monotonicProgress wraps onProgress so it is invoked with strictly
+// increasing cumulative byte counts. DownloadFile fans out concurrent ranged
+// GETs; while the atomic counter is monotonic, two goroutines can race to
+// call onProgress with their captured value out of order. The mutex
+// serializes delivery and drops stale values so callers (and UIs that don't
+// already dedupe) never observe the cumulative total going backwards.
+func monotonicProgress(last *atomic.Int64, onProgress func(int64)) func(int64) {
+	if onProgress == nil {
+		return func(int64) {}
+	}
+	var mu sync.Mutex
+	return func(cur int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		if cur <= last.Load() {
+			return
+		}
+		last.Store(cur)
+		onProgress(cur)
+	}
+}
+
 // DownloadFile downloads a blob to a local file using parallel ranged GETs.
-// concurrency controls how many ranges are fetched in parallel (>=1). The
-// optional onProgress callback receives the cumulative number of bytes written.
-// Returns the number of bytes downloaded.
+// concurrency is the initial parallelism (and floor); an adaptive controller
+// probes higher concurrency while throughput keeps improving, up to
+// downloadHardConcurrencyCap (overridable via BBB_AZBLOB_DOWNLOAD_CONCURRENCY_MAX).
+// The optional onProgress callback receives the cumulative number of bytes
+// written. Returns the number of bytes downloaded.
 func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) (int64, error) {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return 0, errors.New("cannot download directory")
@@ -1217,18 +1292,9 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 	if err != nil {
 		return 0, err
 	}
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	if concurrency > math.MaxUint16 {
-		concurrency = math.MaxUint16
-	}
 	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
-	n, err := blobClient.DownloadFile(ctx, file, &blob.DownloadFileOptions{
-		BlockSize:   downloadBlockSizeBytes(),
-		Concurrency: uint16(concurrency),
-		Progress:    onProgress,
-	})
+
+	props, err := blobClient.GetProperties(ctx, nil)
 	if err != nil {
 		var respErr *azcore.ResponseError
 		if errors.As(err, &respErr) && respErr.ErrorCode == "BlobNotFound" {
@@ -1236,7 +1302,143 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 		}
 		return 0, err
 	}
-	return n, nil
+	if props.ContentLength == nil {
+		return 0, fmt.Errorf("blob %s has no content length", ap.String())
+	}
+	size := *props.ContentLength
+	etag := props.ETag
+
+	if size == 0 {
+		if err := file.Truncate(0); err != nil {
+			return 0, err
+		}
+		if onProgress != nil {
+			onProgress(0)
+		}
+		return 0, nil
+	}
+
+	if stat, err := file.Stat(); err == nil && stat.Size() != size {
+		if err := file.Truncate(size); err != nil {
+			return 0, err
+		}
+	}
+
+	blockSize := downloadBlockSizeBytes()
+	initial, minC, maxC, step := adaptiveBounds(concurrency, downloadHardConcurrencyCap, downloadMaxConcurrencyEnv)
+	// Downloads are typically shorter than uploads (one-way, no commit), so
+	// ramp the adaptive controller faster: bigger step + tighter interval so
+	// concurrency reaches its ceiling within a few seconds rather than after
+	// the transfer has already finished.
+	if step < initial {
+		step = initial
+	}
+	sem := newAdaptiveSem(initial, maxC)
+	var written atomic.Int64
+	// lastReported guards onProgress to deliver monotonically increasing
+	// cumulative byte counts. written.Add returns a monotonic value, but two
+	// goroutines may race to invoke onProgress with their captured value in
+	// any order. monotonicProgress filters out stale callbacks so callers
+	// never see the cumulative total go backwards.
+	var lastReported atomic.Int64
+	emitProgress := monotonicProgress(&lastReported, onProgress)
+	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
+	defer ctrlCancel()
+	done := make(chan struct{})
+	go runAdaptiveController(ctrlCtx, sem, &written, adaptiveControllerConfig{
+		Min:        minC,
+		Max:        maxC,
+		Step:       step,
+		Interval:   250 * time.Millisecond,
+		Hysteresis: 0.05,
+		LogTag:     "download",
+	}, done)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+
+	for offset := int64(0); offset < size; offset += blockSize {
+		if err := ctx.Err(); err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
+			break
+		}
+		if err := sem.Acquire(ctx); err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
+			break
+		}
+		count := min(blockSize, size-offset)
+		wg.Add(1)
+		go func(offset, count int64) {
+			defer func() {
+				sem.Release()
+				wg.Done()
+			}()
+			resp, err := blobClient.DownloadStream(ctx, &blob.DownloadStreamOptions{
+				Range: blob.HTTPRange{Offset: offset, Count: count},
+				AccessConditions: &blob.AccessConditions{
+					ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfMatch: etag},
+				},
+			})
+			if err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+				cancel()
+				return
+			}
+			body := resp.NewRetryReader(ctx, nil)
+			bufPtr := downloadCopyBufPool.Get().(*[]byte)
+			n, copyErr := copyRangeToOffset(file, offset, body, *bufPtr)
+			downloadCopyBufPool.Put(bufPtr)
+			closeErr := body.Close()
+			if copyErr == nil && n != count {
+				copyErr = fmt.Errorf("short download for range [%d,%d): got %d bytes", offset, offset+count, n)
+			}
+			if copyErr != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = copyErr
+				}
+				errMu.Unlock()
+				cancel()
+				return
+			}
+			if closeErr != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = closeErr
+				}
+				errMu.Unlock()
+				cancel()
+				return
+			}
+			cur := written.Add(n)
+			emitProgress(cur)
+		}(offset, count)
+	}
+
+	wg.Wait()
+	close(done)
+
+	if firstErr != nil {
+		return 0, firstErr
+	}
+	emitProgress(size)
+	return size, nil
 }
 
 // Upload writes blob (overwrite)

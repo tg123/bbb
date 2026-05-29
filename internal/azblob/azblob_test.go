@@ -1,6 +1,7 @@
 package azblob
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -9,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
@@ -1211,5 +1214,245 @@ func TestGetCredentialForRoleCachesResult(t *testing.T) {
 	// Both calls should return the same cached instance.
 	if cred1 != cred2 {
 		t.Error("expected cached credential to be reused")
+	}
+}
+
+func TestMonotonicProgressNilCallback(t *testing.T) {
+	var last atomic.Int64
+	emit := monotonicProgress(&last, nil)
+	emit(100)
+	emit(50)
+	if got := last.Load(); got != 0 {
+		t.Fatalf("expected last to remain 0 when onProgress nil, got %d", got)
+	}
+}
+
+func TestMonotonicProgressFiltersStale(t *testing.T) {
+	var last atomic.Int64
+	var calls []int64
+	var mu sync.Mutex
+	emit := monotonicProgress(&last, func(v int64) {
+		mu.Lock()
+		calls = append(calls, v)
+		mu.Unlock()
+	})
+
+	emit(10)
+	emit(5)  // stale: must be dropped
+	emit(10) // duplicate: must be dropped
+	emit(20)
+	emit(15) // stale relative to 20: dropped
+	emit(30)
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []int64{10, 20, 30}
+	if len(calls) != len(want) {
+		t.Fatalf("expected %v, got %v", want, calls)
+	}
+	for i, v := range want {
+		if calls[i] != v {
+			t.Fatalf("call %d: want %d got %d", i, v, calls[i])
+		}
+	}
+	if got := last.Load(); got != 30 {
+		t.Fatalf("expected last=30, got %d", got)
+	}
+}
+
+func TestMonotonicProgressConcurrent(t *testing.T) {
+	var last atomic.Int64
+	var maxSeen atomic.Int64
+	var ordered atomic.Bool
+	ordered.Store(true)
+
+	emit := monotonicProgress(&last, func(v int64) {
+		for {
+			prev := maxSeen.Load()
+			if v <= prev {
+				ordered.Store(false)
+				return
+			}
+			if maxSeen.CompareAndSwap(prev, v) {
+				return
+			}
+		}
+	})
+
+	const goroutines = 32
+	const perG = 100
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(base int64) {
+			defer wg.Done()
+			for i := 1; i <= perG; i++ {
+				// each goroutine emits values from disjoint ranges,
+				// mimicking concurrent ranged-GETs producing increasing
+				// cumulative totals out of order.
+				emit(base*int64(perG) + int64(i))
+			}
+		}(int64(g))
+	}
+	wg.Wait()
+
+	if !ordered.Load() {
+		t.Fatal("onProgress observed a non-monotonic cumulative value")
+	}
+	if got := last.Load(); got != goroutines*perG {
+		t.Fatalf("expected high water %d, got %d", goroutines*perG, got)
+	}
+}
+
+type errReader struct {
+	data    []byte
+	n       int
+	err     error
+	maxRead int // if >0, cap each Read at this many bytes (simulates TLS records)
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if r.n >= len(r.data) {
+		return 0, r.err
+	}
+	want := len(p)
+	if r.maxRead > 0 && want > r.maxRead {
+		want = r.maxRead
+	}
+	avail := len(r.data) - r.n
+	if want > avail {
+		want = avail
+	}
+	n := copy(p[:want], r.data[r.n:r.n+want])
+	r.n += n
+	if r.n >= len(r.data) {
+		return n, r.err
+	}
+	return n, nil
+}
+
+func TestCopyRangeToOffsetBatchesWrites(t *testing.T) {
+	// Simulate small TLS-record-sized reads: 17 chunks of 16 KiB = ~272 KiB.
+	// maxRead caps each Read at 16 KiB so io.ReadFull must loop to fill the
+	// 1 MiB buffer — exercising the very batching the test asserts about.
+	const chunk = 16 * 1024
+	const chunks = 17
+	src := make([]byte, chunk*chunks)
+	for i := range src {
+		src[i] = byte(i)
+	}
+	r := &errReader{data: src, err: io.EOF, maxRead: chunk}
+
+	dst := &countingWriterAt{}
+	buf := make([]byte, 1*1024*1024)
+	n, err := copyRangeToOffset(dst, 100, r, buf)
+	if err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if n != int64(len(src)) {
+		t.Fatalf("n=%d want %d", n, len(src))
+	}
+	// 272 KiB fits in one 1 MiB buffer, so we expect exactly ONE WriteAt
+	// instead of 17 (io.CopyBuffer would have produced 17).
+	if dst.calls != 1 {
+		t.Fatalf("expected 1 WriteAt, got %d", dst.calls)
+	}
+	if dst.firstOffset != 100 {
+		t.Fatalf("expected offset 100, got %d", dst.firstOffset)
+	}
+	if !bytes.Equal(dst.bytes, src) {
+		t.Fatalf("written bytes do not match source")
+	}
+}
+
+func TestCopyRangeToOffsetMultipleBufferLoads(t *testing.T) {
+	// 2.5x buffer size → should produce 3 writes (full, full, partial).
+	// Cap per-read at 100 B so io.ReadFull is forced to loop within each
+	// buffer fill, ensuring the test exercises real batching behavior
+	// regardless of how the underlying reader chunks its output.
+	buf := make([]byte, 1024)
+	src := make([]byte, 2560)
+	for i := range src {
+		src[i] = byte(i * 31)
+	}
+	r := &errReader{data: src, err: io.EOF, maxRead: 100}
+	dst := &countingWriterAt{}
+	n, err := copyRangeToOffset(dst, 0, r, buf)
+	if err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if n != int64(len(src)) {
+		t.Fatalf("n=%d", n)
+	}
+	if dst.calls != 3 {
+		t.Fatalf("expected 3 WriteAt calls, got %d", dst.calls)
+	}
+	if !bytes.Equal(dst.bytes, src) {
+		t.Fatalf("byte mismatch")
+	}
+}
+
+func TestCopyRangeToOffsetPropagatesReadError(t *testing.T) {
+	r := &errReader{data: []byte("hi"), err: errors.New("boom")}
+	dst := &countingWriterAt{}
+	_, err := copyRangeToOffset(dst, 0, r, make([]byte, 4))
+	if err == nil || err.Error() != "boom" {
+		t.Fatalf("expected boom error, got %v", err)
+	}
+}
+
+type countingWriterAt struct {
+	calls       int
+	firstOffset int64
+	bytes       []byte
+}
+
+func (w *countingWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	if w.calls == 0 {
+		w.firstOffset = off
+	}
+	w.calls++
+	w.bytes = append(w.bytes, p...)
+	return len(p), nil
+}
+
+func TestAdaptiveBoundsClampsCallerToHardCap(t *testing.T) {
+	// Caller supplies 1000 but hardCap is 512 — neither initial, min, nor
+	// max should exceed 512.
+	initial, minC, maxC, _ := adaptiveBounds(1000, 512, "")
+	if initial > 512 || minC > 512 || maxC > 512 {
+		t.Fatalf("expected all bounds <= 512, got initial=%d min=%d max=%d", initial, minC, maxC)
+	}
+	if initial != 512 || minC != 512 || maxC != 512 {
+		t.Fatalf("expected all bounds clamped to 512, got initial=%d min=%d max=%d", initial, minC, maxC)
+	}
+}
+
+func TestAdaptiveBoundsClampsEnvOverrideToHardCap(t *testing.T) {
+	t.Setenv("TEST_ADAPTIVE_MAX_ENV", "9999")
+	_, _, maxC, _ := adaptiveBounds(8, 512, "TEST_ADAPTIVE_MAX_ENV")
+	if maxC > 512 {
+		t.Fatalf("expected maxC <= hardCap=512, got %d", maxC)
+	}
+	if maxC != 512 {
+		t.Fatalf("expected maxC clamped to 512, got %d", maxC)
+	}
+}
+
+func TestAdaptiveBoundsEnvOverrideWithinCap(t *testing.T) {
+	t.Setenv("TEST_ADAPTIVE_MAX_ENV", "64")
+	_, _, maxC, _ := adaptiveBounds(8, 512, "TEST_ADAPTIVE_MAX_ENV")
+	if maxC != 64 {
+		t.Fatalf("expected env override to set maxC=64, got %d", maxC)
+	}
+}
+
+func TestAdaptiveBoundsEnvOverrideClampsCallerDown(t *testing.T) {
+	// --concurrency 64 with env max 8 must produce a semaphore capped at 8
+	// (env var is documented as a hard upper bound).
+	t.Setenv("TEST_ADAPTIVE_MAX_ENV", "8")
+	initial, minC, maxC, _ := adaptiveBounds(64, 512, "TEST_ADAPTIVE_MAX_ENV")
+	if initial != 8 || minC != 8 || maxC != 8 {
+		t.Fatalf("expected env override to clamp all bounds to 8, got initial=%d min=%d max=%d", initial, minC, maxC)
 	}
 }
