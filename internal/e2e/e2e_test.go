@@ -1169,6 +1169,75 @@ func TestBasic(t *testing.T) {
 
 }
 
+func TestMultiRangeDownload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e tests in short mode")
+	}
+	if !waitForEndpointReady(azuriteHost) {
+		t.Skipf("azurite endpoint %s not reachable", azuriteHost)
+	}
+
+	// Ensure container exists; ignore "already exists" race with TestBasic.
+	_, _ = runBBB("az", "mkcontainer", "az://"+azuriteAccount+"/test")
+
+	// Force tiny block sizes so a modest payload exercises the multi-range
+	// planning + concurrent WriteAt + final progress path in DownloadFile.
+	t.Setenv("BBB_AZBLOB_DOWNLOAD_BLOCK_MIB", "1")
+	t.Setenv("BBB_AZBLOB_UPLOAD_BLOCK_MIB", "1")
+
+	// 5 MiB of pseudo-random data — enough to force 5 download ranges at
+	// 1 MiB each, small enough to keep the test fast.
+	const payloadSize = 5 * 1024 * 1024
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i*1315423911 + 7)
+	}
+	wantSum := md5.Sum(payload)
+
+	tmpFile, err := os.CreateTemp("", "bbb-e2e-multirange-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if rerr := os.Remove(tmpFile.Name()); rerr != nil {
+			t.Logf("cleanup tmp file: %v", rerr)
+		}
+	}()
+	if _, err := tmpFile.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	remote := "az://" + azuriteAccount + "/test/multirange.bin"
+	if _, err := runBBB("cp", "-f", tmpFile.Name(), remote); err != nil {
+		t.Fatalf("upload failed: %v", err)
+	}
+
+	downloadPath := tmpFile.Name() + ".downloaded"
+	defer func() {
+		if rerr := os.Remove(downloadPath); rerr != nil {
+			t.Logf("cleanup download file: %v", rerr)
+		}
+	}()
+	if _, err := runBBB("cp", "-f", remote, downloadPath); err != nil {
+		t.Fatalf("download failed: %v", err)
+	}
+
+	got, err := os.ReadFile(downloadPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != payloadSize {
+		t.Fatalf("expected %d bytes, got %d", payloadSize, len(got))
+	}
+	gotSum := md5.Sum(got)
+	if gotSum != wantSum {
+		t.Fatalf("md5 mismatch: want %x got %x", wantSum, gotSum)
+	}
+}
+
 func TestHuggingFaceDownload(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e tests in short mode")
