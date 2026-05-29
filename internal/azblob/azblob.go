@@ -562,8 +562,6 @@ var roleEnvVars = []string{
 }
 
 var roleCredentialTriggerEnvVars = map[string]struct{}{
-	"AZURE_CLIENT_ID":               {},
-	"AZURE_TENANT_ID":               {},
 	"AZURE_CLIENT_SECRET":           {},
 	"AZURE_CLIENT_CERTIFICATE_PATH": {},
 	"AZURE_FEDERATED_TOKEN_FILE":    {},
@@ -626,9 +624,14 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	// Save originals so they can be restored by the deferred cleanup below.
 	// Unprefixed values are kept in place to act as defaults; role-prefixed
 	// values temporarily override them while the credential is created.
-	originals := make(map[string]string, len(roleEnvVars))
+	type envEntry struct {
+		value string
+		set   bool
+	}
+	originals := make(map[string]envEntry, len(roleEnvVars))
 	for _, v := range roleEnvVars {
-		originals[v] = os.Getenv(v)
+		val, ok := os.LookupEnv(v)
+		originals[v] = envEntry{value: val, set: ok}
 	}
 	// Override with the role-prefixed values where present.
 	for _, v := range roleEnvVars {
@@ -639,10 +642,10 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	// Restore originals after creating the credential.
 	defer func() {
 		for _, v := range roleEnvVars {
-			if originals[v] == "" {
+			if !originals[v].set {
 				_ = os.Unsetenv(v)
 			} else {
-				_ = os.Setenv(v, originals[v])
+				_ = os.Setenv(v, originals[v].value)
 			}
 		}
 	}()
