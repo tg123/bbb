@@ -23,6 +23,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
@@ -1028,6 +1029,216 @@ func DownloadStream(ctx context.Context, ap AzurePath) (io.ReadCloser, error) {
 	return downloadResp.Body, nil
 }
 
+// downloadBlockSize is the per-range block size used for parallel downloads.
+// It mirrors azcopy's default chunking so a single blob is fetched over many
+// concurrent ranged GETs rather than one sequential stream.
+const downloadBlockSize = 4 * 1024 * 1024 // 4 MiB
+
+const downloadBlockSizeEnv = "BBB_AZBLOB_DOWNLOAD_BLOCK_MIB"
+
+// downloadBlockSizeBytes returns the configured download block size in bytes,
+// honoring BBB_AZBLOB_DOWNLOAD_BLOCK_MIB when set to a positive integer.
+func downloadBlockSizeBytes() int64 {
+	if v := os.Getenv(downloadBlockSizeEnv); v != "" {
+		if mib, err := strconv.ParseInt(v, 10, 64); err == nil && mib > 0 && mib <= math.MaxInt64/(1024*1024) {
+			return mib * 1024 * 1024
+		}
+	}
+	return downloadBlockSize
+}
+
+// uploadBlockSize is the per-block size used for parallel file uploads.
+// It mirrors azcopy's chunked upload model. A larger-than-azcopy default keeps
+// per-block HTTP overhead amortized so we close the gap to azcopy without
+// requiring the user to bump --concurrency.
+const uploadBlockSize = 64 * 1024 * 1024 // 64 MiB
+
+const uploadBlockSizeEnv = "BBB_AZBLOB_UPLOAD_BLOCK_MIB"
+
+// uploadBlockSizeBytes returns the configured upload block size in bytes,
+// honoring BBB_AZBLOB_UPLOAD_BLOCK_MIB when set to a positive integer.
+// For very large files the block size is grown so the total block count
+// stays under Azure's per-blob block limit.
+func uploadBlockSizeBytes(size int64) int64 {
+	block := int64(uploadBlockSize)
+	if v := os.Getenv(uploadBlockSizeEnv); v != "" {
+		if mib, err := strconv.ParseInt(v, 10, 64); err == nil && mib > 0 && mib <= math.MaxInt64/(1024*1024) {
+			block = mib * 1024 * 1024
+		}
+	}
+	if size > 0 {
+		// Azure block blobs are limited to MaxBlocks=50,000 blocks; grow the
+		// block size if a small block would exceed that.
+		minBlock := (size + int64(blockblob.MaxBlocks) - 1) / int64(blockblob.MaxBlocks)
+		if block < minBlock {
+			block = minBlock
+		}
+	}
+	return block
+}
+
+// uploadBlockMaxConcurrencyEnv overrides the upper bound the adaptive
+// concurrency controller may grow the per-upload parallelism to.
+const uploadBlockMaxConcurrencyEnv = "BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX"
+
+// uploadHardConcurrencyCap caps the controller's upper bound regardless of
+// caller input. Azure's per-blob block staging tolerates hundreds of in-flight
+// requests but we set a sensible memory/RAM ceiling.
+const uploadHardConcurrencyCap = 512
+
+// UploadFile uploads a local file to a block blob using parallel ranged reads
+// and StageBlock requests, mirroring azcopy's chunked upload for higher
+// single-file throughput. concurrency is the initial parallelism (and floor);
+// an adaptive controller probes higher concurrency while throughput keeps
+// improving, up to uploadHardConcurrencyCap (overridable via
+// BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX). The optional onProgress callback
+// receives the cumulative number of bytes staged.
+func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) error {
+	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
+		return errors.New("cannot upload to directory-like path")
+	}
+	client, err := getAzBlobClient(ctx, ap.Account)
+	if err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat upload source: %w", err)
+	}
+	size := info.Size()
+	blockSize := uploadBlockSizeBytes(size)
+	blockBlobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
+
+	// Empty blob: commit an empty block list to create a 0-byte blob.
+	if size == 0 {
+		_, err := blockBlobClient.CommitBlockList(ctx, nil, nil)
+		if err != nil {
+			return fmt.Errorf("put failed: %v", err)
+		}
+		if onProgress != nil {
+			onProgress(0)
+		}
+		return nil
+	}
+
+	_, blockIDs, err := planBlocks(size, blockSize, blockblob.MaxBlocks)
+	if err != nil {
+		return err
+	}
+
+	initial, minC, maxC, step := adaptiveBounds(concurrency, uploadHardConcurrencyCap, uploadBlockMaxConcurrencyEnv)
+	sem := newAdaptiveSem(initial, maxC)
+	var staged atomic.Int64
+	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
+	defer ctrlCancel()
+	done := make(chan struct{})
+	go runAdaptiveController(ctrlCtx, sem, &staged, adaptiveControllerConfig{
+		Min:        minC,
+		Max:        maxC,
+		Step:       step,
+		Interval:   750 * time.Millisecond,
+		Hysteresis: 0.05,
+		LogTag:     "upload",
+	}, done)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+
+	for i, blockID := range blockIDs {
+		if err := ctx.Err(); err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
+			break
+		}
+		if err := sem.Acquire(ctx); err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
+			break
+		}
+		offset := int64(i) * blockSize
+		count := min(blockSize, size-offset)
+		wg.Add(1)
+		go func(blockID string, offset, count int64) {
+			defer func() {
+				sem.Release()
+				wg.Done()
+			}()
+			body := streaming.NopCloser(io.NewSectionReader(file, offset, count))
+			if _, err := blockBlobClient.StageBlock(ctx, blockID, body, nil); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+				cancel()
+				return
+			}
+			cur := staged.Add(count)
+			if onProgress != nil {
+				onProgress(cur)
+			}
+		}(blockID, offset, count)
+	}
+
+	wg.Wait()
+	close(done)
+
+	if firstErr != nil {
+		return fmt.Errorf("put failed: %v", firstErr)
+	}
+	if _, err := blockBlobClient.CommitBlockList(ctx, blockIDs, nil); err != nil {
+		return fmt.Errorf("commit block list failed: %w", err)
+	}
+	if onProgress != nil {
+		onProgress(size)
+	}
+	return nil
+}
+
+// DownloadFile downloads a blob to a local file using parallel ranged GETs.
+// concurrency controls how many ranges are fetched in parallel (>=1). The
+// optional onProgress callback receives the cumulative number of bytes written.
+// Returns the number of bytes downloaded.
+func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) (int64, error) {
+	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
+		return 0, errors.New("cannot download directory")
+	}
+	client, err := getAzBlobClient(ctx, ap.Account)
+	if err != nil {
+		return 0, err
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > math.MaxUint16 {
+		concurrency = math.MaxUint16
+	}
+	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
+	n, err := blobClient.DownloadFile(ctx, file, &blob.DownloadFileOptions{
+		BlockSize:   downloadBlockSizeBytes(),
+		Concurrency: uint16(concurrency),
+		Progress:    onProgress,
+	})
+	if err != nil {
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.ErrorCode == "BlobNotFound" {
+			return 0, osNotExist(ap.String())
+		}
+		return 0, err
+	}
+	return n, nil
+}
+
 // Upload writes blob (overwrite)
 func Upload(ctx context.Context, ap AzurePath, data []byte) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
@@ -1271,6 +1482,13 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	return nil
 }
 
+// copyHardConcurrencyCap caps the adaptive controller's upper bound for
+// server-side StageBlockFromURL copies. Overridable via
+// BBB_AZBLOB_COPY_CONCURRENCY_MAX.
+const copyHardConcurrencyCap = 256
+
+const copyMaxConcurrencyEnv = "BBB_AZBLOB_COPY_CONCURRENCY_MAX"
+
 // copyBlobBlocks copies a blob using parallel StageBlockFromURL + CommitBlockList.
 func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource string, totalSize int64, concurrency int, onProgress CopyProgress) error {
 	blockBlobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
@@ -1286,34 +1504,49 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sem := make(chan struct{}, concurrency)
+	initial, minC, maxC, step := adaptiveBounds(concurrency, copyHardConcurrencyCap, copyMaxConcurrencyEnv)
+	sem := newAdaptiveSem(initial, maxC)
+	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
+	defer ctrlCancel()
+	done := make(chan struct{})
+	go runAdaptiveController(ctrlCtx, sem, &copiedBytes, adaptiveControllerConfig{
+		Min:        minC,
+		Max:        maxC,
+		Step:       step,
+		Interval:   750 * time.Millisecond,
+		Hysteresis: 0.05,
+		LogTag:     "s2s-copy",
+	}, done)
+
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
 
 	for i, blockID := range blockIDs {
-		if ctx.Err() != nil {
+		if err := ctx.Err(); err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
 			break
 		}
 
 		offset := int64(i) * blkSize
 		count := min(blkSize, totalSize-offset)
 
-		// Acquire semaphore slot, respecting context cancellation so the
-		// loop doesn't block forever when a peer goroutine cancels ctx.
-		gotSlot := false
-		select {
-		case sem <- struct{}{}:
-			gotSlot = true
-		case <-ctx.Done():
-		}
-		if !gotSlot {
+		if err := sem.Acquire(ctx); err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
 			break
 		}
 		wg.Add(1)
 		go func(blockID string, offset, count int64) {
 			defer func() {
-				<-sem
+				sem.Release()
 				wg.Done()
 			}()
 
@@ -1338,6 +1571,7 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 	}
 
 	wg.Wait()
+	close(done)
 
 	if firstErr != nil {
 		return firstErr
