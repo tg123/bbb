@@ -97,6 +97,10 @@ NODE_BIN="$(command -v node)"
 # azurite-blob shims are Node scripts; run them through node explicitly so the
 # resolved path works regardless of the shebang and PATH under sudo.
 ENTRY="$(${NODE_BIN} -e 'process.stdout.write(require("fs").realpathSync(process.argv[1]))' "${AZURITE_RESOLVED}")"
+if [ -z "${ENTRY}" ]; then
+  log "Could not resolve the Azurite entrypoint from ${AZURITE_RESOLVED}"
+  exit 1
+fi
 
 ${SUDO} bash -c "nohup '${NODE_BIN}' '${ENTRY}' \
   --blobHost 0.0.0.0 --blobPort 443 \

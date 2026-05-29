@@ -17,6 +17,8 @@ on:
   workflow_dispatch:
     inputs:
       size_mb:
+        # Kept small: the emulator is CPU/loopback-bound, so larger files mainly
+        # add runtime without changing the comparison.
         description: Test file size in MiB
         default: "256"
         required: false
