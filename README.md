@@ -56,10 +56,33 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
+| `BBB_PARALLEL_DOWNLOAD` | `1` (on) | Set to `0`, `false`, `no`, or `off` to disable parallel ranged Azure→local single-file downloads and fall back to a single streaming connection |
+| `BBB_PARALLEL_UPLOAD` | `1` (on) | Set to `0`, `false`, `no`, or `off` to disable parallel ranged local→Azure single-file uploads and fall back to the streaming `UploadStream` path |
+| `BBB_AZBLOB_DOWNLOAD_BLOCK_MIB` | `4` | Chunk size in MiB used by the parallel Azure→local download path |
+| `BBB_AZBLOB_UPLOAD_BLOCK_MIB` | `64` | Chunk size in MiB used by the parallel local→Azure upload path (clamped so the total block count stays within Azure's per-blob limit) |
+| `BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX` | *(auto)* | Hard upper bound on in-flight upload blocks for the adaptive concurrency controller (default cap 512) |
+| `BBB_AZBLOB_COPY_CONCURRENCY_MAX` | *(auto)* | Hard upper bound on in-flight blocks for Azure→Azure server-side block copies (default cap 256) |
+
+### Non-Interactive Authentication (`AZURE_*` Env Vars)
+
+By default, when bbb cannot find shared keys or role-specific credentials it discovers the storage account's tenant and authenticates via the Azure CLI, falling back to an interactive browser login. For CI/CD and other headless environments, set the standard `AZURE_*` environment variables to authenticate non-interactively:
+
+| Variable | Purpose |
+| --- | --- |
+| `AZURE_TENANT_ID` | Service principal tenant |
+| `AZURE_CLIENT_ID` | Service principal client ID |
+| `AZURE_CLIENT_SECRET` | Service principal secret |
+
+- When `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` are all set, bbb uses a **service principal** credential.
+- `AZURE_SUBSCRIPTION_ID` is not required for Blob Storage data-plane authentication and is ignored.
+
+These take effect before the interactive CLI/browser flow, so no browser popup is opened when they are configured. Single-endpoint commands (`ls`, `cat`, `rm`, etc.) reuse the `SRC` role internally, so the unprefixed `AZURE_*` vars (and `SRC_AZURE_*`) are honored for them too. For per-account scoping across tenants, use the `SRC_` / `DST_` prefixed variables described below.
 
 ### Multi-Tenant / Multi-Account Authentication (`SRC_` / `DST_` Env Vars)
 
 When copying or syncing between Azure Storage accounts in **different tenants** (or using different credentials), prefix any standard Azure identity environment variable with `SRC_` or `DST_` to scope it to source or destination accounts respectively.
+
+The unprefixed `AZURE_*` variables act as shared defaults: a plain `AZURE_xxx` is interpreted as if it were set for both `SRC_AZURE_xxx` and `DST_AZURE_xxx`, and the role-prefixed variant overrides it when present. This lets a single set of `AZURE_*` vars authenticate both sides while still allowing per-role overrides.
 
 bbb uses `DefaultAzureCredential` under the hood, so all credential types are supported: service principal (secret or certificate), workload identity (OIDC / AKS), managed identity, and Azure CLI.
 
@@ -112,7 +135,7 @@ bbb sync az://src-account/data/ az://dst-account/data/
 **Credential resolution order** (first match wins):
 
 1. Shared key (`SRC_BBB_AZBLOB_ACCOUNTKEY` / `DST_BBB_AZBLOB_ACCOUNTKEY`, or `BBB_AZBLOB_ACCOUNTKEY`)
-2. Role-specific env credential (`SRC_AZURE_*` / `DST_AZURE_*`) via `DefaultAzureCredential`
+2. Role env credential via `DefaultAzureCredential` — `SRC_AZURE_*` / `DST_AZURE_*`, falling back to unprefixed `AZURE_*` defaults. Accounts without an explicit role (single-endpoint commands like `ls`/`cat`/`rm`) reuse the `SRC` role, so unprefixed `AZURE_*` (and `SRC_AZURE_*`) are honored for them.
 3. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
 4. Interactive browser login (fallback)
 

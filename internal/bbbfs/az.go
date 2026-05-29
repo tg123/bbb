@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tg123/bbb/internal/azblob"
@@ -33,6 +35,59 @@ func (azFS) Write(ctx context.Context, path string, r io.Reader) error {
 		return err
 	}
 	return azblob.UploadStream(ctx, ap, r, UploadConcurrency(ctx))
+}
+
+// DownloadToFile downloads the blob at src into localPath using parallel ranged
+// GETs, mirroring azcopy's chunked download for higher single-file throughput.
+func (azFS) DownloadToFile(ctx context.Context, src, localPath string, concurrency int, onProgress func(int64)) (int64, error) {
+	ap, err := azblob.Parse(src)
+	if err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		return 0, err
+	}
+	f, err := os.OpenFile(localPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	n, downloadErr := azblob.DownloadFile(ctx, ap, f, concurrency, onProgress)
+	closeErr := f.Close()
+	if downloadErr != nil {
+		return n, downloadErr
+	}
+	return n, closeErr
+}
+
+// UploadFromFile uploads localPath to the blob at dst using parallel ranged
+// reads + StageBlock, mirroring azcopy's chunked upload for higher single-file
+// throughput.
+func (azFS) UploadFromFile(ctx context.Context, localPath, dst string, concurrency int, onProgress func(int64)) (int64, error) {
+	ap, err := azblob.Parse(dst)
+	if err != nil {
+		return 0, err
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+	var uploaded atomic.Int64
+	tracker := func(n int64) {
+		for {
+			cur := uploaded.Load()
+			if n <= cur || uploaded.CompareAndSwap(cur, n) {
+				break
+			}
+		}
+		if onProgress != nil {
+			onProgress(n)
+		}
+	}
+	if err := azblob.UploadFile(ctx, ap, f, concurrency, tracker); err != nil {
+		return uploaded.Load(), err
+	}
+	return uploaded.Load(), nil
 }
 
 func (azFS) List(ctx context.Context, path string) ([]Entry, error) {

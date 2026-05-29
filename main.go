@@ -542,7 +542,7 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 			if machine {
 				fmt.Printf("%s\t%d\t%s\t%s\n", typ, entry.Size, mod, displayPath)
 			} else {
-				fmt.Printf("%1s %10d %s %s\n", typ, entry.Size, mod, displayPath)
+				fmt.Printf("%1s %10s %s %s\n", typ, formatSize(entry.Size), mod, displayPath)
 			}
 		} else {
 			fmt.Println(displayPath)
@@ -694,6 +694,28 @@ func sendOp[T any](ctx context.Context, ch chan<- T, op T) error {
 	case ch <- op:
 		return nil
 	}
+}
+
+// parallelDownloadEnabled reports whether Az→local copies should use parallel
+// ranged downloads. Enabled by default; set BBB_PARALLEL_DOWNLOAD to a falsey
+// value (0/false/no/off) to fall back to the single-stream download path.
+func parallelDownloadEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("BBB_PARALLEL_DOWNLOAD"))) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
+// parallelUploadEnabled reports whether local→Az copies should use parallel
+// StageBlock uploads. Enabled by default; set BBB_PARALLEL_UPLOAD to a falsey
+// value (0/false/no/off) to fall back to the streaming upload path.
+func parallelUploadEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("BBB_PARALLEL_UPLOAD"))) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
 }
 
 func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<- T) error, worker func(T) error) error {
@@ -1190,11 +1212,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		}
 	}
 	// Distribute concurrency between file-level and block-level parallelism
-	// for az→az server-side copies: total goroutines = cpPoolSize × blockConcurrency ≤ concurrency.
+	// for az→az server-side copies and uploads to Azure: total goroutines =
+	// cpPoolSize × blockConcurrency ≤ concurrency. Without this, an upload of a
+	// single (large) file would run with block concurrency 1 and stage blocks
+	// serially, which is far slower than parallel block uploads.
 	cpPoolSize := concurrency
 	blockConcurrency := concurrency
 	for _, op := range fileOps {
-		if op.srcAz && op.dstAz {
+		if op.dstAz {
 			if concurrency >= 2 {
 				cpPoolSize = max(2, concurrency/4)
 				if cpPoolSize > concurrency {
@@ -1206,6 +1231,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			blockConcurrency = max(1, concurrency/cpPoolSize)
 			break
 		}
+	}
+	// For a single file there is only one active worker, so give the full
+	// concurrency budget to block-level parallelism. Otherwise the per-file
+	// pipeline ends up with only blockConcurrency in-flight blocks, which
+	// caps throughput well below what the network can sustain.
+	if len(fileOps) == 1 {
+		cpPoolSize = 1
+		blockConcurrency = concurrency
 	}
 	if err := runOpPoolWithRetryProgressBytes(ctx, cpPoolSize, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
@@ -1362,19 +1395,175 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			}
 		}
 		if bbbfs.IsRemote(op.src) || bbbfs.IsRemote(op.dst) {
+			// local→Az single-file: use parallel ranged uploads for higher
+			// throughput (mirrors azcopy's chunked upload). Opt out with
+			// BBB_PARALLEL_UPLOAD=0 to fall back to the streaming path.
+			if !op.srcAz && op.dstAz && !bbbfs.IsRemote(op.src) &&
+				parallelUploadEnabled() && bbbfs.CanUploadFromFile(op.dst) {
+				var copyBar *progressBar
+				if showCopyBar {
+					copyBar = newStreamingProgressBar(path.Base(op.src), false, true)
+					if copyBar != nil {
+						copyBar.byteSized = true
+						if size > 0 {
+							copyBar.SetTotal(size)
+						}
+					}
+				}
+				var lastReported atomic.Int64
+				n, err := bbbfs.UploadFromFile(ctx, op.src, op.dst, blockConcurrency, func(copied int64) {
+					if onBytes != nil {
+						for {
+							prev := lastReported.Load()
+							if copied <= prev {
+								break
+							}
+							if lastReported.CompareAndSwap(prev, copied) {
+								onBytes(copied - prev)
+								break
+							}
+						}
+					}
+					if copyBar != nil {
+						atomicMax(&copyBar.bytesDone, copied)
+						atomicMax(&copyBar.done, copied)
+						copyBar.render(copied)
+					}
+				})
+				if copyBar != nil {
+					copyBar.Finish()
+				}
+				if err != nil {
+					return 0, err
+				}
+				if !quiet {
+					lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
+				}
+				if size > 0 {
+					return size, nil
+				}
+				return n, nil
+			}
+			// Az→local single-file: use parallel ranged download for higher
+			// throughput (mirrors azcopy's chunked download). Opt out with
+			// BBB_PARALLEL_DOWNLOAD=0 to fall back to the single-stream path.
+			if op.srcAz && !op.dstAz && !bbbfs.IsRemote(op.dst) &&
+				parallelDownloadEnabled() && bbbfs.CanDownloadToFile(op.src) {
+				var copyBar *progressBar
+				if showCopyBar {
+					copyBar = newStreamingProgressBar(path.Base(op.src), false, true)
+					if copyBar != nil {
+						copyBar.byteSized = true
+						if size > 0 {
+							copyBar.SetTotal(size)
+						}
+					}
+				}
+				var lastReported atomic.Int64
+				n, err := bbbfs.DownloadToFile(ctx, op.src, op.dst, blockConcurrency, func(copied int64) {
+					if onBytes != nil {
+						for {
+							prev := lastReported.Load()
+							if copied <= prev {
+								break
+							}
+							if lastReported.CompareAndSwap(prev, copied) {
+								onBytes(copied - prev)
+								break
+							}
+						}
+					}
+					if copyBar != nil {
+						atomicMax(&copyBar.bytesDone, copied)
+						atomicMax(&copyBar.done, copied)
+						copyBar.render(copied)
+					}
+				})
+				if copyBar != nil {
+					copyBar.Finish()
+				}
+				if err != nil {
+					return 0, err
+				}
+				if !quiet {
+					lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
+				}
+				if size > 0 {
+					return size, nil
+				}
+				return n, nil
+			}
+			var copyBar *progressBar
+			if showCopyBar {
+				copyBar = newStreamingProgressBar(path.Base(op.src), false, true)
+				if copyBar != nil {
+					copyBar.byteSized = true
+					if size > 0 {
+						copyBar.SetTotal(size)
+					}
+				}
+			}
 			reader, err := bbbfs.Resolve(op.src).Read(ctx, op.src)
 			if err != nil {
+				if copyBar != nil {
+					copyBar.Finish()
+				}
 				return 0, err
 			}
+			// Parallelize block uploads when writing to Azure so a single
+			// large file is not staged one block at a time.
+			writeCtx := ctx
+			if op.dstAz {
+				writeCtx = bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
+			}
+			var streamCopied atomic.Int64
+			var lastReported atomic.Int64
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return bbbfs.Resolve(op.dst).Write(ctx, op.dst, r)
+				pr := io.TeeReader(r, &progressWriter{
+					onWrite: func(n int) {
+						copied := streamCopied.Add(int64(n))
+						// Report incremental bytes to the overall taskbar.
+						// Use CAS loop because callbacks may arrive from
+						// parallel goroutines within a single Write.
+						if onBytes != nil {
+							for {
+								prev := lastReported.Load()
+								if copied <= prev {
+									break
+								}
+								if lastReported.CompareAndSwap(prev, copied) {
+									onBytes(copied - prev)
+									break
+								}
+							}
+						}
+						if copyBar != nil {
+							atomicMax(&copyBar.bytesDone, copied)
+							atomicMax(&copyBar.done, copied)
+							copyBar.render(copied)
+						}
+					},
+				})
+				return bbbfs.Resolve(op.dst).Write(writeCtx, op.dst, pr)
 			}); err != nil {
+				if copyBar != nil {
+					copyBar.Finish()
+				}
 				return 0, err
 			}
-		} else {
-			if err := fsops.CopyFile(op.src, op.dst, overwrite); err != nil {
-				return 0, fmt.Errorf("cp: %w", err)
+			if copyBar != nil {
+				copyBar.Finish()
 			}
+			if !quiet {
+				lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
+			}
+			if size > 0 {
+				return size, nil
+			}
+			return streamCopied.Load(), nil
+		}
+		if err := fsops.CopyFile(op.src, op.dst, overwrite); err != nil {
+			return 0, fmt.Errorf("cp: %w", err)
 		}
 		if !quiet {
 			lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
@@ -1508,7 +1697,24 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		if walkIssues {
 			walkIssueErr = fmt.Errorf("%s: one or more files failed to copy", errPrefix)
 		}
-		err := runOpPoolWithRetryProgress(ctx, concurrency, retryCount, len(ops), quiet, errPrefix, func(pending chan<- remoteCopyOp) error {
+		// Distribute concurrency between file-level and block-level parallelism
+		// when uploading to Azure: total goroutines = fileWorkers ×
+		// blockConcurrency ≤ concurrency. Without this, each uploaded file would
+		// stage blocks serially (block concurrency 1).
+		fileWorkers := concurrency
+		blockConcurrency := concurrency
+		if dstAz {
+			if concurrency >= 2 {
+				fileWorkers = max(2, concurrency/4)
+				if fileWorkers > concurrency {
+					fileWorkers = concurrency
+				}
+			} else {
+				fileWorkers = 1
+			}
+			blockConcurrency = max(1, concurrency/fileWorkers)
+		}
+		err := runOpPoolWithRetryProgress(ctx, fileWorkers, retryCount, len(ops), quiet, errPrefix, func(pending chan<- remoteCopyOp) error {
 			for _, op := range ops {
 				if err := sendOp(ctx, pending, op); err != nil {
 					return err
@@ -1523,16 +1729,51 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					return nil
 				}
 			}
+			var copyBar *progressBar
+			if !quiet {
+				copyBar = newStreamingProgressBar(path.Base(work.name), false, true)
+				if copyBar != nil {
+					copyBar.byteSized = true
+					if info, statErr := bbbfs.Resolve(srcPath).Stat(ctx, srcPath); statErr == nil && info.Size > 0 {
+						copyBar.SetTotal(info.Size)
+					}
+				}
+			}
 			reader, err := bbbfs.Resolve(srcPath).Read(ctx, srcPath)
 			if err != nil {
+				if copyBar != nil {
+					copyBar.Finish()
+				}
 				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 				return err
 			}
+			writeCtx := ctx
+			if dstAz {
+				writeCtx = bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
+			}
+			var streamCopied atomic.Int64
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return bbbfs.Resolve(dstPath).Write(ctx, dstPath, r)
+				pr := io.TeeReader(r, &progressWriter{
+					onWrite: func(n int) {
+						if copyBar == nil {
+							return
+						}
+						copied := streamCopied.Add(int64(n))
+						atomicMax(&copyBar.bytesDone, copied)
+						atomicMax(&copyBar.done, copied)
+						copyBar.render(copied)
+					},
+				})
+				return bbbfs.Resolve(dstPath).Write(writeCtx, dstPath, pr)
 			}); err != nil {
+				if copyBar != nil {
+					copyBar.Finish()
+				}
 				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 				return err
+			}
+			if copyBar != nil {
+				copyBar.Finish()
 			}
 			if !quiet {
 				lockedPrintf("Copied %s -> %s\n", srcPath, dstPath)
@@ -1937,10 +2178,12 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			size int64
 		}
 		// Distribute concurrency between file-level and block-level parallelism
-		// for Az→Az server-side copies: total goroutines = syncWorkers × blockConcurrency ≤ concurrency.
+		// for Az→Az server-side copies and uploads to Azure: total goroutines =
+		// syncWorkers × blockConcurrency ≤ concurrency. Without this, uploads
+		// would stage blocks serially (block concurrency 1).
 		syncWorkers := concurrency
 		blockConcurrency := concurrency
-		if srcAz && dstAz {
+		if dstAz {
 			if concurrency < 2 {
 				syncWorkers = 1
 				blockConcurrency = 1
@@ -2071,8 +2314,12 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 				return fmt.Errorf("sync: %s: %w", sPath, err)
 			}
+			writeCtx := ctx
+			if dstAz {
+				writeCtx = bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
+			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return bbbfs.Resolve(dstChild).Write(ctx, dstChild, r)
+				return bbbfs.Resolve(dstChild).Write(writeCtx, dstChild, r)
 			}); err != nil {
 				lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 				return fmt.Errorf("sync: %s: %w", sPath, err)

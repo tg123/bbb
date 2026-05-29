@@ -48,6 +48,58 @@ func UploadConcurrency(ctx context.Context) int {
 	return 1
 }
 
+// fileDownloader is an optional FS extension for downloading a remote file to
+// a local path using a backend-optimized (e.g. parallel ranged) transfer.
+type fileDownloader interface {
+	DownloadToFile(ctx context.Context, src, localPath string, concurrency int, onProgress func(int64)) (int64, error)
+}
+
+// fileUploader is an optional FS extension for uploading a local file to a
+// remote path using a backend-optimized (e.g. parallel ranged) transfer.
+type fileUploader interface {
+	UploadFromFile(ctx context.Context, localPath, dst string, concurrency int, onProgress func(int64)) (int64, error)
+}
+
+// CanDownloadToFile reports whether src's backend supports an optimized
+// download-to-local-file path.
+func CanDownloadToFile(src string) bool {
+	_, ok := Resolve(src).(fileDownloader)
+	return ok
+}
+
+// DownloadToFile downloads the remote file at src into localPath using a
+// backend-optimized transfer (parallel ranged GETs for Azure). onProgress, when
+// non-nil, receives the cumulative number of bytes written. Returns the number
+// of bytes downloaded.
+func DownloadToFile(ctx context.Context, src, localPath string, concurrency int, onProgress func(int64)) (int64, error) {
+	fs := Resolve(src)
+	fd, ok := fs.(fileDownloader)
+	if !ok {
+		return 0, fmt.Errorf("parallel download not supported for %s", src)
+	}
+	return fd.DownloadToFile(ctx, src, localPath, concurrency, onProgress)
+}
+
+// CanUploadFromFile reports whether dst's backend supports an optimized
+// upload-from-local-file path.
+func CanUploadFromFile(dst string) bool {
+	_, ok := Resolve(dst).(fileUploader)
+	return ok
+}
+
+// UploadFromFile uploads the local file at localPath to dst using a
+// backend-optimized transfer (parallel StageBlock for Azure). onProgress, when
+// non-nil, receives the cumulative number of bytes staged. Returns the number
+// of bytes uploaded.
+func UploadFromFile(ctx context.Context, localPath, dst string, concurrency int, onProgress func(int64)) (int64, error) {
+	fs := Resolve(dst)
+	fu, ok := fs.(fileUploader)
+	if !ok {
+		return 0, fmt.Errorf("parallel upload not supported for %s", dst)
+	}
+	return fu.UploadFromFile(ctx, localPath, dst, concurrency, onProgress)
+}
+
 // IsAz returns true if the path targets an Azure Blob Storage backend.
 func IsAz(path string) bool {
 	return azProvider.Match(path)
