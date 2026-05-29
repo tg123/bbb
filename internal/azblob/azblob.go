@@ -650,30 +650,22 @@ func envFlagEnabled(name string) bool {
 // (nil, nil) when no such configuration is present, signalling the caller to
 // fall back to the interactive (Azure CLI / browser) flow.
 //
-// Honored variables:
+// Honored variables (in precedence order):
+//   - AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET →
+//     ClientSecretCredential (service principal). An explicit service
+//     principal is unambiguous and takes precedence over managed identity:
+//     this mirrors Azure's own DefaultAzureCredential, which tries the
+//     environment service principal before managed identity. It also avoids
+//     misusing AZURE_CLIENT_ID — which identifies the service principal — as
+//     a user-assigned managed-identity ID, which would make IMDS reject the
+//     request with "the requested identity isn't assigned to this resource".
 //   - AZURE_USE_IDENTITY (truthy) → ManagedIdentityCredential. When
 //     AZURE_CLIENT_ID is also set it selects that user-assigned identity;
 //     otherwise the system-assigned identity is used.
-//   - AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET →
-//     ClientSecretCredential (service principal).
 //
 // AZURE_SUBSCRIPTION_ID is not required for Blob Storage data-plane
 // authentication and is intentionally ignored here.
 func credentialFromEnv() (azcore.TokenCredential, error) {
-	if envFlagEnabled("AZURE_USE_IDENTITY") {
-		opts := &azidentity.ManagedIdentityCredentialOptions{}
-		if clientID := os.Getenv("AZURE_CLIENT_ID"); clientID != "" {
-			opts.ID = azidentity.ClientID(clientID)
-		}
-		applyTransportToIdentityOptions(&opts.ClientOptions)
-		cred, err := azidentity.NewManagedIdentityCredential(opts)
-		if err != nil {
-			return nil, fmt.Errorf("managed identity credential: %w", err)
-		}
-		slog.Debug("Using managed identity credential (AZURE_USE_IDENTITY)")
-		return cred, nil
-	}
-
 	tenantID := os.Getenv("AZURE_TENANT_ID")
 	clientID := os.Getenv("AZURE_CLIENT_ID")
 	clientSecret := os.Getenv("AZURE_CLIENT_SECRET")
@@ -688,6 +680,20 @@ func credentialFromEnv() (azcore.TokenCredential, error) {
 			return nil, fmt.Errorf("client secret credential: %w", err)
 		}
 		slog.Debug("Using service principal credential (AZURE_* env vars)", "tenant", tenantID, "client", clientID)
+		return cred, nil
+	}
+
+	if envFlagEnabled("AZURE_USE_IDENTITY") {
+		opts := &azidentity.ManagedIdentityCredentialOptions{}
+		if clientID != "" {
+			opts.ID = azidentity.ClientID(clientID)
+		}
+		applyTransportToIdentityOptions(&opts.ClientOptions)
+		cred, err := azidentity.NewManagedIdentityCredential(opts)
+		if err != nil {
+			return nil, fmt.Errorf("managed identity credential: %w", err)
+		}
+		slog.Debug("Using managed identity credential (AZURE_USE_IDENTITY)")
 		return cred, nil
 	}
 

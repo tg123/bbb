@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 )
@@ -1176,6 +1177,9 @@ func TestCredentialFromEnvManagedIdentity(t *testing.T) {
 	if cred == nil {
 		t.Fatal("expected non-nil managed identity credential")
 	}
+	if _, ok := cred.(*azidentity.ManagedIdentityCredential); !ok {
+		t.Fatalf("expected *azidentity.ManagedIdentityCredential, got %T", cred)
+	}
 }
 
 func TestCredentialFromEnvManagedIdentityUserAssigned(t *testing.T) {
@@ -1191,11 +1195,16 @@ func TestCredentialFromEnvManagedIdentityUserAssigned(t *testing.T) {
 	if cred == nil {
 		t.Fatal("expected non-nil user-assigned managed identity credential")
 	}
+	if _, ok := cred.(*azidentity.ManagedIdentityCredential); !ok {
+		t.Fatalf("expected *azidentity.ManagedIdentityCredential, got %T", cred)
+	}
 }
 
-func TestCredentialFromEnvIdentityTakesPrecedence(t *testing.T) {
-	// When AZURE_USE_IDENTITY is set, managed identity is used even if
-	// service principal vars are also present.
+func TestCredentialFromEnvServicePrincipalTakesPrecedence(t *testing.T) {
+	// When a full service principal config is present, it is used even if
+	// AZURE_USE_IDENTITY is also set. AZURE_CLIENT_ID identifies the service
+	// principal, so it must not be misused as a user-assigned managed-identity
+	// ID (which would make IMDS reject the request).
 	t.Setenv("AZURE_USE_IDENTITY", "1")
 	t.Setenv("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000")
 	t.Setenv("AZURE_CLIENT_ID", "11111111-1111-1111-1111-111111111111")
@@ -1207,5 +1216,8 @@ func TestCredentialFromEnvIdentityTakesPrecedence(t *testing.T) {
 	}
 	if cred == nil {
 		t.Fatal("expected non-nil credential")
+	}
+	if _, ok := cred.(*azidentity.ClientSecretCredential); !ok {
+		t.Fatalf("expected *azidentity.ClientSecretCredential, got %T", cred)
 	}
 }

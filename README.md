@@ -68,8 +68,8 @@ By default, when bbb cannot find shared keys or role-specific credentials it dis
 | `AZURE_CLIENT_SECRET` | Service principal secret |
 | `AZURE_USE_IDENTITY` | Set to `1` (or `true`) to authenticate via managed identity |
 
-- When `AZURE_USE_IDENTITY` is truthy, bbb uses a **managed identity** credential. If `AZURE_CLIENT_ID` is also set, that user-assigned identity is selected; otherwise the system-assigned identity is used.
-- Otherwise, when `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` are all set, bbb uses a **service principal** credential.
+- When `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` are all set, bbb uses a **service principal** credential. A fully configured service principal takes precedence over `AZURE_USE_IDENTITY` (mirroring Azure's `DefaultAzureCredential`), since `AZURE_CLIENT_ID` then identifies the service principal rather than a user-assigned managed identity.
+- Otherwise, when `AZURE_USE_IDENTITY` is truthy, bbb uses a **managed identity** credential. If `AZURE_CLIENT_ID` is set (and no service principal secret is configured), that user-assigned identity is selected; otherwise the system-assigned identity is used.
 - `AZURE_SUBSCRIPTION_ID` is not required for Blob Storage data-plane authentication and is ignored.
 
 These take effect before the interactive CLI/browser flow, so no browser popup is opened when they are configured. For per-account scoping across tenants, use the `SRC_` / `DST_` prefixed variables described below.
@@ -130,7 +130,7 @@ bbb sync az://src-account/data/ az://dst-account/data/
 
 1. Shared key (`SRC_BBB_AZBLOB_ACCOUNTKEY` / `DST_BBB_AZBLOB_ACCOUNTKEY`, or `BBB_AZBLOB_ACCOUNTKEY`)
 2. Role-specific env credential (`SRC_AZURE_*` / `DST_AZURE_*`) via `DefaultAzureCredential`
-3. Non-interactive env credential (`AZURE_USE_IDENTITY` managed identity, or `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` service principal)
+3. Non-interactive env credential (`AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` service principal, or `AZURE_USE_IDENTITY` managed identity)
 4. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
 5. Interactive browser login (fallback)
 
