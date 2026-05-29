@@ -57,6 +57,23 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
 
+### Non-Interactive Authentication (`AZURE_*` Env Vars)
+
+By default, when bbb cannot find shared keys or role-specific credentials it discovers the storage account's tenant and authenticates via the Azure CLI, falling back to an interactive browser login. For CI/CD and other headless environments, set the standard `AZURE_*` environment variables to authenticate non-interactively:
+
+| Variable | Purpose |
+| --- | --- |
+| `AZURE_TENANT_ID` | Service principal tenant |
+| `AZURE_CLIENT_ID` | Service principal / user-assigned managed identity client ID |
+| `AZURE_CLIENT_SECRET` | Service principal secret |
+| `AZURE_USE_IDENTITY` | Set to `1` (or `true`) to authenticate via managed identity |
+
+- When `AZURE_USE_IDENTITY` is truthy, bbb uses a **managed identity** credential. If `AZURE_CLIENT_ID` is also set, that user-assigned identity is selected; otherwise the system-assigned identity is used.
+- Otherwise, when `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` are all set, bbb uses a **service principal** credential.
+- `AZURE_SUBSCRIPTION_ID` is not required for Blob Storage data-plane authentication and is ignored.
+
+These take effect before the interactive CLI/browser flow, so no browser popup is opened when they are configured. For per-account scoping across tenants, use the `SRC_` / `DST_` prefixed variables described below.
+
 ### Multi-Tenant / Multi-Account Authentication (`SRC_` / `DST_` Env Vars)
 
 When copying or syncing between Azure Storage accounts in **different tenants** (or using different credentials), prefix any standard Azure identity environment variable with `SRC_` or `DST_` to scope it to source or destination accounts respectively.
@@ -113,8 +130,9 @@ bbb sync az://src-account/data/ az://dst-account/data/
 
 1. Shared key (`SRC_BBB_AZBLOB_ACCOUNTKEY` / `DST_BBB_AZBLOB_ACCOUNTKEY`, or `BBB_AZBLOB_ACCOUNTKEY`)
 2. Role-specific env credential (`SRC_AZURE_*` / `DST_AZURE_*`) via `DefaultAzureCredential`
-3. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
-4. Interactive browser login (fallback)
+3. Non-interactive env credential (`AZURE_USE_IDENTITY` managed identity, or `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` service principal)
+4. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
+5. Interactive browser login (fallback)
 
 ### `BBB_DNS_CACHE`
 

@@ -635,6 +635,65 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	return actual.(azcore.TokenCredential), nil
 }
 
+// envFlagEnabled reports whether the named environment variable is set to a
+// truthy value ("1", "true", "yes", or "on", case-insensitive).
+func envFlagEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// credentialFromEnv builds a non-interactive credential from the standard
+// AZURE_* environment variables when they are configured. It returns
+// (nil, nil) when no such configuration is present, signalling the caller to
+// fall back to the interactive (Azure CLI / browser) flow.
+//
+// Honored variables:
+//   - AZURE_USE_IDENTITY (truthy) → ManagedIdentityCredential. When
+//     AZURE_CLIENT_ID is also set it selects that user-assigned identity;
+//     otherwise the system-assigned identity is used.
+//   - AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET →
+//     ClientSecretCredential (service principal).
+//
+// AZURE_SUBSCRIPTION_ID is not required for Blob Storage data-plane
+// authentication and is intentionally ignored here.
+func credentialFromEnv() (azcore.TokenCredential, error) {
+	if envFlagEnabled("AZURE_USE_IDENTITY") {
+		opts := &azidentity.ManagedIdentityCredentialOptions{}
+		if clientID := os.Getenv("AZURE_CLIENT_ID"); clientID != "" {
+			opts.ID = azidentity.ClientID(clientID)
+		}
+		applyTransportToIdentityOptions(&opts.ClientOptions)
+		cred, err := azidentity.NewManagedIdentityCredential(opts)
+		if err != nil {
+			return nil, fmt.Errorf("managed identity credential: %w", err)
+		}
+		slog.Debug("Using managed identity credential (AZURE_USE_IDENTITY)")
+		return cred, nil
+	}
+
+	tenantID := os.Getenv("AZURE_TENANT_ID")
+	clientID := os.Getenv("AZURE_CLIENT_ID")
+	clientSecret := os.Getenv("AZURE_CLIENT_SECRET")
+	if tenantID != "" && clientID != "" && clientSecret != "" {
+		opts := &azidentity.ClientSecretCredentialOptions{}
+		if strings.EqualFold(os.Getenv("BBB_AZURE_ALLOW_ANY_TENANT"), "true") {
+			opts.AdditionallyAllowedTenants = []string{"*"}
+		}
+		applyTransportToIdentityOptions(&opts.ClientOptions)
+		cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, opts)
+		if err != nil {
+			return nil, fmt.Errorf("client secret credential: %w", err)
+		}
+		slog.Debug("Using service principal credential (AZURE_* env vars)", "tenant", tenantID, "client", clientID)
+		return cred, nil
+	}
+
+	return nil, nil
+}
+
 // tenantIDFromAccessToken returns the "tid" claim from a JWT access token,
 // or "" when the token is not a JWT, can't be decoded, or has no tid claim.
 // Used to detect tenant mismatches between a token issued by AzureCLICredential
@@ -679,6 +738,15 @@ func getCredentialForAccount(ctx context.Context, account string) (azcore.TokenC
 			return cred, nil
 		}
 		// Role env vars not set — fall through to normal credential flow.
+	}
+
+	// Honor explicit credentials configured via the standard AZURE_* env vars
+	// (service principal) or AZURE_USE_IDENTITY (managed identity) before
+	// falling back to tenant discovery and interactive CLI/browser login.
+	if cred, err := credentialFromEnv(); err != nil {
+		return nil, err
+	} else if cred != nil {
+		return cred, nil
 	}
 
 	tid := accountTenantID(ctx, account)
