@@ -23,6 +23,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
@@ -1076,11 +1077,22 @@ func uploadBlockSizeBytes(size int64) int64 {
 	return block
 }
 
+// uploadBlockMaxConcurrencyEnv overrides the upper bound the adaptive
+// concurrency controller may grow the per-upload parallelism to.
+const uploadBlockMaxConcurrencyEnv = "BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX"
+
+// uploadHardConcurrencyCap caps the controller's upper bound regardless of
+// caller input. Azure's per-blob block staging tolerates hundreds of in-flight
+// requests but we set a sensible memory/RAM ceiling.
+const uploadHardConcurrencyCap = 512
+
 // UploadFile uploads a local file to a block blob using parallel ranged reads
 // and StageBlock requests, mirroring azcopy's chunked upload for higher
-// single-file throughput. concurrency controls how many blocks are uploaded in
-// parallel (>=1). The optional onProgress callback receives the cumulative
-// number of bytes staged.
+// single-file throughput. concurrency is the initial parallelism (and floor);
+// an adaptive controller probes higher concurrency while throughput keeps
+// improving, up to uploadHardConcurrencyCap (overridable via
+// BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX). The optional onProgress callback
+// receives the cumulative number of bytes staged.
 func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return errors.New("cannot upload to directory-like path")
@@ -1089,24 +1101,96 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 	if err != nil {
 		return err
 	}
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	if concurrency > math.MaxUint16 {
-		concurrency = math.MaxUint16
-	}
-	size := int64(-1)
-	if info, statErr := file.Stat(); statErr == nil {
-		size = info.Size()
-	}
-	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
-	_, err = blobClient.UploadFile(ctx, file, &blockblob.UploadFileOptions{
-		BlockSize:   uploadBlockSizeBytes(size),
-		Concurrency: uint16(concurrency),
-		Progress:    onProgress,
-	})
+	info, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("put failed: %v", err)
+		return fmt.Errorf("stat upload source: %w", err)
+	}
+	size := info.Size()
+	blockSize := uploadBlockSizeBytes(size)
+	blockBlobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
+
+	// Empty blob: commit an empty block list to create a 0-byte blob.
+	if size == 0 {
+		_, err := blockBlobClient.CommitBlockList(ctx, nil, nil)
+		if err != nil {
+			return fmt.Errorf("put failed: %v", err)
+		}
+		if onProgress != nil {
+			onProgress(0)
+		}
+		return nil
+	}
+
+	_, blockIDs, err := planBlocks(size, blockSize, blockblob.MaxBlocks)
+	if err != nil {
+		return err
+	}
+
+	initial, minC, maxC, step := adaptiveBounds(concurrency, uploadHardConcurrencyCap, uploadBlockMaxConcurrencyEnv)
+	sem := newAdaptiveSem(initial, maxC)
+	var staged atomic.Int64
+	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
+	defer ctrlCancel()
+	done := make(chan struct{})
+	go runAdaptiveController(ctrlCtx, sem, &staged, adaptiveControllerConfig{
+		Min:        minC,
+		Max:        maxC,
+		Step:       step,
+		Interval:   750 * time.Millisecond,
+		Hysteresis: 0.05,
+		LogTag:     "upload",
+	}, done)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+
+	for i, blockID := range blockIDs {
+		if ctx.Err() != nil {
+			break
+		}
+		if err := sem.Acquire(ctx); err != nil {
+			break
+		}
+		offset := int64(i) * blockSize
+		count := min(blockSize, size-offset)
+		wg.Add(1)
+		go func(blockID string, offset, count int64) {
+			defer func() {
+				sem.Release()
+				wg.Done()
+			}()
+			body := streaming.NopCloser(io.NewSectionReader(file, offset, count))
+			if _, err := blockBlobClient.StageBlock(ctx, blockID, body, nil); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+				cancel()
+				return
+			}
+			cur := staged.Add(count)
+			if onProgress != nil {
+				onProgress(cur)
+			}
+		}(blockID, offset, count)
+	}
+
+	wg.Wait()
+	close(done)
+
+	if firstErr != nil {
+		return fmt.Errorf("put failed: %v", firstErr)
+	}
+	if _, err := blockBlobClient.CommitBlockList(ctx, blockIDs, nil); err != nil {
+		return fmt.Errorf("commit block list failed: %w", err)
+	}
+	if onProgress != nil {
+		onProgress(size)
 	}
 	return nil
 }
@@ -1388,6 +1472,13 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	return nil
 }
 
+// copyHardConcurrencyCap caps the adaptive controller's upper bound for
+// server-side StageBlockFromURL copies. Overridable via
+// BBB_AZBLOB_COPY_CONCURRENCY_MAX.
+const copyHardConcurrencyCap = 256
+
+const copyMaxConcurrencyEnv = "BBB_AZBLOB_COPY_CONCURRENCY_MAX"
+
 // copyBlobBlocks copies a blob using parallel StageBlockFromURL + CommitBlockList.
 func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource string, totalSize int64, concurrency int, onProgress CopyProgress) error {
 	blockBlobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
@@ -1403,7 +1494,20 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sem := make(chan struct{}, concurrency)
+	initial, minC, maxC, step := adaptiveBounds(concurrency, copyHardConcurrencyCap, copyMaxConcurrencyEnv)
+	sem := newAdaptiveSem(initial, maxC)
+	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
+	defer ctrlCancel()
+	done := make(chan struct{})
+	go runAdaptiveController(ctrlCtx, sem, &copiedBytes, adaptiveControllerConfig{
+		Min:        minC,
+		Max:        maxC,
+		Step:       step,
+		Interval:   750 * time.Millisecond,
+		Hysteresis: 0.05,
+		LogTag:     "s2s-copy",
+	}, done)
+
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
@@ -1416,21 +1520,13 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 		offset := int64(i) * blkSize
 		count := min(blkSize, totalSize-offset)
 
-		// Acquire semaphore slot, respecting context cancellation so the
-		// loop doesn't block forever when a peer goroutine cancels ctx.
-		gotSlot := false
-		select {
-		case sem <- struct{}{}:
-			gotSlot = true
-		case <-ctx.Done():
-		}
-		if !gotSlot {
+		if err := sem.Acquire(ctx); err != nil {
 			break
 		}
 		wg.Add(1)
 		go func(blockID string, offset, count int64) {
 			defer func() {
-				<-sem
+				sem.Release()
 				wg.Done()
 			}()
 
@@ -1455,6 +1551,7 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 	}
 
 	wg.Wait()
+	close(done)
 
 	if firstErr != nil {
 		return firstErr
