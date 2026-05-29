@@ -1005,9 +1005,11 @@ func TestRoleEnvVarsCoversAllExpectedVars(t *testing.T) {
 func TestGetCredentialForRoleReturnsNilWhenNoEnvSet(t *testing.T) {
 	// Clear any cached credential for "TESTROLE".
 	roleCredCache.Delete("TESTROLE")
-	// Ensure no TESTROLE_ env vars are set.
+	// Ensure no TESTROLE_ env vars are set, and no unprefixed defaults that
+	// the role would otherwise inherit.
 	for _, v := range roleEnvVars {
 		t.Setenv("TESTROLE_"+v, "")
+		t.Setenv(v, "")
 	}
 	cred, err := getCredentialForRole("TESTROLE")
 	if err != nil {
@@ -1075,6 +1077,60 @@ func TestGetCredentialForRoleRestoresOriginalEnv(t *testing.T) {
 	}
 	if got := os.Getenv("AZURE_CLIENT_SECRET"); got != "original-secret" {
 		t.Errorf("AZURE_CLIENT_SECRET not restored, got %q", got)
+	}
+}
+
+func TestGetCredentialForRoleInheritsUnprefixedDefaults(t *testing.T) {
+	// An unprefixed AZURE_* var must be interpreted as a default shared by both
+	// roles, i.e. AZURE_xxx behaves like SRC_AZURE_xxx and DST_AZURE_xxx.
+	roleCredCache.Delete("INHERIT")
+
+	// Ensure no role-prefixed values are set.
+	for _, v := range roleEnvVars {
+		t.Setenv("INHERIT_"+v, "")
+		t.Setenv(v, "")
+	}
+	// Configure only unprefixed service-principal vars.
+	t.Setenv("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000")
+	t.Setenv("AZURE_CLIENT_ID", "11111111-1111-1111-1111-111111111111")
+	t.Setenv("AZURE_CLIENT_SECRET", "secret")
+
+	cred, err := getCredentialForRole("INHERIT")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cred == nil {
+		t.Fatal("expected credential built from unprefixed AZURE_* defaults")
+	}
+
+	// Unprefixed defaults must remain intact after the call.
+	if got := os.Getenv("AZURE_TENANT_ID"); got != "00000000-0000-0000-0000-000000000000" {
+		t.Errorf("AZURE_TENANT_ID not preserved, got %q", got)
+	}
+}
+
+func TestGetCredentialForRolePrefixedOverridesUnprefixed(t *testing.T) {
+	roleCredCache.Delete("OVERRIDE")
+
+	// Unprefixed defaults.
+	t.Setenv("AZURE_TENANT_ID", "default-tenant")
+	t.Setenv("AZURE_CLIENT_ID", "default-client")
+	t.Setenv("AZURE_CLIENT_SECRET", "default-secret")
+
+	// Role-prefixed override for one var only; the others fall back to defaults.
+	t.Setenv("OVERRIDE_AZURE_CLIENT_ID", "role-client")
+
+	_, err := getCredentialForRole("OVERRIDE")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Unprefixed defaults must be restored after the call.
+	if got := os.Getenv("AZURE_CLIENT_ID"); got != "default-client" {
+		t.Errorf("AZURE_CLIENT_ID not restored, got %q", got)
+	}
+	if got := os.Getenv("AZURE_TENANT_ID"); got != "default-tenant" {
+		t.Errorf("AZURE_TENANT_ID not restored, got %q", got)
 	}
 }
 

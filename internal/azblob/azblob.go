@@ -569,17 +569,23 @@ var roleCredMu sync.Mutex
 // getCredentialForRole returns a DefaultAzureCredential built from
 // {role}_AZURE_* (and {role}_MSI_*, {role}_IDENTITY_*, etc.) environment
 // variables. The role-prefixed env vars are temporarily mapped to their
-// standard names so the Azure SDK picks them up. Returns (nil, nil) when
-// no role-prefixed env vars are set.
+// standard names so the Azure SDK picks them up.
+//
+// Unprefixed AZURE_* variables act as defaults shared by both roles: a plain
+// AZURE_xxx is interpreted as if it were set for both SRC_AZURE_xxx and
+// DST_AZURE_xxx, with the role-prefixed variant overriding it when present.
+// Returns (nil, nil) when neither role-prefixed nor unprefixed env vars are
+// set.
 func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 	if cached, ok := roleCredCache.Load(role); ok {
 		return cached.(azcore.TokenCredential), nil
 	}
 
-	// Check if any role-prefixed env var is set.
+	// Check if any role-prefixed env var is set, or any unprefixed default
+	// that the role should inherit.
 	hasAny := false
 	for _, v := range roleEnvVars {
-		if os.Getenv(role+"_"+v) != "" {
+		if os.Getenv(role+"_"+v) != "" || os.Getenv(v) != "" {
 			hasAny = true
 			break
 		}
@@ -598,13 +604,13 @@ func getCredentialForRole(role string) (azcore.TokenCredential, error) {
 		return cached.(azcore.TokenCredential), nil
 	}
 
-	// Save originals and clear all identity vars to avoid cross-contamination.
+	// Save originals so they can be restored afterwards. Unprefixed values are
+	// left in place as defaults; role-prefixed values override them below.
 	originals := make(map[string]string, len(roleEnvVars))
 	for _, v := range roleEnvVars {
 		originals[v] = os.Getenv(v)
-		_ = os.Unsetenv(v)
 	}
-	// Set only the role-prefixed values.
+	// Override with the role-prefixed values where present.
 	for _, v := range roleEnvVars {
 		if prefixed := os.Getenv(role + "_" + v); prefixed != "" {
 			_ = os.Setenv(v, prefixed)

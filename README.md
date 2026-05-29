@@ -78,6 +78,8 @@ These take effect before the interactive CLI/browser flow, so no browser popup i
 
 When copying or syncing between Azure Storage accounts in **different tenants** (or using different credentials), prefix any standard Azure identity environment variable with `SRC_` or `DST_` to scope it to source or destination accounts respectively.
 
+The unprefixed `AZURE_*` variables act as shared defaults: a plain `AZURE_xxx` is interpreted as if it were set for both `SRC_AZURE_xxx` and `DST_AZURE_xxx`, and the role-prefixed variant overrides it when present. This lets a single set of `AZURE_*` vars authenticate both sides while still allowing per-role overrides.
+
 bbb uses `DefaultAzureCredential` under the hood, so all credential types are supported: service principal (secret or certificate), workload identity (OIDC / AKS), managed identity, and Azure CLI.
 
 **Supported env vars** — prefix with `SRC_` or `DST_`:
@@ -129,8 +131,8 @@ bbb sync az://src-account/data/ az://dst-account/data/
 **Credential resolution order** (first match wins):
 
 1. Shared key (`SRC_BBB_AZBLOB_ACCOUNTKEY` / `DST_BBB_AZBLOB_ACCOUNTKEY`, or `BBB_AZBLOB_ACCOUNTKEY`)
-2. Role-specific env credential (`SRC_AZURE_*` / `DST_AZURE_*`) via `DefaultAzureCredential`
-3. Non-interactive env credential (`AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` service principal, or `AZURE_USE_IDENTITY` managed identity)
+2. Role-specific env credential (`SRC_AZURE_*` / `DST_AZURE_*`, falling back to unprefixed `AZURE_*` defaults) via `DefaultAzureCredential`
+3. Non-interactive env credential for accounts without a role (`AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` service principal, or `AZURE_USE_IDENTITY` managed identity)
 4. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
 5. Interactive browser login (fallback)
 
