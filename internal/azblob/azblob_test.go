@@ -1,6 +1,7 @@
 package azblob
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -1301,4 +1302,102 @@ func TestMonotonicProgressConcurrent(t *testing.T) {
 	if got := last.Load(); got != goroutines*perG {
 		t.Fatalf("expected high water %d, got %d", goroutines*perG, got)
 	}
+}
+
+type errReader struct {
+	data []byte
+	n    int
+	err  error
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if r.n >= len(r.data) {
+		return 0, r.err
+	}
+	n := copy(p, r.data[r.n:])
+	r.n += n
+	if r.n >= len(r.data) {
+		return n, r.err
+	}
+	return n, nil
+}
+
+func TestCopyRangeToOffsetBatchesWrites(t *testing.T) {
+	// Simulate small TLS-record-sized reads: 17 chunks of 16 KiB = ~272 KiB.
+	const chunk = 16 * 1024
+	const chunks = 17
+	src := make([]byte, chunk*chunks)
+	for i := range src {
+		src[i] = byte(i)
+	}
+	r := &errReader{data: src, err: io.EOF}
+
+	dst := &countingWriterAt{}
+	buf := make([]byte, 1*1024*1024)
+	n, err := copyRangeToOffset(dst, 100, r, buf)
+	if err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if n != int64(len(src)) {
+		t.Fatalf("n=%d want %d", n, len(src))
+	}
+	// 272 KiB fits in one 1 MiB buffer, so we expect exactly ONE WriteAt
+	// instead of 17 (io.CopyBuffer would have produced 17).
+	if dst.calls != 1 {
+		t.Fatalf("expected 1 WriteAt, got %d", dst.calls)
+	}
+	if dst.firstOffset != 100 {
+		t.Fatalf("expected offset 100, got %d", dst.firstOffset)
+	}
+	if !bytes.Equal(dst.bytes, src) {
+		t.Fatalf("written bytes do not match source")
+	}
+}
+
+func TestCopyRangeToOffsetMultipleBufferLoads(t *testing.T) {
+	// 2.5x buffer size → should produce 3 writes (full, full, partial).
+	buf := make([]byte, 1024)
+	src := make([]byte, 2560)
+	for i := range src {
+		src[i] = byte(i * 31)
+	}
+	r := &errReader{data: src, err: io.EOF}
+	dst := &countingWriterAt{}
+	n, err := copyRangeToOffset(dst, 0, r, buf)
+	if err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if n != int64(len(src)) {
+		t.Fatalf("n=%d", n)
+	}
+	if dst.calls != 3 {
+		t.Fatalf("expected 3 WriteAt calls, got %d", dst.calls)
+	}
+	if !bytes.Equal(dst.bytes, src) {
+		t.Fatalf("byte mismatch")
+	}
+}
+
+func TestCopyRangeToOffsetPropagatesReadError(t *testing.T) {
+	r := &errReader{data: []byte("hi"), err: errors.New("boom")}
+	dst := &countingWriterAt{}
+	_, err := copyRangeToOffset(dst, 0, r, make([]byte, 4))
+	if err == nil || err.Error() != "boom" {
+		t.Fatalf("expected boom error, got %v", err)
+	}
+}
+
+type countingWriterAt struct {
+	calls       int
+	firstOffset int64
+	bytes       []byte
+}
+
+func (w *countingWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	if w.calls == 0 {
+		w.firstOffset = off
+	}
+	w.calls++
+	w.bytes = append(w.bytes, p...)
+	return len(p), nil
 }

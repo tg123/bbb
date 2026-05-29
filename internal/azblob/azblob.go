@@ -1227,6 +1227,35 @@ var downloadCopyBufPool = sync.Pool{
 	},
 }
 
+// copyRangeToOffset streams src into dst at the given offset, accumulating
+// reads into buf before issuing a single pwrite per full buffer. io.CopyBuffer
+// performs one write per read, but HTTP/TLS reads typically return a single
+// TLS record (~16 KiB), which made the old implementation issue one 16 KiB
+// pwrite per chunk — ~656k pwrites per 10 GiB blob vs azcopy's ~15k. Batching
+// up to len(buf) bytes (1 MiB by default) before writing cuts pwrite count
+// ~64× and substantially reduces kernel sys time without changing memory use
+// (each in-flight range already owns one pooled buffer).
+func copyRangeToOffset(dst io.WriterAt, offset int64, src io.Reader, buf []byte) (int64, error) {
+	var total int64
+	for {
+		n, rerr := io.ReadFull(src, buf)
+		if n > 0 {
+			if _, werr := dst.WriteAt(buf[:n], offset+total); werr != nil {
+				return total, werr
+			}
+			total += int64(n)
+		}
+		switch rerr {
+		case nil:
+			continue
+		case io.EOF, io.ErrUnexpectedEOF:
+			return total, nil
+		default:
+			return total, rerr
+		}
+	}
+}
+
 // monotonicProgress wraps onProgress so it is invoked with strictly
 // increasing cumulative byte counts. DownloadFile fans out concurrent ranged
 // GETs; while the atomic counter is monotonic, two goroutines can race to
@@ -1373,7 +1402,7 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 			}
 			body := resp.NewRetryReader(ctx, nil)
 			bufPtr := downloadCopyBufPool.Get().(*[]byte)
-			n, copyErr := io.CopyBuffer(io.NewOffsetWriter(file, offset), body, *bufPtr)
+			n, copyErr := copyRangeToOffset(file, offset, body, *bufPtr)
 			downloadCopyBufPool.Put(bufPtr)
 			closeErr := body.Close()
 			if copyErr == nil && n != count {
