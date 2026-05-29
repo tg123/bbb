@@ -542,7 +542,7 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 			if machine {
 				fmt.Printf("%s\t%d\t%s\t%s\n", typ, entry.Size, mod, displayPath)
 			} else {
-				fmt.Printf("%1s %10d %s %s\n", typ, entry.Size, mod, displayPath)
+				fmt.Printf("%1s %10s %s %s\n", typ, formatSize(entry.Size), mod, displayPath)
 			}
 		} else {
 			fmt.Println(displayPath)
