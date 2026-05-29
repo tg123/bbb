@@ -1026,7 +1026,7 @@ func TestGetCredentialForRoleIgnoresHelperOnlyEnv(t *testing.T) {
 		t.Setenv(v, "")
 	}
 
-	t.Setenv("AZURE_CONFIG_DIR", "/tmp/fake-azure-config")
+	t.Setenv("AZURE_CONFIG_DIR", t.TempDir())
 	t.Setenv("HELPERONLY_AZURE_USERNAME", "user@example.com")
 
 	cred, err := getCredentialForRole("HELPERONLY")
