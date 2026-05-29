@@ -8,6 +8,54 @@ import (
 	"time"
 )
 
+func TestAdaptiveSemGrowAfterShrinkWithDeficit(t *testing.T) {
+	sem := newAdaptiveSem(4, 8)
+	ctx := context.Background()
+	// Take out all 4 tokens.
+	for i := 0; i < 4; i++ {
+		if err := sem.Acquire(ctx); err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+	}
+	// Shrink while everything is in flight: deficit = 2, capacity = 2.
+	sem.SetCapacity(2)
+	// Grow back to 6 while deficit is still outstanding. Effective in-flight
+	// must never exceed 6 (4 outstanding + at most 2 new tokens), and the
+	// deficit must be absorbed by the grow instead of by future Releases.
+	sem.SetCapacity(6)
+	// Two more slots should now be available without any Release.
+	for i := 0; i < 2; i++ {
+		ctxT, cancel := context.WithTimeout(ctx, time.Second)
+		if err := sem.Acquire(ctxT); err != nil {
+			cancel()
+			t.Fatalf("acquire-after-grow %d: %v", i, err)
+		}
+		cancel()
+	}
+	// At this point 6 tokens are out and capacity is 6. Acquire must block.
+	blocked := make(chan struct{})
+	go func() {
+		_ = sem.Acquire(ctx)
+		close(blocked)
+	}()
+	select {
+	case <-blocked:
+		t.Fatal("acquire returned past intended cap; deficit not absorbed by grow")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// Release one -> Acquire goroutine should unblock; no token-dropping.
+	sem.Release()
+	select {
+	case <-blocked:
+	case <-time.After(time.Second):
+		t.Fatal("Acquire did not return after Release")
+	}
+	// Drain the rest.
+	for i := 0; i < 6; i++ {
+		sem.Release()
+	}
+}
+
 func TestAdaptiveSemAcquireRelease(t *testing.T) {
 	sem := newAdaptiveSem(2, 4)
 	ctx := context.Background()

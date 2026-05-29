@@ -70,11 +70,25 @@ func (s *adaptiveSem) SetCapacity(n int) {
 	}
 	if n > s.capacity {
 		extra := n - s.capacity
+		// First absorb any outstanding deficit so we don't double-count
+		// shrink-then-grow as new capacity.
+		if s.deficit > 0 {
+			absorb := s.deficit
+			if absorb > extra {
+				absorb = extra
+			}
+			s.deficit -= absorb
+			extra -= absorb
+			s.capacity += absorb
+		}
 		if cap(s.tokens) < n {
 			// Channel was sized to the original max; we cap growth there.
-			extra = cap(s.tokens) - len(s.tokens) - s.deficit
-			if extra < 0 {
-				extra = 0
+			room := cap(s.tokens) - len(s.tokens) - s.deficit
+			if room < 0 {
+				room = 0
+			}
+			if extra > room {
+				extra = room
 			}
 		}
 		added := 0
