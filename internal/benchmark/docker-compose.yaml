@@ -1,0 +1,75 @@
+# Benchmark Compose stack. Mirrors internal/e2e: the Azurite emulator runs as its
+# own service (the official image — nothing emulator-specific in the Dockerfile),
+# and the benchmark container shares its network namespace
+# (network_mode: service:azurite), builds bbb from the repo, and runs it against
+# the emulator alongside py-bbb and azcopy.
+#
+# Unlike internal/e2e (plain HTTP on blob.localhost), py-bbb (boostedblob)
+# hardcodes https://{account}.blob.core.windows.net with no host or port override,
+# so the emulator must answer at that exact host over TLS on :443. Two things make
+# that work, both mirroring e2e's style:
+#   - extra_hosts on the azurite service maps that host to 127.0.0.1; because the
+#     benchmark container shares azurite's netns, it inherits the mapping too (no
+#     /etc/hosts editing needed).
+#   - the benchmark container generates the TLS material into the shared
+#     bench-state volume and trusts the CA (setup-emulator.sh); azurite serves
+#     :443 with that certificate.
+# Everything happens inside the containers, so the benchmark needs no host
+# privileges, no secrets and no real Azure account.
+#
+#   docker compose up --build --abort-on-container-exit --exit-code-from benchmark
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    # Bind privileged port 443 (py-bbb has no port override) — run as root.
+    user: root
+    # Inherited by the benchmark container via network_mode: service:azurite.
+    extra_hosts:
+      - "devstoreaccount1.blob.core.windows.net:127.0.0.1"
+    volumes:
+      - bench-state:/bench-state
+    # The benchmark container generates the TLS material into the shared volume;
+    # clear any cert left over from a previous run (the named volume persists),
+    # wait for the freshly generated certificate, then serve Azurite over HTTPS
+    # on :443.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo 'azurite: clearing any TLS material left over from a previous run...'
+        rm -f /bench-state/tls-ready /bench-state/server.crt /bench-state/server.key
+        echo 'azurite: waiting for the benchmark to generate the TLS certificate...'
+        while [ ! -s /bench-state/tls-ready ]; do
+          sleep 0.5
+        done
+        exec azurite-blob \
+          --blobHost 0.0.0.0 --blobPort 443 \
+          --cert /bench-state/server.crt --key /bench-state/server.key \
+          --skipApiVersionCheck \
+          --location /data --silent
+
+  benchmark:
+    build:
+      context: ../..
+      dockerfile: internal/benchmark/Dockerfile
+    # Share the azurite service's network namespace (and its extra_hosts) so the
+    # hardcoded host resolves to the emulator on 127.0.0.1:443.
+    network_mode: service:azurite
+    depends_on:
+      - azurite
+    volumes:
+      - ../..:/src
+      - bench-state:/bench-state
+    working_dir: /src
+    environment:
+      - BENCH_STATE_DIR=/bench-state
+      - BENCH_SIZE_MB=${BENCH_SIZE_MB:-1024}
+      - BENCH_RUNS=${BENCH_RUNS:-3}
+      - BENCH_FAIL_FACTOR=${BENCH_FAIL_FACTOR:-1.05}
+      # Results table is written here too; the path is under the mounted repo so
+      # the workflow can append it to the GitHub job summary after the run.
+      - BENCH_SUMMARY_FILE=/src/internal/benchmark/.benchmark-summary.md
+    command: ["bash", "internal/benchmark/run.sh"]
+
+volumes:
+  bench-state:

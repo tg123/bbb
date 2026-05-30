@@ -34,3 +34,6 @@ go.work.sum
 dist/bbb
 
 /bbb
+
+# Benchmark summary output (internal/benchmark)
+.benchmark-summary.md

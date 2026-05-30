@@ -1,0 +1,60 @@
+name: Benchmark
+
+# Compares bbb (this repo) upload/download throughput against azcopy and
+# boostedblob (py-bbb) using the Azurite emulator, so it needs no secrets and
+# runs on every pull request and push to main (plus on demand).
+#
+# Everything runs inside Docker Compose (internal/benchmark), mirroring the E2E
+# suite: the Azurite emulator runs as its own service and the benchmark container
+# builds bbb, serves the emulator behind the production-style
+# https://{account}.blob.core.windows.net host that py-bbb hardcodes, and runs
+# all three tools against it.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      size_mb:
+        description: Test file size in MiB
+        default: "1024"
+        required: false
+      runs:
+        description: Timed runs per tool/direction
+        default: "3"
+        required: false
+      fail_factor:
+        description: Fail if bbb is slower than the fastest other tool by more than this factor (e.g. 1.05 = 5%; blank = report only)
+        default: "1.05"
+        required: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Run benchmark
+        run: docker compose up --build --abort-on-container-exit --exit-code-from benchmark
+        working-directory: internal/benchmark
+        env:
+          COMPOSE_DOCKER_CLI_BUILD: "1"
+          DOCKER_BUILDKIT: "1"
+          BENCH_SIZE_MB: ${{ github.event.inputs.size_mb || '1024' }}
+          BENCH_RUNS: ${{ github.event.inputs.runs || '3' }}
+          BENCH_FAIL_FACTOR: ${{ github.event.inputs.fail_factor || '1.05' }}
+
+      - name: Publish results to job summary
+        if: always()
+        run: |
+          if [ -f internal/benchmark/.benchmark-summary.md ]; then
+            cat internal/benchmark/.benchmark-summary.md >> "${GITHUB_STEP_SUMMARY}"
+          fi

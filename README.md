@@ -613,6 +613,47 @@ bbb az mkcontainer az://account/container
 bbb az mkcontainer az://myaccount/newcontainer
 ```
 
+## Benchmark
+
+The [`Benchmark`](.github/workflows/benchmark.yml) workflow compares `bbb`'s
+single-file upload and download throughput against
+[`azcopy`](https://learn.microsoft.com/azure/storage/common/storage-use-azcopy-v10)
+and [`boostedblob`](https://github.com/hauntsaninja/boostedblob) (the upstream
+Python `bbb`, referred to as *py-bbb*). It guards the parallel transfer paths
+introduced in [#87](https://github.com/tg123/bbb/pull/87) and
+[#89](https://github.com/tg123/bbb/pull/89) against regressions.
+
+Because `boostedblob` hardcodes the `https://{account}.blob.core.windows.net`
+endpoint (no port or host override), the benchmark serves the
+[Azurite](https://github.com/Azure/Azurite) emulator at that exact host. The
+whole benchmark runs inside Docker Compose
+([`internal/benchmark`](internal/benchmark)), mirroring the
+[E2E](.github/workflows/e2e.yaml) suite: Azurite runs as its own service (the
+official image), and the benchmark container generates a local CA (trusted inside
+the container), points `{account}.blob.core.windows.net` at the emulator over TLS
+on port 443, builds `bbb`, and runs all three tools against the same emulator.
+Because everything is containerised, the benchmark needs **no host privileges, no
+secrets and no real Azure account**, so it runs on every pull request.
+
+The workflow runs on every pull request, on pushes to `main`, and on demand via
+**Run workflow** (`workflow_dispatch`), where you can set the test-file size, the
+number of runs, and a `fail_factor` that fails the job when `bbb` is slower than
+the fastest other tool by more than that factor (default `1.05`, i.e. a 5%
+regression gate; set it blank for report-only). Results are written to the job
+summary as a table.
+
+> The emulator is CPU/loopback-bound, so the numbers reflect client-side
+> overhead rather than real network throughput; `fail_factor` defaults to `1.05`
+> (a 5% gate) and can be set blank to report only.
+
+To run it locally you only need Docker:
+
+```bash
+cd internal/benchmark
+docker compose up --build --abort-on-container-exit --exit-code-from benchmark
+# Optional overrides: BENCH_SIZE_MB, BENCH_RUNS, BENCH_FAIL_FACTOR
+```
+
 ## License
 
 See [LICENSE](LICENSE) for details.
