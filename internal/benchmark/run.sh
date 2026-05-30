@@ -5,10 +5,10 @@
 # Runs entirely inside the container (see internal/benchmark/Dockerfile and
 # docker-compose.yaml), so it is root and needs no host privileges. It:
 #
-#   1. generates the TLS material and trusts the CA so the production-style host
-#      https://{account}.blob.core.windows.net resolves to the azurite service
-#      on :443 (setup-emulator.sh); the azurite service serves TLS with the
-#      shared certificate,
+#   1. generates the TLS material and trusts the CA (setup-emulator.sh) so the
+#      production-style host https://{account}.blob.core.windows.net — mapped to
+#      the azurite service's loopback by the compose extra_hosts — is served over
+#      TLS with the shared certificate,
 #   2. builds bbb from the mounted repo,
 #   3. runs the benchmark (benchmark.sh).
 #
@@ -20,8 +20,9 @@ cd "$(dirname "$0")/../.."
 # to it so setup-emulator.sh, the benchmark and the emulator all agree.
 STATE_DIR="${BENCH_STATE_DIR:-/bench-state}"
 
-# Generate the TLS material (into STATE_DIR, shared with the azurite service),
-# trust the CA, and map the hardcoded host to the shared loopback.
+# Generate the TLS material (into STATE_DIR, shared with the azurite service)
+# and trust the CA. The hardcoded host is mapped to the shared loopback by the
+# azurite service's extra_hosts (inherited via network_mode).
 BENCH_STATE_DIR="${STATE_DIR}" bash internal/benchmark/setup-emulator.sh
 
 # Make every TLS client in this container (Go and Python alike) trust the CA

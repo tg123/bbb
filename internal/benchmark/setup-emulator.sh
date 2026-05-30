@@ -9,18 +9,18 @@
 #
 # py-bbb (boostedblob) hardcodes `https://{account}.blob.core.windows.net` with
 # no endpoint or port override, so the emulator has to be reachable at that exact
-# host over HTTPS on port 443. This script therefore:
+# host over HTTPS on port 443. The compose file maps that host to 127.0.0.1 via
+# the azurite service's extra_hosts (inherited here through
+# network_mode: service:azurite), so this script only has to:
 #
-#   1. generates a local CA and a server certificate for
+#   1. generate a local CA and a server certificate for
 #      `{account}.blob.core.windows.net` into the shared state dir (so the
-#      azurite service can serve TLS with it) and installs the CA into the
-#      system trust store (so Go-based bbb/azcopy and Python's ssl all trust it),
-#   2. points `{account}.blob.core.windows.net` at 127.0.0.1 via /etc/hosts (the
-#      benchmark container shares the azurite service's network namespace, so the
-#      emulator listens on the shared loopback at :443).
+#      azurite service can serve TLS with it), and
+#   2. install the CA into the system trust store (so Go-based bbb/azcopy and
+#      Python's ssl all trust it).
 #
-# It needs root (for /etc/hosts and the trust store); when not run as root it
-# re-invokes the privileged bits with sudo.
+# It needs root for the trust store; when not run as root it re-invokes the
+# privileged bits with sudo.
 #
 # Environment:
 #   BENCH_ACCOUNT   Storage account name      (default: devstoreaccount1)
@@ -78,14 +78,6 @@ openssl x509 -req -in "${BENCH_STATE_DIR}/server.csr" -CA "${CA_PEM}" \
 log "Trusting the CA in the system store"
 ${SUDO} cp "${CA_PEM}" /usr/local/share/ca-certificates/bbb-bench-ca.crt
 ${SUDO} update-ca-certificates >/dev/null 2>&1
-
-# ---------------------------------------------------------------------------
-# 2. /etc/hosts.
-# ---------------------------------------------------------------------------
-if ! getent hosts "${HOST}" | grep -q '127.0.0.1'; then
-  log "Pointing ${HOST} at 127.0.0.1"
-  printf '127.0.0.1 %s\n' "${HOST}" | ${SUDO} tee -a /etc/hosts >/dev/null
-fi
 
 log "TLS trust ready for https://${HOST}"
 printf 'BENCH_STATE_DIR=%s\n' "${BENCH_STATE_DIR}"

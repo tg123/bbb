@@ -1,17 +1,21 @@
 # Benchmark Compose stack. Mirrors internal/e2e: the Azurite emulator runs as its
 # own service (the official image — nothing emulator-specific in the Dockerfile),
-# and the benchmark container builds bbb from the repo and runs it against that
-# emulator alongside py-bbb and azcopy.
+# and the benchmark container shares its network namespace
+# (network_mode: service:azurite), builds bbb from the repo, and runs it against
+# the emulator alongside py-bbb and azcopy.
 #
-# py-bbb (boostedblob) hardcodes https://{account}.blob.core.windows.net with no
-# override, so the emulator has to answer at that exact host over TLS on :443. The
-# benchmark container therefore shares the azurite service's network namespace
-# (network_mode: service:azurite, as in internal/e2e) and, in setup-emulator.sh,
-# points that host at 127.0.0.1 and trusts a locally generated CA. The same CA's
-# server certificate is shared with the azurite service through the bench-state
-# volume, so Azurite can serve TLS on :443. Everything happens inside the
-# containers, so the benchmark needs no host privileges, no secrets and no real
-# Azure account.
+# Unlike internal/e2e (plain HTTP on blob.localhost), py-bbb (boostedblob)
+# hardcodes https://{account}.blob.core.windows.net with no host or port override,
+# so the emulator must answer at that exact host over TLS on :443. Two things make
+# that work, both mirroring e2e's style:
+#   - extra_hosts on the azurite service maps that host to 127.0.0.1; because the
+#     benchmark container shares azurite's netns, it inherits the mapping too (no
+#     /etc/hosts editing needed).
+#   - the benchmark container generates the TLS material into the shared
+#     bench-state volume and trusts the CA (setup-emulator.sh); azurite serves
+#     :443 with that certificate.
+# Everything happens inside the containers, so the benchmark needs no host
+# privileges, no secrets and no real Azure account.
 #
 #   docker compose up --build --abort-on-container-exit --exit-code-from benchmark
 services:
@@ -19,6 +23,9 @@ services:
     image: mcr.microsoft.com/azure-storage/azurite
     # Bind privileged port 443 (py-bbb has no port override) — run as root.
     user: root
+    # Inherited by the benchmark container via network_mode: service:azurite.
+    extra_hosts:
+      - "devstoreaccount1.blob.core.windows.net:127.0.0.1"
     volumes:
       - bench-state:/bench-state
     # The benchmark container generates the TLS material into the shared volume;
@@ -41,8 +48,8 @@ services:
     build:
       context: ../..
       dockerfile: internal/benchmark/Dockerfile
-    # Share the azurite service's network namespace so the emulator is reachable
-    # on 127.0.0.1:443 (setup-emulator.sh maps the hardcoded host there).
+    # Share the azurite service's network namespace (and its extra_hosts) so the
+    # hardcoded host resolves to the emulator on 127.0.0.1:443.
     network_mode: service:azurite
     depends_on:
       - azurite
