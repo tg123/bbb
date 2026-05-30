@@ -1382,6 +1382,8 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 	}
 	if envOn(envDownloadFadvise) {
 		tryFadviseSequential(file)
+	}
+	if envOn("BBB_DOWNLOAD_FADVISE_DONTNEED") {
 		defer tryFadviseDontneed(file)
 	}
 	// Experimental: mmap the destination file so worker goroutines write
