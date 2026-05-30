@@ -1,6 +1,7 @@
 package azblob
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -1135,6 +1136,24 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 		return err
 	}
 
+	// Experimental: hint kernel to do aggressive readahead and drop pages
+	// past the read window, reducing page-cache pressure for large uploads.
+	if envOn(envUploadFadvise) {
+		tryFadviseSequential(file)
+	}
+	// Experimental: mmap the source file so block bodies are served from a
+	// shared mapped region instead of issuing a pread per HTTP body chunk.
+	var uploadMmap []byte
+	if envOn(envUploadMmap) && size > 0 {
+		if m, mErr := mmapFile(file, size, false); mErr == nil {
+			uploadMmap = m
+			madviseSequential(uploadMmap)
+			defer munmap(uploadMmap)
+		} else {
+			slog.Debug("upload mmap failed, falling back to pread", "err", mErr)
+		}
+	}
+
 	initial, minC, maxC, step := adaptiveBounds(concurrency, uploadHardConcurrencyCap, uploadBlockMaxConcurrencyEnv)
 	sem := newAdaptiveSem(initial, maxC)
 	var staged atomic.Int64
@@ -1182,7 +1201,12 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 				sem.Release()
 				wg.Done()
 			}()
-			body := streaming.NopCloser(io.NewSectionReader(file, offset, count))
+			var body io.ReadSeekCloser
+			if uploadMmap != nil {
+				body = streaming.NopCloser(bytes.NewReader(uploadMmap[offset : offset+count]))
+			} else {
+				body = streaming.NopCloser(io.NewSectionReader(file, offset, count))
+			}
 			if _, err := blockBlobClient.StageBlock(ctx, blockID, body, nil); err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -1256,6 +1280,33 @@ func copyRangeToOffset(dst io.WriterAt, offset int64, src io.Reader, buf []byte)
 	}
 }
 
+// copyRangeToMmap reads from src into the mmap region [offset, offset+count)
+// directly, avoiding the pwrite syscall. Kernel writeback flushes dirty
+// pages asynchronously.
+func copyRangeToMmap(mmap []byte, offset, count int64, src io.Reader) (int64, error) {
+	dst := mmap[offset : offset+count]
+	var total int64
+	for total < count {
+		end := total + downloadCopyBufferSize
+		if end > count {
+			end = count
+		}
+		n, rerr := io.ReadFull(src, dst[total:end])
+		if n > 0 {
+			total += int64(n)
+		}
+		switch rerr {
+		case nil:
+			continue
+		case io.EOF, io.ErrUnexpectedEOF:
+			return total, nil
+		default:
+			return total, rerr
+		}
+	}
+	return total, nil
+}
+
 // monotonicProgress wraps onProgress so it is invoked with strictly
 // increasing cumulative byte counts. DownloadFile fans out concurrent ranged
 // GETs; while the atomic counter is monotonic, two goroutines can race to
@@ -1321,6 +1372,29 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 	if stat, err := file.Stat(); err == nil && stat.Size() != size {
 		if err := file.Truncate(size); err != nil {
 			return 0, err
+		}
+	}
+
+	// Experimental: preallocate destination extents so per-pwrite cost
+	// drops from ~ms (extent allocation + journal commit) to ~us.
+	if envOn(envDownloadFallocate) {
+		tryFallocate(file, size)
+	}
+	if envOn(envDownloadFadvise) {
+		tryFadviseSequential(file)
+		defer tryFadviseDontneed(file)
+	}
+	// Experimental: mmap the destination file so worker goroutines write
+	// decrypted bytes directly into the mapped region via memcpy, removing
+	// the pwrite syscall entirely (kernel writeback handles persistence).
+	var downloadMmap []byte
+	if envOn(envDownloadMmap) {
+		if m, mErr := mmapFile(file, size, true); mErr == nil {
+			downloadMmap = m
+			madviseSequential(downloadMmap)
+			defer munmap(downloadMmap)
+		} else {
+			slog.Debug("download mmap failed, falling back to pwrite", "err", mErr)
 		}
 	}
 
@@ -1401,9 +1475,15 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 				return
 			}
 			body := resp.NewRetryReader(ctx, nil)
-			bufPtr := downloadCopyBufPool.Get().(*[]byte)
-			n, copyErr := copyRangeToOffset(file, offset, body, *bufPtr)
-			downloadCopyBufPool.Put(bufPtr)
+			var n int64
+			var copyErr error
+			if downloadMmap != nil {
+				n, copyErr = copyRangeToMmap(downloadMmap, offset, count, body)
+			} else {
+				bufPtr := downloadCopyBufPool.Get().(*[]byte)
+				n, copyErr = copyRangeToOffset(file, offset, body, *bufPtr)
+				downloadCopyBufPool.Put(bufPtr)
+			}
 			closeErr := body.Close()
 			if copyErr == nil && n != count {
 				copyErr = fmt.Errorf("short download for range [%d,%d): got %d bytes", offset, offset+count, n)
