@@ -4,10 +4,11 @@
 # azcopy and boostedblob (py-bbb) using the Azurite emulator.
 #
 # The emulator must already be running and reachable at
-# `https://${BENCH_ACCOUNT}.blob.core.windows.net` (port 443) — see
-# setup-emulator.sh, which arranges the TLS cert, /etc/hosts entry and the
-# Azurite process. py-bbb (boostedblob) hardcodes that host, so all three tools
-# are pointed at it for an apples-to-apples comparison.
+# `https://${BENCH_ACCOUNT}.blob.core.windows.net` (port 443). The Compose stack
+# (docker-compose.yaml) runs Azurite as its own service and maps that host to it;
+# setup-emulator.sh only arranges the TLS cert and trust. py-bbb (boostedblob)
+# hardcodes that host, so all three tools are pointed at it for an
+# apples-to-apples comparison.
 #
 # Environment:
 #   BENCH_ACCOUNT      Storage account name             (default: devstoreaccount1)

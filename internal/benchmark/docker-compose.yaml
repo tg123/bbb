@@ -29,13 +29,17 @@ services:
     volumes:
       - bench-state:/bench-state
     # The benchmark container generates the TLS material into the shared volume;
-    # wait for it, then serve Azurite over HTTPS on :443.
+    # clear any cert left over from a previous run (the named volume persists),
+    # wait for the freshly generated certificate, then serve Azurite over HTTPS
+    # on :443.
     command:
       - /bin/sh
       - -c
       - |
+        echo 'azurite: clearing any TLS material left over from a previous run...'
+        rm -f /bench-state/tls-ready /bench-state/server.crt /bench-state/server.key
         echo 'azurite: waiting for the benchmark to generate the TLS certificate...'
-        while [ ! -s /bench-state/server.crt ] || [ ! -s /bench-state/server.key ]; do
+        while [ ! -s /bench-state/tls-ready ]; do
           sleep 0.5
         done
         exec azurite-blob \

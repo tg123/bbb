@@ -50,6 +50,14 @@ CA_KEY="${BENCH_STATE_DIR}/ca.key"
 CA_PEM="${BENCH_STATE_DIR}/ca.pem"
 SRV_KEY="${BENCH_STATE_DIR}/server.key"
 SRV_CRT="${BENCH_STATE_DIR}/server.crt"
+READY="${BENCH_STATE_DIR}/tls-ready"
+
+# The shared bench-state volume persists across runs, so remove any TLS material
+# (and the readiness sentinel) left over from a previous run before regenerating.
+# The azurite service waits for the sentinel, so it never serves a stale cert.
+rm -f "${CA_KEY}" "${CA_PEM}" "${SRV_KEY}" "${SRV_CRT}" "${READY}" \
+  "${BENCH_STATE_DIR}/server.csr" "${BENCH_STATE_DIR}/san.ext" \
+  "${BENCH_STATE_DIR}/ca.srl"
 
 log "Generating CA and server certificate for ${HOST}"
 openssl genrsa -out "${CA_KEY}" 2048 >/dev/null 2>&1
@@ -80,4 +88,10 @@ ${SUDO} cp "${CA_PEM}" /usr/local/share/ca-certificates/bbb-bench-ca.crt
 ${SUDO} update-ca-certificates >/dev/null 2>&1
 
 log "TLS trust ready for https://${HOST}"
+
+# Signal to the azurite service (which waits on this sentinel) that the freshly
+# generated TLS material is complete and ready to be served. Written last so the
+# service never picks up a partially written certificate.
+printf 'ready\n' >"${READY}"
+
 printf 'BENCH_STATE_DIR=%s\n' "${BENCH_STATE_DIR}"
