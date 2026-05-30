@@ -1,21 +1,18 @@
-# Image for the benchmark Compose service. It bundles every tool the benchmark
-# compares (bbb is built from the repo at run time, plus py-bbb/boostedblob and
-# azcopy) together with the Azurite emulator and the certificate tooling, so the
-# whole benchmark runs inside the container without touching the host.
+# Image for the benchmark Compose service. It bundles the client tools the
+# benchmark compares (bbb is built from the repo at run time, plus
+# py-bbb/boostedblob and azcopy) together with the certificate tooling. The
+# Azurite emulator itself runs as its own Compose service (see
+# docker-compose.yaml), so it is not installed here.
 FROM golang:1.26-trixie
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # openssl + ca-certificates: local CA for the emulator's TLS endpoint.
-# nodejs + npm: Azurite.
 # python3 + venv: py-bbb (boostedblob) and the SAS generator for azcopy.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl openssl nodejs npm python3 python3-venv \
+        ca-certificates curl openssl python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
-
-# Azurite emulator.
-RUN npm install -g azurite
 
 # py-bbb (boostedblob) and azure-storage-blob (used to mint the azcopy SAS),
 # installed into a venv so they stay isolated from the system Python.

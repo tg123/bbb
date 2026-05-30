@@ -14,7 +14,7 @@
 #   BENCH_KEY          Shared key for the account
 #                      (default: the well-known Azurite key)
 #   BENCH_CONTAINER    Container to use, created if missing (default: bench)
-#   BENCH_SIZE_MB      Test file size in MiB             (default: 256)
+#   BENCH_SIZE_MB      Test file size in MiB             (default: 1024)
 #   BENCH_RUNS         Timed runs per tool/direction     (default: 3)
 #   BENCH_CONCURRENCY  Concurrency passed to bbb/azcopy  (default: nproc)
 #   BBB_BIN            Path to the bbb binary under test (default: bbb on PATH)
@@ -33,7 +33,7 @@ set -euo pipefail
 BENCH_ACCOUNT="${BENCH_ACCOUNT:-devstoreaccount1}"
 BENCH_KEY="${BENCH_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}"
 BENCH_CONTAINER="${BENCH_CONTAINER:-bench}"
-BENCH_SIZE_MB="${BENCH_SIZE_MB:-256}"
+BENCH_SIZE_MB="${BENCH_SIZE_MB:-1024}"
 BENCH_RUNS="${BENCH_RUNS:-3}"
 BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-$(nproc)}"
 BBB_BIN="${BBB_BIN:-bbb}"

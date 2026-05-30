@@ -2,10 +2,11 @@ name: Benchmark
 
 # Compares bbb (this repo) upload/download throughput against azcopy and
 # boostedblob (py-bbb) using the Azurite emulator, so it needs no secrets and
-# runs on every pull request and push to main (plus on demand and weekly).
+# runs on every pull request and push to main (plus on demand).
 #
 # Everything runs inside Docker Compose (internal/benchmark), mirroring the E2E
-# suite: a single container builds bbb, serves Azurite behind the production-style
+# suite: the Azurite emulator runs as its own service and the benchmark container
+# builds bbb, serves the emulator behind the production-style
 # https://{account}.blob.core.windows.net host that py-bbb hardcodes, and runs
 # all three tools against it.
 
@@ -19,10 +20,8 @@ on:
   workflow_dispatch:
     inputs:
       size_mb:
-        # Kept small: the emulator is CPU/loopback-bound, so larger files mainly
-        # add runtime without changing the comparison.
         description: Test file size in MiB
-        default: "256"
+        default: "1024"
         required: false
       runs:
         description: Timed runs per tool/direction
@@ -32,8 +31,6 @@ on:
         description: Fail if bbb is slower than the fastest other tool by this factor (blank = report only)
         default: ""
         required: false
-  schedule:
-    - cron: "0 6 * * 1" # Mondays 06:00 UTC
 
 jobs:
   benchmark:
@@ -51,7 +48,7 @@ jobs:
         env:
           COMPOSE_DOCKER_CLI_BUILD: "1"
           DOCKER_BUILDKIT: "1"
-          BENCH_SIZE_MB: ${{ github.event.inputs.size_mb || '256' }}
+          BENCH_SIZE_MB: ${{ github.event.inputs.size_mb || '1024' }}
           BENCH_RUNS: ${{ github.event.inputs.runs || '3' }}
           BENCH_FAIL_FACTOR: ${{ github.event.inputs.fail_factor || '' }}
 

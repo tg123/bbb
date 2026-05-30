@@ -628,18 +628,18 @@ endpoint (no port or host override), the benchmark serves the
 [Azurite](https://github.com/Azure/Azurite) emulator at that exact host. The
 whole benchmark runs inside Docker Compose
 ([`internal/benchmark`](internal/benchmark)), mirroring the
-[E2E](.github/workflows/e2e.yaml) suite: a single container generates a local CA
-(trusted inside the container), points `{account}.blob.core.windows.net` at
-`127.0.0.1`, starts Azurite over TLS on port 443, builds `bbb`, and runs all
-three tools against the same emulator. Because everything is containerised, the
-benchmark needs **no host privileges, no secrets and no real Azure account**, so
-it runs on every pull request.
+[E2E](.github/workflows/e2e.yaml) suite: Azurite runs as its own service (the
+official image), and the benchmark container generates a local CA (trusted inside
+the container), points `{account}.blob.core.windows.net` at the emulator over TLS
+on port 443, builds `bbb`, and runs all three tools against the same emulator.
+Because everything is containerised, the benchmark needs **no host privileges, no
+secrets and no real Azure account**, so it runs on every pull request.
 
-The workflow runs on every pull request, on pushes to `main`, weekly, and on
-demand via **Run workflow** (`workflow_dispatch`), where you can set the
-test-file size, the number of runs, and an optional `fail_factor` that fails the
-job when `bbb` is slower than the fastest other tool by more than that factor.
-Results are written to the job summary as a table.
+The workflow runs on every pull request, on pushes to `main`, and on demand via
+**Run workflow** (`workflow_dispatch`), where you can set the test-file size, the
+number of runs, and an optional `fail_factor` that fails the job when `bbb` is
+slower than the fastest other tool by more than that factor. Results are written
+to the job summary as a table.
 
 > The emulator is CPU/loopback-bound, so the numbers reflect client-side
 > overhead rather than real network throughput; `fail_factor` is off by default.

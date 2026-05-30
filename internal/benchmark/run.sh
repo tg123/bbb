@@ -5,8 +5,10 @@
 # Runs entirely inside the container (see internal/benchmark/Dockerfile and
 # docker-compose.yaml), so it is root and needs no host privileges. It:
 #
-#   1. sets up the Azurite emulator behind the production-style host
-#      https://{account}.blob.core.windows.net on :443 (setup-emulator.sh),
+#   1. generates the TLS material and trusts the CA so the production-style host
+#      https://{account}.blob.core.windows.net resolves to the azurite service
+#      on :443 (setup-emulator.sh); the azurite service serves TLS with the
+#      shared certificate,
 #   2. builds bbb from the mounted repo,
 #   3. runs the benchmark (benchmark.sh).
 #
@@ -14,11 +16,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-STATE_DIR="$(mktemp -d)"
+# The azurite service shares this volume to pick up the TLS certificate; default
+# to it so setup-emulator.sh, the benchmark and the emulator all agree.
+STATE_DIR="${BENCH_STATE_DIR:-/bench-state}"
 
-# Start the emulator and trust its CA. setup-emulator.sh prints
-# "BENCH_STATE_DIR=<dir>"; capture it so cleanup and the benchmark agree on the
-# location, though run.sh provides it up front.
+# Generate the TLS material (into STATE_DIR, shared with the azurite service),
+# trust the CA, and map the hardcoded host to the shared loopback.
 BENCH_STATE_DIR="${STATE_DIR}" bash internal/benchmark/setup-emulator.sh
 
 # Make every TLS client in this container (Go and Python alike) trust the CA
@@ -27,6 +30,20 @@ BENCH_STATE_DIR="${STATE_DIR}" bash internal/benchmark/setup-emulator.sh
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 export REQUESTS_CA_BUNDLE="${SSL_CERT_FILE}"
 export CURL_CA_BUNDLE="${SSL_CERT_FILE}"
+
+# Wait for the azurite service (running in the shared network namespace) to come
+# up on :443 now that it has the certificate.
+HOST="${BENCH_ACCOUNT:-devstoreaccount1}.blob.core.windows.net"
+for _ in $(seq 1 60); do
+  if curl -s -o /dev/null "https://${HOST}/?comp=list"; then
+    break
+  fi
+  sleep 1
+done
+if ! curl -s -o /dev/null "https://${HOST}/?comp=list"; then
+  echo "Azurite did not become ready at https://${HOST}" >&2
+  exit 1
+fi
 
 # py-bbb and the SAS generator live in the image's venv.
 export PYBBB="/opt/venv/bin/python -m boostedblob"
