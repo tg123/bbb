@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
 # benchmark.sh — compare bbb (this repo) upload/download throughput against
-# azcopy and boostedblob (py-bbb) using the Azurite emulator.
+# azcopy and boostedblob (py-bbb) using the Azurite emulator. Each tool's
+# download is verified against the source file's MD5 so a corrupt or truncated
+# transfer fails the run rather than being reported as a (fast but wrong) result.
 #
 # The emulator must already be running and reachable at
 # `https://${BENCH_ACCOUNT}.blob.core.windows.net` (port 443). The Compose stack
@@ -78,6 +80,23 @@ mbps() { # seconds -> MB/s for BENCH_SIZE_MB
   awk -v mb="${BENCH_SIZE_MB}" -v s="$1" 'BEGIN { if (s <= 0) { print "n/a" } else { printf "%.1f", mb / s } }'
 }
 
+# verify_md5 checks that the file at $1 matches the source file's MD5, failing
+# the whole benchmark otherwise so an upload/download that silently corrupts or
+# truncates data can never be reported as a fast (but wrong) result.
+verify_md5() {
+  local label="$1" file="$2" got
+  if [ ! -f "${file}" ]; then
+    log "INTEGRITY: ${label} produced no downloaded file (${file})"
+    exit 1
+  fi
+  got="$(md5sum "${file}" | awk '{ print $1 }')"
+  if [ "${got}" != "${SRC_MD5}" ]; then
+    log "INTEGRITY: ${label} MD5 mismatch — expected ${SRC_MD5}, got ${got}"
+    exit 1
+  fi
+  log "${label} round-trip MD5 OK (${got})"
+}
+
 # ---------------------------------------------------------------------------
 # Per-tool auth.
 # ---------------------------------------------------------------------------
@@ -121,6 +140,8 @@ PY
 
 log "Generating ${BENCH_SIZE_MB} MiB test file"
 dd if=/dev/urandom of="${SRC_FILE}" bs=1M count="${BENCH_SIZE_MB}" status=none
+SRC_MD5="$(md5sum "${SRC_FILE}" | awk '{ print $1 }')"
+log "Test file MD5: ${SRC_MD5}"
 
 # ---------------------------------------------------------------------------
 # Per-tool transfer commands. Each tool gets its own blob name so runs do not
@@ -155,6 +176,16 @@ for tool in bbb pybbb azcopy; do
   log "Benchmarking ${tool} download (${BENCH_RUNS} runs)"
   DOWN[${tool}]="$(best_of "${tool}_download")"
 done
+
+# ---------------------------------------------------------------------------
+# Integrity check: every tool's last download must round-trip the test file
+# byte-for-byte (verified via MD5), so a corrupt or truncated transfer fails the
+# benchmark instead of being reported as a result.
+# ---------------------------------------------------------------------------
+log "Verifying upload/download integrity (MD5)"
+verify_md5 "bbb"        "${WORKDIR}/dl-bbb.bin"
+verify_md5 "py-bbb"     "${WORKDIR}/dl-pybbb.bin"
+verify_md5 "azcopy"     "${WORKDIR}/dl-azcopy.bin"
 
 # ---------------------------------------------------------------------------
 # Report.
