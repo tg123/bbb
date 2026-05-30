@@ -24,7 +24,8 @@
 #   PYBBB              Command to invoke py-bbb           (default: python -m boostedblob)
 #   AZCOPY_BIN         Path to azcopy                    (default: azcopy on PATH)
 #   BENCH_FAIL_FACTOR  If set, fail when bbb is slower than the fastest other
-#                      tool by more than this factor (e.g. 1.5). Unset = report only.
+#                      tool by more than this factor (e.g. 1.05 = 5%; default via
+#                      compose/CI is 1.05). Empty = report only.
 #   BENCH_PYTHON       Python used to mint the azcopy SAS (needs
 #                      azure-storage-blob)               (default: python3)
 #   BENCH_SUMMARY_FILE When set, the results table is also appended to this file.

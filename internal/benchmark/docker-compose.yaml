@@ -65,7 +65,7 @@ services:
       - BENCH_STATE_DIR=/bench-state
       - BENCH_SIZE_MB=${BENCH_SIZE_MB:-1024}
       - BENCH_RUNS=${BENCH_RUNS:-3}
-      - BENCH_FAIL_FACTOR=${BENCH_FAIL_FACTOR:-}
+      - BENCH_FAIL_FACTOR=${BENCH_FAIL_FACTOR:-1.05}
       # Results table is written here too; the path is under the mounted repo so
       # the workflow can append it to the GitHub job summary after the run.
       - BENCH_SUMMARY_FILE=/src/internal/benchmark/.benchmark-summary.md

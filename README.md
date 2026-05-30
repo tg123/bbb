@@ -637,12 +637,14 @@ secrets and no real Azure account**, so it runs on every pull request.
 
 The workflow runs on every pull request, on pushes to `main`, and on demand via
 **Run workflow** (`workflow_dispatch`), where you can set the test-file size, the
-number of runs, and an optional `fail_factor` that fails the job when `bbb` is
-slower than the fastest other tool by more than that factor. Results are written
-to the job summary as a table.
+number of runs, and a `fail_factor` that fails the job when `bbb` is slower than
+the fastest other tool by more than that factor (default `1.05`, i.e. a 5%
+regression gate; set it blank for report-only). Results are written to the job
+summary as a table.
 
 > The emulator is CPU/loopback-bound, so the numbers reflect client-side
-> overhead rather than real network throughput; `fail_factor` is off by default.
+> overhead rather than real network throughput; `fail_factor` defaults to `1.05`
+> (a 5% gate) and can be set blank to report only.
 
 To run it locally you only need Docker:
 
