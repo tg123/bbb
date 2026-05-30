@@ -38,6 +38,12 @@ BBB_BIN="$(mktemp -d)/bbb"
 go build -buildvcs=false -o "${BBB_BIN}" .
 export BBB_BIN
 
+# Record the repo's short commit so the report identifies the exact bbb build.
+# The bind mount is owned by another user, so allow git to read it regardless.
+git config --global --add safe.directory "$(pwd)" 2>/dev/null || true
+BBB_VERSION="$(git rev-parse --short HEAD 2>/dev/null || true)"
+export BBB_VERSION
+
 # Start fresh so the workflow only appends this run's table to the job summary.
 if [ -n "${BENCH_SUMMARY_FILE:-}" ]; then
   : >"${BENCH_SUMMARY_FILE}"

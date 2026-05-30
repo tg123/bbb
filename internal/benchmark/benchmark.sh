@@ -18,6 +18,8 @@
 #   BENCH_RUNS         Timed runs per tool/direction     (default: 3)
 #   BENCH_CONCURRENCY  Concurrency passed to bbb/azcopy  (default: nproc)
 #   BBB_BIN            Path to the bbb binary under test (default: bbb on PATH)
+#   BBB_VERSION        Identifier shown for bbb in the report, e.g. the repo's
+#                      short commit sha (default: derived via `git`, else unset)
 #   PYBBB              Command to invoke py-bbb           (default: python -m boostedblob)
 #   AZCOPY_BIN         Path to azcopy                    (default: azcopy on PATH)
 #   BENCH_FAIL_FACTOR  If set, fail when bbb is slower than the fastest other
@@ -157,13 +159,31 @@ done
 # ---------------------------------------------------------------------------
 emit() { printf '%s\n' "$1"; if [ -n "${BENCH_SUMMARY_FILE:-}" ]; then printf '%s\n' "$1" >>"${BENCH_SUMMARY_FILE}"; fi; }
 
+# ---------------------------------------------------------------------------
+# Tool identity labels for the report: bbb's short commit sha, and the actual
+# installed versions of boostedblob and azcopy, so the table records exactly
+# what was compared. Each falls back to a bare name if its version can't be
+# resolved.
+# ---------------------------------------------------------------------------
+BBB_VERSION="${BBB_VERSION:-}"
+BBB_LABEL="bbb (this repo)"
+[ -n "${BBB_VERSION}" ] && BBB_LABEL="bbb (${BBB_VERSION})"
+
+PYBBB_VERSION="$("${BENCH_PYTHON}" -m pip show boostedblob 2>/dev/null | awk -F': ' '/^Version:/ { print $2; exit }')"
+PYBBB_LABEL="boostedblob"
+[ -n "${PYBBB_VERSION}" ] && PYBBB_LABEL="boostedblob (${PYBBB_VERSION})"
+
+AZCOPY_VERSION="$("${AZCOPY_BIN}" --version 2>/dev/null | awk '{ print $NF; exit }')"
+AZCOPY_LABEL="azcopy"
+[ -n "${AZCOPY_VERSION}" ] && AZCOPY_LABEL="azcopy (${AZCOPY_VERSION})"
+
 emit "### Transfer benchmark (Azurite emulator) — ${BENCH_SIZE_MB} MiB, best of ${BENCH_RUNS}, concurrency ${BENCH_CONCURRENCY}"
 emit ""
 emit "| Tool | Upload (s) | Upload MB/s | Download (s) | Download MB/s |"
 emit "|------|-----------:|------------:|-------------:|--------------:|"
-emit "| bbb (this repo) | ${UP[bbb]} | $(mbps "${UP[bbb]}") | ${DOWN[bbb]} | $(mbps "${DOWN[bbb]}") |"
-emit "| py-bbb (boostedblob) | ${UP[pybbb]} | $(mbps "${UP[pybbb]}") | ${DOWN[pybbb]} | $(mbps "${DOWN[pybbb]}") |"
-emit "| azcopy | ${UP[azcopy]} | $(mbps "${UP[azcopy]}") | ${DOWN[azcopy]} | $(mbps "${DOWN[azcopy]}") |"
+emit "| ${BBB_LABEL} | ${UP[bbb]} | $(mbps "${UP[bbb]}") | ${DOWN[bbb]} | $(mbps "${DOWN[bbb]}") |"
+emit "| ${PYBBB_LABEL} | ${UP[pybbb]} | $(mbps "${UP[pybbb]}") | ${DOWN[pybbb]} | $(mbps "${DOWN[pybbb]}") |"
+emit "| ${AZCOPY_LABEL} | ${UP[azcopy]} | $(mbps "${UP[azcopy]}") | ${DOWN[azcopy]} | $(mbps "${DOWN[azcopy]}") |"
 emit ""
 emit "> The Azurite emulator is CPU/loopback-bound, so absolute numbers measure client-side overhead rather than real network throughput."
 
