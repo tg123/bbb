@@ -50,14 +50,24 @@ SRV_CRT="${BENCH_STATE_DIR}/server.crt"
 
 log "Generating CA and server certificate for ${HOST}"
 openssl genrsa -out "${CA_KEY}" 2048 >/dev/null 2>&1
+# The CA needs explicit basicConstraints/keyUsage extensions; without them
+# strict TLS stacks (notably Python's, used by py-bbb) reject the chain with
+# "CA cert does not include key usage extension".
 openssl req -x509 -new -nodes -key "${CA_KEY}" -sha256 -days 3650 \
-  -subj "/CN=bbb-bench-ca" -out "${CA_PEM}" >/dev/null 2>&1
+  -subj "/CN=bbb-bench-ca" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -out "${CA_PEM}" >/dev/null 2>&1
 
 openssl genrsa -out "${SRV_KEY}" 2048 >/dev/null 2>&1
 openssl req -new -key "${SRV_KEY}" -subj "/CN=${HOST}" \
   -out "${BENCH_STATE_DIR}/server.csr" >/dev/null 2>&1
-printf 'subjectAltName=DNS:%s,DNS:*.blob.core.windows.net\n' "${HOST}" \
-  >"${BENCH_STATE_DIR}/san.ext"
+cat >"${BENCH_STATE_DIR}/san.ext" <<EXT
+subjectAltName=DNS:${HOST},DNS:*.blob.core.windows.net
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+EXT
 openssl x509 -req -in "${BENCH_STATE_DIR}/server.csr" -CA "${CA_PEM}" \
   -CAkey "${CA_KEY}" -CAcreateserial -days 3650 -sha256 \
   -extfile "${BENCH_STATE_DIR}/san.ext" -out "${SRV_CRT}" >/dev/null 2>&1

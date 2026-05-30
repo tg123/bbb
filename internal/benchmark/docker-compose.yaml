@@ -1,0 +1,24 @@
+# Benchmark Compose stack. Mirrors internal/e2e: a single container builds bbb
+# from the repo and runs it against the Azurite emulator, alongside py-bbb and
+# azcopy. py-bbb (boostedblob) hardcodes https://{account}.blob.core.windows.net
+# with no override, so run.sh serves Azurite at that host over TLS on :443 with a
+# locally trusted CA. Everything happens inside the container, so the benchmark
+# needs no host privileges, no secrets and no real Azure account.
+#
+#   docker compose up --build --abort-on-container-exit --exit-code-from benchmark
+services:
+  benchmark:
+    build:
+      context: ../..
+      dockerfile: internal/benchmark/Dockerfile
+    volumes:
+      - ../..:/src
+    working_dir: /src
+    environment:
+      - BENCH_SIZE_MB=${BENCH_SIZE_MB:-256}
+      - BENCH_RUNS=${BENCH_RUNS:-3}
+      - BENCH_FAIL_FACTOR=${BENCH_FAIL_FACTOR:-}
+      # Results table is written here too; the path is under the mounted repo so
+      # the workflow can append it to the GitHub job summary after the run.
+      - BENCH_SUMMARY_FILE=/src/internal/benchmark/.benchmark-summary.md
+    command: ["bash", "internal/benchmark/run.sh"]

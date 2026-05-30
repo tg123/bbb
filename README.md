@@ -625,12 +625,15 @@ introduced in [#87](https://github.com/tg123/bbb/pull/87) and
 
 Because `boostedblob` hardcodes the `https://{account}.blob.core.windows.net`
 endpoint (no port or host override), the benchmark serves the
-[Azurite](https://github.com/Azure/Azurite) emulator at that exact host:
-[`internal/benchmark/setup-emulator.sh`](internal/benchmark/setup-emulator.sh)
-generates a local CA (trusted system-wide), points
-`{account}.blob.core.windows.net` at `127.0.0.1`, and starts Azurite over TLS on
-port 443. All three tools then hit the same emulator, so **no secrets or real
-Azure account are required** and the benchmark runs on every pull request.
+[Azurite](https://github.com/Azure/Azurite) emulator at that exact host. The
+whole benchmark runs inside Docker Compose
+([`internal/benchmark`](internal/benchmark)), mirroring the
+[E2E](.github/workflows/e2e.yaml) suite: a single container generates a local CA
+(trusted inside the container), points `{account}.blob.core.windows.net` at
+`127.0.0.1`, starts Azurite over TLS on port 443, builds `bbb`, and runs all
+three tools against the same emulator. Because everything is containerised, the
+benchmark needs **no host privileges, no secrets and no real Azure account**, so
+it runs on every pull request.
 
 The workflow runs on every pull request, on pushes to `main`, weekly, and on
 demand via **Run workflow** (`workflow_dispatch`), where you can set the
@@ -641,13 +644,12 @@ Results are written to the job summary as a table.
 > The emulator is CPU/loopback-bound, so the numbers reflect client-side
 > overhead rather than real network throughput; `fail_factor` is off by default.
 
-To run it locally (needs `sudo` for port 443, `/etc/hosts` and the trust store):
+To run it locally you only need Docker:
 
 ```bash
-npm install -g azurite
-BENCH_STATE_DIR=/tmp/azurite bash internal/benchmark/setup-emulator.sh
-go build -o /tmp/bbb .
-BBB_BIN=/tmp/bbb bash internal/benchmark/benchmark.sh
+cd internal/benchmark
+docker compose up --build --abort-on-container-exit --exit-code-from benchmark
+# Optional overrides: BENCH_SIZE_MB, BENCH_RUNS, BENCH_FAIL_FACTOR
 ```
 
 ## License

@@ -22,7 +22,9 @@
 #   AZCOPY_BIN         Path to azcopy                    (default: azcopy on PATH)
 #   BENCH_FAIL_FACTOR  If set, fail when bbb is slower than the fastest other
 #                      tool by more than this factor (e.g. 1.5). Unset = report only.
-#   GITHUB_STEP_SUMMARY  When set, the results table is appended to it.
+#   BENCH_PYTHON       Python used to mint the azcopy SAS (needs
+#                      azure-storage-blob)               (default: python3)
+#   BENCH_SUMMARY_FILE When set, the results table is also appended to this file.
 #
 set -euo pipefail
 
@@ -35,6 +37,7 @@ BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-$(nproc)}"
 BBB_BIN="${BBB_BIN:-bbb}"
 PYBBB="${PYBBB:-python -m boostedblob}"
 AZCOPY_BIN="${AZCOPY_BIN:-azcopy}"
+BENCH_PYTHON="${BENCH_PYTHON:-python3}"
 
 HOST="${BENCH_ACCOUNT}.blob.core.windows.net"
 BLOB_HOST="https://${HOST}"
@@ -84,23 +87,33 @@ export BBB_AZBLOB_ACCOUNTKEY="${BENCH_KEY}"
 export AZURE_STORAGE_ACCOUNT="${BENCH_ACCOUNT}"
 export AZURE_STORAGE_ACCOUNT_KEY="${BENCH_KEY}"
 
-# azcopy authenticates with a container SAS generated from the emulator
-# connection string.
-CONN="DefaultEndpointsProtocol=https;AccountName=${BENCH_ACCOUNT};AccountKey=${BENCH_KEY};BlobEndpoint=${BLOB_HOST};"
+# azcopy authenticates with a container SAS minted from the account key with
+# azure-storage-blob (so no host `az` CLI is required).
 export AZCOPY_LOG_LEVEL=ERROR
 
 log "Ensuring container ${BENCH_CONTAINER} exists"
 "${BBB_BIN}" az mkcontainer "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}" >/dev/null 2>&1 || true
 
-SAS_EXPIRY="$(date -u -d '+2 hours' '+%Y-%m-%dT%H:%MZ')"
-SAS="$(az storage container generate-sas \
-  --connection-string "${CONN}" \
-  --name "${BENCH_CONTAINER}" \
-  --permissions racwdl \
-  --expiry "${SAS_EXPIRY}" \
-  --https-only \
-  --only-show-errors \
-  --output tsv)"
+SAS="$("${BENCH_PYTHON}" - "${BENCH_ACCOUNT}" "${BENCH_CONTAINER}" "${BENCH_KEY}" <<'PY'
+import sys
+from datetime import datetime, timedelta, timezone
+
+from azure.storage.blob import ContainerSasPermissions, generate_container_sas
+
+account, container, key = sys.argv[1:4]
+sys.stdout.write(
+    generate_container_sas(
+        account_name=account,
+        container_name=container,
+        account_key=key,
+        permission=ContainerSasPermissions(
+            read=True, add=True, create=True, write=True, delete=True, list=True
+        ),
+        expiry=datetime.now(timezone.utc) + timedelta(hours=2),
+    )
+)
+PY
+)"
 
 log "Generating ${BENCH_SIZE_MB} MiB test file"
 dd if=/dev/urandom of="${SRC_FILE}" bs=1M count="${BENCH_SIZE_MB}" status=none
@@ -142,7 +155,7 @@ done
 # ---------------------------------------------------------------------------
 # Report.
 # ---------------------------------------------------------------------------
-emit() { printf '%s\n' "$1"; if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then printf '%s\n' "$1" >>"${GITHUB_STEP_SUMMARY}"; fi; }
+emit() { printf '%s\n' "$1"; if [ -n "${BENCH_SUMMARY_FILE:-}" ]; then printf '%s\n' "$1" >>"${BENCH_SUMMARY_FILE}"; fi; }
 
 emit "### Transfer benchmark (Azurite emulator) — ${BENCH_SIZE_MB} MiB, best of ${BENCH_RUNS}, concurrency ${BENCH_CONCURRENCY}"
 emit ""
