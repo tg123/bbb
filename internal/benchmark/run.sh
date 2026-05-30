@@ -41,7 +41,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 if ! curl -s -o /dev/null "https://${HOST}/?comp=list"; then
-  echo "Azurite did not become ready at https://${HOST}" >&2
+  echo "Azurite did not become ready at https://${HOST} after 60 seconds" >&2
   exit 1
 fi
 
