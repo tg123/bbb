@@ -1755,8 +1755,23 @@ func copySourceOAuth(ctx context.Context, src AzurePath) (string, string, error)
 	if err != nil {
 		return "", "", err
 	}
-	srcURL := fmt.Sprintf("%s/%s/%s", getEndpoint(src.Account), src.Container, src.Blob)
+	// TrimRight defends against BBB_AZBLOB_ENDPOINT values that include a
+	// trailing slash (e.g. "https://%s.blob.core.windows.net/"), which would
+	// otherwise produce a double slash. PathEscape handles blob names
+	// containing spaces, '#', '?', etc.
+	endpoint := strings.TrimRight(getEndpoint(src.Account), "/")
+	srcURL := fmt.Sprintf("%s/%s/%s", endpoint, url.PathEscape(src.Container), pathEscapeBlobName(src.Blob))
 	return srcURL, "Bearer " + tok.Token, nil
+}
+
+// pathEscapeBlobName URL-escapes a blob name segment-by-segment, preserving
+// the '/' separators so blob names with slashes remain valid path segments.
+func pathEscapeBlobName(name string) string {
+	parts := strings.Split(name, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, "/")
 }
 
 // copyHardConcurrencyCap is the absolute upper bound on parallel
@@ -1773,16 +1788,15 @@ const copyMaxConcurrencyEnv = "BBB_AZBLOB_COPY_CONCURRENCY_MAX"
 const copyDefaultConcurrency = 256
 
 // copyConcurrencyCap returns the parallel StageBlockFromURL cap for a single
-// S2S copy. It honors the caller-provided concurrency (falling back to
-// copyDefaultConcurrency when concurrency <= 0), clamps the result to the
-// block count and to copyHardConcurrencyCap, and lets
-// BBB_AZBLOB_COPY_CONCURRENCY_MAX override the caller's request (still
-// subject to copyHardConcurrencyCap) for ad-hoc tuning.
-func copyConcurrencyCap(concurrency, blockCount int) int {
-	cap := concurrency
-	if cap <= 0 {
-		cap = copyDefaultConcurrency
-	}
+// S2S copy. Because StageBlockFromURL does no client-side buffering, the
+// per-blob fan-out is independent of the caller's --concurrency (which
+// governs client I/O for upload/download). We start from
+// copyDefaultConcurrency, allow BBB_AZBLOB_COPY_CONCURRENCY_MAX to override,
+// and clamp the result to the block count and to copyHardConcurrencyCap.
+// The concurrency parameter is accepted for API symmetry and is currently
+// ignored.
+func copyConcurrencyCap(_ /*concurrency*/, blockCount int) int {
+	cap := copyDefaultConcurrency
 	if env := envMaxConcurrency(copyMaxConcurrencyEnv, 0); env > 0 {
 		cap = env
 	}

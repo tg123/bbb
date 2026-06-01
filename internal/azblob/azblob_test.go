@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -1457,7 +1458,7 @@ func TestAdaptiveBoundsEnvOverrideClampsCallerDown(t *testing.T) {
 	}
 }
 
-// --- S2S copy: block size + concurrency cap (regression tests for PR #93) ---
+// --- S2S copy: block size + concurrency cap regression tests ---
 
 func TestCopyBlockSizeDefault(t *testing.T) {
 	t.Setenv(copyBlockSizeEnv, "")
@@ -1502,23 +1503,23 @@ func TestCopyBlockSizeAutoGrowsAboveMaxBlocks(t *testing.T) {
 	}
 }
 
-// TestCopyConcurrencyCapBypassesAdaptiveThrottling is the regression test for
-// the bug fixed in PR #93: the adaptive controller derived maxC=32 from the
-// caller's default concurrency=4 and immediately throttled S2S parallelism
-// down to 32, even when 256 concurrent StageBlockFromURL calls would still be
-// cheap (no client-side buffering). The S2S path now uses copyConcurrencyCap
+// TestCopyConcurrencyCapBypassesAdaptiveThrottling guards against a
+// regression where the adaptive controller derived maxC=32 from the caller's
+// default concurrency=4 and immediately throttled S2S parallelism down to
+// 32, even when 256 concurrent StageBlockFromURL calls would still be cheap
+// (no client-side buffering). The S2S path now uses copyConcurrencyCap
 // directly, which honors the passed-in concurrency without the adaptive
 // controller's stair-stepped throttling.
 func TestCopyConcurrencyCapBypassesAdaptiveThrottling(t *testing.T) {
 	t.Setenv(copyMaxConcurrencyEnv, "")
 	// Pre-fix behavior: adaptiveBounds(4, 256, env) returned maxC=32, so the
 	// controller would throttle a fresh sem(initial=256, max=32) to 32.
-	// Post-fix: copyConcurrencyCap(4, 1000) honors the caller value of 4.
-	if got := copyConcurrencyCap(4, 1000); got != 4 {
-		t.Fatalf("expected cap to honor caller concurrency=4, got %d", got)
+	// Post-fix: copyConcurrencyCap ignores the caller's concurrency (which
+	// only governs client-side I/O) and uses the S2S default, clamped to
+	// the hard cap. So copyConcurrencyCap(4, 1000) == copyHardConcurrencyCap.
+	if got := copyConcurrencyCap(4, 1000); got != copyHardConcurrencyCap {
+		t.Fatalf("expected cap to ignore caller concurrency and clamp at hard cap %d, got %d", copyHardConcurrencyCap, got)
 	}
-	// And a large caller value rides up to the hard cap, not the
-	// adaptive-derived 32 the old controller would have settled at.
 	if got := copyConcurrencyCap(1024, 5000); got != copyHardConcurrencyCap {
 		t.Fatalf("expected cap to clamp at hard cap %d, got %d", copyHardConcurrencyCap, got)
 	}
@@ -1559,5 +1560,36 @@ func TestCopyConcurrencyCapMinimumOne(t *testing.T) {
 	t.Setenv(copyMaxConcurrencyEnv, "")
 	if got := copyConcurrencyCap(0, 1); got != 1 {
 		t.Fatalf("expected minimum cap of 1 for single-block transfer, got %d", got)
+	}
+}
+
+func TestPathEscapeBlobName(t *testing.T) {
+	cases := map[string]string{
+		"simple.bin":            "simple.bin",
+		"dir/sub/blob.bin":      "dir/sub/blob.bin",
+		"with space.bin":        "with%20space.bin",
+		"weird#name?.bin":       "weird%23name%3F.bin",
+		"a/b c/d#e":             "a/b%20c/d%23e",
+	}
+	for in, want := range cases {
+		if got := pathEscapeBlobName(in); got != want {
+			t.Errorf("pathEscapeBlobName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestCopySourceOAuthURLNoDoubleSlash verifies that BBB_AZBLOB_ENDPOINT
+// values with a trailing slash (e.g. "https://%s.blob.core.windows.net/")
+// do not produce a malformed "host//container/blob" URL, which previously
+// broke StageBlockFromURL when the benchmark harness configured the
+// endpoint with the trailing slash.
+func TestCopySourceOAuthURLNoDoubleSlash(t *testing.T) {
+	t.Setenv("BBB_AZBLOB_ENDPOINT", "https://%s.blob.core.windows.net/")
+	endpoint := strings.TrimRight(getEndpoint("acct"), "/")
+	src := AzurePath{Account: "acct", Container: "c", Blob: "dir/blob name.bin"}
+	srcURL := endpoint + "/" + url.PathEscape(src.Container) + "/" + pathEscapeBlobName(src.Blob)
+	want := "https://acct.blob.core.windows.net/c/dir/blob%20name.bin"
+	if srcURL != want {
+		t.Fatalf("source URL = %q, want %q", srcURL, want)
 	}
 }

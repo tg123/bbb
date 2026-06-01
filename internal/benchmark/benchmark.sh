@@ -59,8 +59,13 @@ log() { printf '>>> %s\n' "$*" >&2; }
 seconds() {
   local start end rc
   start="$(date +%s.%N)"
+  # Disable errexit around the timed command so we can capture its exit code
+  # ourselves; otherwise `set -euo pipefail` would terminate the script before
+  # `rc=$?` ran and the caller would never see the failure.
+  set +e
   "$@" >/dev/null 2>&1
   rc=$?
+  set -e
   end="$(date +%s.%N)"
   if [ "${rc}" -ne 0 ]; then
     echo "command failed (exit ${rc}): $*" >&2
@@ -206,12 +211,18 @@ verify_md5 "azcopy"     "${WORKDIR}/dl-azcopy.bin"
 
 for tool in bbb pybbb azcopy; do
   log "Benchmarking ${tool} s2s copy (${BENCH_RUNS} runs)"
-  # azcopy on Azurite hits NotImplementedError on PutBlobFromUrl (its only
-  # S2S path for blobs ≤ 5 GiB; see Azure/Azurite#2402) and exits non-zero
-  # without writing the destination. Record "n/a" rather than aborting the
-  # whole benchmark so bbb and py-bbb still get reported.
   if ! S2S[${tool}]="$(best_of "${tool}_s2s")"; then
-    S2S[${tool}]="n/a"
+    # azcopy on Azurite hits NotImplementedError on PutBlobFromUrl (its only
+    # S2S path for blobs ≤ 5 GiB; see Azure/Azurite#2402) and exits non-zero
+    # without writing the destination. Record "n/a" for azcopy specifically
+    # so the bbb/py-bbb numbers are still reported; abort for any other tool
+    # so real regressions are not silently masked.
+    if [ "${tool}" = "azcopy" ]; then
+      S2S[${tool}]="n/a"
+    else
+      log "S2S benchmark for ${tool} failed; aborting"
+      exit 1
+    fi
   fi
 done
 
