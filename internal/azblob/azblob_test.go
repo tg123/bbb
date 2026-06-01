@@ -1561,13 +1561,3 @@ func TestCopyConcurrencyCapMinimumOne(t *testing.T) {
 		t.Fatalf("expected minimum cap of 1 for single-block transfer, got %d", got)
 	}
 }
-
-func TestCopyMaxPutBlobSizeMatchesAzcopy(t *testing.T) {
-	// azcopy's common.MaxPutBlobSize is 5000 MiB; mirror exactly so the
-	// "small enough for single-shot" heuristic agrees with azcopy and the
-	// Azure REST API's documented limit for PutBlobFromURL.
-	want := int64(5000) * 1024 * 1024
-	if copyMaxPutBlobSize != want {
-		t.Fatalf("copyMaxPutBlobSize = %d, want %d (azcopy parity)", copyMaxPutBlobSize, want)
-	}
-}

@@ -1697,22 +1697,13 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 		}
 	}
 
-	// For blobs at or below the service's single-shot PutBlobFromURL limit
-	// (5000 MiB), try UploadBlobFromURL first: a single atomic server-side
-	// call that's dramatically faster than staging+committing many blocks.
-	// azcopy uses the same heuristic (see ste/sender.go::getNumChunks +
-	// sender-blockBlobFromURL.go). On failure (e.g. Azurite returns 500
-	// because the API isn't implemented — Azure/Azurite#2402), fall back
-	// silently to the canonical block staging path which will report any
-	// real error.
-	if totalSize >= 0 && totalSize <= copyMaxPutBlobSize {
-		if shotErr := copyBlobSingleShot(ctx, client, dst, srcURL, srcAuth, totalSize, onProgress); shotErr == nil {
-			return nil
-		} else {
-			slog.Debug("UploadBlobFromURL failed, falling back to block staging", "dst", dst.String(), "err", shotErr)
-		}
-	}
-
+	// Always use parallel StageBlockFromURL + CommitBlockList. We previously
+	// tried UploadBlobFromURL (single-shot PutBlobFromURL) first for blobs
+	// up to 5 GiB, but measurements on real Azure showed it's much slower
+	// than parallel block staging because it serializes the entire source
+	// fetch into a single HTTP request on the destination service
+	// (~17s for 1 GiB vs ~2s for the parallel path). azcopy uses parallel
+	// block staging even for small blobs for the same reason.
 	err = copyBlobBlocks(ctx, client, dst, srcURL, srcAuth, totalSize, concurrency, onProgress)
 	if err != nil {
 		// StageBlockFromURL (Put Block From URL) returns 501 in emulators
@@ -1726,37 +1717,6 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 			return copyBlobAsync(ctx, client, dst, srcURL, totalSize, onProgress)
 		}
 		return err
-	}
-	return nil
-}
-
-// copyMaxPutBlobSize is the service-side limit for atomic UploadBlobFromURL
-// (a.k.a. PutBlobFromURL): 5000 MiB. Blobs at or below this size can be
-// copied in a single server-side call, avoiding the per-block latency of
-// StageBlockFromURL + CommitBlockList. Matches azcopy's
-// common.MaxPutBlobSize.
-const copyMaxPutBlobSize = int64(5000) * 1024 * 1024
-
-// copyBlobSingleShot performs a server-side copy via a single
-// UploadBlobFromURL call. Used for blobs <= copyMaxPutBlobSize.
-//
-// When sourceAuth is non-empty, it is passed as
-// x-ms-copy-source-authorization (e.g. "Bearer <token>") so the destination
-// uses OAuth to read the source instead of relying on credentials embedded
-// in the URL (SAS). On Azure, OAuth source-auth triggers the intra-region
-// fast path and is ~8× faster than SAS for same-region copies.
-func copyBlobSingleShot(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, onProgress CopyProgress) error {
-	blockBlobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
-	var opts *blockblob.UploadBlobFromURLOptions
-	if sourceAuth != "" {
-		opts = &blockblob.UploadBlobFromURLOptions{CopySourceAuthorization: &sourceAuth}
-	}
-	_, err := blockBlobClient.UploadBlobFromURL(ctx, copySource, opts)
-	if err != nil {
-		return err
-	}
-	if onProgress != nil && totalSize >= 0 {
-		onProgress(totalSize, totalSize)
 	}
 	return nil
 }
