@@ -155,7 +155,7 @@ bbb_download()  { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://
 # On low-vCPU CI runners (--concurrency = nproc = 4) that under-pipelines a
 # single large copy; raise the cap to the hard ceiling for the bench so we
 # measure server-side throughput rather than 4-way client serialisation.
-bbb_s2s()       { BBB_AZBLOB_COPY_CONCURRENCY_MAX=256 "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb-s2s.bin"; }
+bbb_s2s()       { BBB_AZBLOB_COPY_CONCURRENCY_MAX=256 "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb-s2s.bin" 2>&1 | tee -a "${WORKDIR}/bbb-s2s.log" >/dev/null; }
 
 # ${PYBBB} is intentionally left unquoted so that multi-word commands such as
 # the default "python -m boostedblob" word-split into separate arguments.
@@ -204,6 +204,11 @@ for tool in bbb pybbb azcopy; do
   log "Benchmarking ${tool} s2s copy (${BENCH_RUNS} runs)"
   S2S[${tool}]="$(best_of "${tool}_s2s")"
 done
+
+if [ -s "${WORKDIR}/bbb-s2s.log" ]; then
+  log "bbb s2s stderr (first lines):"
+  head -20 "${WORKDIR}/bbb-s2s.log" | sed 's/^/  /' >&2
+fi
 
 # ---------------------------------------------------------------------------
 # Report.

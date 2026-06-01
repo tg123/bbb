@@ -1696,7 +1696,7 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 		} else if !shouldFallbackToBlockStaging(err) {
 			return err
 		}
-		slog.Debug("UploadBlobFromURL failed, falling back to block staging", "dst", dst.String())
+		slog.Warn("UploadBlobFromURL failed, falling back to block staging", "dst", dst.String(), "err", err)
 	}
 
 	err = copyBlobBlocks(ctx, client, dst, copySource, totalSize, concurrency, onProgress)
