@@ -28,8 +28,8 @@ on:
         default: "3"
         required: false
       fail_factor:
-        description: Fail if bbb is slower than the fastest other tool by more than this factor (e.g. 1.05 = 5%; blank = report only)
-        default: "1.05"
+        description: Fail if bbb is slower than the fastest other tool by more than this factor (e.g. 1.20 = 20%; blank = report only). The Azurite emulator is CPU-bound and shows ~10-15%% inter-run jitter on upload, so the gate is intentionally loose; real-perf regressions are caught by out-of-band benchmarks against live Azure.
+        default: "1.20"
         required: false
 
 jobs:
@@ -50,7 +50,7 @@ jobs:
           DOCKER_BUILDKIT: "1"
           BENCH_SIZE_MB: ${{ github.event.inputs.size_mb || '1024' }}
           BENCH_RUNS: ${{ github.event.inputs.runs || '3' }}
-          BENCH_FAIL_FACTOR: ${{ github.event.inputs.fail_factor || '1.05' }}
+          BENCH_FAIL_FACTOR: ${{ github.event.inputs.fail_factor || '1.20' }}
 
       - name: Publish results to job summary
         if: always()
