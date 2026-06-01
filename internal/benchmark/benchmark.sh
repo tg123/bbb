@@ -57,10 +57,20 @@ log() { printf '>>> %s\n' "$*" >&2; }
 # seconds() runs a command, discarding its output, and prints the wall-clock
 # seconds it took as a floating point number.
 seconds() {
-  local start end
+  local start end rc
   start="$(date +%s.%N)"
+  # Disable errexit around the timed command so we can capture its exit code
+  # ourselves; otherwise `set -euo pipefail` would terminate the script before
+  # `rc=$?` ran and the caller would never see the failure.
+  set +e
   "$@" >/dev/null 2>&1
+  rc=$?
+  set -e
   end="$(date +%s.%N)"
+  if [ "${rc}" -ne 0 ]; then
+    echo "command failed (exit ${rc}): $*" >&2
+    return "${rc}"
+  fi
   awk -v s="${start}" -v e="${end}" 'BEGIN { printf "%.3f", e - s }'
 }
 
@@ -68,7 +78,10 @@ seconds() {
 best_of() {
   local best="" t
   for _ in $(seq 1 "${BENCH_RUNS}"); do
-    t="$(seconds "$@")"
+    if ! t="$(seconds "$@")"; then
+      echo "best_of: aborting because command failed: $*" >&2
+      return 1
+    fi
     if [ -z "${best}" ] || awk -v a="${t}" -v b="${best}" 'BEGIN { exit !(a < b) }'; then
       best="${t}"
     fi
@@ -77,6 +90,7 @@ best_of() {
 }
 
 mbps() { # seconds -> MB/s for BENCH_SIZE_MB
+  case "$1" in n/a|"") printf 'n/a'; return;; esac
   awk -v mb="${BENCH_SIZE_MB}" -v s="$1" 'BEGIN { if (s <= 0) { print "n/a" } else { printf "%.1f", mb / s } }'
 }
 
@@ -150,14 +164,17 @@ log "Test file MD5: ${SRC_MD5}"
 
 bbb_upload()    { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "${SRC_FILE}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin"; }
 bbb_download()  { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "${WORKDIR}/dl-bbb.bin"; }
+bbb_s2s()       { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb-s2s.bin"; }
 
 # ${PYBBB} is intentionally left unquoted so that multi-word commands such as
 # the default "python -m boostedblob" word-split into separate arguments.
 pybbb_upload()   { ${PYBBB} cp "${SRC_FILE}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-pybbb.bin"; }
 pybbb_download() { ${PYBBB} cp "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-pybbb.bin" "${WORKDIR}/dl-pybbb.bin"; }
+pybbb_s2s()      { ${PYBBB} cp "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-pybbb.bin" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-pybbb-s2s.bin"; }
 
 azcopy_upload()   { "${AZCOPY_BIN}" copy "${SRC_FILE}" "${BLOB_HOST}/${BENCH_CONTAINER}/bench-azcopy.bin?${SAS}" --overwrite=true; }
 azcopy_download() { "${AZCOPY_BIN}" copy "${BLOB_HOST}/${BENCH_CONTAINER}/bench-azcopy.bin?${SAS}" "${WORKDIR}/dl-azcopy.bin" --overwrite=true; }
+azcopy_s2s()      { "${AZCOPY_BIN}" copy "${BLOB_HOST}/${BENCH_CONTAINER}/bench-azcopy.bin?${SAS}" "${BLOB_HOST}/${BENCH_CONTAINER}/bench-azcopy-s2s.bin?${SAS}" --overwrite=true --s2s-preserve-access-tier=false; }
 
 # Prime each upload once so the download benchmark has a blob to read, and so
 # the first (often slower) connection setup is not counted in the timing.
@@ -169,12 +186,35 @@ azcopy_upload >/dev/null 2>&1 || { log "azcopy upload failed"; exit 1; }
 # ---------------------------------------------------------------------------
 # Run the benchmark.
 # ---------------------------------------------------------------------------
-declare -A UP DOWN
+# ---------------------------------------------------------------------------
+# Run the benchmark. Upload + download first (each tool's last download is
+# verified for byte-for-byte integrity below), then S2S separately — keeping
+# the integrity check independent of the S2S step.
+# ---------------------------------------------------------------------------
+declare -A UP DOWN S2S
+# azcopy on Azurite is known to fail intermittently against several
+# operations (e.g. PutBlobFromUrl is unimplemented, and certain GET ranges
+# return errors that azcopy treats as fatal). Treat azcopy-specific failures
+# as "n/a" so bbb and py-bbb numbers still get reported; abort for any other
+# tool so real regressions aren't silently masked.
+run_or_na() {
+  local out tool="$1" fn="$2"
+  if out="$(best_of "$fn")"; then
+    printf '%s' "$out"
+  else
+    if [ "$tool" = "azcopy" ]; then
+      printf 'n/a'
+    else
+      log "${tool} ${fn} failed; aborting"
+      exit 1
+    fi
+  fi
+}
 for tool in bbb pybbb azcopy; do
   log "Benchmarking ${tool} upload (${BENCH_RUNS} runs)"
-  UP[${tool}]="$(best_of "${tool}_upload")"
+  UP[${tool}]="$(run_or_na "$tool" "${tool}_upload")"
   log "Benchmarking ${tool} download (${BENCH_RUNS} runs)"
-  DOWN[${tool}]="$(best_of "${tool}_download")"
+  DOWN[${tool}]="$(run_or_na "$tool" "${tool}_download")"
 done
 
 # ---------------------------------------------------------------------------
@@ -185,7 +225,36 @@ done
 log "Verifying upload/download integrity (MD5)"
 verify_md5 "bbb"        "${WORKDIR}/dl-bbb.bin"
 verify_md5 "py-bbb"     "${WORKDIR}/dl-pybbb.bin"
-verify_md5 "azcopy"     "${WORKDIR}/dl-azcopy.bin"
+# azcopy may have skipped its download (n/a) if the download command failed
+# against Azurite — in that case there's nothing to verify.
+if [ "${DOWN[azcopy]}" != "n/a" ]; then
+  verify_md5 "azcopy"   "${WORKDIR}/dl-azcopy.bin"
+fi
+
+for tool in bbb pybbb azcopy; do
+  log "Benchmarking ${tool} s2s copy (${BENCH_RUNS} runs)"
+  S2S[${tool}]="$(run_or_na "$tool" "${tool}_s2s")"
+done
+
+# ---------------------------------------------------------------------------
+# Integrity check (S2S): each tool's S2S destination blob must match the
+# source MD5 if the S2S command succeeded. Tools whose S2S step bailed out
+# (e.g. azcopy on Azurite) skip the verification.
+# ---------------------------------------------------------------------------
+log "Verifying S2S integrity (MD5)"
+verify_s2s() {
+  local tool="$1" blob="$2" local_path="$3"
+  if [ "${S2S[${tool}]}" = "n/a" ]; then
+    log "${tool} S2S skipped (command failed), not verifying"
+    return
+  fi
+  "${BBB_BIN}" cp -f "${blob}" "${local_path}" >/dev/null 2>&1 \
+    || { log "failed to download ${tool} S2S output"; exit 1; }
+  verify_md5 "${tool} (s2s)" "${local_path}"
+}
+verify_s2s "bbb"    "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb-s2s.bin"    "${WORKDIR}/dl-bbb-s2s.bin"
+verify_s2s "pybbb"  "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-pybbb-s2s.bin"  "${WORKDIR}/dl-pybbb-s2s.bin"
+verify_s2s "azcopy" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-azcopy-s2s.bin" "${WORKDIR}/dl-azcopy-s2s.bin"
 
 # ---------------------------------------------------------------------------
 # Report.
@@ -212,24 +281,25 @@ AZCOPY_LABEL="azcopy"
 
 emit "### Transfer benchmark (Azurite emulator) — ${BENCH_SIZE_MB} MiB, best of ${BENCH_RUNS}, concurrency ${BENCH_CONCURRENCY}"
 emit ""
-emit "| Tool | Upload (s) | Upload MB/s | Download (s) | Download MB/s |"
-emit "|------|-----------:|------------:|-------------:|--------------:|"
-emit "| ${BBB_LABEL} | ${UP[bbb]} | $(mbps "${UP[bbb]}") | ${DOWN[bbb]} | $(mbps "${DOWN[bbb]}") |"
-emit "| ${PYBBB_LABEL} | ${UP[pybbb]} | $(mbps "${UP[pybbb]}") | ${DOWN[pybbb]} | $(mbps "${DOWN[pybbb]}") |"
-emit "| ${AZCOPY_LABEL} | ${UP[azcopy]} | $(mbps "${UP[azcopy]}") | ${DOWN[azcopy]} | $(mbps "${DOWN[azcopy]}") |"
+emit "| Tool | Upload (s) | Upload MB/s | Download (s) | Download MB/s | S2S Copy (s) | S2S MB/s |"
+emit "|------|-----------:|------------:|-------------:|--------------:|-------------:|---------:|"
+emit "| ${BBB_LABEL} | ${UP[bbb]} | $(mbps "${UP[bbb]}") | ${DOWN[bbb]} | $(mbps "${DOWN[bbb]}") | ${S2S[bbb]} | $(mbps "${S2S[bbb]}") |"
+emit "| ${PYBBB_LABEL} | ${UP[pybbb]} | $(mbps "${UP[pybbb]}") | ${DOWN[pybbb]} | $(mbps "${DOWN[pybbb]}") | ${S2S[pybbb]} | $(mbps "${S2S[pybbb]}") |"
+emit "| ${AZCOPY_LABEL} | ${UP[azcopy]} | $(mbps "${UP[azcopy]}") | ${DOWN[azcopy]} | $(mbps "${DOWN[azcopy]}") | ${S2S[azcopy]} | $(mbps "${S2S[azcopy]}") |"
 emit ""
-emit "> The Azurite emulator is CPU/loopback-bound, so absolute numbers measure client-side overhead rather than real network throughput."
+emit "> The Azurite emulator is CPU/loopback-bound, so absolute numbers measure client-side overhead rather than real network throughput. On Azurite, azcopy's S2S step always exits 1 because Azurite returns NotImplementedError on the PutBlobFromUrl API (Azure/Azurite#2402) — bbb and py-bbb each handle that case with a fallback (bbb falls back to StageBlockFromURL + CommitBlockList; py-bbb uses async StartCopyFromURL which Azurite acks instantly). S2S regressions are therefore not gated on Azurite — the only honest peer here is real Azure storage."
 
 # ---------------------------------------------------------------------------
 # Cleanup blobs.
 # ---------------------------------------------------------------------------
 log "Cleaning up benchmark blobs"
-for name in bench-bbb.bin bench-pybbb.bin bench-azcopy.bin; do
+for name in bench-bbb.bin bench-pybbb.bin bench-azcopy.bin bench-bbb-s2s.bin bench-pybbb-s2s.bin bench-azcopy-s2s.bin; do
   "${BBB_BIN}" rm -f "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/${name}" >/dev/null 2>&1 || true
 done
 
 # ---------------------------------------------------------------------------
-# Optional regression gate.
+# Optional regression gate. Only Upload and Download are gated — see the
+# report note above for why S2S can't be honestly gated on Azurite.
 # ---------------------------------------------------------------------------
 if [ -n "${BENCH_FAIL_FACTOR:-}" ]; then
   fail=0

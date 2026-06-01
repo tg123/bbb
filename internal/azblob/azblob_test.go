@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -1454,5 +1455,144 @@ func TestAdaptiveBoundsEnvOverrideClampsCallerDown(t *testing.T) {
 	initial, minC, maxC, _ := adaptiveBounds(64, 512, "TEST_ADAPTIVE_MAX_ENV")
 	if initial != 8 || minC != 8 || maxC != 8 {
 		t.Fatalf("expected env override to clamp all bounds to 8, got initial=%d min=%d max=%d", initial, minC, maxC)
+	}
+}
+
+// --- S2S copy: block size + concurrency cap regression tests ---
+
+func TestCopyBlockSizeDefault(t *testing.T) {
+	t.Setenv(copyBlockSizeEnv, "")
+	if got := copyBlockSizeBytes(0); got != int64(copyBlockSize) {
+		t.Fatalf("expected default block size %d, got %d", copyBlockSize, got)
+	}
+	if got := copyBlockSizeBytes(1 << 30); got != int64(copyBlockSize) {
+		t.Fatalf("expected default block size %d for 1 GiB transfer, got %d", copyBlockSize, got)
+	}
+}
+
+func TestCopyBlockSizeEnvOverride(t *testing.T) {
+	t.Setenv(copyBlockSizeEnv, "32")
+	if got := copyBlockSizeBytes(1 << 30); got != 32*1024*1024 {
+		t.Fatalf("expected env override to 32 MiB, got %d", got)
+	}
+}
+
+func TestCopyBlockSizeInvalidEnvIgnored(t *testing.T) {
+	for _, v := range []string{"", "0", "-1", "abc"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv(copyBlockSizeEnv, v)
+			if got := copyBlockSizeBytes(1 << 20); got != int64(copyBlockSize) {
+				t.Fatalf("expected invalid env %q to fall back to default, got %d", v, got)
+			}
+		})
+	}
+}
+
+func TestCopyBlockSizeAutoGrowsAboveMaxBlocks(t *testing.T) {
+	// A blob far larger than copyBlockSize * MaxBlocks must auto-grow the
+	// block size so the plan fits under blockblob.MaxBlocks=50000.
+	t.Setenv(copyBlockSizeEnv, "")
+	const size = int64(copyBlockSize) * 60000 // 60k * 8 MiB > MaxBlocks
+	got := copyBlockSizeBytes(size)
+	maxBlocks := int64(50000) // blockblob.MaxBlocks
+	if got < int64(copyBlockSize) {
+		t.Fatalf("block size should not shrink, got %d", got)
+	}
+	if (size+got-1)/got > maxBlocks {
+		t.Fatalf("auto-grown block size %d still produces > MaxBlocks blocks for size %d", got, size)
+	}
+}
+
+// TestCopyConcurrencyCapBypassesAdaptiveThrottling guards against a
+// regression where the adaptive controller derived maxC=32 from the caller's
+// default concurrency=4 and immediately throttled S2S parallelism down to
+// 32, even when 256 concurrent StageBlockFromURL calls would still be cheap
+// (no client-side buffering). The S2S path now uses copyConcurrencyCap
+// directly, which ignores the caller's concurrency (S2S has no client-side
+// buffering, so per-blob fan-out is decoupled from the CLI --concurrency)
+// and always starts from copyDefaultConcurrency.
+func TestCopyConcurrencyCapBypassesAdaptiveThrottling(t *testing.T) {
+	t.Setenv(copyMaxConcurrencyEnv, "")
+	// Pre-fix behavior: adaptiveBounds(4, 256, env) returned maxC=32, so the
+	// controller would throttle a fresh sem(initial=256, max=32) to 32.
+	// Post-fix: copyConcurrencyCap ignores the caller's concurrency (which
+	// only governs client-side I/O) and uses the S2S default, clamped to
+	// the hard cap. So copyConcurrencyCap(4, 1000) == copyHardConcurrencyCap.
+	if got := copyConcurrencyCap(4, 1000); got != copyHardConcurrencyCap {
+		t.Fatalf("expected cap to ignore caller concurrency and clamp at hard cap %d, got %d", copyHardConcurrencyCap, got)
+	}
+	if got := copyConcurrencyCap(1024, 5000); got != copyHardConcurrencyCap {
+		t.Fatalf("expected cap to clamp at hard cap %d, got %d", copyHardConcurrencyCap, got)
+	}
+}
+
+func TestCopyConcurrencyCapDefaultsWhenZero(t *testing.T) {
+	// The caller's concurrency is ignored for S2S; the cap always starts
+	// from copyDefaultConcurrency regardless of the value passed in.
+	t.Setenv(copyMaxConcurrencyEnv, "")
+	if got := copyConcurrencyCap(0, 10000); got != copyDefaultConcurrency {
+		t.Fatalf("expected default %d when caller concurrency=0, got %d", copyDefaultConcurrency, got)
+	}
+	if got := copyConcurrencyCap(-1, 10000); got != copyDefaultConcurrency {
+		t.Fatalf("expected default %d when caller concurrency<0, got %d", copyDefaultConcurrency, got)
+	}
+}
+
+func TestCopyConcurrencyCapClampsToBlockCount(t *testing.T) {
+	t.Setenv(copyMaxConcurrencyEnv, "")
+	if got := copyConcurrencyCap(64, 5); got != 5 {
+		t.Fatalf("expected cap clamped to blockCount=5, got %d", got)
+	}
+}
+
+func TestCopyConcurrencyCapEnvOverridesCaller(t *testing.T) {
+	t.Setenv(copyMaxConcurrencyEnv, "16")
+	if got := copyConcurrencyCap(128, 10000); got != 16 {
+		t.Fatalf("expected env override to set cap=16, got %d", got)
+	}
+}
+
+func TestCopyConcurrencyCapEnvOverrideClampedByHardCap(t *testing.T) {
+	t.Setenv(copyMaxConcurrencyEnv, "9999")
+	if got := copyConcurrencyCap(8, 10000); got != copyHardConcurrencyCap {
+		t.Fatalf("expected env override clamped to hard cap %d, got %d", copyHardConcurrencyCap, got)
+	}
+}
+
+func TestCopyConcurrencyCapMinimumOne(t *testing.T) {
+	t.Setenv(copyMaxConcurrencyEnv, "")
+	if got := copyConcurrencyCap(0, 1); got != 1 {
+		t.Fatalf("expected minimum cap of 1 for single-block transfer, got %d", got)
+	}
+}
+
+func TestPathEscapeBlobName(t *testing.T) {
+	cases := map[string]string{
+		"simple.bin":       "simple.bin",
+		"dir/sub/blob.bin": "dir/sub/blob.bin",
+		"with space.bin":   "with%20space.bin",
+		"weird#name?.bin":  "weird%23name%3F.bin",
+		"a/b c/d#e":        "a/b%20c/d%23e",
+	}
+	for in, want := range cases {
+		if got := pathEscapeBlobName(in); got != want {
+			t.Errorf("pathEscapeBlobName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestCopySourceOAuthURLNoDoubleSlash verifies that BBB_AZBLOB_ENDPOINT
+// values with a trailing slash (e.g. "https://%s.blob.core.windows.net/")
+// do not produce a malformed "host//container/blob" URL, which previously
+// broke StageBlockFromURL when the benchmark harness configured the
+// endpoint with the trailing slash.
+func TestCopySourceOAuthURLNoDoubleSlash(t *testing.T) {
+	t.Setenv("BBB_AZBLOB_ENDPOINT", "https://%s.blob.core.windows.net/")
+	endpoint := strings.TrimRight(getEndpoint("acct"), "/")
+	src := AzurePath{Account: "acct", Container: "c", Blob: "dir/blob name.bin"}
+	srcURL := endpoint + "/" + url.PathEscape(src.Container) + "/" + pathEscapeBlobName(src.Blob)
+	want := "https://acct.blob.core.windows.net/c/dir/blob%20name.bin"
+	if srcURL != want {
+		t.Fatalf("source URL = %q, want %q", srcURL, want)
 	}
 }

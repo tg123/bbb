@@ -227,6 +227,20 @@ func main() {
 
 			if transport, ok := http.DefaultTransport.(*http.Transport); ok {
 				transport = transport.Clone()
+				// Go's http.DefaultTransport defaults to MaxIdleConnsPerHost=2,
+				// which kills throughput when many concurrent operations target
+				// the same Azure Storage endpoint (e.g. S2S with 256 in-flight
+				// StageBlockFromURL calls). Each completed request closes its
+				// idle conn beyond the 2-limit, forcing fresh TLS handshakes
+				// for the next batch. azcopy's NewAzcopyHTTPClient raises this
+				// for the same reason. 1024 per host comfortably exceeds the
+				// per-blob concurrency caps (upload/download 512, S2S 256).
+				// MaxIdleConns is capped to avoid unbounded idle socket growth;
+				// IdleConnTimeout still reaps idle sockets after 180s, and
+				// MaxConnsPerHost=0 lets in-flight requests scale.
+				transport.MaxIdleConnsPerHost = 1024
+				transport.MaxIdleConns = 4096
+				transport.IdleConnTimeout = 180 * time.Second
 				baseDial := (&net.Dialer{
 					Timeout:   30 * time.Second,
 					KeepAlive: 30 * time.Second,
