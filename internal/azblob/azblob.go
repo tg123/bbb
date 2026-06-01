@@ -1324,6 +1324,21 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 		}
 	}
 
+	// Preallocate destination extents so per-pwrite cost drops from ~ms
+	// (extent allocation + journal commit on ext4/xfs) to ~us. Best-effort:
+	// non-extent filesystems and non-Linux platforms fall through unchanged.
+	// Pair with FADV_SEQUENTIAL so the kernel sizes writeback IO for the
+	// access pattern we know we're about to perform.
+	tryFallocate(file, size)
+	tryFadviseSequential(file)
+	// FADV_DONTNEED on close forces synchronous page eviction during
+	// writeback, which reduces page-cache pressure but adds wall-clock
+	// latency. Gate behind env for users who care about cache hygiene
+	// more than wall time on a single transfer.
+	if envOn(envDownloadFadviseDontneed) {
+		defer tryFadviseDontneed(file)
+	}
+
 	blockSize := downloadBlockSizeBytes()
 	initial, minC, maxC, step := adaptiveBounds(concurrency, downloadHardConcurrencyCap, downloadMaxConcurrencyEnv)
 	// Downloads are typically shorter than uploads (one-way, no commit), so
