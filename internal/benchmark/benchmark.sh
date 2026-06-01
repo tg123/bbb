@@ -83,11 +83,22 @@ seconds() {
 }
 
 # best_of runs the given command BENCH_RUNS times and prints the fastest time.
+# Each run is retried up to BENCH_ATTEMPTS times (default 3) to tolerate
+# transient Azurite flakes (HTTP 500 on PutBlockList etc.) without aborting
+# the whole benchmark.
 best_of() {
-  local best="" t
+  local best="" t attempt attempts="${BENCH_ATTEMPTS:-3}" ok
   for _ in $(seq 1 "${BENCH_RUNS}"); do
-    if ! t="$(seconds "$@")"; then
-      echo "best_of: aborting because command failed: $*" >&2
+    ok=0
+    for attempt in $(seq 1 "${attempts}"); do
+      if t="$(seconds "$@")"; then
+        ok=1
+        break
+      fi
+      echo "best_of: attempt ${attempt}/${attempts} failed for: $*" >&2
+    done
+    if [ "${ok}" -ne 1 ]; then
+      echo "best_of: aborting because command failed after ${attempts} attempts: $*" >&2
       return 1
     fi
     if [ -z "${best}" ] || awk -v a="${t}" -v b="${best}" 'BEGIN { exit !(a < b) }'; then
