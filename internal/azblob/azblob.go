@@ -1753,33 +1753,29 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 
 	// S2S StageBlockFromURL operations don't pass bytes through the client
 	// (server-to-server transfer), so concurrency carries near-zero memory
-	// or CPU cost. Start high instead of ramping from a small value —
-	// otherwise the adaptive controller (4→8→16→… every 750ms) spends
-	// half the transfer below saturation. azcopy defaults to 300 concurrent
-	// operations for the same reason. Use the caller's `concurrency` as a
-	// floor but ensure the initial parallelism is meaningful.
-	initial, minC, maxC, step := adaptiveBounds(concurrency, copyHardConcurrencyCap, copyMaxConcurrencyEnv)
-	if initial < copyInitialConcurrency {
-		initial = copyInitialConcurrency
-		if initial > maxC {
-			initial = maxC
-		}
-		if initial > len(blockIDs) {
-			initial = len(blockIDs)
-		}
+	// or CPU cost. Use a fixed high concurrency instead of the adaptive
+	// ramp — azcopy defaults to 300 concurrent operations for the same
+	// reason. The adaptive controller's stair-stepped throughput sampling
+	// (driven by block-completion bursts) caused it to throttle down even
+	// when more parallelism would help.
+	_, _, _, _ = adaptiveBounds(concurrency, copyHardConcurrencyCap, copyMaxConcurrencyEnv) // honor env validation, ignore derived bounds
+	fixedCap := copyInitialConcurrency
+	if env := envMaxConcurrency(copyMaxConcurrencyEnv, 0); env > 0 {
+		fixedCap = env
 	}
-	sem := newAdaptiveSem(initial, maxC)
-	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
-	defer ctrlCancel()
-	done := make(chan struct{})
-	go runAdaptiveController(ctrlCtx, sem, &copiedBytes, adaptiveControllerConfig{
-		Min:        minC,
-		Max:        maxC,
-		Step:       step,
-		Interval:   750 * time.Millisecond,
-		Hysteresis: 0.05,
-		LogTag:     "s2s-copy",
-	}, done)
+	if fixedCap > copyHardConcurrencyCap {
+		fixedCap = copyHardConcurrencyCap
+	}
+	if fixedCap > len(blockIDs) {
+		fixedCap = len(blockIDs)
+	}
+	if fixedCap < 1 {
+		fixedCap = 1
+	}
+	sem := newAdaptiveSem(fixedCap, fixedCap)
+	done := make(chan struct{}) // retained for symmetry with other paths
+	_ = done
+	slog.Debug("s2s-copy concurrency", "cap", fixedCap, "blocks", len(blockIDs), "block_size", blkSize)
 
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
