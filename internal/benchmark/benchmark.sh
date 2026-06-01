@@ -162,6 +162,13 @@ log "Test file MD5: ${SRC_MD5}"
 # clobber one another.
 # ---------------------------------------------------------------------------
 
+# bbb's S2S code path ignores --concurrency and defaults to 256 parallel
+# StageBlockFromURL calls (which is great against real Azure but overwhelms
+# Azurite's single-process loopback emulator and causes intermittent
+# connection resets). Cap S2S parallelism to the same BENCH_CONCURRENCY the
+# other tools use so the benchmark stays apples-to-apples and stable.
+export BBB_AZBLOB_COPY_CONCURRENCY_MAX="${BBB_AZBLOB_COPY_CONCURRENCY_MAX:-${BENCH_CONCURRENCY}}"
+
 bbb_upload()    { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "${SRC_FILE}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin"; }
 bbb_download()  { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "${WORKDIR}/dl-bbb.bin"; }
 bbb_s2s()       { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb-s2s.bin"; }
@@ -305,7 +312,20 @@ if [ -n "${BENCH_FAIL_FACTOR:-}" ]; then
   fail=0
   for direction in UP DOWN; do
     declare -n times="${direction}"
-    others_best="$(awk -v a="${times[pybbb]}" -v b="${times[azcopy]}" 'BEGIN { print (a < b ? a : b) }')"
+    # Skip tools that recorded n/a (e.g. azcopy on Azurite when its upload
+    # or download failed) — they'd otherwise make others_best become an
+    # empty/zero string and trigger a spurious regression.
+    others_best="$(awk -v a="${times[pybbb]}" -v b="${times[azcopy]}" '
+      BEGIN {
+        best = ""
+        if (a != "n/a" && a != "") best = a + 0
+        if (b != "n/a" && b != "") { x = b + 0; if (best == "" || x < best) best = x }
+        print best
+      }')"
+    if [ -z "${others_best}" ]; then
+      log "skip ${direction} gate (no peer baseline; pybbb=${times[pybbb]} azcopy=${times[azcopy]})"
+      continue
+    fi
     if awk -v bbb="${times[bbb]}" -v other="${others_best}" -v f="${BENCH_FAIL_FACTOR}" \
         'BEGIN { exit !(bbb > other * f) }'; then
       log "REGRESSION: bbb ${direction} ${times[bbb]}s is slower than ${others_best}s * ${BENCH_FAIL_FACTOR}"
