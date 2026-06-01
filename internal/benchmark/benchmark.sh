@@ -150,14 +150,17 @@ log "Test file MD5: ${SRC_MD5}"
 
 bbb_upload()    { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "${SRC_FILE}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin"; }
 bbb_download()  { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "${WORKDIR}/dl-bbb.bin"; }
+bbb_s2s()       { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb-s2s.bin"; }
 
 # ${PYBBB} is intentionally left unquoted so that multi-word commands such as
 # the default "python -m boostedblob" word-split into separate arguments.
 pybbb_upload()   { ${PYBBB} cp "${SRC_FILE}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-pybbb.bin"; }
 pybbb_download() { ${PYBBB} cp "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-pybbb.bin" "${WORKDIR}/dl-pybbb.bin"; }
+pybbb_s2s()      { ${PYBBB} cp "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-pybbb.bin" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-pybbb-s2s.bin"; }
 
 azcopy_upload()   { "${AZCOPY_BIN}" copy "${SRC_FILE}" "${BLOB_HOST}/${BENCH_CONTAINER}/bench-azcopy.bin?${SAS}" --overwrite=true; }
 azcopy_download() { "${AZCOPY_BIN}" copy "${BLOB_HOST}/${BENCH_CONTAINER}/bench-azcopy.bin?${SAS}" "${WORKDIR}/dl-azcopy.bin" --overwrite=true; }
+azcopy_s2s()      { "${AZCOPY_BIN}" copy "${BLOB_HOST}/${BENCH_CONTAINER}/bench-azcopy.bin?${SAS}" "${BLOB_HOST}/${BENCH_CONTAINER}/bench-azcopy-s2s.bin?${SAS}" --overwrite=true --s2s-preserve-access-tier=false; }
 
 # Prime each upload once so the download benchmark has a blob to read, and so
 # the first (often slower) connection setup is not counted in the timing.
@@ -169,12 +172,14 @@ azcopy_upload >/dev/null 2>&1 || { log "azcopy upload failed"; exit 1; }
 # ---------------------------------------------------------------------------
 # Run the benchmark.
 # ---------------------------------------------------------------------------
-declare -A UP DOWN
+declare -A UP DOWN S2S
 for tool in bbb pybbb azcopy; do
   log "Benchmarking ${tool} upload (${BENCH_RUNS} runs)"
   UP[${tool}]="$(best_of "${tool}_upload")"
   log "Benchmarking ${tool} download (${BENCH_RUNS} runs)"
   DOWN[${tool}]="$(best_of "${tool}_download")"
+  log "Benchmarking ${tool} s2s copy (${BENCH_RUNS} runs)"
+  S2S[${tool}]="$(best_of "${tool}_s2s")"
 done
 
 # ---------------------------------------------------------------------------
@@ -212,11 +217,11 @@ AZCOPY_LABEL="azcopy"
 
 emit "### Transfer benchmark (Azurite emulator) — ${BENCH_SIZE_MB} MiB, best of ${BENCH_RUNS}, concurrency ${BENCH_CONCURRENCY}"
 emit ""
-emit "| Tool | Upload (s) | Upload MB/s | Download (s) | Download MB/s |"
-emit "|------|-----------:|------------:|-------------:|--------------:|"
-emit "| ${BBB_LABEL} | ${UP[bbb]} | $(mbps "${UP[bbb]}") | ${DOWN[bbb]} | $(mbps "${DOWN[bbb]}") |"
-emit "| ${PYBBB_LABEL} | ${UP[pybbb]} | $(mbps "${UP[pybbb]}") | ${DOWN[pybbb]} | $(mbps "${DOWN[pybbb]}") |"
-emit "| ${AZCOPY_LABEL} | ${UP[azcopy]} | $(mbps "${UP[azcopy]}") | ${DOWN[azcopy]} | $(mbps "${DOWN[azcopy]}") |"
+emit "| Tool | Upload (s) | Upload MB/s | Download (s) | Download MB/s | S2S Copy (s) | S2S MB/s |"
+emit "|------|-----------:|------------:|-------------:|--------------:|-------------:|---------:|"
+emit "| ${BBB_LABEL} | ${UP[bbb]} | $(mbps "${UP[bbb]}") | ${DOWN[bbb]} | $(mbps "${DOWN[bbb]}") | ${S2S[bbb]} | $(mbps "${S2S[bbb]}") |"
+emit "| ${PYBBB_LABEL} | ${UP[pybbb]} | $(mbps "${UP[pybbb]}") | ${DOWN[pybbb]} | $(mbps "${DOWN[pybbb]}") | ${S2S[pybbb]} | $(mbps "${S2S[pybbb]}") |"
+emit "| ${AZCOPY_LABEL} | ${UP[azcopy]} | $(mbps "${UP[azcopy]}") | ${DOWN[azcopy]} | $(mbps "${DOWN[azcopy]}") | ${S2S[azcopy]} | $(mbps "${S2S[azcopy]}") |"
 emit ""
 emit "> The Azurite emulator is CPU/loopback-bound, so absolute numbers measure client-side overhead rather than real network throughput."
 
@@ -224,7 +229,7 @@ emit "> The Azurite emulator is CPU/loopback-bound, so absolute numbers measure 
 # Cleanup blobs.
 # ---------------------------------------------------------------------------
 log "Cleaning up benchmark blobs"
-for name in bench-bbb.bin bench-pybbb.bin bench-azcopy.bin; do
+for name in bench-bbb.bin bench-pybbb.bin bench-azcopy.bin bench-bbb-s2s.bin bench-pybbb-s2s.bin bench-azcopy-s2s.bin; do
   "${BBB_BIN}" rm -f "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/${name}" >/dev/null 2>&1 || true
 done
 
@@ -233,7 +238,7 @@ done
 # ---------------------------------------------------------------------------
 if [ -n "${BENCH_FAIL_FACTOR:-}" ]; then
   fail=0
-  for direction in UP DOWN; do
+  for direction in UP DOWN S2S; do
     declare -n times="${direction}"
     others_best="$(awk -v a="${times[pybbb]}" -v b="${times[azcopy]}" 'BEGIN { print (a < b ? a : b) }')"
     if awk -v bbb="${times[bbb]}" -v other="${others_best}" -v f="${BENCH_FAIL_FACTOR}" \

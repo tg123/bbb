@@ -95,7 +95,7 @@ var validBlobSuffixes = []string{
 
 const (
 	defaultCopySASExpiry     = time.Hour
-	clockSkewTolerance       = 5 * time.Minute   // backdate SAS start to tolerate clock differences
+	clockSkewTolerance       = 5 * time.Minute // backdate SAS start to tolerate clock differences
 	copyBlockSize            = 8 * 1024 * 1024 // Default 8 MiB per StageBlockFromURL block; matches azcopy's S2S sweet spot. Smaller blocks let Azure's destination pipeline more PBFU operations in parallel per blob, dramatically improving S2S throughput vs the 256 MiB used for client-side uploads.
 	copyBlockSizeEnv         = "BBB_AZBLOB_COPY_BLOCK_MIB"
 	copyPollInitialDelay     = 100 * time.Millisecond
@@ -1700,18 +1700,43 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	return nil
 }
 
-// copyHardConcurrencyCap caps the adaptive controller's upper bound for
-// server-side StageBlockFromURL copies. Overridable via
+// copyHardConcurrencyCap is the absolute upper bound on parallel
+// StageBlockFromURL operations for a single S2S copy. Overridable via
 // BBB_AZBLOB_COPY_CONCURRENCY_MAX.
 const copyHardConcurrencyCap = 256
 
 const copyMaxConcurrencyEnv = "BBB_AZBLOB_COPY_CONCURRENCY_MAX"
 
-// copyInitialConcurrency is the starting parallelism for S2S transfers.
-// Mirrors azcopy's default (300, capped at our hard cap of 256). S2S has
-// near-zero per-request resource cost on the client so high initial
-// concurrency is free; the adaptive controller can only reduce from here.
-const copyInitialConcurrency = 256
+// copyDefaultConcurrency is the fallback parallelism when the caller passes
+// concurrency <= 0. Mirrors azcopy's default of ~300 (capped at our hard
+// cap of 256). S2S has near-zero per-request resource cost on the client
+// so high concurrency is effectively free.
+const copyDefaultConcurrency = 256
+
+// copyConcurrencyCap returns the parallel StageBlockFromURL cap for a single
+// S2S copy. It honors the caller-supplied concurrency budget (so
+// `--concurrency` and `cpWorkers × innerConcurrency` still apply) but clamps
+// to the block count and to copyHardConcurrencyCap, and lets
+// BBB_AZBLOB_COPY_CONCURRENCY_MAX override the cap entirely for tuning.
+func copyConcurrencyCap(concurrency, blockCount int) int {
+	cap := concurrency
+	if cap <= 0 {
+		cap = copyDefaultConcurrency
+	}
+	if env := envMaxConcurrency(copyMaxConcurrencyEnv, 0); env > 0 {
+		cap = env
+	}
+	if cap > copyHardConcurrencyCap {
+		cap = copyHardConcurrencyCap
+	}
+	if cap > blockCount && blockCount >= 1 {
+		cap = blockCount
+	}
+	if cap < 1 {
+		cap = 1
+	}
+	return cap
+}
 
 // copyBlockSizeBytes returns the StageBlockFromURL block size for a given
 // total transfer size. Defaults to 8 MiB (azcopy's S2S sweet spot, ~30×
@@ -1753,28 +1778,13 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 
 	// S2S StageBlockFromURL operations don't pass bytes through the client
 	// (server-to-server transfer), so concurrency carries near-zero memory
-	// or CPU cost. Use a fixed high concurrency instead of the adaptive
-	// ramp — azcopy defaults to 300 concurrent operations for the same
-	// reason. The adaptive controller's stair-stepped throughput sampling
-	// (driven by block-completion bursts) caused it to throttle down even
-	// when more parallelism would help.
-	_, _, _, _ = adaptiveBounds(concurrency, copyHardConcurrencyCap, copyMaxConcurrencyEnv) // honor env validation, ignore derived bounds
-	fixedCap := copyInitialConcurrency
-	if env := envMaxConcurrency(copyMaxConcurrencyEnv, 0); env > 0 {
-		fixedCap = env
-	}
-	if fixedCap > copyHardConcurrencyCap {
-		fixedCap = copyHardConcurrencyCap
-	}
-	if fixedCap > len(blockIDs) {
-		fixedCap = len(blockIDs)
-	}
-	if fixedCap < 1 {
-		fixedCap = 1
-	}
+	// or CPU cost. Use a fixed cap instead of the adaptive ramp — azcopy
+	// defaults to 300 concurrent operations for the same reason. The
+	// adaptive controller's stair-stepped throughput sampling (driven by
+	// block-completion bursts) caused it to throttle down even when more
+	// parallelism would help.
+	fixedCap := copyConcurrencyCap(concurrency, len(blockIDs))
 	sem := newAdaptiveSem(fixedCap, fixedCap)
-	done := make(chan struct{}) // retained for symmetry with other paths
-	_ = done
 	slog.Debug("s2s-copy concurrency", "cap", fixedCap, "blocks", len(blockIDs), "block_size", blkSize)
 
 	var wg sync.WaitGroup
@@ -1830,7 +1840,6 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 	}
 
 	wg.Wait()
-	close(done)
 
 	if firstErr != nil {
 		return firstErr
