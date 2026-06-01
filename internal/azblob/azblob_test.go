@@ -274,6 +274,64 @@ func TestPlanBlocksNegativeSize(t *testing.T) {
 	}
 }
 
+func TestUploadInitialConcurrencyForSize(t *testing.T) {
+	const (
+		mib = int64(1024 * 1024)
+		gib = 1024 * mib
+	)
+	cases := []struct {
+		name   string
+		caller int
+		size   int64
+		want   int
+	}{
+		{"small file keeps caller value", 8, 10 * mib, 8},
+		{"100 MiB keeps caller value", 16, 100 * mib, 16},
+		{"500 MiB just under threshold keeps caller", 16, 500 * mib, 16},
+		{"512 MiB boosts to 64", 16, 512 * mib, 64},
+		{"1 GiB boosts to 64", 32, 1 * gib, 64},
+		{"1 GiB caller above floor wins", 96, 1 * gib, 96},
+		{"4 GiB boosts to 128", 32, 4 * gib, 128},
+		{"10 GiB caller above 128 wins", 200, 10 * gib, 200},
+		{"caller above hard cap is clamped", 1024, 10 * gib, uploadHardConcurrencyCap},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := uploadInitialConcurrencyForSize(tc.caller, tc.size); got != tc.want {
+				t.Fatalf("uploadInitialConcurrencyForSize(%d, %d) = %d, want %d", tc.caller, tc.size, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUploadAdaptiveBoundsRespectFloor verifies that the size-based initial
+// concurrency boost lifts only `initial` and `maxC`, while `minC` (the floor
+// the adaptive controller can shrink back to) stays at the caller's
+// --concurrency value. This lets the controller drop back if the boosted
+// concurrency causes throughput regression.
+func TestUploadAdaptiveBoundsRespectFloor(t *testing.T) {
+	const gib = int64(1024 * 1024 * 1024)
+	caller := 32
+	size := int64(10) * gib
+
+	_, callerMin, _, _ := adaptiveBounds(caller, uploadHardConcurrencyCap, uploadBlockMaxConcurrencyEnv)
+	boosted := uploadInitialConcurrencyForSize(caller, size)
+	boostedInitial, _, boostedMax, _ := adaptiveBounds(boosted, uploadHardConcurrencyCap, uploadBlockMaxConcurrencyEnv)
+
+	if callerMin != caller {
+		t.Fatalf("expected caller-derived minC to equal caller (%d), got %d", caller, callerMin)
+	}
+	if boostedInitial != boosted {
+		t.Fatalf("expected boosted initial = %d, got %d", boosted, boostedInitial)
+	}
+	if boostedMax <= callerMin {
+		t.Fatalf("expected boosted maxC (%d) > caller minC (%d) so controller can grow", boostedMax, callerMin)
+	}
+	if boostedInitial <= callerMin {
+		t.Fatalf("expected boosted initial (%d) > caller minC (%d) so we start above the floor", boostedInitial, callerMin)
+	}
+}
+
 func TestUploadStreamBlockSizeWithinLimit(t *testing.T) {
 	blockSize := uploadStreamBlockSize(100000 * uploadStreamBlockMin)
 	if blockSize != uploadStreamBlockMin {
