@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 )
@@ -1560,28 +1559,6 @@ func TestCopyConcurrencyCapMinimumOne(t *testing.T) {
 	t.Setenv(copyMaxConcurrencyEnv, "")
 	if got := copyConcurrencyCap(0, 1); got != 1 {
 		t.Fatalf("expected minimum cap of 1 for single-block transfer, got %d", got)
-	}
-}
-
-func TestShouldFallbackToBlockStaging(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"501 not implemented (Azurite)", &azcore.ResponseError{StatusCode: 501}, true},
-		{"413 payload too large", &azcore.ResponseError{StatusCode: 413}, true},
-		{"403 forbidden (real auth error)", &azcore.ResponseError{StatusCode: 403}, false},
-		{"500 server error", &azcore.ResponseError{StatusCode: 500}, false},
-		{"non-Azure error", errors.New("network"), false},
-		{"nil", nil, false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := shouldFallbackToBlockStaging(c.err); got != c.want {
-				t.Fatalf("shouldFallbackToBlockStaging(%v) = %v, want %v", c.err, got, c.want)
-			}
-		})
 	}
 }
 

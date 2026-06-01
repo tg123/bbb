@@ -1685,18 +1685,20 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	}
 
 	// For blobs at or below the service's single-shot PutBlobFromURL limit
-	// (5000 MiB), use UploadBlobFromURL: a single atomic server-side call
+	// (5000 MiB), try UploadBlobFromURL: a single atomic server-side call
 	// that's dramatically faster than staging+committing many blocks,
 	// especially on emulators with single-threaded loopback. azcopy uses
 	// the same heuristic (see ste/sender.go::getNumChunks: only blobs >
-	// putBlobSize get multi-chunked).
+	// putBlobSize get multi-chunked). This is opportunistic — any failure
+	// (including emulator quirks like Azurite returning a generic 500 +
+	// empty body for unsupported APIs) silently falls back to the canonical
+	// block staging path, which will report any real error.
 	if totalSize >= 0 && totalSize <= copyMaxPutBlobSize {
-		if err := copyBlobSingleShot(ctx, client, dst, copySource, totalSize, onProgress); err == nil {
+		if shotErr := copyBlobSingleShot(ctx, client, dst, copySource, totalSize, onProgress); shotErr == nil {
 			return nil
-		} else if !shouldFallbackToBlockStaging(err) {
-			return err
+		} else {
+			slog.Debug("UploadBlobFromURL failed, falling back to block staging", "dst", dst.String(), "err", shotErr)
 		}
-		slog.Warn("UploadBlobFromURL failed, falling back to block staging", "dst", dst.String(), "err", err)
 	}
 
 	err = copyBlobBlocks(ctx, client, dst, copySource, totalSize, concurrency, onProgress)
@@ -1722,18 +1724,6 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 // StageBlockFromURL + CommitBlockList. Matches azcopy's
 // common.MaxPutBlobSize.
 const copyMaxPutBlobSize = int64(5000) * 1024 * 1024
-
-// shouldFallbackToBlockStaging reports whether an UploadBlobFromURL error
-// indicates the API is unsupported (e.g. Azurite emulator returns 501) or
-// the source is too large for a single call (413). In those cases the caller
-// should retry via the multi-block StageBlockFromURL + CommitBlockList path.
-func shouldFallbackToBlockStaging(err error) bool {
-	var respErr *azcore.ResponseError
-	if errors.As(err, &respErr) {
-		return respErr.StatusCode == 501 || respErr.StatusCode == 413
-	}
-	return false
-}
 
 // copyBlobSingleShot performs a server-side copy via a single
 // UploadBlobFromURL call. Used for blobs <= copyMaxPutBlobSize.
