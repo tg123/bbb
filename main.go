@@ -233,12 +233,17 @@ func main() {
 				// StageBlockFromURL calls). Each completed request closes its
 				// idle conn beyond the 2-limit, forcing fresh TLS handshakes
 				// for the next batch. azcopy's NewAzcopyHTTPClient raises this
-				// for the same reason. We size the idle pool to comfortably
-				// exceed the per-blob concurrency caps used by upload (512),
-				// download (512), and S2S (256). MaxConnsPerHost stays at 0
+				// for the same reason. 1024 per host comfortably exceeds the
+				// per-blob concurrency caps (upload/download 512, S2S 256).
+				// We also cap the global idle pool (across all hosts) so
+				// long-running operations against many endpoints — multi-
+				// account batches, multiple container clients within one
+				// process — don't accumulate an unbounded number of idle
+				// TCP+TLS connections, while still being generous enough to
+				// keep keep-alive effective. MaxConnsPerHost stays at 0
 				// (unlimited) so simultaneous in-flight requests can scale.
 				transport.MaxIdleConnsPerHost = 1024
-				transport.MaxIdleConns = 0
+				transport.MaxIdleConns = 4096
 				transport.IdleConnTimeout = 180 * time.Second
 				baseDial := (&net.Dialer{
 					Timeout:   30 * time.Second,

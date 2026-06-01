@@ -1663,9 +1663,9 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
 		return errors.New("destination path is directory-like")
 	}
-	if concurrency < 1 {
-		concurrency = 1
-	}
+	// concurrency <= 0 means "use the default" — copyConcurrencyCap maps
+	// that to copyDefaultConcurrency. Don't clamp to 1 here, or the
+	// fallback in copyConcurrencyCap becomes dead code.
 	client, err := getAzBlobClient(ctx, dst.Account)
 	if err != nil {
 		return err
@@ -1752,10 +1752,11 @@ const copyMaxConcurrencyEnv = "BBB_AZBLOB_COPY_CONCURRENCY_MAX"
 const copyDefaultConcurrency = 256
 
 // copyConcurrencyCap returns the parallel StageBlockFromURL cap for a single
-// S2S copy. It honors the caller-supplied concurrency budget (so
-// `--concurrency` and `cpWorkers × innerConcurrency` still apply) but clamps
-// to the block count and to copyHardConcurrencyCap, and lets
-// BBB_AZBLOB_COPY_CONCURRENCY_MAX override the cap entirely for tuning.
+// S2S copy. It honors the caller-provided concurrency (falling back to
+// copyDefaultConcurrency when concurrency <= 0), clamps the result to the
+// block count and to copyHardConcurrencyCap, and lets
+// BBB_AZBLOB_COPY_CONCURRENCY_MAX override the caller's request (still
+// subject to copyHardConcurrencyCap) for ad-hoc tuning.
 func copyConcurrencyCap(concurrency, blockCount int) int {
 	cap := concurrency
 	if cap <= 0 {
