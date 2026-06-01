@@ -1697,13 +1697,30 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 		}
 	}
 
-	// Always use parallel StageBlockFromURL + CommitBlockList. We previously
-	// tried UploadBlobFromURL (single-shot PutBlobFromURL) first for blobs
-	// up to 5 GiB, but measurements on real Azure showed it's much slower
-	// than parallel block staging because it serializes the entire source
-	// fetch into a single HTTP request on the destination service
-	// (~17s for 1 GiB vs ~2s for the parallel path). azcopy uses parallel
-	// block staging even for small blobs for the same reason.
+	// Same-account copies are metadata operations on Azure: the source and
+	// destination share the same storage stamp, so StartCopyFromURL
+	// completes essentially instantly regardless of blob size (the bytes
+	// don't physically move). This matches what azcopy does and what we
+	// observe empirically: azcopy completes 10 GiB and 100 GiB same-account
+	// S2S copies in ~2 s. For cross-account copies, async would have to
+	// pull the source over the public REST endpoint and could take a long
+	// time, so we keep parallel StageBlockFromURL for that case (where it
+	// also benefits from CopySourceAuthorization OAuth fast path).
+	if strings.EqualFold(src.Account, dst.Account) {
+		if asyncErr := copyBlobAsync(ctx, client, dst, srcURL, totalSize, onProgress); asyncErr == nil {
+			return nil
+		} else {
+			slog.Debug("same-account StartCopyFromURL failed, falling back to block staging", "dst", dst.String(), "err", asyncErr)
+		}
+	}
+
+	// Parallel StageBlockFromURL + CommitBlockList. We previously tried
+	// UploadBlobFromURL (single-shot PutBlobFromURL) first for blobs up to
+	// 5 GiB, but measurements on real Azure showed it's much slower than
+	// parallel block staging because it serializes the entire source fetch
+	// into a single HTTP request on the destination service (~17 s for
+	// 1 GiB vs ~2 s for the parallel path). azcopy uses parallel block
+	// staging for cross-account copies for the same reason.
 	err = copyBlobBlocks(ctx, client, dst, srcURL, srcAuth, totalSize, concurrency, onProgress)
 	if err != nil {
 		// StageBlockFromURL (Put Block From URL) returns 501 in emulators
