@@ -150,11 +150,7 @@ log "Test file MD5: ${SRC_MD5}"
 
 bbb_upload()    { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "${SRC_FILE}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin"; }
 bbb_download()  { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "${WORKDIR}/dl-bbb.bin"; }
-# S2S on Azurite is throughput-bound by the emulator's single Node process.
-# 128 concurrent PBFU calls (cap = block count) overwhelm it (~17s for 1 GiB).
-# azcopy uses ~40 concurrent and finishes in ~2s. Pass --concurrency=32 so
-# bbb's copyConcurrencyCap settles at the same range.
-bbb_s2s()       { "${BBB_BIN}" cp -f --concurrency 32 "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb-s2s.bin"; }
+bbb_s2s()       { "${BBB_BIN}" cp -f --concurrency "${BENCH_CONCURRENCY}" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb.bin" "az://${BENCH_ACCOUNT}/${BENCH_CONTAINER}/bench-bbb-s2s.bin"; }
 
 # ${PYBBB} is intentionally left unquoted so that multi-word commands such as
 # the default "python -m boostedblob" word-split into separate arguments.

@@ -235,11 +235,20 @@ func main() {
 				// for the next batch. azcopy's NewAzcopyHTTPClient raises this
 				// for the same reason. We size the idle pool to comfortably
 				// exceed the per-blob concurrency caps used by upload (512),
-				// download (512), and S2S (256). MaxConnsPerHost stays at 0
-				// (unlimited) so simultaneous in-flight requests can scale.
+				// download (512), and S2S (256).
 				transport.MaxIdleConnsPerHost = 1024
 				transport.MaxIdleConns = 0
 				transport.IdleConnTimeout = 180 * time.Second
+				// Cap the total open TCP+TLS connections per host. Without
+				// this, hundreds of concurrent requests each open their own
+				// connection, serialising TLS handshakes on the server (e.g.
+				// Azurite's single Node process) and dwarfing actual work
+				// time. azcopy uses 10×NumCPU; we mirror that.
+				transport.MaxConnsPerHost = 10 * runtime.NumCPU()
+				// Azure Blob payloads are already binary; auto-decompression
+				// adds CPU and prevents pooling for keep-alive on some
+				// responses. azcopy disables it for the same reasons.
+				transport.DisableCompression = true
 				baseDial := (&net.Dialer{
 					Timeout:   30 * time.Second,
 					KeepAlive: 30 * time.Second,
