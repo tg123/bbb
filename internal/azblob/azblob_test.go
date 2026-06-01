@@ -1508,8 +1508,9 @@ func TestCopyBlockSizeAutoGrowsAboveMaxBlocks(t *testing.T) {
 // default concurrency=4 and immediately throttled S2S parallelism down to
 // 32, even when 256 concurrent StageBlockFromURL calls would still be cheap
 // (no client-side buffering). The S2S path now uses copyConcurrencyCap
-// directly, which honors the passed-in concurrency without the adaptive
-// controller's stair-stepped throttling.
+// directly, which ignores the caller's concurrency (S2S has no client-side
+// buffering, so per-blob fan-out is decoupled from the CLI --concurrency)
+// and always starts from copyDefaultConcurrency.
 func TestCopyConcurrencyCapBypassesAdaptiveThrottling(t *testing.T) {
 	t.Setenv(copyMaxConcurrencyEnv, "")
 	// Pre-fix behavior: adaptiveBounds(4, 256, env) returned maxC=32, so the
@@ -1526,12 +1527,14 @@ func TestCopyConcurrencyCapBypassesAdaptiveThrottling(t *testing.T) {
 }
 
 func TestCopyConcurrencyCapDefaultsWhenZero(t *testing.T) {
+	// The caller's concurrency is ignored for S2S; the cap always starts
+	// from copyDefaultConcurrency regardless of the value passed in.
 	t.Setenv(copyMaxConcurrencyEnv, "")
 	if got := copyConcurrencyCap(0, 10000); got != copyDefaultConcurrency {
-		t.Fatalf("expected default %d when concurrency=0, got %d", copyDefaultConcurrency, got)
+		t.Fatalf("expected default %d when caller concurrency=0, got %d", copyDefaultConcurrency, got)
 	}
 	if got := copyConcurrencyCap(-1, 10000); got != copyDefaultConcurrency {
-		t.Fatalf("expected default %d when concurrency<0, got %d", copyDefaultConcurrency, got)
+		t.Fatalf("expected default %d when caller concurrency<0, got %d", copyDefaultConcurrency, got)
 	}
 }
 

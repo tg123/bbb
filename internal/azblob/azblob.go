@@ -1663,9 +1663,11 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
 		return errors.New("destination path is directory-like")
 	}
-	// concurrency <= 0 means "use the default" — copyConcurrencyCap maps
-	// that to copyDefaultConcurrency. Don't clamp to 1 here, or the
-	// fallback in copyConcurrencyCap becomes dead code.
+	// copyConcurrencyCap ignores the caller's concurrency entirely (S2S has
+	// no client-side buffering, so per-blob fan-out is independent of the
+	// CLI --concurrency that governs client I/O). It always starts from
+	// copyDefaultConcurrency, optionally overridden by
+	// BBB_AZBLOB_COPY_CONCURRENCY_MAX, and is clamped to copyHardConcurrencyCap.
 	client, err := getAzBlobClient(ctx, dst.Account)
 	if err != nil {
 		return err
@@ -1781,10 +1783,11 @@ const copyHardConcurrencyCap = 256
 
 const copyMaxConcurrencyEnv = "BBB_AZBLOB_COPY_CONCURRENCY_MAX"
 
-// copyDefaultConcurrency is the fallback parallelism when the caller passes
-// concurrency <= 0. Mirrors azcopy's default of ~300 (capped at our hard
-// cap of 256). S2S has near-zero per-request resource cost on the client
-// so high concurrency is effectively free.
+// copyDefaultConcurrency is the parallel StageBlockFromURL fan-out used for
+// every S2S copy (independent of the caller's --concurrency). Mirrors
+// azcopy's default of ~300, capped at our hard cap of 256. S2S has
+// near-zero per-request resource cost on the client so high concurrency is
+// effectively free.
 const copyDefaultConcurrency = 256
 
 // copyConcurrencyCap returns the parallel StageBlockFromURL cap for a single
@@ -1795,7 +1798,7 @@ const copyDefaultConcurrency = 256
 // and clamp the result to the block count and to copyHardConcurrencyCap.
 // The concurrency parameter is accepted for API symmetry and is currently
 // ignored.
-func copyConcurrencyCap(_ /*concurrency*/, blockCount int) int {
+func copyConcurrencyCap(_ int, blockCount int) int {
 	cap := copyDefaultConcurrency
 	if env := envMaxConcurrency(copyMaxConcurrencyEnv, 0); env > 0 {
 		cap = env
