@@ -57,6 +57,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 )
 
+// defaultAzuriteKey is the well-known, publicly documented Azurite emulator
+// shared key. It is only ever used against the local emulator and must never be
+// used for real Azure credentials.
 const defaultAzuriteKey = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 
 func envOr(key, def string) string {
@@ -286,7 +289,8 @@ func TestBenchmark(t *testing.T) {
 	// Per-tool auth.
 	// ---------------------------------------------------------------------
 	// bbb (this repo) talks to the production-style host via BBB_AZBLOB_ENDPOINT
-	// and authenticates with the shared key.
+	// and authenticates with the shared key. The %s is bbb's account-name
+	// placeholder (it is substituted by bbb at runtime, not here).
 	t.Setenv("BBB_AZBLOB_ENDPOINT", "https://%s.blob.core.windows.net/")
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", cfg.key)
 	// py-bbb (boostedblob) uses AZURE_STORAGE_ACCOUNT(+_KEY) and the hardcoded host.
