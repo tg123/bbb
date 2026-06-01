@@ -1335,7 +1335,8 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 	// writeback, which reduces page-cache pressure but adds wall-clock
 	// latency. Gate behind env for users who care about cache hygiene
 	// more than wall time on a single transfer.
-	if envOn(envDownloadFadviseDontneed) {
+	enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(envDownloadFadviseDontneed)))
+	if err == nil && enabled {
 		defer tryFadviseDontneed(file)
 	}
 

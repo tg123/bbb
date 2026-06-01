@@ -51,13 +51,13 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BBB_LOG_LEVEL` | `info` | Same as `--loglevel` flag |
-| `BBB_DNS_CACHE` | *(off)* | Set to `1`, `true`, `yes`, or `on` to enable process-local DNS caching |
-| `BBB_DNS_PIN` | *(off)* | Set to `1`, `true`, `yes`, or `on` to pin DNS to a single IP (implies `BBB_DNS_CACHE=1`) |
+| `BBB_DNS_CACHE` | *(off)* | Set to `1` or `true` to enable process-local DNS caching |
+| `BBB_DNS_PIN` | *(off)* | Set to `1` or `true` to pin DNS to a single IP (implies `BBB_DNS_CACHE=1`) |
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
-| `BBB_PARALLEL_DOWNLOAD` | `1` (on) | Set to `0`, `false`, `no`, or `off` to disable parallel ranged Azure→local single-file downloads and fall back to a single streaming connection |
-| `BBB_PARALLEL_UPLOAD` | `1` (on) | Set to `0`, `false`, `no`, or `off` to disable parallel ranged local→Azure single-file uploads and fall back to the streaming `UploadStream` path |
+| `BBB_PARALLEL_DOWNLOAD` | `1` (`true`) | Set to `0` or `false` to disable parallel ranged Azure→local single-file downloads and fall back to a single streaming connection |
+| `BBB_PARALLEL_UPLOAD` | `1` (`true`) | Set to `0` or `false` to disable parallel ranged local→Azure single-file uploads and fall back to the streaming `UploadStream` path |
 | `BBB_AZBLOB_DOWNLOAD_BLOCK_MIB` | `16` | Chunk size in MiB used by the parallel Azure→local download path |
 | `BBB_AZBLOB_UPLOAD_BLOCK_MIB` | `64` | Chunk size in MiB used by the parallel local→Azure upload path (clamped so the total block count stays within Azure's per-blob limit) |
 | `BBB_AZBLOB_DOWNLOAD_CONCURRENCY_MAX` | *(auto)* | Hard upper bound on in-flight download ranges for the adaptive concurrency controller (default cap 512) |
