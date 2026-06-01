@@ -1688,22 +1688,15 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	// (5000 MiB), try UploadBlobFromURL first: a single atomic server-side
 	// call that's dramatically faster than staging+committing many blocks.
 	// azcopy uses the same heuristic (see ste/sender.go::getNumChunks +
-	// sender-blockBlobFromURL.go). On failure, fall back to the async
-	// StartCopyFromURL path before resorting to block staging — Azurite
-	// (and some other emulators) return 500 for UploadBlobFromURL because
-	// the API isn't implemented (Azure/Azurite#2402) but happily process
-	// StartCopyFromURL, completing 1 GiB loopback copies in ~0.2s vs
-	// ~17s for hundreds of parallel block-stage requests.
+	// sender-blockBlobFromURL.go). On failure (e.g. Azurite returns 500
+	// because the API isn't implemented — Azure/Azurite#2402), fall back
+	// silently to the canonical block staging path which will report any
+	// real error.
 	if totalSize >= 0 && totalSize <= copyMaxPutBlobSize {
 		if shotErr := copyBlobSingleShot(ctx, client, dst, copySource, totalSize, onProgress); shotErr == nil {
 			return nil
 		} else {
-			slog.Debug("UploadBlobFromURL failed, trying async StartCopyFromURL", "dst", dst.String(), "err", shotErr)
-		}
-		if asyncErr := copyBlobAsync(ctx, client, dst, copySource, totalSize, onProgress); asyncErr == nil {
-			return nil
-		} else {
-			slog.Debug("StartCopyFromURL failed, falling back to block staging", "dst", dst.String(), "err", asyncErr)
+			slog.Debug("UploadBlobFromURL failed, falling back to block staging", "dst", dst.String(), "err", shotErr)
 		}
 	}
 
