@@ -57,20 +57,28 @@ log() { printf '>>> %s\n' "$*" >&2; }
 # seconds() runs a command, discarding its output, and prints the wall-clock
 # seconds it took as a floating point number.
 seconds() {
-  local start end rc
+  local start end rc stderr_file
+  stderr_file="$(mktemp)"
   start="$(date +%s.%N)"
   # Disable errexit around the timed command so we can capture its exit code
   # ourselves; otherwise `set -euo pipefail` would terminate the script before
   # `rc=$?` ran and the caller would never see the failure.
   set +e
-  "$@" >/dev/null 2>&1
+  "$@" >/dev/null 2>"${stderr_file}"
   rc=$?
   set -e
   end="$(date +%s.%N)"
   if [ "${rc}" -ne 0 ]; then
     echo "command failed (exit ${rc}): $*" >&2
+    if [ -s "${stderr_file}" ]; then
+      echo "--- stderr (last 30 lines) ---" >&2
+      tail -30 "${stderr_file}" >&2
+      echo "--- end stderr ---" >&2
+    fi
+    rm -f "${stderr_file}"
     return "${rc}"
   fi
+  rm -f "${stderr_file}"
   awk -v s="${start}" -v e="${end}" 'BEGIN { printf "%.3f", e - s }'
 }
 
