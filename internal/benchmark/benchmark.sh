@@ -177,14 +177,17 @@ azcopy_upload >/dev/null 2>&1 || { log "azcopy upload failed"; exit 1; }
 # ---------------------------------------------------------------------------
 # Run the benchmark.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Run the benchmark. Upload + download first (each tool's last download is
+# verified for byte-for-byte integrity below), then S2S separately — keeping
+# the integrity check independent of the S2S step.
+# ---------------------------------------------------------------------------
 declare -A UP DOWN S2S
 for tool in bbb pybbb azcopy; do
   log "Benchmarking ${tool} upload (${BENCH_RUNS} runs)"
   UP[${tool}]="$(best_of "${tool}_upload")"
   log "Benchmarking ${tool} download (${BENCH_RUNS} runs)"
   DOWN[${tool}]="$(best_of "${tool}_download")"
-  log "Benchmarking ${tool} s2s copy (${BENCH_RUNS} runs)"
-  S2S[${tool}]="$(best_of "${tool}_s2s")"
 done
 
 # ---------------------------------------------------------------------------
@@ -196,6 +199,11 @@ log "Verifying upload/download integrity (MD5)"
 verify_md5 "bbb"        "${WORKDIR}/dl-bbb.bin"
 verify_md5 "py-bbb"     "${WORKDIR}/dl-pybbb.bin"
 verify_md5 "azcopy"     "${WORKDIR}/dl-azcopy.bin"
+
+for tool in bbb pybbb azcopy; do
+  log "Benchmarking ${tool} s2s copy (${BENCH_RUNS} runs)"
+  S2S[${tool}]="$(best_of "${tool}_s2s")"
+done
 
 # ---------------------------------------------------------------------------
 # Report.
