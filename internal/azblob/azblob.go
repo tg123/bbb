@@ -1707,6 +1707,12 @@ const copyHardConcurrencyCap = 256
 
 const copyMaxConcurrencyEnv = "BBB_AZBLOB_COPY_CONCURRENCY_MAX"
 
+// copyInitialConcurrency is the starting parallelism for S2S transfers.
+// Mirrors azcopy's default (300, capped at our hard cap of 256). S2S has
+// near-zero per-request resource cost on the client so high initial
+// concurrency is free; the adaptive controller can only reduce from here.
+const copyInitialConcurrency = 256
+
 // copyBlockSizeBytes returns the StageBlockFromURL block size for a given
 // total transfer size. Defaults to 8 MiB (azcopy's S2S sweet spot, ~30×
 // smaller than what client-side uploads use). Smaller blocks let Azure's
@@ -1745,7 +1751,23 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// S2S StageBlockFromURL operations don't pass bytes through the client
+	// (server-to-server transfer), so concurrency carries near-zero memory
+	// or CPU cost. Start high instead of ramping from a small value —
+	// otherwise the adaptive controller (4→8→16→… every 750ms) spends
+	// half the transfer below saturation. azcopy defaults to 300 concurrent
+	// operations for the same reason. Use the caller's `concurrency` as a
+	// floor but ensure the initial parallelism is meaningful.
 	initial, minC, maxC, step := adaptiveBounds(concurrency, copyHardConcurrencyCap, copyMaxConcurrencyEnv)
+	if initial < copyInitialConcurrency {
+		initial = copyInitialConcurrency
+		if initial > maxC {
+			initial = maxC
+		}
+		if initial > len(blockIDs) {
+			initial = len(blockIDs)
+		}
+	}
 	sem := newAdaptiveSem(initial, maxC)
 	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
 	defer ctrlCancel()
