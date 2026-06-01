@@ -235,15 +235,11 @@ func main() {
 				// for the next batch. azcopy's NewAzcopyHTTPClient raises this
 				// for the same reason. 1024 per host comfortably exceeds the
 				// per-blob concurrency caps (upload/download 512, S2S 256).
-				// We also cap the global idle pool (across all hosts) so
-				// long-running operations against many endpoints — multi-
-				// account batches, multiple container clients within one
-				// process — don't accumulate an unbounded number of idle
-				// TCP+TLS connections, while still being generous enough to
-				// keep keep-alive effective. MaxConnsPerHost stays at 0
-				// (unlimited) so simultaneous in-flight requests can scale.
+				// MaxIdleConns=0 leaves the global idle pool unlimited;
+				// IdleConnTimeout still reaps idle sockets after 180s, and
+				// MaxConnsPerHost=0 lets in-flight requests scale.
 				transport.MaxIdleConnsPerHost = 1024
-				transport.MaxIdleConns = 4096
+				transport.MaxIdleConns = 0
 				transport.IdleConnTimeout = 180 * time.Second
 				baseDial := (&net.Dialer{
 					Timeout:   30 * time.Second,
