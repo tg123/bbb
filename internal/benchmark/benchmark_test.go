@@ -125,9 +125,27 @@ func (e endpoint) az(name string) string {
 	return fmt.Sprintf("az://%s/%s/%s", e.account, e.container, name)
 }
 
+// bbbKeyEnv returns the BBB_AZBLOB_ACCOUNTKEY assignment(s) carrying this
+// endpoint's shared key under the given variable names, or nil when no key is
+// configured so bbb falls back to its default environment-driven credentials.
+func (e endpoint) bbbKeyEnv(names ...string) []string {
+	if e.key == "" {
+		return nil
+	}
+	env := make([]string, 0, len(names))
+	for _, n := range names {
+		env = append(env, n+"="+e.key)
+	}
+	return env
+}
+
 // azcopyURL builds an azcopy blob URL with the given container SAS query string.
 func (e endpoint) azcopyURL(name, saSig string) string {
-	return fmt.Sprintf("%s/%s/%s?%s", e.blobHost, e.container, name, saSig)
+	u := fmt.Sprintf("%s/%s/%s", e.blobHost, e.container, name)
+	if saSig != "" {
+		u += "?" + saSig
+	}
+	return u
 }
 
 // config holds the resolved benchmark settings derived from the environment.
@@ -151,7 +169,7 @@ type config struct {
 func loadConfig() config {
 	src := endpoint{
 		account:   firstNonEmpty(os.Getenv("BENCH_SRC_ACCOUNT"), os.Getenv("BENCH_ACCOUNT"), defaultAzuriteAccount),
-		key:       firstNonEmpty(os.Getenv("BENCH_SRC_KEY"), os.Getenv("BENCH_KEY"), defaultAzuriteKey),
+		key:       firstNonEmpty(os.Getenv("BENCH_SRC_KEY"), os.Getenv("BENCH_KEY")),
 		container: firstNonEmpty(os.Getenv("BENCH_SRC_CONTAINER"), os.Getenv("BENCH_CONTAINER"), "bench"),
 	}
 
@@ -165,10 +183,18 @@ func loadConfig() config {
 		dst.key = firstNonEmpty(os.Getenv("BENCH_DST_KEY"), src.key)
 		dst.container = firstNonEmpty(os.Getenv("BENCH_DST_CONTAINER"), src.container)
 	} else {
-		dst.key = firstNonEmpty(os.Getenv("BENCH_DST_KEY"), os.Getenv("BENCH_KEY"), defaultAzuriteKey)
+		dst.key = firstNonEmpty(os.Getenv("BENCH_DST_KEY"), os.Getenv("BENCH_KEY"))
 	}
 
 	for _, e := range []*endpoint{&src, &dst} {
+		// The well-known Azurite emulator account has a single fixed key, so
+		// default to it to keep the simulator working out of the box. For a real
+		// account no key is forced: the caller is responsible for setting whatever
+		// auth the three tools read from the environment (a BENCH_*_KEY shared key
+		// here, or e.g. an azcopy/az login and bbb's default credential chain).
+		if e.key == "" && e.account == defaultAzuriteAccount {
+			e.key = defaultAzuriteKey
+		}
 		e.host = e.account + ".blob.core.windows.net"
 		e.blobHost = "https://" + e.host
 	}
@@ -368,6 +394,11 @@ func verifyMD5(t *testing.T, label, file, srcMD5 string) {
 // former benchmark.sh generated with azure-storage-blob for azcopy.
 func containerSAS(t *testing.T, e endpoint) string {
 	t.Helper()
+	if e.key == "" {
+		// No shared key: rely on whatever auth the caller configured for azcopy
+		// (e.g. azcopy login / AZCOPY_AUTO_LOGIN_TYPE), so use a plain URL.
+		return ""
+	}
 	cred, err := azblob.NewSharedKeyCredential(e.account, e.key)
 	if err != nil {
 		t.Fatalf("shared key credential: %v", err)
@@ -414,8 +445,12 @@ func TestBenchmark(t *testing.T) {
 	t.Setenv("BBB_AZBLOB_ENDPOINT", "https://%s.blob.core.windows.net/")
 	// py-bbb (boostedblob) uses AZURE_STORAGE_ACCOUNT(+_KEY) and the hardcoded
 	// host. It only takes a single account/key, so it is pointed at the source.
+	// With no shared key the account-key var is left untouched so py-bbb uses
+	// whatever auth the caller configured (e.g. az login).
 	t.Setenv("AZURE_STORAGE_ACCOUNT", cfg.src.account)
-	t.Setenv("AZURE_STORAGE_ACCOUNT_KEY", cfg.src.key)
+	if cfg.src.key != "" {
+		t.Setenv("AZURE_STORAGE_ACCOUNT_KEY", cfg.src.key)
+	}
 	// azcopy: keep its own log quiet.
 	t.Setenv("AZCOPY_LOG_LEVEL", "ERROR")
 	// bbb's S2S code path defaults to 256 parallel StageBlockFromURL calls,
@@ -429,12 +464,12 @@ func TestBenchmark(t *testing.T) {
 	// container exists. Each command carries the right key for its account.
 	t.Logf("Ensuring container %s exists on %s", cfg.src.container, cfg.src.account)
 	mkSrc := exec.Command(cfg.bbbBin, "az", "mkcontainer", fmt.Sprintf("az://%s/%s", cfg.src.account, cfg.src.container))
-	mkSrc.Env = append(os.Environ(), "BBB_AZBLOB_ACCOUNTKEY="+cfg.src.key)
+	mkSrc.Env = append(os.Environ(), cfg.src.bbbKeyEnv("BBB_AZBLOB_ACCOUNTKEY")...)
 	_ = mkSrc.Run()
 	if cfg.dst.account != cfg.src.account || cfg.dst.container != cfg.src.container {
 		t.Logf("Ensuring container %s exists on %s", cfg.dst.container, cfg.dst.account)
 		mk := exec.Command(cfg.bbbBin, "az", "mkcontainer", fmt.Sprintf("az://%s/%s", cfg.dst.account, cfg.dst.container))
-		mk.Env = append(os.Environ(), "BBB_AZBLOB_ACCOUNTKEY="+cfg.dst.key)
+		mk.Env = append(os.Environ(), cfg.dst.bbbKeyEnv("BBB_AZBLOB_ACCOUNTKEY")...)
 		_ = mk.Run()
 	}
 
@@ -481,21 +516,18 @@ func benchSize(t *testing.T, cfg config, sizeMB int, srcSAS, dstSAS string) {
 	// destination account and an S2S's destination account can need different
 	// keys; supplying them per invocation keeps each correct. When src == dst
 	// (the simulator and same-account case) all of these are the same key.
-	bbbSrcEnv := []string{"BBB_AZBLOB_ACCOUNTKEY=" + cfg.src.key}
-	bbbDstEnv := []string{"BBB_AZBLOB_ACCOUNTKEY=" + cfg.dst.key}
-	bbbS2SEnv := []string{
-		"BBB_AZBLOB_ACCOUNTKEY=" + cfg.src.key,
-		"SRC_BBB_AZBLOB_ACCOUNTKEY=" + cfg.src.key,
-		"DST_BBB_AZBLOB_ACCOUNTKEY=" + cfg.dst.key,
-	}
+	bbbSrcEnv := cfg.src.bbbKeyEnv("BBB_AZBLOB_ACCOUNTKEY")
+	bbbDstEnv := cfg.dst.bbbKeyEnv("BBB_AZBLOB_ACCOUNTKEY")
+	bbbS2SEnv := append(cfg.src.bbbKeyEnv("BBB_AZBLOB_ACCOUNTKEY", "SRC_BBB_AZBLOB_ACCOUNTKEY"),
+		cfg.dst.bbbKeyEnv("DST_BBB_AZBLOB_ACCOUNTKEY")...)
 
 	workdir := t.TempDir()
 	srcFile := filepath.Join(workdir, "testfile.bin")
 	t.Logf("Generating %d MiB test file", sizeMB)
-	if err := writeRandomFile(srcFile, sizeMB); err != nil {
+	srcMD5, err := writeRandomFile(srcFile, sizeMB)
+	if err != nil {
 		t.Fatalf("generate test file: %v", err)
 	}
-	srcMD5 := fileMD5(t, srcFile)
 	t.Logf("Test file MD5: %s", srcMD5)
 
 	// ---------------------------------------------------------------------
@@ -745,23 +777,30 @@ func pybbbArgs(cfg config, args ...string) []string {
 	return append(append([]string{}, cfg.pybbb[1:]...), args...)
 }
 
-// writeRandomFile writes sizeMB MiB of random data to path in 1 MiB chunks.
-func writeRandomFile(path string, sizeMB int) error {
+// writeRandomFile writes sizeMB MiB of random data to path in 1 MiB chunks and
+// returns the MD5 of the data, computed as it is written so the (possibly
+// multi-GiB) source file never has to be read back to be hashed.
+func writeRandomFile(path string, sizeMB int) (string, error) {
 	f, err := os.Create(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() { _ = f.Close() }()
+	h := md5.New()
+	w := io.MultiWriter(f, h)
 	buf := make([]byte, 1<<20)
 	for i := 0; i < sizeMB; i++ {
 		if _, err := rand.Read(buf); err != nil {
-			return err
+			return "", err
 		}
-		if _, err := f.Write(buf); err != nil {
-			return err
+		if _, err := w.Write(buf); err != nil {
+			return "", err
 		}
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // boostedblobVersion resolves the installed boostedblob version for the report
