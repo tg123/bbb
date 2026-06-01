@@ -192,11 +192,29 @@ azcopy_upload >/dev/null 2>&1 || { log "azcopy upload failed"; exit 1; }
 # the integrity check independent of the S2S step.
 # ---------------------------------------------------------------------------
 declare -A UP DOWN S2S
+# azcopy on Azurite is known to fail intermittently against several
+# operations (e.g. PutBlobFromUrl is unimplemented, and certain GET ranges
+# return errors that azcopy treats as fatal). Treat azcopy-specific failures
+# as "n/a" so bbb and py-bbb numbers still get reported; abort for any other
+# tool so real regressions aren't silently masked.
+run_or_na() {
+  local out tool="$1" fn="$2"
+  if out="$(best_of "$fn")"; then
+    printf '%s' "$out"
+  else
+    if [ "$tool" = "azcopy" ]; then
+      printf 'n/a'
+    else
+      log "${tool} ${fn} failed; aborting"
+      exit 1
+    fi
+  fi
+}
 for tool in bbb pybbb azcopy; do
   log "Benchmarking ${tool} upload (${BENCH_RUNS} runs)"
-  UP[${tool}]="$(best_of "${tool}_upload")"
+  UP[${tool}]="$(run_or_na "$tool" "${tool}_upload")"
   log "Benchmarking ${tool} download (${BENCH_RUNS} runs)"
-  DOWN[${tool}]="$(best_of "${tool}_download")"
+  DOWN[${tool}]="$(run_or_na "$tool" "${tool}_download")"
 done
 
 # ---------------------------------------------------------------------------
@@ -207,23 +225,15 @@ done
 log "Verifying upload/download integrity (MD5)"
 verify_md5 "bbb"        "${WORKDIR}/dl-bbb.bin"
 verify_md5 "py-bbb"     "${WORKDIR}/dl-pybbb.bin"
-verify_md5 "azcopy"     "${WORKDIR}/dl-azcopy.bin"
+# azcopy may have skipped its download (n/a) if the download command failed
+# against Azurite — in that case there's nothing to verify.
+if [ "${DOWN[azcopy]}" != "n/a" ]; then
+  verify_md5 "azcopy"   "${WORKDIR}/dl-azcopy.bin"
+fi
 
 for tool in bbb pybbb azcopy; do
   log "Benchmarking ${tool} s2s copy (${BENCH_RUNS} runs)"
-  if ! S2S[${tool}]="$(best_of "${tool}_s2s")"; then
-    # azcopy on Azurite hits NotImplementedError on PutBlobFromUrl (its only
-    # S2S path for blobs ≤ 5 GiB; see Azure/Azurite#2402) and exits non-zero
-    # without writing the destination. Record "n/a" for azcopy specifically
-    # so the bbb/py-bbb numbers are still reported; abort for any other tool
-    # so real regressions are not silently masked.
-    if [ "${tool}" = "azcopy" ]; then
-      S2S[${tool}]="n/a"
-    else
-      log "S2S benchmark for ${tool} failed; aborting"
-      exit 1
-    fi
-  fi
+  S2S[${tool}]="$(run_or_na "$tool" "${tool}_s2s")"
 done
 
 # ---------------------------------------------------------------------------
