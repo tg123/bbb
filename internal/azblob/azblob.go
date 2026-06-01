@@ -1672,22 +1672,38 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	if err != nil {
 		return err
 	}
-	// Try OAuth-authenticated source first: the destination uses our token to
-	// authenticate against the source via the x-ms-copy-source-authorization
-	// header. This unlocks Azure's intra-region fast path for
-	// UploadBlobFromURL / StageBlockFromURL (~8× faster than SAS-in-URL,
-	// which forces the destination to fetch via the public REST endpoint).
-	// azcopy uses the same approach. We fall back to a SAS URL when no
-	// OAuth credential is available (e.g. cross-tenant copies).
-	srcURL, srcAuth, oauthErr := copySourceOAuth(ctx, src)
-	if oauthErr != nil {
-		slog.Debug("s2s: OAuth source auth unavailable, falling back to SAS", "src", src.String(), "err", oauthErr)
+	// Auth strategy for the source:
+	//   1. If a shared key is configured for the source account, skip the
+	//      OAuth path and go straight to SAS — OAuth would trigger
+	//      DefaultAzureCredential probing (and could open an interactive
+	//      browser) in environments that intentionally use shared-key-only.
+	//   2. Otherwise try OAuth: the destination uses our token to
+	//      authenticate against the source via x-ms-copy-source-authorization,
+	//      which unlocks Azure's intra-region fast path for
+	//      UploadBlobFromURL / StageBlockFromURL (~8× faster than SAS-in-URL,
+	//      which forces the destination to fetch via the public REST
+	//      endpoint). azcopy uses the same approach.
+	//   3. Fall back to SAS when no OAuth credential is available (e.g.
+	//      cross-tenant copies).
+	var srcURL, srcAuth string
+	if accountKey(src.Account) != "" {
 		sasURL, sasErr := blobSASURL(ctx, src)
 		if sasErr != nil {
 			return sasErr
 		}
 		srcURL = sasURL
-		srcAuth = ""
+	} else {
+		var oauthErr error
+		srcURL, srcAuth, oauthErr = copySourceOAuth(ctx, src)
+		if oauthErr != nil {
+			slog.Debug("s2s: OAuth source auth unavailable, falling back to SAS", "src", src.String(), "err", oauthErr)
+			sasURL, sasErr := blobSASURL(ctx, src)
+			if sasErr != nil {
+				return sasErr
+			}
+			srcURL = sasURL
+			srcAuth = ""
+		}
 	}
 
 	// Use provided size when available to avoid a HeadBlob round-trip.
