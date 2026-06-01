@@ -1167,7 +1167,22 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 		return err
 	}
 
-	initial, minC, maxC, step := adaptiveBounds(uploadInitialConcurrencyForSize(concurrency, size), uploadHardConcurrencyCap, uploadBlockMaxConcurrencyEnv)
+	// Adaptive bounds:
+	//   * minC and step are derived from the caller's --concurrency so the
+	//     adaptive floor still respects the user's knob — the controller can
+	//     shrink back down to the caller value if throughput regresses.
+	//   * maxC and initial are derived from the size-based boost so large
+	//     uploads can both start near the optimum and grow further if Azure
+	//     keeps responding well.
+	_, minC, _, step := adaptiveBounds(concurrency, uploadHardConcurrencyCap, uploadBlockMaxConcurrencyEnv)
+	boosted := uploadInitialConcurrencyForSize(concurrency, size)
+	initial, _, maxC, _ := adaptiveBounds(boosted, uploadHardConcurrencyCap, uploadBlockMaxConcurrencyEnv)
+	if initial < minC {
+		initial = minC
+	}
+	if maxC < minC {
+		maxC = minC
+	}
 	sem := newAdaptiveSem(initial, maxC)
 	var staged atomic.Int64
 	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
