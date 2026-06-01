@@ -1568,11 +1568,11 @@ func TestCopyConcurrencyCapMinimumOne(t *testing.T) {
 
 func TestPathEscapeBlobName(t *testing.T) {
 	cases := map[string]string{
-		"simple.bin":            "simple.bin",
-		"dir/sub/blob.bin":      "dir/sub/blob.bin",
-		"with space.bin":        "with%20space.bin",
-		"weird#name?.bin":       "weird%23name%3F.bin",
-		"a/b c/d#e":             "a/b%20c/d%23e",
+		"simple.bin":       "simple.bin",
+		"dir/sub/blob.bin": "dir/sub/blob.bin",
+		"with space.bin":   "with%20space.bin",
+		"weird#name?.bin":  "weird%23name%3F.bin",
+		"a/b c/d#e":        "a/b%20c/d%23e",
 	}
 	for in, want := range cases {
 		if got := pathEscapeBlobName(in); got != want {
