@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -244,18 +245,11 @@ func main() {
 					KeepAlive: 30 * time.Second,
 				}).DialContext
 
-				var dnsPin bool
-				switch strings.ToLower(os.Getenv("BBB_DNS_PIN")) {
-				case "1", "true", "yes", "on":
-					dnsPin = true
-				}
+				dnsPin, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv("BBB_DNS_PIN")))
 
 				dnsCache := dnsPin // BBB_DNS_PIN implies caching
 				if !dnsCache {
-					switch strings.ToLower(os.Getenv("BBB_DNS_CACHE")) {
-					case "1", "true", "yes", "on":
-						dnsCache = true
-					}
+					dnsCache, _ = strconv.ParseBool(strings.TrimSpace(os.Getenv("BBB_DNS_CACHE")))
 				}
 
 				if dnsCache {
@@ -710,23 +704,21 @@ func sendOp[T any](ctx context.Context, ch chan<- T, op T) error {
 }
 
 // parallelDownloadEnabled reports whether Az→local copies should use parallel
-// ranged downloads. Enabled by default; set BBB_PARALLEL_DOWNLOAD to a falsey
-// value (0/false/no/off) to fall back to the single-stream download path.
+// ranged downloads. Enabled by default; set BBB_PARALLEL_DOWNLOAD to false
+// (or 0) to fall back to the single-stream download path.
 func parallelDownloadEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("BBB_PARALLEL_DOWNLOAD"))) {
-	case "0", "false", "no", "off":
-		return false
+	if enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("BBB_PARALLEL_DOWNLOAD"))); err == nil {
+		return enabled
 	}
 	return true
 }
 
 // parallelUploadEnabled reports whether local→Az copies should use parallel
-// StageBlock uploads. Enabled by default; set BBB_PARALLEL_UPLOAD to a falsey
-// value (0/false/no/off) to fall back to the streaming upload path.
+// StageBlock uploads. Enabled by default; set BBB_PARALLEL_UPLOAD to false
+// (or 0) to fall back to the streaming upload path.
 func parallelUploadEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("BBB_PARALLEL_UPLOAD"))) {
-	case "0", "false", "no", "off":
-		return false
+	if enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("BBB_PARALLEL_UPLOAD"))); err == nil {
+		return enabled
 	}
 	return true
 }
