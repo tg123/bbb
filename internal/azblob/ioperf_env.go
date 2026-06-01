@@ -2,16 +2,11 @@ package azblob
 
 import "os"
 
-// Experimental high-performance I/O env flags. All default-off; set to
-// "1" or "true" to enable. These are intentionally undocumented while we
-// benchmark them; winners will be promoted to defaults.
-const (
-	envDownloadFallocate = "BBB_DOWNLOAD_FALLOCATE"
-	envDownloadFadvise   = "BBB_DOWNLOAD_FADVISE"
-	envDownloadMmap      = "BBB_DOWNLOAD_MMAP"
-	envUploadFadvise     = "BBB_UPLOAD_FADVISE"
-	envUploadMmap        = "BBB_UPLOAD_MMAP"
-)
+// envDownloadFadviseDontneed lets users opt into POSIX_FADV_DONTNEED on
+// the destination file once the download finishes. It forces synchronous
+// page eviction and trades wall-clock time for reduced page-cache
+// pressure — useful on hosts where another workload owns the cache.
+const envDownloadFadviseDontneed = "BBB_DOWNLOAD_FADVISE_DONTNEED"
 
 func envOn(name string) bool {
 	switch os.Getenv(name) {
