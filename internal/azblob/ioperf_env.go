@@ -1,6 +1,9 @@
 package azblob
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 // envDownloadFadviseDontneed lets users opt into POSIX_FADV_DONTNEED on
 // the destination file once the download finishes. It forces synchronous
@@ -9,8 +12,8 @@ import "os"
 const envDownloadFadviseDontneed = "BBB_DOWNLOAD_FADVISE_DONTNEED"
 
 func envOn(name string) bool {
-	switch os.Getenv(name) {
-	case "1", "true", "TRUE", "yes", "on":
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
 		return true
 	}
 	return false

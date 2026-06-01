@@ -1328,9 +1328,7 @@ func DownloadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency 
 	// (extent allocation + journal commit on ext4/xfs) to ~us. Best-effort:
 	// non-extent filesystems and non-Linux platforms fall through unchanged.
 	// Pair with FADV_SEQUENTIAL so the kernel sizes writeback IO for the
-	// access pattern we know we're about to perform. Measured impact on a
-	// 10 GiB Azure→ext4 download (5 reps, interleaved median): -13% sys,
-	// -6% wall vs unhinted/non-preallocated baseline.
+	// access pattern we know we're about to perform.
 	tryFallocate(file, size)
 	tryFadviseSequential(file)
 	// FADV_DONTNEED on close forces synchronous page eviction during
