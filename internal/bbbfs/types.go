@@ -42,6 +42,7 @@ var (
 	providers       []FS
 	providersMu     sync.RWMutex
 	azProvider      = azFS{}
+	s3Provider      = s3FS{}
 	hfProvider      = hfFS{}
 	localFSProvider = localFS{}
 )
@@ -50,6 +51,7 @@ func init() {
 	// Register order defines resolution priority; localFS is the fallback.
 	Register(hfProvider)
 	Register(azProvider)
+	Register(s3Provider)
 	Register(localFSProvider)
 }
 
