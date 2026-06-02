@@ -654,6 +654,68 @@ docker compose up --build --abort-on-container-exit --exit-code-from benchmark
 # Optional overrides: BENCH_SIZE_MB, BENCH_RUNS, BENCH_FAIL_FACTOR
 ```
 
+### Real Azure results
+
+The same harness can be pointed at two real Azure Storage accounts:
+
+```bash
+export BENCH_SRC_ACCOUNT=<src-account>
+export BENCH_DST_ACCOUNT=<dst-account>
+export BENCH_CONTAINER=bench
+export BENCH_SIZES_MB=10,100,500,1000,5000,10000   # comma-separated
+export BENCH_RUNS=3
+export BENCH_FAIL_FACTOR=99                         # disable the regression gate
+
+go test -count=1 -timeout 0 -v -run TestBenchmark ./internal/benchmark/
+```
+
+Sample numbers (best of 3 runs, concurrency 32, seconds — lower is better).
+
+Test environment:
+- Client node: `Standard_E32ads_v5` (32 vCPU AMD EPYC 7763, 256 GiB RAM), AKS in
+  `southcentralus`.
+- Source account: `southcentralus` (same region as the client, used for upload
+  and download).
+- Destination account: `uksouth` (S2S destination — cross-region copy).
+- bbb commit at time of run: `55f4e44` (PR #99 head).
+- Tool versions: bbb (this repo), boostedblob 10.0.0, azcopy 10.32.2.
+
+#### Upload (s)
+
+| Size      |    bbb | py-bbb | azcopy |
+|-----------|-------:|-------:|-------:|
+|   10 MiB  | **0.44** |   0.70 |   2.23 |
+|  100 MiB  | **0.76** |   1.43 |   2.34 |
+|  500 MiB  |   1.89 |   3.30 | **2.13** |
+| 1000 MiB  | **1.26** |   5.27 |   2.25 |
+| 5000 MiB  | **3.87** |  17.29 |   4.15 |
+|10000 MiB  | **6.43** |  31.69 |   8.15 |
+
+#### Download (s)
+
+| Size      |    bbb | py-bbb | azcopy |
+|-----------|-------:|-------:|-------:|
+|   10 MiB  | **0.29** |   0.60 |   2.29 |
+|  100 MiB  | **0.64** |   1.42 |   2.24 |
+|  500 MiB  | **1.41** |   2.34 |   2.24 |
+| 1000 MiB  | **1.57** |   3.69 |   2.26 |
+| 5000 MiB  | **5.34** |  10.28 |   6.52 |
+|10000 MiB  | **9.57** |  17.98 |  13.06 |
+
+#### Server-to-server copy (s)
+
+| Size      |    bbb | py-bbb | azcopy |
+|-----------|-------:|-------:|-------:|
+|   10 MiB  | **3.44** |   3.53 |   4.75 |
+|  100 MiB  | **4.07** |   5.02 |   4.71 |
+|  500 MiB  | **4.29** |   5.50 |   4.85 |
+| 1000 MiB  | **3.91** |   5.64 |   4.87 |
+| 5000 MiB  | **4.62** |  11.95 |   5.90 |
+|10000 MiB  | **6.58** |  18.58 |   6.88 |
+
+Network conditions vary, so treat these as representative rather than absolute;
+the Azurite-based CI run is the regression gate.
+
 ## License
 
 See [LICENSE](LICENSE) for details.
