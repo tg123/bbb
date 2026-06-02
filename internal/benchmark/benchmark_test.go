@@ -497,10 +497,12 @@ func TestBenchmark(t *testing.T) {
 	}
 	// azcopy: keep its own log quiet.
 	t.Setenv("AZCOPY_LOG_LEVEL", "ERROR")
-	// bbb's S2S code path defaults to 256 parallel StageBlockFromURL calls,
-	// which overwhelms Azurite's single-process loopback emulator. Cap it to the
-	// same concurrency the other tools use so the benchmark stays stable.
-	if os.Getenv("BBB_AZBLOB_COPY_CONCURRENCY_MAX") == "" {
+	// On Azurite (single-process loopback emulator) bbb's S2S default of
+	// 256 parallel StageBlockFromURL calls overwhelms the emulator, so cap
+	// it to the benchmark concurrency to keep the run stable. Do NOT cap on
+	// real Azure: the 256-way fan-out is critical for cross-account S2S
+	// throughput (without it, 10 GiB takes ~30s instead of ~7s).
+	if !cfg.external && os.Getenv("BBB_AZBLOB_COPY_CONCURRENCY_MAX") == "" {
 		t.Setenv("BBB_AZBLOB_COPY_CONCURRENCY_MAX", strconv.Itoa(cfg.concurrency))
 	}
 
