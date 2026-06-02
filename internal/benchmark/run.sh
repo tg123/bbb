@@ -69,5 +69,7 @@ fi
 
 # Run the benchmark as a Go test. -count=1 disables the test cache and
 # -timeout 0 disables the default 10m limit so large transfers aren't killed.
-# Output is streamed so the progress logs appear live in CI.
+# Per-step logs (per size/tool/direction) are printed by the test itself via
+# t.Log; the benchmarked CLI processes have their own stdout discarded, so
+# tool-internal progress isn't streamed.
 go test -count=1 -timeout 0 -v ./internal/benchmark/

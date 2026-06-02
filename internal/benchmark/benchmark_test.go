@@ -166,6 +166,17 @@ type config struct {
 	crossAccount bool // src and dst are different accounts
 }
 
+// parsePybbb returns the (possibly multi-word) py-bbb invocation command,
+// falling back to the default when the supplied value is empty or contains
+// only whitespace, so later cfg.pybbb[0] accesses never panic.
+func parsePybbb(raw string) []string {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		fields = strings.Fields("python -m boostedblob")
+	}
+	return fields
+}
+
 func loadConfig() config {
 	src := endpoint{
 		account:   firstNonEmpty(os.Getenv("BENCH_SRC_ACCOUNT"), os.Getenv("BENCH_ACCOUNT"), defaultAzuriteAccount),
@@ -206,7 +217,7 @@ func loadConfig() config {
 		attempts:     envIntOr("BENCH_ATTEMPTS", 3),
 		concurrency:  envIntOr("BENCH_CONCURRENCY", runtime.NumCPU()),
 		bbbBin:       envOr("BBB_BIN", "bbb"),
-		pybbb:        strings.Fields(envOr("PYBBB", "python -m boostedblob")),
+		pybbb:        parsePybbb(os.Getenv("PYBBB")),
 		azcopyBin:    envOr("AZCOPY_BIN", "azcopy"),
 		failFactor:   os.Getenv("BENCH_FAIL_FACTOR"),
 		summaryFile:  os.Getenv("BENCH_SUMMARY_FILE"),
@@ -300,9 +311,32 @@ func timeCmdEnv(extraEnv []string, name string, args ...string) (time.Duration, 
 	err := cmd.Run()
 	elapsed := time.Since(start)
 	if err != nil {
-		return elapsed, fmt.Errorf("command failed (%v): %s %s\n%s", err, name, strings.Join(args, " "), tailLines(stderr.String(), 30))
+		return elapsed, fmt.Errorf("command failed (%v): %s %s\n%s", err, name, redactArgs(args), tailLines(stderr.String(), 30))
 	}
 	return elapsed, nil
+}
+
+// redactArgs replaces the query string of any http(s) URL argument with
+// "?<redacted>" so SAS tokens (and any other URL-borne credentials) don't end
+// up in test failure messages or CI logs.
+func redactArgs(args []string) string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = redactURL(a)
+	}
+	return strings.Join(out, " ")
+}
+
+// redactURL strips the query string from an http(s) URL, leaving non-URL
+// arguments untouched.
+func redactURL(arg string) string {
+	if !strings.HasPrefix(arg, "http://") && !strings.HasPrefix(arg, "https://") {
+		return arg
+	}
+	if i := strings.IndexByte(arg, '?'); i >= 0 {
+		return arg[:i] + "?<redacted>"
+	}
+	return arg
 }
 
 func tailLines(s string, n int) string {
@@ -426,10 +460,19 @@ func toolVersionLabel(name, version string) string {
 }
 
 func TestBenchmark(t *testing.T) {
+	// Require an explicit opt-in. The benchmark drives real CLI binaries
+	// (bbb/azcopy/py-bbb) against either Azurite or a real storage account, so
+	// a plain `go test ./...` run with no infrastructure must not pick it up.
+	// run.sh exports BBB_BIN, the docker-compose driver exports BENCH_ACCOUNT,
+	// and external runs set BENCH_SRC_ACCOUNT — any of those is sufficient.
+	if os.Getenv("BBB_BIN") == "" && os.Getenv("BENCH_ACCOUNT") == "" && os.Getenv("BENCH_SRC_ACCOUNT") == "" {
+		t.Skip("benchmark not enabled: set BBB_BIN (or BENCH_ACCOUNT/BENCH_SRC_ACCOUNT) to run; see internal/benchmark/run.sh")
+	}
+
 	cfg := loadConfig()
 
-	// Skip gracefully (e.g. on a plain `go test ./...`) when the storage
-	// endpoints the benchmark needs are not reachable.
+	// Skip gracefully when the storage endpoints the benchmark needs are not
+	// reachable (e.g. Azurite isn't running).
 	skipUnlessReachable(t, cfg.src.host)
 	if cfg.crossAccount {
 		skipUnlessReachable(t, cfg.dst.host)
@@ -777,27 +820,23 @@ func pybbbArgs(cfg config, args ...string) []string {
 	return append(append([]string{}, cfg.pybbb[1:]...), args...)
 }
 
-// writeRandomFile writes sizeMB MiB of random data to path in 1 MiB chunks and
-// returns the MD5 of the data, computed as it is written so the (possibly
-// multi-GiB) source file never has to be read back to be hashed.
-func writeRandomFile(path string, sizeMB int) (string, error) {
+// writeRandomFile writes sizeMB MiB of random data to path and returns the
+// MD5 of the data, computed as it is written so the (possibly multi-GiB)
+// source file never has to be read back to be hashed.
+func writeRandomFile(path string, sizeMB int) (_ string, retErr error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = f.Close() }()
+	defer func() {
+		if cerr := f.Close(); cerr != nil && retErr == nil {
+			retErr = cerr
+		}
+	}()
 	h := md5.New()
-	w := io.MultiWriter(f, h)
 	buf := make([]byte, 1<<20)
-	for i := 0; i < sizeMB; i++ {
-		if _, err := rand.Read(buf); err != nil {
-			return "", err
-		}
-		if _, err := w.Write(buf); err != nil {
-			return "", err
-		}
-	}
-	if err := f.Close(); err != nil {
+	src := io.LimitReader(rand.Reader, int64(sizeMB)<<20)
+	if _, err := io.CopyBuffer(io.MultiWriter(f, h), src, buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
