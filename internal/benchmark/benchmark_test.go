@@ -16,8 +16,9 @@
 // Environment:
 //
 //	BENCH_ACCOUNT      Storage account name             (default: devstoreaccount1)
-//	BENCH_KEY          Shared key for the account
-//	                   (default: the well-known Azurite key)
+//	BENCH_KEY          Shared key for the account. When the account is the Azurite
+//	                   default (devstoreaccount1), defaults to the well-known key.
+//	                   For real Azure accounts, no key is defaulted.
 //	BENCH_CONTAINER    Container to use, created if missing (default: bench)
 //	BENCH_SRC_ACCOUNT  Source storage account for upload/download and the S2S
 //	                   source. Overrides BENCH_ACCOUNT for the source side.
