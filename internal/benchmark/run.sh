@@ -10,7 +10,7 @@
 #      the azurite service's loopback by the compose extra_hosts — is served over
 #      TLS with the shared certificate,
 #   2. builds bbb from the mounted repo,
-#   3. runs the benchmark (benchmark.sh).
+#   3. runs the benchmark (go test ./internal/benchmark).
 #
 set -euo pipefail
 
@@ -67,4 +67,9 @@ if [ -n "${BENCH_SUMMARY_FILE:-}" ]; then
   : >"${BENCH_SUMMARY_FILE}"
 fi
 
-bash internal/benchmark/benchmark.sh
+# Run the benchmark as a Go test. -count=1 disables the test cache and
+# -timeout 0 disables the default 10m limit so large transfers aren't killed.
+# Per-step logs (per size/tool/direction) are printed by the test itself via
+# t.Log; the benchmarked CLI processes have their own stdout discarded, so
+# tool-internal progress isn't streamed.
+go test -count=1 -timeout 0 -v ./internal/benchmark/

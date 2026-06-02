@@ -20,8 +20,12 @@ on:
   workflow_dispatch:
     inputs:
       size_mb:
-        description: Test file size in MiB
+        description: Test file size in MiB (used when sizes_mb is blank)
         default: "1024"
+        required: false
+      sizes_mb:
+        description: Comma-separated list of file sizes in MiB to sweep, each run as its own subtest (e.g. "10,100,1000,10000"). Blank = a single size_mb run.
+        default: ""
         required: false
       runs:
         description: Timed runs per tool/direction
@@ -49,6 +53,7 @@ jobs:
           COMPOSE_DOCKER_CLI_BUILD: "1"
           DOCKER_BUILDKIT: "1"
           BENCH_SIZE_MB: ${{ github.event.inputs.size_mb || '1024' }}
+          BENCH_SIZES_MB: ${{ github.event.inputs.sizes_mb || '' }}
           BENCH_RUNS: ${{ github.event.inputs.runs || '3' }}
           BENCH_FAIL_FACTOR: ${{ github.event.inputs.fail_factor || '1.20' }}
 
