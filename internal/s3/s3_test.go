@@ -108,6 +108,8 @@ func TestEscapeKey(t *testing.T) {
 		{"dir/file.txt", "dir/file.txt"},
 		{"a b.txt", "a%20b.txt"},
 		{"name+plus", "name%2Bplus"},
+		{"tab\tend", "tab%09end"},
+		{"nl\nend", "nl%0Aend"},
 	}
 	for _, c := range cases {
 		if got := escapeKey(c.in); got != c.want {

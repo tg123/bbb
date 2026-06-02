@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -709,7 +708,7 @@ func pathSegmentEscape(s string) string {
 			continue
 		}
 		b.WriteByte('%')
-		b.WriteString(strings.ToUpper(strconv.FormatInt(int64(r), 16)))
+		b.WriteString(fmt.Sprintf("%02X", r))
 	}
 	return b.String()
 }

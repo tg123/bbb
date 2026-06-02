@@ -1217,7 +1217,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			// directory prefix. Skip the expensive Stat for HF sources.
 			if srcObj {
 				if _, statErr := bbbfs.Resolve(src).Stat(ctx, src); statErr != nil {
-					slog.Debug("source not found as blob, trying as directory", "src", src, "error", statErr)
+					slog.Debug("source not found as object, trying as directory", "src", src, "error", statErr)
 					dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
 					continue
 				}
