@@ -726,11 +726,11 @@ func parallelUploadEnabled() bool {
 }
 
 // forceS2SEnabled reports whether Az→Az copies must use server-side copy.
-// When enabled (set BBB_AZURE_FORCE_S2S to 1/true), bbb does not fall back to
+// When enabled (set BBB_AZBLOB_FORCE_S2S to 1/true), bbb does not fall back to
 // client-side streaming on a server-side copy failure; the error is returned
 // so the operation is retried (honouring --retry-count).
 func forceS2SEnabled() bool {
-	if enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("BBB_AZURE_FORCE_S2S"))); err == nil {
+	if enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("BBB_AZBLOB_FORCE_S2S"))); err == nil {
 		return enabled
 	}
 	return false
