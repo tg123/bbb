@@ -63,6 +63,8 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_AZBLOB_DOWNLOAD_CONCURRENCY_MAX` | *(auto)* | Hard upper bound on in-flight download ranges for the adaptive concurrency controller (default cap 512) |
 | `BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX` | *(auto)* | Hard upper bound on in-flight upload blocks for the adaptive concurrency controller (default cap 512) |
 | `BBB_AZBLOB_COPY_CONCURRENCY_MAX` | *(auto)* | Hard upper bound on in-flight blocks for Azure→Azure server-side block copies (default cap 256) |
+| `BBB_FORCE_S2S` | *(off)* | Set to `1` or `true` to force Azure→Azure server-side (S2S) copy. On a server-side copy failure, bbb does **not** fall back to client-side streaming; instead the error is retried (honouring `--retry-count`) |
+| `BBB_RETRY_JITTER` | *(off)* | Go duration (e.g. `500ms`, `2s`) to wait a random amount of time in `[0, value)` before each retry attempt. Applies to all operations that honour `--retry-count` |
 
 ### Non-Interactive Authentication (`AZURE_*` Env Vars)
 
