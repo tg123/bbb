@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -758,7 +758,7 @@ func sleepJitter(ctx context.Context, jitter time.Duration) error {
 	if jitter <= 0 {
 		return nil
 	}
-	wait := time.Duration(rand.Int63n(int64(jitter)))
+	wait := time.Duration(rand.Int64N(int64(jitter)))
 	if wait <= 0 {
 		return nil
 	}
