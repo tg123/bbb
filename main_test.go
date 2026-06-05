@@ -990,19 +990,19 @@ func TestRetryJitterInvalidIgnored(t *testing.T) {
 }
 
 func TestForceS2SEnabled(t *testing.T) {
-	t.Setenv("BBB_FORCE_S2S", "")
+	t.Setenv("BBB_AZURE_FORCE_S2S", "")
 	if forceS2SEnabled() {
 		t.Fatal("expected force-S2S off by default")
 	}
-	t.Setenv("BBB_FORCE_S2S", "1")
+	t.Setenv("BBB_AZURE_FORCE_S2S", "1")
 	if !forceS2SEnabled() {
 		t.Fatal("expected force-S2S on for 1")
 	}
-	t.Setenv("BBB_FORCE_S2S", "true")
+	t.Setenv("BBB_AZURE_FORCE_S2S", "true")
 	if !forceS2SEnabled() {
 		t.Fatal("expected force-S2S on for true")
 	}
-	t.Setenv("BBB_FORCE_S2S", "0")
+	t.Setenv("BBB_AZURE_FORCE_S2S", "0")
 	if forceS2SEnabled() {
 		t.Fatal("expected force-S2S off for 0")
 	}
