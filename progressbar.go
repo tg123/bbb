@@ -23,7 +23,7 @@ var (
 	elapsedWg        sync.WaitGroup
 )
 
-// startElapsedTicker starts a 1-second background ticker that re-renders
+// startElapsedTicker starts a 2-second background ticker that re-renders
 // active progress bars so the elapsed-time field stays up-to-date even when
 // no new progress events arrive. It is safe to call multiple times; only
 // one ticker runs at a time. Requires outputMu NOT to be held.
@@ -142,6 +142,10 @@ func rerenderActiveBars() {
 // the screen-blanking clear used by clearActiveBars. Use this for routine
 // progress updates; use clearActiveBars+rerenderActiveBars when emitting
 // a permanent line above the bars.
+//
+// outputMu must be held when calling this, because redrawActiveBars (and the
+// repositionForRedraw it calls) reads and updates lastDrawnLines and activeBars,
+// which are synchronized by outputMu.
 func redrawActiveBars() {
 	if len(activeBars) == 0 && lastDrawnLines == 0 {
 		return
@@ -462,7 +466,7 @@ func (p *progressBar) render(done int64) {
 	// will draw it, even if this call is throttled.
 	addActiveBar(p)
 	// Global throttle: coalesce redraws across all bars to at most one per
-	// renderMinInterval. The 1s elapsed ticker guarantees the screen still
+	// renderMinInterval. The 2s elapsed ticker guarantees the screen still
 	// refreshes regularly even when updates are throttled.
 	now := time.Now().UnixNano()
 	last := lastGlobalRender.Load()
