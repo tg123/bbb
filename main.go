@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -724,6 +725,57 @@ func parallelUploadEnabled() bool {
 	return true
 }
 
+// forceS2SEnabled reports whether Az→Az copies must use server-side copy.
+// When enabled (set BBB_AZBLOB_FORCE_S2S to 1/true), bbb does not fall back to
+// client-side streaming on a server-side copy failure; the error is returned
+// so the operation is retried (honouring --retry-count).
+func forceS2SEnabled() bool {
+	if enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("BBB_AZBLOB_FORCE_S2S"))); err == nil {
+		return enabled
+	}
+	return false
+}
+
+// retryJitter returns the maximum random wait inserted before each retry
+// attempt, parsed from BBB_RETRY_JITTER (a Go duration such as "500ms" or
+// "2s"). Returns 0 (no wait) when unset or invalid.
+func retryJitter() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("BBB_RETRY_JITTER"))
+	if raw == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("invalid BBB_RETRY_JITTER, ignoring", "value", raw, "error", err)
+		return 0
+	}
+	if d < 0 {
+		slog.Warn("invalid BBB_RETRY_JITTER, ignoring", "value", raw, "error", "negative duration")
+		return 0
+	}
+	return d
+}
+
+// sleepJitter waits a random duration in [0, jitter) before the next retry,
+// returning early if the context is canceled.
+func sleepJitter(ctx context.Context, jitter time.Duration) error {
+	if jitter <= 0 {
+		return nil
+	}
+	wait := time.Duration(rand.Int64N(int64(jitter)))
+	if wait <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func runOpPool[T any](ctx context.Context, concurrency int, producer func(chan<- T) error, worker func(T) error) error {
 	if concurrency < 1 {
 		concurrency = 1
@@ -775,10 +827,17 @@ func retryOp(ctx context.Context, retryCount int, op func() error) error {
 	if retryCount < 0 {
 		retryCount = 0
 	}
+	jitter := retryJitter()
 	var err error
 	for attempt := 0; attempt <= retryCount; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if attempt > 0 {
+			// Wait a little bit (BBB_RETRY_JITTER) before retrying.
+			if werr := sleepJitter(ctx, jitter); werr != nil {
+				return werr
+			}
 		}
 		err = op()
 		if err == nil {
@@ -1309,6 +1368,12 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			}); err != nil {
 				if copyBar != nil {
 					copyBar.Finish()
+				}
+				// When S2S is forced, do not fall back to client-side
+				// streaming. Return the error so the operation is retried
+				// (honouring --retry-count, with BBB_RETRY_JITTER waits).
+				if forceS2SEnabled() {
+					return 0, fmt.Errorf("cp: server-side copy: %w", err)
 				}
 				// Server-side copy failed — fall back to client-side streaming.
 				// This handles cross-tenant copies where the destination cannot
