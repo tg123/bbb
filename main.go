@@ -745,8 +745,12 @@ func retryJitter() time.Duration {
 		return 0
 	}
 	d, err := time.ParseDuration(raw)
-	if err != nil || d < 0 {
+	if err != nil {
 		slog.Warn("invalid BBB_RETRY_JITTER, ignoring", "value", raw, "error", err)
+		return 0
+	}
+	if d < 0 {
+		slog.Warn("invalid BBB_RETRY_JITTER, ignoring", "value", raw, "error", "negative duration")
 		return 0
 	}
 	return d
@@ -760,7 +764,7 @@ func sleepJitter(ctx context.Context, jitter time.Duration) error {
 	}
 	wait := time.Duration(rand.Int64N(int64(jitter)))
 	if wait <= 0 {
-		return nil
+		return ctx.Err()
 	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
