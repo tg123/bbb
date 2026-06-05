@@ -13,13 +13,14 @@ import (
 )
 
 var (
-	outputMu        sync.Mutex
-	activeBars      []*progressBar // guarded by outputMu; rendered in order
-	maxLabelWidth   int            // guarded by outputMu; high-water mark for label alignment
-	elapsedTickerMu sync.Mutex
-	elapsedTicker   *time.Ticker
-	elapsedDone     chan struct{}
-	elapsedWg       sync.WaitGroup
+	outputMu         sync.Mutex
+	activeBars       []*progressBar // guarded by outputMu; rendered in order
+	maxLabelWidth    int            // guarded by outputMu; high-water mark for label alignment
+	lastGlobalRender atomic.Int64   // unix nanos of last screen redraw; for global throttling
+	elapsedTickerMu  sync.Mutex
+	elapsedTicker    *time.Ticker
+	elapsedDone      chan struct{}
+	elapsedWg        sync.WaitGroup
 )
 
 // startElapsedTicker starts a 1-second background ticker that re-renders
@@ -32,7 +33,7 @@ func startElapsedTicker() {
 	if elapsedTicker != nil {
 		return // already running
 	}
-	elapsedTicker = time.NewTicker(1 * time.Second)
+	elapsedTicker = time.NewTicker(2 * time.Second)
 	elapsedDone = make(chan struct{})
 	// Capture the current ticker and done channel so the goroutine does not
 	// depend on the mutable package-level pointers.
@@ -51,8 +52,8 @@ func startElapsedTicker() {
 				}
 				outputMu.Lock()
 				if len(activeBars) > 0 {
-					clearActiveBars()
-					rerenderActiveBars()
+					lastGlobalRender.Store(time.Now().UnixNano())
+					redrawActiveBars()
 				}
 				outputMu.Unlock()
 			}
@@ -76,24 +77,77 @@ func stopElapsedTicker() {
 	elapsedWg.Wait()
 }
 
+// lastDrawnLines tracks how many bar lines we currently occupy on screen.
+// Guarded by outputMu. We use this to position the cursor for in-place
+// overwrites and to detect when a destructive clear is required (i.e. the
+// bar count shrank, so leftover trailing lines must be erased).
+var lastDrawnLines int
+
+// repositionForRedraw moves the cursor back to the first bar line so the
+// next render pass can overwrite the existing bars in place. When the bar
+// count has shrunk since the last draw, it also issues a one-shot
+// "clear to end of screen" to remove the now-orphaned trailing lines.
+// Without that conditional clear we'd leave stale bar lines behind; with
+// it suppressed in the steady-state case, we avoid blanking the screen
+// every frame (which is what users perceive as flashing).
+func repositionForRedraw(nextLines int) {
+	if !isTerminal(os.Stderr) {
+		return
+	}
+	if lastDrawnLines == 0 {
+		return
+	}
+	if lastDrawnLines > 1 {
+		fmt.Fprintf(os.Stderr, "\033[%dA", lastDrawnLines-1)
+	}
+	fmt.Fprint(os.Stderr, "\r")
+	if nextLines < lastDrawnLines {
+		// Bar count decreased; clear from cursor to end of screen so the
+		// orphaned bottom lines disappear. Renders that fill the same
+		// number of lines (the common case) skip this clear, which is
+		// what eliminates the flashing.
+		fmt.Fprint(os.Stderr, "\033[J")
+	}
+}
+
+// clearActiveBars retains the prior aggressive clear semantics for callers
+// that need a guaranteed-blank slate (permanent-line writers like
+// lockedPrintf and Finish). Steady-state bar updates use the lighter
+// repositionForRedraw path instead.
 func clearActiveBars() {
-	n := len(activeBars)
+	n := lastDrawnLines
 	if n == 0 || !isTerminal(os.Stderr) {
 		return
 	}
 	if n > 1 {
-		fmt.Fprintf(os.Stderr, "\033[%dA", n-1) // move cursor up to first bar line
+		fmt.Fprintf(os.Stderr, "\033[%dA", n-1)
 	}
-	fmt.Fprintf(os.Stderr, "\r\033[J") // clear from cursor to end of screen
+	fmt.Fprint(os.Stderr, "\r\033[J")
+	lastDrawnLines = 0
 }
 
 func rerenderActiveBars() {
 	for i, bar := range activeBars {
+		// renderAligned writes "\r\033[K<line>" on a TTY, so each line is
+		// overwritten in place without blanking it first.
 		bar.renderAligned(maxLabelWidth)
 		if i < len(activeBars)-1 {
 			fmt.Fprintf(os.Stderr, "\n")
 		}
 	}
+	lastDrawnLines = len(activeBars)
+}
+
+// redrawActiveBars performs an in-place redraw of all active bars without
+// the screen-blanking clear used by clearActiveBars. Use this for routine
+// progress updates; use clearActiveBars+rerenderActiveBars when emitting
+// a permanent line above the bars.
+func redrawActiveBars() {
+	if len(activeBars) == 0 && lastDrawnLines == 0 {
+		return
+	}
+	repositionForRedraw(len(activeBars))
+	rerenderActiveBars()
 }
 
 func addActiveBar(p *progressBar) {
@@ -134,6 +188,7 @@ func lockedPrintf(format string, args ...any) {
 	clearActiveBars()
 	fmt.Printf(format, args...)
 	rerenderActiveBars()
+	lastGlobalRender.Store(time.Now().UnixNano())
 }
 
 func lockedPrintln(args ...any) {
@@ -142,6 +197,7 @@ func lockedPrintln(args ...any) {
 	clearActiveBars()
 	fmt.Println(args...)
 	rerenderActiveBars()
+	lastGlobalRender.Store(time.Now().UnixNano())
 }
 
 func lockedFprintf(w io.Writer, format string, args ...any) {
@@ -152,6 +208,7 @@ func lockedFprintf(w io.Writer, format string, args ...any) {
 		fmt.Fprintln(os.Stderr, err)
 	}
 	rerenderActiveBars()
+	lastGlobalRender.Store(time.Now().UnixNano())
 }
 
 // barAwareHandler wraps an slog.Handler so log output coordinates with the
@@ -191,24 +248,23 @@ func isTerminal(f *os.File) bool {
 }
 
 type progressBar struct {
-	label      string
-	width      int
-	showSpeed  bool
-	byteSized  bool // if true, show done/total as formatted byte sizes
-	startedAt  time.Time
-	total      atomic.Int64
-	done       atomic.Int64
-	bytesDone  atomic.Int64
-	lastDone   atomic.Int64
-	lastTotal  atomic.Int64
-	finished   atomic.Bool
-	pinBottom  bool         // if true, renders at the bottom of the bar stack
-	lastRender atomic.Int64 // unix nanos of last actual render; for throttling
+	label     string
+	width     int
+	showSpeed bool
+	byteSized bool // if true, show done/total as formatted byte sizes
+	startedAt time.Time
+	total     atomic.Int64
+	done      atomic.Int64
+	bytesDone atomic.Int64
+	lastDone  atomic.Int64
+	lastTotal atomic.Int64
+	finished  atomic.Bool
+	pinBottom bool // if true, renders at the bottom of the bar stack
 }
 
 const (
 	progressUninitialized = int64(-1)
-	renderMinInterval     = 500 * time.Millisecond // throttle renders from parallel goroutines
+	renderMinInterval     = 1 * time.Second // throttle renders from parallel goroutines
 
 	ansiReset = "\033[0m"
 	ansiBold  = "\033[1m"
@@ -336,6 +392,7 @@ func (p *progressBar) Finish() {
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 	rerenderActiveBars()
+	lastGlobalRender.Store(time.Now().UnixNano())
 	noActiveBars := len(activeBars) == 0
 	outputMu.Unlock()
 	if noActiveBars {
@@ -399,21 +456,23 @@ func (p *progressBar) render(done int64) {
 	}
 	p.lastDone.Store(done)
 	p.lastTotal.Store(total)
-	// Throttle: skip rendering if another render happened within renderMinInterval.
-	// This prevents parallel goroutines from flooding the terminal with ANSI escapes.
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	// Always register the bar so the background ticker (and future renders)
+	// will draw it, even if this call is throttled.
+	addActiveBar(p)
+	// Global throttle: coalesce redraws across all bars to at most one per
+	// renderMinInterval. The 1s elapsed ticker guarantees the screen still
+	// refreshes regularly even when updates are throttled.
 	now := time.Now().UnixNano()
-	last := p.lastRender.Load()
+	last := lastGlobalRender.Load()
 	if now-last < int64(renderMinInterval) {
 		return
 	}
-	if !p.lastRender.CompareAndSwap(last, now) {
+	if !lastGlobalRender.CompareAndSwap(last, now) {
 		return // another goroutine won the race
 	}
-	outputMu.Lock()
-	defer outputMu.Unlock()
-	clearActiveBars()
-	addActiveBar(p)
-	rerenderActiveBars()
+	redrawActiveBars()
 }
 
 func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool, elapsed time.Duration) string {
