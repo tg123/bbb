@@ -949,6 +949,76 @@ func TestRetryOpRetries500(t *testing.T) {
 	}
 }
 
+func TestRetryJitterWaitsBetweenAttempts(t *testing.T) {
+	t.Setenv("BBB_RETRY_JITTER", "20ms")
+	ctx := context.Background()
+	attempts := 0
+	start := time.Now()
+	err := retryOp(ctx, 3, func() error {
+		attempts++
+		if attempts < 4 {
+			return errors.New("retry")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryOp failed: %v", err)
+	}
+	if attempts != 4 {
+		t.Fatalf("expected 4 attempts, got %d", attempts)
+	}
+	// 3 retries each wait in [0, 20ms); ensure jitter does not hang. The
+	// first attempt has no wait.
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("unexpectedly slow with jitter: %v", elapsed)
+	}
+}
+
+func TestRetryJitterInvalidIgnored(t *testing.T) {
+	t.Setenv("BBB_RETRY_JITTER", "not-a-duration")
+	if d := retryJitter(); d != 0 {
+		t.Fatalf("expected 0 jitter for invalid value, got %v", d)
+	}
+	t.Setenv("BBB_RETRY_JITTER", "")
+	if d := retryJitter(); d != 0 {
+		t.Fatalf("expected 0 jitter when unset, got %v", d)
+	}
+	t.Setenv("BBB_RETRY_JITTER", "250ms")
+	if d := retryJitter(); d != 250*time.Millisecond {
+		t.Fatalf("expected 250ms jitter, got %v", d)
+	}
+}
+
+func TestForceS2SEnabled(t *testing.T) {
+	t.Setenv("BBB_AZBLOB_FORCE_S2S", "")
+	if forceS2SEnabled() {
+		t.Fatal("expected force-S2S off by default")
+	}
+	t.Setenv("BBB_AZBLOB_FORCE_S2S", "1")
+	if !forceS2SEnabled() {
+		t.Fatal("expected force-S2S on for 1")
+	}
+	t.Setenv("BBB_AZBLOB_FORCE_S2S", "true")
+	if !forceS2SEnabled() {
+		t.Fatal("expected force-S2S on for true")
+	}
+	t.Setenv("BBB_AZBLOB_FORCE_S2S", "0")
+	if forceS2SEnabled() {
+		t.Fatal("expected force-S2S off for 0")
+	}
+}
+
+func TestSleepJitterContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sleepJitter(ctx, time.Hour); err == nil {
+		t.Fatal("expected context error when canceled")
+	}
+	if err := sleepJitter(context.Background(), 0); err != nil {
+		t.Fatalf("expected no error for zero jitter, got %v", err)
+	}
+}
+
 func TestRunOpPoolWithRetry(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
