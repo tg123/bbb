@@ -274,10 +274,10 @@ func UploadStream(ctx context.Context, sp S3Path, reader io.Reader, concurrency 
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
+	uploader := manager.NewUploader(client, func(u *manager.Uploader) { //nolint:staticcheck // transfermanager replacement is still a v0.x developer preview; stay on the GA manager API
 		u.Concurrency = concurrency
 	})
-	_, err = uploader.Upload(ctx, &awss3.PutObjectInput{
+	_, err = uploader.Upload(ctx, &awss3.PutObjectInput{ //nolint:staticcheck // see manager.NewUploader note above
 		Bucket: aws.String(sp.Bucket),
 		Key:    aws.String(sp.Key),
 		Body:   reader,
@@ -300,10 +300,10 @@ func UploadFile(ctx context.Context, sp S3Path, file *os.File, concurrency int, 
 	if onProgress != nil {
 		body = &progressReader{r: file, read: &read, onProgress: onProgress}
 	}
-	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
+	uploader := manager.NewUploader(client, func(u *manager.Uploader) { //nolint:staticcheck // transfermanager replacement is still a v0.x developer preview; stay on the GA manager API
 		u.Concurrency = concurrency
 	})
-	_, err = uploader.Upload(ctx, &awss3.PutObjectInput{
+	_, err = uploader.Upload(ctx, &awss3.PutObjectInput{ //nolint:staticcheck // see manager.NewUploader note above
 		Bucket: aws.String(sp.Bucket),
 		Key:    aws.String(sp.Key),
 		Body:   body,
@@ -339,7 +339,7 @@ func DownloadFile(ctx context.Context, sp S3Path, file *os.File, concurrency int
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	downloader := manager.NewDownloader(client, func(d *manager.Downloader) {
+	downloader := manager.NewDownloader(client, func(d *manager.Downloader) { //nolint:staticcheck // transfermanager replacement is still a v0.x developer preview; stay on the GA manager API
 		d.Concurrency = concurrency
 	})
 	var w io.WriterAt = file
@@ -347,7 +347,7 @@ func DownloadFile(ctx context.Context, sp S3Path, file *os.File, concurrency int
 		var written atomic.Int64
 		w = &progressWriterAt{w: file, written: &written, onProgress: onProgress}
 	}
-	n, err := downloader.Download(ctx, w, &awss3.GetObjectInput{
+	n, err := downloader.Download(ctx, w, &awss3.GetObjectInput{ //nolint:staticcheck // see manager.NewDownloader note above
 		Bucket: aws.String(sp.Bucket),
 		Key:    aws.String(sp.Key),
 	})
@@ -708,7 +708,7 @@ func pathSegmentEscape(s string) string {
 			continue
 		}
 		b.WriteByte('%')
-		b.WriteString(fmt.Sprintf("%02X", r))
+		fmt.Fprintf(&b, "%02X", r)
 	}
 	return b.String()
 }
