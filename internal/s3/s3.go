@@ -67,7 +67,7 @@ func (p S3Path) Child(rel string) S3Path {
 	if p.Key == "" {
 		return S3Path{Bucket: p.Bucket, Key: rel}
 	}
-	return S3Path{Bucket: p.Bucket, Key: path.Clean(p.Key+"/"+rel)}
+	return S3Path{Bucket: p.Bucket, Key: path.Clean(p.Key + "/" + rel)}
 }
 
 // String renders the path back into its s3://bucket/key form.
