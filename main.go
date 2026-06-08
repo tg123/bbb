@@ -358,13 +358,14 @@ func main() {
 							if !bbbfs.IsS3(target) {
 								return fmt.Errorf("mkbucket: only s3:// paths supported")
 							}
-							bucket, err := bbbfs.S3Bucket(target)
+							sp, err := s3pkg.Parse(target)
 							if err != nil {
 								return fmt.Errorf("mkbucket: %w", err)
 							}
-							if bucket == "" {
+							if sp.Bucket == "" || sp.Key != "" {
 								return fmt.Errorf("mkbucket: need s3://bucket")
 							}
+							bucket := sp.Bucket
 							if err := bbbfs.MkDir(ctx, target); err != nil {
 								return err
 							}

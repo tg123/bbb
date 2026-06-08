@@ -143,6 +143,14 @@ func endpoint() string {
 	return strings.TrimSpace(os.Getenv("BBB_S3_ENDPOINT"))
 }
 
+// Endpoint returns the configured custom S3 endpoint (BBB_S3_ENDPOINT), or an
+// empty string when targeting AWS.
+func Endpoint() string { return endpoint() }
+
+// ForcePathStyle reports whether path-style addressing is forced
+// (BBB_S3_FORCE_PATH_STYLE).
+func ForcePathStyle() bool { return forcePathStyle() }
+
 // getClient returns a process-wide cached S3 client. Credentials and region are
 // resolved from the standard AWS sources (environment, shared config/credential
 // files, IAM roles). The endpoint and path-style addressing can be overridden
@@ -405,8 +413,16 @@ func MkBucket(ctx context.Context, bucket string) error {
 		var ae smithy.APIError
 		if errors.As(err, &ae) {
 			switch ae.ErrorCode() {
-			case "BucketAlreadyOwnedByYou", "BucketAlreadyExists":
+			case "BucketAlreadyOwnedByYou":
 				return nil
+			case "BucketAlreadyExists":
+				// On AWS this means the globally-unique name is taken by
+				// someone else, so surface it. Only treat it as idempotent
+				// success against S3-compatible endpoints (e.g. MinIO), where
+				// bucket names are local and a custom endpoint is configured.
+				if endpoint() != "" {
+					return nil
+				}
 			}
 		}
 		return err

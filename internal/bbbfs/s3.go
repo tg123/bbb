@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -347,16 +348,21 @@ func (s3FS) ShareInfo(p string) (portal, direct string, err error) {
 	if err != nil {
 		return "", "", err
 	}
+	if ep := s3pkg.Endpoint(); ep != "" {
+		base := strings.TrimRight(ep, "/")
+		if !s3pkg.ForcePathStyle() {
+			if u, perr := url.Parse(base); perr == nil && u.Host != "" {
+				direct = fmt.Sprintf("%s://%s.%s/%s", u.Scheme, sp.Bucket, u.Host, sp.Key)
+			}
+		}
+		if direct == "" {
+			direct = fmt.Sprintf("%s/%s/%s", base, sp.Bucket, sp.Key)
+		}
+		// S3-compatible endpoints have no vendor-agnostic web console, so
+		// surface the object URL for both.
+		return direct, direct, nil
+	}
 	portal = fmt.Sprintf("https://s3.console.aws.amazon.com/s3/object/%s?prefix=%s", sp.Bucket, sp.Key)
 	direct = fmt.Sprintf("https://%s.s3.amazonaws.com/%s", sp.Bucket, sp.Key)
 	return portal, direct, nil
-}
-
-// S3Bucket returns the bucket name from an s3:// path.
-func S3Bucket(p string) (string, error) {
-	sp, err := s3pkg.Parse(p)
-	if err != nil {
-		return "", err
-	}
-	return sp.Bucket, nil
 }
