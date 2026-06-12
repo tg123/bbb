@@ -110,9 +110,21 @@ func IsHF(path string) bool {
 	return hfProvider.Match(path)
 }
 
+// IsS3 returns true if the path targets an Amazon S3 (or S3-compatible) backend.
+func IsS3(path string) bool {
+	return s3Provider.Match(path)
+}
+
+// IsObjectStore returns true if the path targets a remote object-store backend
+// with virtual-directory semantics, chunked transfer and Stat-based existence
+// checks (Azure Blob Storage or Amazon S3).
+func IsObjectStore(path string) bool {
+	return IsAz(path) || IsS3(path)
+}
+
 // IsRemote returns true if the path targets a remote (non-local) backend.
 func IsRemote(path string) bool {
-	return IsAz(path) || IsHF(path)
+	return IsAz(path) || IsHF(path) || IsS3(path)
 }
 
 // dirChecker is an optional FS extension for checking whether a path is directory-like.
@@ -234,12 +246,23 @@ type serverSideCopier interface {
 }
 
 // CanCopyServerSide returns true when both src and dst can use server-side copy.
+// Server-side copy is only valid within the same provider (Azure→Azure or
+// S3→S3), never across providers.
 func CanCopyServerSide(src, dst string) bool {
 	srcFS := Resolve(src)
 	dstFS := Resolve(dst)
 	_, srcOK := srcFS.(serverSideCopier)
 	_, dstOK := dstFS.(serverSideCopier)
-	return srcOK && dstOK && IsAz(src) && IsAz(dst)
+	if !srcOK || !dstOK {
+		return false
+	}
+	if IsAz(src) && IsAz(dst) {
+		return true
+	}
+	if IsS3(src) && IsS3(dst) {
+		return true
+	}
+	return false
 }
 
 // CopyServerSide performs an optimised server-side copy (e.g. Azure→Azure).

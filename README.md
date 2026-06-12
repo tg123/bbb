@@ -1,6 +1,6 @@
 # bbb
 
-A Go fork of [boostedblob](https://github.com/hauntsaninja/boostedblob) — a fast, concurrent CLI for working with local files, Azure Blob Storage (`az://`), and Hugging Face (`hf://`).
+A Go fork of [boostedblob](https://github.com/hauntsaninja/boostedblob) — a fast, concurrent CLI for working with local files, Azure Blob Storage (`az://`), Amazon S3 (`s3://`), and Hugging Face (`hf://`).
 
 ## Why a fork of boostedblob
 
@@ -21,6 +21,7 @@ go install github.com/tg123/bbb@latest
 |--------|-------------|---------|
 | *(none)* | Local filesystem | `/tmp/data/`, `./file.txt` |
 | `az://` | Azure Blob Storage | `az://myaccount/mycontainer/path/to/blob` |
+| `s3://` | Amazon S3 (and S3-compatible stores) | `s3://mybucket/path/to/object` |
 | `hf://` | Hugging Face Hub | `hf://meta-llama/Llama-2-7b/weights.bin`, `hf://datasets/org/repo/data.csv` |
 
 ## Global Flags
@@ -141,6 +142,37 @@ bbb sync az://src-account/data/ az://dst-account/data/
 2. Role env credential via `DefaultAzureCredential` — `SRC_AZURE_*` / `DST_AZURE_*`, falling back to unprefixed `AZURE_*` defaults. Accounts without an explicit role (single-endpoint commands like `ls`/`cat`/`rm`) reuse the `SRC` role, so unprefixed `AZURE_*` (and `SRC_AZURE_*`) are honored for them.
 3. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
 4. Interactive browser login (fallback)
+
+### Amazon S3 (`s3://`) Authentication and Configuration
+
+S3 paths use the standard AWS SDK credential and region resolution chain, so any
+mechanism the AWS CLI/SDK understands works out of the box: environment
+variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`),
+shared config/credential files (`~/.aws/credentials`, `AWS_PROFILE`), SSO, and
+IAM instance/task roles.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | `us-east-1` | AWS region for S3 requests |
+| `BBB_S3_REGION` | *(unset)* | Overrides the region for bbb only (takes precedence over `AWS_REGION`) |
+| `BBB_S3_ENDPOINT` | *(unset)* | Custom endpoint URL for S3-compatible stores (e.g. MinIO, Cloudflare R2, Wasabi) |
+| `BBB_S3_FORCE_PATH_STYLE` | `0` | Set to `1`/`true` to use path-style addressing (required by most S3-compatible servers) |
+
+Example using an S3-compatible server (MinIO):
+
+```bash
+export AWS_ACCESS_KEY_ID=minioadmin
+export AWS_SECRET_ACCESS_KEY=minioadmin
+export BBB_S3_ENDPOINT=http://127.0.0.1:9000
+export BBB_S3_FORCE_PATH_STYLE=1
+
+bbb cp ./data.bin s3://mybucket/data.bin
+bbb ls s3://mybucket/
+```
+
+S3→S3 copies (within the same account/endpoint) use server-side `CopyObject`
+— with a multipart `UploadPartCopy` fallback for objects larger than 5 GiB —
+and never stream bytes through the client.
 
 ### `BBB_DNS_CACHE`
 
@@ -613,6 +645,19 @@ bbb az mkcontainer az://account/container
 ```bash
 # Create a new Azure Blob container
 bbb az mkcontainer az://myaccount/newcontainer
+```
+
+### `s3 mkbucket` — Create an S3 bucket
+
+```
+bbb s3 mkbucket s3://bucket
+```
+
+**Example:**
+
+```bash
+# Create a new S3 bucket
+bbb s3 mkbucket s3://newbucket
 ```
 
 ## Benchmark
