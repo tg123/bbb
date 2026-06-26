@@ -32,6 +32,7 @@ import (
 	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/fsops"
 	"github.com/tg123/bbb/internal/hf"
+	s3pkg "github.com/tg123/bbb/internal/s3"
 )
 
 var mainver string = "(devel)"
@@ -300,6 +301,7 @@ func main() {
 				// early enough.
 				azblob.SetHTTPTransport(transport)
 				hf.SetHTTPClient(&http.Client{Transport: transport})
+				s3pkg.SetHTTPClient(&http.Client{Transport: transport})
 			}
 
 			return ctx, nil
@@ -334,6 +336,40 @@ func main() {
 								return err
 							}
 							fmt.Printf("Created container %s/%s\n", account, container)
+							return nil
+						},
+					},
+				},
+			},
+			{
+				Name:      "s3",
+				Usage:     "Amazon S3 related commands",
+				UsageText: "bbb s3 <command>",
+				Commands: []*cli.Command{
+					{
+						Name:      "mkbucket",
+						Usage:     "Create an S3 bucket",
+						UsageText: "bbb s3 mkbucket s3://bucket",
+						Action: func(ctx context.Context, c *cli.Command) error {
+							if c.Args().Len() != 1 {
+								return fmt.Errorf("mkbucket: need s3://bucket")
+							}
+							target := c.Args().Get(0)
+							if !bbbfs.IsS3(target) {
+								return fmt.Errorf("mkbucket: only s3:// paths supported")
+							}
+							sp, err := s3pkg.Parse(target)
+							if err != nil {
+								return fmt.Errorf("mkbucket: %w", err)
+							}
+							if sp.Bucket == "" || sp.Key != "" {
+								return fmt.Errorf("mkbucket: need s3://bucket")
+							}
+							bucket := sp.Bucket
+							if err := bbbfs.MkDir(ctx, target); err != nil {
+								return err
+							}
+							fmt.Printf("Created bucket %s\n", bucket)
 							return nil
 						},
 					},
@@ -683,7 +719,7 @@ func cmdTouch(ctx context.Context, c *cli.Command) error {
 	ts := time.Now()
 	for i := 0; i < c.Args().Len(); i++ {
 		p := c.Args().Get(i)
-		if bbbfs.IsAz(p) {
+		if bbbfs.IsObjectStore(p) {
 			if err := bbbfs.Touch(ctx, p); err != nil {
 				return err
 			}
@@ -1206,28 +1242,28 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	if bbbfs.IsHF(dst) {
 		return fmt.Errorf("cp: hf:// only supported as source")
 	}
-	dstAz := bbbfs.IsAz(dst)
-	// Determine if dst is directory (local or Azure)
+	dstObj := bbbfs.IsObjectStore(dst)
+	// Determine if dst is directory (local or remote object store)
 	isDstDir := bbbfs.IsDirLikeFromPath(dst)
 	type cpDirOp struct {
 		src string
 		dst string
 	}
 	type cpFileOp struct {
-		src   string
-		dst   string
-		srcAz bool
-		dstAz bool
-		size  int64
-		base  string
+		src    string
+		dst    string
+		srcObj bool
+		dstObj bool
+		size   int64
+		base   string
 	}
 	dirOps := make([]cpDirOp, 0, len(srcs))
 	fileOps := make([]cpFileOp, 0, len(srcs))
 	for _, src := range srcs {
 		src := src
-		srcAz := bbbfs.IsAz(src)
+		srcObj := bbbfs.IsObjectStore(src)
 		base := bbbfs.BaseName(src)
-		if bbbfs.IsHF(src) || srcAz {
+		if bbbfs.IsHF(src) || srcObj {
 			dirLike, err := bbbfs.IsDirLike(ctx, src)
 			if err != nil {
 				return err
@@ -1236,12 +1272,12 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
 				continue
 			}
-			// IsDirLike only checks path syntax. For Azure sources,
-			// verify the blob exists; if not, the path may be a virtual
+			// IsDirLike only checks path syntax. For object-store sources,
+			// verify the object exists; if not, the path may be a virtual
 			// directory prefix. Skip the expensive Stat for HF sources.
-			if srcAz {
+			if srcObj {
 				if _, statErr := bbbfs.Resolve(src).Stat(ctx, src); statErr != nil {
-					slog.Debug("source not found as blob, trying as directory", "src", src, "error", statErr)
+					slog.Debug("source not found as object, trying as directory", "src", src, "error", statErr)
 					dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
 					continue
 				}
@@ -1262,12 +1298,12 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			dstPath = dst
 		}
 		fileOps = append(fileOps, cpFileOp{
-			src:   src,
-			dst:   dstPath,
-			srcAz: srcAz,
-			dstAz: dstAz,
-			size:  srcSize,
-			base:  base,
+			src:    src,
+			dst:    dstPath,
+			srcObj: srcObj,
+			dstObj: dstObj,
+			size:   srcSize,
+			base:   base,
 		})
 	}
 	for _, op := range dirOps {
@@ -1284,7 +1320,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	cpPoolSize := concurrency
 	blockConcurrency := concurrency
 	for _, op := range fileOps {
-		if op.dstAz {
+		if op.dstObj {
 			if concurrency >= 2 {
 				cpPoolSize = max(2, concurrency/4)
 				if cpPoolSize > concurrency {
@@ -1322,8 +1358,8 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				size = info.Size
 			}
 		}
-		// Az→Az: server-side copy with progress
-		if op.srcAz && op.dstAz {
+		// Same-provider server-side copy with progress (Az→Az or S3→S3).
+		if bbbfs.CanCopyServerSide(op.src, op.dst) {
 			if !overwrite {
 				if exists, _ := bbbfs.ExistsAsBlob(ctx, op.dst); exists {
 					return 0, errors.New("cp: destination exists")
@@ -1466,10 +1502,10 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			}
 		}
 		if bbbfs.IsRemote(op.src) || bbbfs.IsRemote(op.dst) {
-			// local→Az single-file: use parallel ranged uploads for higher
-			// throughput (mirrors azcopy's chunked upload). Opt out with
+			// local→object store single-file: use parallel ranged uploads for
+			// higher throughput (mirrors azcopy's chunked upload). Opt out with
 			// BBB_PARALLEL_UPLOAD=0 to fall back to the streaming path.
-			if !op.srcAz && op.dstAz && !bbbfs.IsRemote(op.src) &&
+			if !bbbfs.IsRemote(op.src) && op.dstObj &&
 				parallelUploadEnabled() && bbbfs.CanUploadFromFile(op.dst) {
 				var copyBar *progressBar
 				if showCopyBar {
@@ -1515,10 +1551,10 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				}
 				return n, nil
 			}
-			// Az→local single-file: use parallel ranged download for higher
-			// throughput (mirrors azcopy's chunked download). Opt out with
+			// object store→local single-file: use parallel ranged download for
+			// higher throughput (mirrors azcopy's chunked download). Opt out with
 			// BBB_PARALLEL_DOWNLOAD=0 to fall back to the single-stream path.
-			if op.srcAz && !op.dstAz && !bbbfs.IsRemote(op.dst) &&
+			if op.srcObj && !bbbfs.IsRemote(op.dst) &&
 				parallelDownloadEnabled() && bbbfs.CanDownloadToFile(op.src) {
 				var copyBar *progressBar
 				if showCopyBar {
@@ -1581,10 +1617,10 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				}
 				return 0, err
 			}
-			// Parallelize block uploads when writing to Azure so a single
-			// large file is not staged one block at a time.
+			// Parallelize block uploads when writing to a remote object store
+			// so a single large file is not staged one block at a time.
 			writeCtx := ctx
-			if op.dstAz {
+			if op.dstObj {
 				writeCtx = bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
 			}
 			var streamCopied atomic.Int64
@@ -1652,9 +1688,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPrefix string, concurrency int, retryCount int) error {
 	if bbbfs.IsRemote(src) || bbbfs.IsRemote(dst) {
 		// Remote copy: list source files and copy each
-		srcAz, dstAz := bbbfs.IsAz(src), bbbfs.IsAz(dst)
-		if srcAz && dstAz {
-			// Az→Az: server-side copy with per-file progress.
+		dstObj := bbbfs.IsObjectStore(dst)
+		if bbbfs.CanCopyServerSide(src, dst) {
+			// Same-provider (Az→Az or S3→S3): server-side copy with per-file progress.
 			// Stream listing into the worker pool so copy work starts
 			// while listing is still in progress.
 			type ssOp struct {
@@ -1774,7 +1810,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		// stage blocks serially (block concurrency 1).
 		fileWorkers := concurrency
 		blockConcurrency := concurrency
-		if dstAz {
+		if dstObj {
 			if concurrency >= 2 {
 				fileWorkers = max(2, concurrency/4)
 				if fileWorkers > concurrency {
@@ -1819,7 +1855,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				return err
 			}
 			writeCtx := ctx
-			if dstAz {
+			if dstObj {
 				writeCtx = bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
 			}
 			var streamCopied atomic.Int64
@@ -1985,7 +2021,7 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 		}
 		return nil
 	}, func(op rmOp) error {
-		if bbbfs.IsAz(op.path) {
+		if bbbfs.IsObjectStore(op.path) {
 			if err := bbbfs.Delete(ctx, op.path); err != nil {
 				if force {
 					lower := strings.ToLower(err.Error())
@@ -2025,7 +2061,7 @@ func cmdRMTree(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("rmtree: need directory root")
 	}
 	root := c.Args().Get(0)
-	if bbbfs.IsAz(root) {
+	if bbbfs.IsObjectStore(root) {
 		files, err := bbbfs.ListFilesFlat(ctx, root)
 		if err != nil {
 			return err
@@ -2080,6 +2116,16 @@ func cmdShare(ctx context.Context, c *cli.Command) error {
 		}
 		fmt.Println("Azure Portal:", portal)
 		fmt.Println("Direct Blob (if public):", direct)
+		return nil
+	}
+	if bbbfs.IsS3(p) {
+		console, direct, err := bbbfs.ParseShareInfo(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "share: %s: %v\n", p, err)
+			return err
+		}
+		fmt.Println("S3 Console:", console)
+		fmt.Println("Direct Object (if public):", direct)
 		return nil
 	}
 	// For local files, print a file:// link
@@ -2242,19 +2288,19 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 	} else {
 		excludeMatch = func(string) bool { return false }
 	}
-	if bbbfs.IsAz(src) || bbbfs.IsAz(dst) || srcHF {
-		srcAz, dstAz := bbbfs.IsAz(src), bbbfs.IsAz(dst)
+	if bbbfs.IsObjectStore(src) || bbbfs.IsObjectStore(dst) || srcHF {
+		srcObj, dstObj := bbbfs.IsObjectStore(src), bbbfs.IsObjectStore(dst)
 		type item struct {
 			rel  string
 			size int64
 		}
 		// Distribute concurrency between file-level and block-level parallelism
-		// for Az→Az server-side copies and uploads to Azure: total goroutines =
-		// syncWorkers × blockConcurrency ≤ concurrency. Without this, uploads
-		// would stage blocks serially (block concurrency 1).
+		// for same-provider server-side copies and uploads to object stores:
+		// total goroutines = syncWorkers × blockConcurrency ≤ concurrency.
+		// Without this, uploads would stage blocks serially (block concurrency 1).
 		syncWorkers := concurrency
 		blockConcurrency := concurrency
-		if dstAz {
+		if dstObj {
 			if concurrency < 2 {
 				syncWorkers = 1
 				blockConcurrency = 1
@@ -2266,8 +2312,8 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				blockConcurrency = max(1, concurrency/syncWorkers)
 			}
 		}
-		// Build producer: for Azure sources, stream listing into the worker
-		// pool so processing starts while listing continues. For HF and
+		// Build producer: for object-store sources, stream listing into the
+		// worker pool so processing starts while listing continues. For HF and
 		// local→remote paths, collect first (these are either small or have
 		// different constraints).
 		var syncProgress *progressBar
@@ -2279,7 +2325,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		}
 		var totalItems atomic.Int64
 		producer := func(pending chan<- item) error {
-			if srcAz {
+			if srcObj {
 				return bbbfs.ListRecursiveWithSizeStream(ctx, src, func(entry bbbfs.Entry) error {
 					if entry.Name == "" || excludeMatch(entry.Name) {
 						return nil
@@ -2336,7 +2382,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			sPath := f.rel
 			srcChild := bbbfs.ChildPath(src, sPath)
 			dstChild := bbbfs.ChildPath(dst, sPath)
-			if srcAz && dstAz {
+			if bbbfs.CanCopyServerSide(srcChild, dstChild) {
 				if dry {
 					if !quiet {
 						lockedPrintln("COPY", srcChild, "->", dstChild)
@@ -2386,7 +2432,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				return fmt.Errorf("sync: %s: %w", sPath, err)
 			}
 			writeCtx := ctx
-			if dstAz {
+			if dstObj {
 				writeCtx = bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
 			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
@@ -2577,7 +2623,7 @@ func cmdLL(ctx context.Context, c *cli.Command) error {
 	relFlag := c.Bool("s")
 	parentPath, pattern := splitWildcard(target)
 	fs := bbbfs.Resolve(parentPath)
-	if bbbfs.IsAz(parentPath) {
+	if bbbfs.IsObjectStore(parentPath) {
 		var totalSize int64
 		var count int
 		var anyListed bool
