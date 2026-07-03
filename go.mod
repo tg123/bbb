@@ -12,7 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.103.0
 	github.com/aws/smithy-go v1.26.0
 	github.com/creack/pty v1.1.24
-	github.com/urfave/cli/v3 v3.10.0
+	github.com/urfave/cli/v3 v3.10.1
 	golang.org/x/sys v0.46.0
 )
 
