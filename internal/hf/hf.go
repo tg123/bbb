@@ -171,13 +171,18 @@ func ResolveDirectURL(ctx context.Context, p Path) (directURL string, size int64
 	if err != nil {
 		return "", 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, resolveURL, nil)
+	// Use HEAD (not a ranged GET) so we resolve redirects and read headers
+	// without downloading the file through this client. Critically, we must
+	// NOT send a Range header: Hugging Face's Xet/CloudFront bridge bakes the
+	// requested Range into the signed URL's policy (ByteRange condition), which
+	// would restrict the resulting URL to that exact range and cause Azure's
+	// server-side copy (StageBlockFromURL / CopyFromURL) to fail with 403
+	// CannotVerifyCopySource. A rangeless HEAD yields a signed URL that accepts
+	// arbitrary Range requests, which is required for block-based S2S copy.
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, resolveURL, nil)
 	if err != nil {
 		return "", 0, err
 	}
-	// Request only the first byte so we resolve redirects and read headers
-	// without downloading the whole file through this client.
-	req.Header.Set("Range", "bytes=0-0")
 	resp, err := doRequest(req)
 	if err != nil {
 		return "", 0, err
