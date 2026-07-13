@@ -1654,3 +1654,75 @@ func TestCopySourceOAuthURLNoDoubleSlash(t *testing.T) {
 		t.Fatalf("source URL = %q, want %q", srcURL, want)
 	}
 }
+
+// TestCopyBlobFromURLServerSideSelfHealsInvalidBlobOrBlock verifies that when
+// StageBlockFromURL is rejected with InvalidBlobOrBlock (a destination blob
+// poisoned by stale uncommitted blocks of a different ID length), the copy
+// path deletes the poisoned blob and retries the stage+commit exactly once,
+// ultimately succeeding.
+func TestCopyBlobFromURLServerSideSelfHealsInvalidBlobOrBlock(t *testing.T) {
+	prev := sharedHTTPClient.Load()
+	t.Cleanup(func() { sharedHTTPClient.Store(prev) })
+
+	account := "selfhealcheck"
+	blobClientCache.Delete(account)
+	t.Cleanup(func() { blobClientCache.Delete(account) })
+
+	// Shared-key credential bypasses token acquisition network calls.
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "dGVzdGtleQ==") // base64("testkey")
+
+	var stageCalls, commitCalls, deleteCalls atomic.Int64
+	var deleted atomic.Bool
+
+	nopBody := func() io.ReadCloser { return io.NopCloser(strings.NewReader("")) }
+	SetHTTPTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		comp := req.URL.Query().Get("comp")
+		switch {
+		case req.Method == http.MethodDelete:
+			deleteCalls.Add(1)
+			deleted.Store(true)
+			return &http.Response{StatusCode: 202, Header: http.Header{}, Body: nopBody(), Request: req}, nil
+		case req.Method == http.MethodPut && comp == "block":
+			stageCalls.Add(1)
+			if !deleted.Load() {
+				// Poisoned: reject staging with InvalidBlobOrBlock until the
+				// blob is cleared.
+				return &http.Response{
+					StatusCode: 400,
+					Header:     http.Header{"X-Ms-Error-Code": []string{string(bloberror.InvalidBlobOrBlock)}},
+					Body:       io.NopCloser(strings.NewReader(`<?xml version="1.0"?><Error><Code>InvalidBlobOrBlock</Code><Message>poisoned</Message></Error>`)),
+					Request:    req,
+				}, nil
+			}
+			return &http.Response{StatusCode: 201, Header: http.Header{}, Body: nopBody(), Request: req}, nil
+		case req.Method == http.MethodPut && comp == "blocklist":
+			commitCalls.Add(1)
+			return &http.Response{StatusCode: 201, Header: http.Header{}, Body: nopBody(), Request: req}, nil
+		default:
+			return &http.Response{StatusCode: 201, Header: http.Header{}, Body: nopBody(), Request: req}, nil
+		}
+	}))
+	t.Cleanup(func() { SetHTTPTransport(nil) })
+
+	dst := AzurePath{Account: account, Container: "c", Blob: "poisoned.bin"}
+	var lastCopied, lastTotal int64
+	err := CopyBlobFromURLServerSide(context.Background(), dst,
+		"https://source.example/blob?sig=abc", 8, 1, func(copied, total int64) {
+			lastCopied, lastTotal = copied, total
+		})
+	if err != nil {
+		t.Fatalf("CopyBlobFromURLServerSide should self-heal and succeed, got: %v", err)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 delete (self-heal), got %d", got)
+	}
+	if got := stageCalls.Load(); got < 2 {
+		t.Fatalf("expected at least 2 stage attempts (initial failure + retry), got %d", got)
+	}
+	if got := commitCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 successful commit after retry, got %d", got)
+	}
+	if lastCopied != 8 || lastTotal != 8 {
+		t.Fatalf("expected final progress 8/8, got %d/%d", lastCopied, lastTotal)
+	}
+}

@@ -1141,6 +1141,12 @@ func uploadInitialConcurrencyForSize(caller int, size int64) int {
 // prior aborted upload — the poisoned blob is cleared and the upload is retried
 // once from a clean slate.
 func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) error {
+	// Guard against non-monotonic progress across the self-heal retry below,
+	// which restarts the byte counter from zero.
+	if onProgress != nil {
+		var last atomic.Int64
+		onProgress = monotonicProgress(&last, onProgress)
+	}
 	err := uploadFileOnce(ctx, ap, file, concurrency, onProgress)
 	if err != nil && isInvalidBlobOrBlock(err) {
 		slog.Warn("upload hit InvalidBlobOrBlock; clearing stale uncommitted blocks and retrying", "dst", ap.String())
@@ -1174,7 +1180,7 @@ func uploadFileOnce(ctx context.Context, ap AzurePath, file *os.File, concurrenc
 	if size == 0 {
 		_, err := blockBlobClient.CommitBlockList(ctx, nil, nil)
 		if err != nil {
-			return fmt.Errorf("put failed: %v", err)
+			return fmt.Errorf("put failed: %w", err)
 		}
 		if onProgress != nil {
 			onProgress(0)
@@ -1536,7 +1542,7 @@ func Upload(ctx context.Context, ap AzurePath, data []byte) error {
 	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
 	_, err = blobClient.UploadBuffer(ctx, data, nil)
 	if err != nil {
-		return fmt.Errorf("put failed: %v", err)
+		return fmt.Errorf("put failed: %w", err)
 	}
 	return nil
 }
@@ -1672,7 +1678,7 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader, concurren
 		Concurrency: concurrency,
 	})
 	if err != nil {
-		return fmt.Errorf("put failed: %v", err)
+		return fmt.Errorf("put failed: %w", err)
 	}
 	return nil
 }
@@ -1748,6 +1754,11 @@ func clearUncommittedBlocks(ctx context.Context, client *azblob.Client, ap Azure
 
 // CopyProgress is called during server-side copy with the number of
 // bytes copied so far and the total size in bytes.
+//
+// It may be invoked concurrently from multiple StageBlockFromURL goroutines,
+// so implementations must be goroutine-safe. The copied value passed to a
+// single CopyProgress is already clamped to be monotonically non-decreasing,
+// even across an internal InvalidBlobOrBlock self-heal retry.
 type CopyProgress func(copied, total int64)
 
 func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concurrency int, sizeHint int64, onProgress CopyProgress) error {
@@ -1993,6 +2004,14 @@ func CopyBlobFromURLServerSide(ctx context.Context, dst AzurePath, sourceURL str
 // prior aborted upload — the poisoned blob is cleared and the copy is retried
 // once from a clean slate.
 func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, concurrency int, onProgress CopyProgress) error {
+	// Guard against non-monotonic progress across the self-heal retry below,
+	// which restarts the byte counter from zero.
+	if onProgress != nil {
+		orig := onProgress
+		var last atomic.Int64
+		emit := monotonicProgress(&last, func(copied int64) { orig(copied, totalSize) })
+		onProgress = func(copied, _ int64) { emit(copied) }
+	}
 	err := copyBlobBlocksOnce(ctx, client, dst, copySource, sourceAuth, totalSize, concurrency, onProgress)
 	if err != nil && isInvalidBlobOrBlock(err) {
 		slog.Warn("server-side copy hit InvalidBlobOrBlock; clearing stale uncommitted blocks and retrying", "dst", dst.String())
