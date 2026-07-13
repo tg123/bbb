@@ -1733,7 +1733,7 @@ func planBlocks(totalSize int64, defaultBlockSize int64, maxBlocks int64) (block
 // stale uncommitted blocks are cleared.
 func isInvalidBlobOrBlock(err error) bool {
 	var respErr *azcore.ResponseError
-	return errors.As(err, &respErr) && respErr.ErrorCode == "InvalidBlobOrBlock"
+	return errors.As(err, &respErr) && respErr.ErrorCode == string(bloberror.InvalidBlobOrBlock)
 }
 
 // clearUncommittedBlocks deletes the destination blob to discard any
