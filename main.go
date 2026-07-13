@@ -2415,6 +2415,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				// short-lived. Fall back to streaming the file through this
 				// client via a temp file + size-aware block upload.
 				slog.Debug("HF→Az server-side copy failed, falling back to streaming", "src", srcChild, "error", err)
+				lockedFprintf(os.Stderr, "sync: %s: server-side copy failed (%v); falling back to streaming\n", sPath, err)
 				reader, rerr := bbbfs.Resolve(srcChild).Read(ctx, srcChild)
 				if rerr != nil {
 					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, rerr)
