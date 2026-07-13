@@ -27,6 +27,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
@@ -1731,11 +1732,17 @@ func isInvalidBlobOrBlock(err error) bool {
 
 // clearUncommittedBlocks deletes the destination blob to discard any
 // uncommitted blocks poisoning it, so a subsequent staged upload starts from a
-// clean slate. Best effort: a missing blob (nothing to clear) is not an error.
+// clean slate. Best effort: a missing blob (BlobNotFound — nothing to clear) is
+// expected and ignored silently; any other delete error is logged at Warn for
+// diagnosis but not returned, since the caller retries the upload regardless.
 func clearUncommittedBlocks(ctx context.Context, client *azblob.Client, ap AzurePath) {
 	bbc := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
 	if _, err := bbc.Delete(ctx, nil); err != nil {
-		slog.Debug("clearUncommittedBlocks: delete returned error (ignored)", "dst", ap.String(), "err", err)
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.ErrorCode == string(bloberror.BlobNotFound) {
+			return
+		}
+		slog.Warn("clearUncommittedBlocks: delete failed (ignored)", "dst", ap.String(), "err", err)
 	}
 }
 
