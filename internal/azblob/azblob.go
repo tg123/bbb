@@ -1900,6 +1900,44 @@ func copyBlockSizeBytes(size int64) int64 {
 	return block
 }
 
+// CopyBlobFromURLServerSide copies an external, publicly-readable HTTP(S)
+// source URL directly into an Azure blob without streaming the bytes through
+// this client. It is used for cross-backend server-side copy (e.g. Hugging
+// Face → Azure), where the source URL is a public/signed CDN URL. size must be
+// the exact source size in bytes.
+func CopyBlobFromURLServerSide(ctx context.Context, dst AzurePath, sourceURL string, size int64, concurrency int, onProgress CopyProgress) error {
+	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
+		return errors.New("destination path is directory-like")
+	}
+	if sourceURL == "" {
+		return errors.New("empty source URL")
+	}
+	if size < 0 {
+		return errors.New("unknown source size")
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	client, err := getAzBlobClient(ctx, dst.Account)
+	if err != nil {
+		return err
+	}
+	// The external source URL already carries its own auth (a signed CDN
+	// query string), so no x-ms-copy-source-authorization header is sent.
+	err = copyBlobBlocks(ctx, client, dst, sourceURL, "", size, concurrency, onProgress)
+	if err != nil {
+		// StageBlockFromURL (Put Block From URL) returns 501 in emulators
+		// like Azurite. Fall back to the async StartCopyFromURL approach.
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.StatusCode == 501 {
+			slog.Debug("StageBlockFromURL not supported, falling back to StartCopyFromURL", "dst", dst.String())
+			return copyBlobAsync(ctx, client, dst, sourceURL, size, onProgress)
+		}
+		return err
+	}
+	return nil
+}
+
 // copyBlobBlocks copies a blob using parallel StageBlockFromURL + CommitBlockList.
 //
 // When sourceAuth is non-empty, it is forwarded as

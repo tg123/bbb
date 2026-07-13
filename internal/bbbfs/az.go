@@ -244,6 +244,47 @@ func (azFS) CopyServerSide(ctx context.Context, src, dst string, concurrency int
 	return azblob.CopyBlobServerSide(ctx, srcAP, dstAP, concurrency, sizeHint, onProgress)
 }
 
+// CopyFromURLServerSide copies a public source URL directly into an Azure blob
+// server-side, without streaming bytes through this process.
+func (azFS) CopyFromURLServerSide(ctx context.Context, sourceURL, dst string, size int64, concurrency int, onProgress CopyProgress) error {
+	dstAP, err := azblob.Parse(dst)
+	if err != nil {
+		return err
+	}
+	return azblob.CopyBlobFromURLServerSide(ctx, dstAP, sourceURL, size, concurrency, onProgress)
+}
+
+// UploadReader ingests an arbitrary reader into an Azure blob by first spooling
+// it to a temporary file and then using the size-aware parallel block-staging
+// upload path (16 MiB blocks), which is more robust on real Azure than the
+// SDK's streaming uploader (whose 256 MiB block floor can trigger
+// InvalidBlobOrBlock on some accounts). onProgress, when non-nil, receives the
+// cumulative number of bytes uploaded.
+func (azFS) UploadReader(ctx context.Context, dst string, r io.Reader, concurrency int, onProgress func(copied int64)) error {
+	ap, err := azblob.Parse(dst)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp("", "bbb-upload-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+	if _, err := io.Copy(tmp, r); err != nil {
+		return err
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	// UploadFile reports cumulative bytes uploaded, matching onProgress's
+	// contract, so it is forwarded directly.
+	return azblob.UploadFile(ctx, ap, tmp, concurrency, onProgress)
+}
+
 func (azFS) ListStream(ctx context.Context, p string, fn func(Entry) error) error {
 	ap, err := azblob.Parse(p)
 	if err != nil {

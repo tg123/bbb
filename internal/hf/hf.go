@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -159,6 +160,80 @@ type downloadReadCloser struct {
 // Size reports the HTTP Content-Length or -1 if unknown.
 func (d downloadReadCloser) Size() int64 {
 	return d.size
+}
+
+// ResolveDirectURL resolves the final, redirect-followed download URL for a
+// Hugging Face file along with its size in bytes. The returned URL is a public
+// (typically signed CDN) URL suitable for server-side copy by another service
+// (e.g. Azure Blob's copy-from-URL). Size is -1 when unknown.
+func ResolveDirectURL(ctx context.Context, p Path) (directURL string, size int64, err error) {
+	resolveURL, err := p.URL()
+	if err != nil {
+		return "", 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, resolveURL, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	// Request only the first byte so we resolve redirects and read headers
+	// without downloading the whole file through this client.
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := doRequest(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", 0, fmt.Errorf("hf resolve failed: %w", &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status})
+	}
+	directURL = resolveURL
+	if resp.Request != nil && resp.Request.URL != nil {
+		directURL = resp.Request.URL.String()
+	}
+	size = resolvedSize(resp)
+	return directURL, size, nil
+}
+
+// resolvedSize derives the total file size from a resolve response, preferring
+// the Content-Range total (present on a ranged 206), then Hugging Face's
+// X-Linked-Size header, then Content-Length. Returns -1 when unknown.
+func resolvedSize(resp *http.Response) int64 {
+	if total := parseContentRangeTotal(resp.Header.Get("Content-Range")); total >= 0 {
+		return total
+	}
+	if v := resp.Header.Get("X-Linked-Size"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	if resp.ContentLength >= 0 && resp.Request != nil && resp.Request.Header.Get("Range") == "" {
+		return resp.ContentLength
+	}
+	return -1
+}
+
+// parseContentRangeTotal extracts the total size from a Content-Range header
+// value of the form "bytes 0-0/12345". Returns -1 when the total is unknown
+// or unparseable.
+func parseContentRangeTotal(v string) int64 {
+	if v == "" {
+		return -1
+	}
+	idx := strings.LastIndex(v, "/")
+	if idx < 0 {
+		return -1
+	}
+	total := strings.TrimSpace(v[idx+1:])
+	if total == "" || total == "*" {
+		return -1
+	}
+	n, err := strconv.ParseInt(total, 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 // ListFiles retrieves repo files for directory-like paths.
