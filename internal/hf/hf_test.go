@@ -56,17 +56,21 @@ func TestResolveDirectURL(t *testing.T) {
 	const cdnURL = "https://cdn-lfs.huggingface.co/repo/model.bin?sig=abc"
 	original := doRequest
 	doRequest = func(req *http.Request) (*http.Response, error) {
-		if req.Header.Get("Range") != "bytes=0-0" {
-			t.Fatalf("expected range header, got %q", req.Header.Get("Range"))
+		if req.Method != http.MethodHead {
+			t.Fatalf("expected HEAD request, got %q", req.Method)
 		}
-		hdr := make(http.Header)
-		hdr.Set("Content-Range", "bytes 0-0/1048576")
-		finalReq, _ := http.NewRequest(http.MethodGet, cdnURL, nil)
+		// A Range header would range-lock the signed CDN URL and break
+		// server-side copy, so it must not be sent.
+		if r := req.Header.Get("Range"); r != "" {
+			t.Fatalf("expected no range header, got %q", r)
+		}
+		finalReq, _ := http.NewRequest(http.MethodHead, cdnURL, nil)
 		return &http.Response{
-			StatusCode: http.StatusPartialContent,
-			Body:       io.NopCloser(strings.NewReader("x")),
-			Header:     hdr,
-			Request:    finalReq,
+			StatusCode:    http.StatusOK,
+			Body:          io.NopCloser(strings.NewReader("")),
+			Header:        make(http.Header),
+			ContentLength: 1048576,
+			Request:       finalReq,
 		}, nil
 	}
 	t.Cleanup(func() { doRequest = original })
