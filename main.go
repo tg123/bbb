@@ -2426,6 +2426,11 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 					upBar = newStreamingProgressBar(path.Base(sPath), false, true)
 					if upBar != nil {
 						upBar.byteSized = true
+						if sized, ok := reader.(interface{ Size() int64 }); ok {
+							if total := sized.Size(); total > 0 {
+								upBar.SetTotal(total)
+							}
+						}
 					}
 				}
 				uerr := withReadCloser(reader, func(r io.Reader) error {

@@ -1134,8 +1134,6 @@ func uploadInitialConcurrencyForSize(caller int, size int64) int {
 // improving, up to uploadHardConcurrencyCap (overridable via
 // BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX). The optional onProgress callback
 // receives the cumulative number of bytes staged.
-// UploadFile uploads a local file to a block blob using an adaptive parallel
-// StageBlock + CommitBlockList pass.
 //
 // If staging is rejected with InvalidBlobOrBlock — which happens when the
 // destination retains uncommitted blocks of a different block-ID length from a
@@ -1153,6 +1151,8 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 	return err
 }
 
+// uploadFileOnce performs a single adaptive parallel StageBlock +
+// CommitBlockList upload pass, without any InvalidBlobOrBlock self-heal.
 func uploadFileOnce(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return errors.New("cannot upload to directory-like path")
