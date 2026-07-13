@@ -1134,7 +1134,26 @@ func uploadInitialConcurrencyForSize(caller int, size int64) int {
 // improving, up to uploadHardConcurrencyCap (overridable via
 // BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX). The optional onProgress callback
 // receives the cumulative number of bytes staged.
+// UploadFile uploads a local file to a block blob using an adaptive parallel
+// StageBlock + CommitBlockList pass.
+//
+// If staging is rejected with InvalidBlobOrBlock — which happens when the
+// destination retains uncommitted blocks of a different block-ID length from a
+// prior aborted upload — the poisoned blob is cleared and the upload is retried
+// once from a clean slate.
 func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) error {
+	err := uploadFileOnce(ctx, ap, file, concurrency, onProgress)
+	if err != nil && isInvalidBlobOrBlock(err) {
+		slog.Warn("upload hit InvalidBlobOrBlock; clearing stale uncommitted blocks and retrying", "dst", ap.String())
+		if client, cerr := getAzBlobClient(ctx, ap.Account); cerr == nil {
+			clearUncommittedBlocks(ctx, client, ap)
+		}
+		err = uploadFileOnce(ctx, ap, file, concurrency, onProgress)
+	}
+	return err
+}
+
+func uploadFileOnce(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return errors.New("cannot upload to directory-like path")
 	}
@@ -1250,7 +1269,7 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 	close(done)
 
 	if firstErr != nil {
-		return fmt.Errorf("put failed: %v", firstErr)
+		return fmt.Errorf("put failed: %w", firstErr)
 	}
 	if _, err := blockBlobClient.CommitBlockList(ctx, blockIDs, nil); err != nil {
 		return fmt.Errorf("commit block list failed: %w", err)
@@ -1698,6 +1717,28 @@ func planBlocks(totalSize int64, defaultBlockSize int64, maxBlocks int64) (block
 	return blockSize, ids, nil
 }
 
+// isInvalidBlobOrBlock reports whether err is an Azure "InvalidBlobOrBlock"
+// (HTTP 400) response. This occurs when a block blob has pre-existing
+// uncommitted blocks whose IDs differ in length from the ones being staged —
+// e.g. left behind by a prior aborted upload that used a different block
+// size/ID scheme. Azure requires every block ID for a blob to be the same
+// length, so staging new blocks on such a "poisoned" blob is rejected until the
+// stale uncommitted blocks are cleared.
+func isInvalidBlobOrBlock(err error) bool {
+	var respErr *azcore.ResponseError
+	return errors.As(err, &respErr) && respErr.ErrorCode == "InvalidBlobOrBlock"
+}
+
+// clearUncommittedBlocks deletes the destination blob to discard any
+// uncommitted blocks poisoning it, so a subsequent staged upload starts from a
+// clean slate. Best effort: a missing blob (nothing to clear) is not an error.
+func clearUncommittedBlocks(ctx context.Context, client *azblob.Client, ap AzurePath) {
+	bbc := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
+	if _, err := bbc.Delete(ctx, nil); err != nil {
+		slog.Debug("clearUncommittedBlocks: delete returned error (ignored)", "dst", ap.String(), "err", err)
+	}
+}
+
 // CopyProgress is called during server-side copy with the number of
 // bytes copied so far and the total size in bytes.
 type CopyProgress func(copied, total int64)
@@ -1940,11 +1981,28 @@ func CopyBlobFromURLServerSide(ctx context.Context, dst AzurePath, sourceURL str
 
 // copyBlobBlocks copies a blob using parallel StageBlockFromURL + CommitBlockList.
 //
+// If staging is rejected with InvalidBlobOrBlock — which happens when the
+// destination retains uncommitted blocks of a different block-ID length from a
+// prior aborted upload — the poisoned blob is cleared and the copy is retried
+// once from a clean slate.
+func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, concurrency int, onProgress CopyProgress) error {
+	err := copyBlobBlocksOnce(ctx, client, dst, copySource, sourceAuth, totalSize, concurrency, onProgress)
+	if err != nil && isInvalidBlobOrBlock(err) {
+		slog.Warn("server-side copy hit InvalidBlobOrBlock; clearing stale uncommitted blocks and retrying", "dst", dst.String())
+		clearUncommittedBlocks(ctx, client, dst)
+		err = copyBlobBlocksOnce(ctx, client, dst, copySource, sourceAuth, totalSize, concurrency, onProgress)
+	}
+	return err
+}
+
+// copyBlobBlocksOnce performs a single parallel StageBlockFromURL +
+// CommitBlockList pass.
+//
 // When sourceAuth is non-empty, it is forwarded as
 // x-ms-copy-source-authorization on every StageBlockFromURL request so the
 // destination uses OAuth to read the source instead of relying on
 // SAS-embedded credentials (~8× faster intra-region on real Azure).
-func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, concurrency int, onProgress CopyProgress) error {
+func copyBlobBlocksOnce(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, concurrency int, onProgress CopyProgress) error {
 	blockBlobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
 
 	// Plan blocks and generate IDs.
