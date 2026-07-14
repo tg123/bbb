@@ -699,6 +699,14 @@ func multipartCopy(ctx context.Context, client *awss3.Client, src, dst S3Path, c
 				errs[i] = err
 				return
 			}
+			// Guard against a successful response with a missing
+			// CopyPartResult/ETag: recording an error (rather than
+			// dereferencing) triggers the AbortMultipartUpload cleanup below
+			// instead of panicking and leaking the multipart upload.
+			if out.CopyPartResult == nil || out.CopyPartResult.ETag == nil {
+				errs[i] = fmt.Errorf("UploadPartCopy part %d: response missing CopyPartResult ETag", num)
+				return
+			}
 			results[i] = s3types.CompletedPart{
 				ETag:       out.CopyPartResult.ETag,
 				PartNumber: aws.Int32(num),
