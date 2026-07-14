@@ -1966,8 +1966,13 @@ func copyBlockSizeBytes(size int64) int64 {
 // CopyBlobFromURLServerSide copies an external, publicly-readable HTTP(S)
 // source URL directly into an Azure blob without streaming the bytes through
 // this client. It is used for cross-backend server-side copy (e.g. Hugging
-// Face → Azure), where the source URL is a public/signed CDN URL. size must be
-// the exact source size in bytes.
+// Face → Azure), where the source URL is a public/signed CDN URL.
+//
+// size is the exact source size in bytes when known; pass a negative value
+// when the size is unknown. A known size uses the parallel StageBlockFromURL +
+// CommitBlockList path (which must plan block IDs up front); an unknown size
+// routes to Azure's async StartCopyFromURL, which transfers the whole blob
+// server-side without a pre-known size.
 func CopyBlobFromURLServerSide(ctx context.Context, dst AzurePath, sourceURL string, size int64, concurrency int, onProgress CopyProgress) error {
 	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
 		return errors.New("destination path is directory-like")
