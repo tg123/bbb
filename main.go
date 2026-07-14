@@ -2290,6 +2290,9 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 	}
 	if bbbfs.IsObjectStore(src) || bbbfs.IsObjectStore(dst) || srcHF {
 		srcObj, dstObj := bbbfs.IsObjectStore(src), bbbfs.IsObjectStore(dst)
+		// dstAz gates the HF→Az server-side copy fast path below; the HF
+		// source guard above already requires an az:// destination.
+		dstAz := bbbfs.IsAz(dst)
 		type item struct {
 			rel  string
 			size int64
