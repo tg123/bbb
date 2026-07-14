@@ -2013,6 +2013,10 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 	if onProgress != nil {
 		orig := onProgress
 		var last atomic.Int64
+		// Seed below zero so a 0-byte copy's onProgress(0, 0) is still
+		// delivered; monotonicProgress otherwise drops any value not strictly
+		// greater than the initial count.
+		last.Store(-1)
 		emit := monotonicProgress(&last, func(copied int64) { orig(copied, totalSize) })
 		onProgress = func(copied, _ int64) { emit(copied) }
 	}
