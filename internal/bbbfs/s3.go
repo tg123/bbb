@@ -357,6 +357,11 @@ func (s3FS) ShareInfo(p string) (portal, direct string, err error) {
 		if !s3pkg.ForcePathStyle() {
 			if u, perr := url.Parse(base); perr == nil && u.Host != "" {
 				direct = fmt.Sprintf("%s://%s.%s", u.Scheme, sp.Bucket, u.Host)
+				// Preserve any path prefix on the endpoint (e.g.
+				// https://proxy.example.com/minio) between host and key.
+				if prefix := strings.Trim(u.Path, "/"); prefix != "" {
+					direct = joinURLPath(direct, prefix)
+				}
 				direct = joinURLPath(direct, escapedPath)
 			}
 		}

@@ -26,6 +26,33 @@ func TestEscapeS3KeyPath(t *testing.T) {
 	}
 }
 
+func TestS3ShareInfoEndpointPathPrefix(t *testing.T) {
+	// Virtual-host style: endpoint path prefix must be preserved between the
+	// bucket host and the key.
+	t.Setenv("BBB_S3_ENDPOINT", "https://proxy.example.com/minio")
+	t.Setenv("BBB_S3_FORCE_PATH_STYLE", "")
+	portal, direct, err := s3FS{}.ShareInfo("s3://mybucket/a b.txt")
+	if err != nil {
+		t.Fatalf("ShareInfo error: %v", err)
+	}
+	want := "https://mybucket.proxy.example.com/minio/a%20b.txt"
+	if direct != want || portal != want {
+		t.Errorf("vhost: portal=%q direct=%q, want %q", portal, direct, want)
+	}
+
+	// Path style: endpoint path prefix is naturally kept since the whole base
+	// (including prefix) precedes bucket/key.
+	t.Setenv("BBB_S3_FORCE_PATH_STYLE", "true")
+	_, direct, err = s3FS{}.ShareInfo("s3://mybucket/a b.txt")
+	if err != nil {
+		t.Fatalf("ShareInfo (path style) error: %v", err)
+	}
+	wantPath := "https://proxy.example.com/minio/mybucket/a%20b.txt"
+	if direct != wantPath {
+		t.Errorf("path style: direct=%q, want %q", direct, wantPath)
+	}
+}
+
 func TestS3ShareInfoAWSEscaping(t *testing.T) {
 	// Force the AWS branch (no custom endpoint).
 	t.Setenv("BBB_S3_ENDPOINT", "")
