@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/tg123/bbb/internal/hf"
 )
@@ -111,9 +112,21 @@ func IsHF(path string) bool {
 	return hfProvider.Match(path)
 }
 
+// IsS3 returns true if the path targets an Amazon S3 (or S3-compatible) backend.
+func IsS3(path string) bool {
+	return s3Provider.Match(path)
+}
+
+// IsObjectStore returns true if the path targets a remote object-store backend
+// with virtual-directory semantics, chunked transfer and Stat-based existence
+// checks (Azure Blob Storage or Amazon S3).
+func IsObjectStore(path string) bool {
+	return IsAz(path) || IsS3(path)
+}
+
 // IsRemote returns true if the path targets a remote (non-local) backend.
 func IsRemote(path string) bool {
-	return IsAz(path) || IsHF(path)
+	return IsAz(path) || IsHF(path) || IsS3(path)
 }
 
 // dirChecker is an optional FS extension for checking whether a path is directory-like.
@@ -235,12 +248,23 @@ type serverSideCopier interface {
 }
 
 // CanCopyServerSide returns true when both src and dst can use server-side copy.
+// Server-side copy is only valid within the same provider (Azure→Azure or
+// S3→S3), never across providers.
 func CanCopyServerSide(src, dst string) bool {
 	srcFS := Resolve(src)
 	dstFS := Resolve(dst)
 	_, srcOK := srcFS.(serverSideCopier)
 	_, dstOK := dstFS.(serverSideCopier)
-	return srcOK && dstOK && IsAz(src) && IsAz(dst)
+	if !srcOK || !dstOK {
+		return false
+	}
+	if IsAz(src) && IsAz(dst) {
+		return true
+	}
+	if IsS3(src) && IsS3(dst) {
+		return true
+	}
+	return false
 }
 
 // CopyServerSide performs an optimised server-side copy (e.g. Azure→Azure).
@@ -405,6 +429,22 @@ func IsNonRetryableHTTPErr(err error) bool {
 	}
 	var azErr *azcore.ResponseError
 	if errors.As(err, &azErr) && (azErr.StatusCode == 401 || azErr.StatusCode == 403 || azErr.StatusCode == 404) {
+		return true
+	}
+	// S3 (and other AWS SDK) HTTP responses surface status via a smithy
+	// transport error; treat 401/403/404 as non-retryable.
+	var smErr *smithyhttp.ResponseError
+	if errors.As(err, &smErr) {
+		switch smErr.HTTPStatusCode() {
+		case 401, 403, 404:
+			return true
+		}
+	}
+	// Backends may also wrap not-found as a typed error implementing
+	// NotFound() (e.g. s3.notExistError, azblob.notExistError), returned when
+	// a Stat/existence check fails; those are inherently non-retryable.
+	var nfErr interface{ NotFound() bool }
+	if errors.As(err, &nfErr) && nfErr.NotFound() {
 		return true
 	}
 	return false
