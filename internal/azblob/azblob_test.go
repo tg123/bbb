@@ -1286,6 +1286,25 @@ func TestMonotonicProgressNilCallback(t *testing.T) {
 	}
 }
 
+func TestMonotonicProgressDeliversLeadingZero(t *testing.T) {
+	// UploadFile seeds last=-1 so a 0-byte upload's onProgress(0) is still
+	// delivered instead of being swallowed as a non-increasing value.
+	var last atomic.Int64
+	last.Store(-1)
+	var calls []int64
+	emit := monotonicProgress(&last, func(v int64) { calls = append(calls, v) })
+
+	emit(0) // leading zero: must be delivered when seeded at -1
+	emit(0) // duplicate: dropped
+
+	if len(calls) != 1 || calls[0] != 0 {
+		t.Fatalf("expected exactly one 0 delivery, got %v", calls)
+	}
+	if got := last.Load(); got != 0 {
+		t.Fatalf("expected last=0, got %d", got)
+	}
+}
+
 func TestMonotonicProgressFiltersStale(t *testing.T) {
 	var last atomic.Int64
 	var calls []int64

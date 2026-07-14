@@ -1145,6 +1145,10 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 	// which restarts the byte counter from zero.
 	if onProgress != nil {
 		var last atomic.Int64
+		// Start below zero so a legitimate 0-byte upload (empty blob) still
+		// delivers its onProgress(0); monotonicProgress otherwise drops any
+		// value not strictly greater than the initial count.
+		last.Store(-1)
 		onProgress = monotonicProgress(&last, onProgress)
 	}
 	err := uploadFileOnce(ctx, ap, file, concurrency, onProgress)
