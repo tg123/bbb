@@ -2124,6 +2124,13 @@ func cmdShare(ctx context.Context, c *cli.Command) error {
 			fmt.Fprintf(os.Stderr, "share: %s: %v\n", p, err)
 			return err
 		}
+		if console == direct {
+			// S3-compatible endpoints (e.g. MinIO) have no separate web
+			// console, so ShareInfo returns the same object URL for both;
+			// print a single line rather than a misleading "S3 Console" label.
+			fmt.Println("Object URL:", direct)
+			return nil
+		}
 		fmt.Println("S3 Console:", console)
 		fmt.Println("Direct Object (if public):", direct)
 		return nil
