@@ -2400,14 +2400,19 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 					copyBar.SetTotal(total)
 					copyBar.render(copied)
 				})
-				if copyBar != nil {
-					copyBar.Finish()
-				}
 				if err == nil {
+					if copyBar != nil {
+						copyBar.Finish()
+					}
 					if !quiet {
 						lockedPrintf("Copied %s -> %s\n", srcChild, dstChild)
 					}
 					return nil
+				}
+				// Copy failed: tear the bar down without rendering it as a
+				// completed 100% line before falling back to streaming.
+				if copyBar != nil {
+					copyBar.Abort()
 				}
 				// Server-side copy failed — commonly because Azure cannot read
 				// the Hugging Face source URL (403 CannotVerifyCopySource) for
