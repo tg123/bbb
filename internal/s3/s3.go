@@ -560,12 +560,32 @@ func DeletePrefix(ctx context.Context, sp S3Path) error {
 		if len(batch) == 0 {
 			return nil
 		}
-		_, err := client.DeleteObjects(ctx, &awss3.DeleteObjectsInput{
+		out, err := client.DeleteObjects(ctx, &awss3.DeleteObjectsInput{
 			Bucket: aws.String(sp.Bucket),
 			Delete: &s3types.Delete{Objects: batch, Quiet: aws.Bool(true)},
 		})
 		batch = batch[:0]
-		return err
+		if err != nil {
+			return err
+		}
+		// S3 can return a 200 while reporting per-object failures in
+		// out.Errors (Quiet mode still returns errors, just not successes).
+		// Surface them so a prefix delete is never silently incomplete.
+		if len(out.Errors) > 0 {
+			first := out.Errors[0]
+			key, code, msg := "", "", ""
+			if first.Key != nil {
+				key = *first.Key
+			}
+			if first.Code != nil {
+				code = *first.Code
+			}
+			if first.Message != nil {
+				msg = *first.Message
+			}
+			return fmt.Errorf("delete %d object(s) failed, first: %s (%s: %s)", len(out.Errors), key, code, msg)
+		}
+		return nil
 	}
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
