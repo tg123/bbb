@@ -1745,3 +1745,64 @@ func TestCopyBlobFromURLServerSideSelfHealsInvalidBlobOrBlock(t *testing.T) {
 		t.Fatalf("expected final progress 8/8, got %d/%d", lastCopied, lastTotal)
 	}
 }
+
+// TestCopyBlobFromURLServerSideUnknownSizeUsesAsyncCopy verifies that when the
+// source size is unknown (negative), the server-side copy does not hard-fail
+// but instead routes to the async StartCopyFromURL path, which does not need a
+// pre-known size.
+func TestCopyBlobFromURLServerSideUnknownSizeUsesAsyncCopy(t *testing.T) {
+	prev := sharedHTTPClient.Load()
+	t.Cleanup(func() { sharedHTTPClient.Store(prev) })
+
+	account := "asynccopycheck"
+	blobClientCache.Delete(account)
+	t.Cleanup(func() { blobClientCache.Delete(account) })
+
+	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "dGVzdGtleQ==") // base64("testkey")
+
+	var startCopyCalls, getPropsCalls, stageCalls atomic.Int64
+	nopBody := func() io.ReadCloser { return io.NopCloser(strings.NewReader("")) }
+	SetHTTPTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodPut && req.URL.Query().Get("comp") == "block":
+			stageCalls.Add(1)
+			return &http.Response{StatusCode: 201, Header: http.Header{}, Body: nopBody(), Request: req}, nil
+		case req.Method == http.MethodPut && req.URL.Query().Get("comp") == "":
+			// StartCopyFromURL: PUT to the blob with no comp param.
+			startCopyCalls.Add(1)
+			h := http.Header{}
+			h.Set("x-ms-copy-status", "success")
+			return &http.Response{StatusCode: 202, Header: h, Body: nopBody(), Request: req}, nil
+		case req.Method == http.MethodHead:
+			getPropsCalls.Add(1)
+			h := http.Header{}
+			h.Set("x-ms-copy-status", "success")
+			h.Set("x-ms-copy-progress", "1024/1024")
+			return &http.Response{StatusCode: 200, Header: h, Body: nopBody(), Request: req}, nil
+		default:
+			return &http.Response{StatusCode: 201, Header: http.Header{}, Body: nopBody(), Request: req}, nil
+		}
+	}))
+	t.Cleanup(func() { SetHTTPTransport(nil) })
+
+	dst := AzurePath{Account: account, Container: "c", Blob: "unknown-size.bin"}
+	var lastCopied, lastTotal int64
+	err := CopyBlobFromURLServerSide(context.Background(), dst,
+		"https://source.example/blob?sig=abc", -1, 4, func(copied, total int64) {
+			lastCopied, lastTotal = copied, total
+		})
+	if err != nil {
+		t.Fatalf("expected unknown-size copy to succeed via async path, got: %v", err)
+	}
+	if got := startCopyCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 StartCopyFromURL, got %d", got)
+	}
+	if got := stageCalls.Load(); got != 0 {
+		t.Fatalf("expected no StageBlockFromURL calls for unknown-size copy, got %d", got)
+	}
+	// Progress is reported from the service (1024/1024), not from the unknown
+	// caller-provided size.
+	if lastCopied != 1024 || lastTotal != 1024 {
+		t.Fatalf("expected service-reported progress 1024/1024, got %d/%d", lastCopied, lastTotal)
+	}
+}

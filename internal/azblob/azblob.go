@@ -1975,15 +1975,22 @@ func CopyBlobFromURLServerSide(ctx context.Context, dst AzurePath, sourceURL str
 	if sourceURL == "" {
 		return errors.New("empty source URL")
 	}
-	if size < 0 {
-		return errors.New("unknown source size")
-	}
 	if concurrency < 1 {
 		concurrency = 1
 	}
 	client, err := getAzBlobClient(ctx, dst.Account)
 	if err != nil {
 		return err
+	}
+	if size < 0 {
+		// Unknown source size: the block-staging path needs a size up front
+		// to plan block IDs, but Azure's StartCopyFromURL performs the entire
+		// transfer server-side without one (progress is polled from the
+		// service). Route straight to the async copy instead of failing, so
+		// sources lacking a reliable Content-Length/X-Linked-Size still get a
+		// server-side copy rather than a client-side streaming fallback.
+		slog.Debug("source size unknown; using async StartCopyFromURL for server-side copy", "dst", dst.String())
+		return copyBlobAsync(ctx, client, dst, sourceURL, size, onProgress)
 	}
 	// The external source URL already carries its own auth (a signed CDN
 	// query string), so no x-ms-copy-source-authorization header is sent.
@@ -2193,7 +2200,10 @@ func copyBlobAsync(ctx context.Context, client *azblob.Client, dst AzurePath, co
 	if copyStatus != blob.CopyStatusTypeSuccess {
 		return fmt.Errorf("copy failed with status %s", copyStatus)
 	}
-	if onProgress != nil {
+	// Emit a final 100% signal only when the total is known; with an unknown
+	// (negative) size, the last poll's reportCopyProgress already delivered
+	// the service-reported total.
+	if onProgress != nil && totalSize >= 0 {
 		onProgress(totalSize, totalSize)
 	}
 	return nil
