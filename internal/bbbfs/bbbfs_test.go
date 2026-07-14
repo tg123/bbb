@@ -125,3 +125,20 @@ func TestRegisterAzAccountRolesNonAzIgnored(t *testing.T) {
 		t.Fatalf("expected SRC for myacct, got %q (ok=%v)", role, ok)
 	}
 }
+
+func TestUploadSpoolMax(t *testing.T) {
+	cases := map[string]int{
+		"":       4, // default
+		"0":      4, // non-positive ignored
+		"-3":     4, // negative ignored
+		"notint": 4, // unparseable ignored
+		"1":      1,
+		"16":     16,
+	}
+	for in, want := range cases {
+		t.Setenv("BBB_AZ_UPLOAD_SPOOL_MAX", in)
+		if got := uploadSpoolMax(); got != want {
+			t.Fatalf("uploadSpoolMax() with %q = %d, want %d", in, got, want)
+		}
+	}
+}

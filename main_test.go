@@ -1697,3 +1697,25 @@ func TestDNSPinCacheReturnsSameIP(t *testing.T) {
 		}
 	}
 }
+
+func TestProgressBarAbortDoesNotMarkComplete(t *testing.T) {
+	p := &progressBar{}
+	p.total.Store(1000)
+	p.done.Store(400)
+	p.lastTotal.Store(progressUninitialized)
+
+	p.Abort()
+
+	if !p.finished.Load() {
+		t.Fatal("expected Abort to mark the bar finished")
+	}
+	// Abort must not render the bar as completed (done left as-is, not total).
+	if got := p.done.Load(); got != 400 {
+		t.Fatalf("expected done to stay 400 after Abort, got %d", got)
+	}
+	// A subsequent Finish must be a no-op and must not resurrect the bar to 100%.
+	p.Finish()
+	if got := p.done.Load(); got != 400 {
+		t.Fatalf("expected done to remain 400 after Finish following Abort, got %d", got)
+	}
+}

@@ -404,6 +404,29 @@ func (p *progressBar) Finish() {
 	}
 }
 
+// Abort tears the bar down without rendering it as completed. Unlike Finish,
+// it does not set done=total or print a trailing "100%" line — use it when the
+// underlying operation failed (e.g. a server-side copy that will fall back to
+// streaming) so the user is not shown a misleading completed bar.
+func (p *progressBar) Abort() {
+	if p == nil {
+		return
+	}
+	if !p.finished.CompareAndSwap(false, true) {
+		return
+	}
+	outputMu.Lock()
+	clearActiveBars()
+	removeActiveBar(p)
+	rerenderActiveBars()
+	lastGlobalRender.Store(time.Now().UnixNano())
+	noActiveBars := len(activeBars) == 0
+	outputMu.Unlock()
+	if noActiveBars {
+		stopElapsedTicker()
+	}
+}
+
 // renderAligned writes the progress bar to stderr with the label padded to
 // labelWidth characters. This aligns bars with different-length labels.
 // outputMu must be held.

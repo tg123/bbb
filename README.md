@@ -538,6 +538,12 @@ Unidirectional sync: copies new and updated files from source to destination.
 bbb sync [flags] src dst
 ```
 
+> **Server-side copy:** For Azure→Azure and Hugging Face→Azure syncs, `bbb`
+> instructs Azure Blob Storage to pull each file directly from the source
+> (Az→Az) or from the Hugging Face CDN URL (HF→Az), so the data never transits
+> the client. If a Hugging Face file can't be copied server-side, `bbb`
+> automatically falls back to streaming it through the client.
+
 | Flag | Description |
 |------|-------------|
 | `--taskfile FILE` | Batch task file with one `src dst` pair per line; use `-` for stdin |
