@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/tg123/bbb/internal/hf"
 )
@@ -428,6 +429,22 @@ func IsNonRetryableHTTPErr(err error) bool {
 	}
 	var azErr *azcore.ResponseError
 	if errors.As(err, &azErr) && (azErr.StatusCode == 401 || azErr.StatusCode == 403 || azErr.StatusCode == 404) {
+		return true
+	}
+	// S3 (and other AWS SDK) HTTP responses surface status via a smithy
+	// transport error; treat 401/403/404 as non-retryable.
+	var smErr *smithyhttp.ResponseError
+	if errors.As(err, &smErr) {
+		switch smErr.HTTPStatusCode() {
+		case 401, 403, 404:
+			return true
+		}
+	}
+	// Backends may also wrap not-found as a typed error implementing
+	// NotFound() (e.g. s3.notExistError, azblob.notExistError), returned when
+	// a Stat/existence check fails; those are inherently non-retryable.
+	var nfErr interface{ NotFound() bool }
+	if errors.As(err, &nfErr) && nfErr.NotFound() {
 		return true
 	}
 	return false

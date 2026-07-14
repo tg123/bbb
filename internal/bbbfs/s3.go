@@ -348,21 +348,52 @@ func (s3FS) ShareInfo(p string) (portal, direct string, err error) {
 	if err != nil {
 		return "", "", err
 	}
+	// Keys are opaque and may contain spaces, '#', '?', '%', etc. Escape each
+	// path segment (preserving '/' separators) for URL paths, and query-escape
+	// the console prefix parameter, so links are always valid.
+	escapedPath := escapeS3KeyPath(sp.Key)
 	if ep := s3pkg.Endpoint(); ep != "" {
 		base := strings.TrimRight(ep, "/")
 		if !s3pkg.ForcePathStyle() {
 			if u, perr := url.Parse(base); perr == nil && u.Host != "" {
-				direct = fmt.Sprintf("%s://%s.%s/%s", u.Scheme, sp.Bucket, u.Host, sp.Key)
+				direct = fmt.Sprintf("%s://%s.%s", u.Scheme, sp.Bucket, u.Host)
+				direct = joinURLPath(direct, escapedPath)
 			}
 		}
 		if direct == "" {
-			direct = fmt.Sprintf("%s/%s/%s", base, sp.Bucket, sp.Key)
+			direct = joinURLPath(base+"/"+sp.Bucket, escapedPath)
 		}
 		// S3-compatible endpoints have no vendor-agnostic web console, so
 		// surface the object URL for both.
 		return direct, direct, nil
 	}
-	portal = fmt.Sprintf("https://s3.console.aws.amazon.com/s3/object/%s?prefix=%s", sp.Bucket, sp.Key)
-	direct = fmt.Sprintf("https://%s.s3.amazonaws.com/%s", sp.Bucket, sp.Key)
+	portal = "https://s3.console.aws.amazon.com/s3/object/" + sp.Bucket
+	if sp.Key != "" {
+		portal += "?prefix=" + url.QueryEscape(sp.Key)
+	}
+	direct = joinURLPath("https://"+sp.Bucket+".s3.amazonaws.com", escapedPath)
 	return portal, direct, nil
+}
+
+// escapeS3KeyPath URL-escapes each '/'-separated segment of an S3 key while
+// preserving the separators, yielding a valid URL path fragment. Returns ""
+// for an empty key.
+func escapeS3KeyPath(key string) string {
+	if key == "" {
+		return ""
+	}
+	segs := strings.Split(key, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	return strings.Join(segs, "/")
+}
+
+// joinURLPath appends an (already-escaped) path fragment to a base URL,
+// inserting a single '/' only when the fragment is non-empty.
+func joinURLPath(base, escapedPath string) string {
+	if escapedPath == "" {
+		return base
+	}
+	return base + "/" + escapedPath
 }
