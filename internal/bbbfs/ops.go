@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -251,6 +252,64 @@ func CopyServerSide(ctx context.Context, src, dst string, concurrency int, sizeH
 		return sc.CopyServerSide(ctx, src, dst, concurrency, sizeHint, onProgress)
 	}
 	return errors.New("server-side copy not supported")
+}
+
+// copySourceURLProvider is implemented by backends that can produce a public,
+// redirect-resolved URL for a file, suitable for another backend to copy from
+// server-side.
+type copySourceURLProvider interface {
+	CopySourceURL(ctx context.Context, path string) (url string, size int64, err error)
+}
+
+// urlServerSideCopier is implemented by backends that can copy directly from a
+// public source URL into themselves server-side (e.g. Azure copy-from-URL).
+type urlServerSideCopier interface {
+	CopyFromURLServerSide(ctx context.Context, sourceURL, dst string, size int64, concurrency int, onProgress CopyProgress) error
+}
+
+// CanCopyServerSideFromURL returns true when src can produce a public source
+// URL and dst can copy from a URL server-side (e.g. Hugging Face → Azure).
+func CanCopyServerSideFromURL(src, dst string) bool {
+	_, srcOK := Resolve(src).(copySourceURLProvider)
+	_, dstOK := Resolve(dst).(urlServerSideCopier)
+	return srcOK && dstOK
+}
+
+// CopyServerSideFromURL resolves a public source URL from src and asks dst to
+// copy from it server-side, without streaming the bytes through this process.
+func CopyServerSideFromURL(ctx context.Context, src, dst string, concurrency int, onProgress CopyProgress) error {
+	srcFS := Resolve(src)
+	sp, ok := srcFS.(copySourceURLProvider)
+	if !ok {
+		return errors.New("source does not support server-side copy URLs")
+	}
+	dstFS := Resolve(dst)
+	uc, ok := dstFS.(urlServerSideCopier)
+	if !ok {
+		return errors.New("destination does not support server-side copy from URL")
+	}
+	sourceURL, size, err := sp.CopySourceURL(ctx, src)
+	if err != nil {
+		return err
+	}
+	return uc.CopyFromURLServerSide(ctx, sourceURL, dst, size, concurrency, onProgress)
+}
+
+// readerUploader is implemented by backends that can ingest a reader using a
+// more reliable upload path than streaming Write (e.g. Azure spools to a temp
+// file and uses size-aware parallel block staging).
+type readerUploader interface {
+	UploadReader(ctx context.Context, dst string, r io.Reader, concurrency int, onProgress func(copied int64)) error
+}
+
+// UploadReader writes r to dst using the backend's most reliable upload path,
+// falling back to a plain streaming Write when the backend does not implement
+// readerUploader. onProgress, when non-nil, receives cumulative bytes uploaded.
+func UploadReader(ctx context.Context, dst string, r io.Reader, concurrency int, onProgress func(copied int64)) error {
+	if u, ok := Resolve(dst).(readerUploader); ok {
+		return u.UploadReader(ctx, dst, r, concurrency, onProgress)
+	}
+	return Resolve(dst).Write(ctx, dst, r)
 }
 
 // streamLister is an optional FS extension for streaming list.

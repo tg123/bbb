@@ -29,6 +29,16 @@ func (hfFS) Read(ctx context.Context, path string) (io.ReadCloser, error) {
 	return hf.DownloadStream(ctx, hp)
 }
 
+// CopySourceURL resolves a public, redirect-followed download URL and size for
+// a Hugging Face file so another backend can copy it server-side.
+func (hfFS) CopySourceURL(ctx context.Context, path string) (string, int64, error) {
+	hp, err := hf.Parse(path)
+	if err != nil {
+		return "", 0, err
+	}
+	return hf.ResolveDirectURL(ctx, hp)
+}
+
 func (hfFS) Write(ctx context.Context, path string, r io.Reader) error {
 	return ErrWriteUnsupported
 }

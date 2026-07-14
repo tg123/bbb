@@ -2380,6 +2380,91 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				}
 				return nil
 			}
+			// HF→Az: prefer server-side copy (Azure pulls directly from the
+			// Hugging Face CDN URL) so bytes never transit this client. Fall
+			// back to streaming Read+Write on failure.
+			if srcHF && dstAz {
+				var copyBar *progressBar
+				if !quiet {
+					copyBar = newStreamingProgressBar(path.Base(sPath), false, true)
+					if copyBar != nil {
+						copyBar.byteSized = true
+					}
+				}
+				err := bbbfs.CopyServerSideFromURL(ctx, srcChild, dstChild, blockConcurrency, func(copied, total int64) {
+					if total <= 0 || copyBar == nil {
+						return
+					}
+					atomicMax(&copyBar.bytesDone, copied)
+					atomicMax(&copyBar.done, copied)
+					copyBar.SetTotal(total)
+					copyBar.render(copied)
+				})
+				if err == nil {
+					if copyBar != nil {
+						copyBar.Finish()
+					}
+					if !quiet {
+						lockedPrintf("Copied %s -> %s\n", srcChild, dstChild)
+					}
+					return nil
+				}
+				// Copy failed: tear the bar down without rendering it as a
+				// completed 100% line before falling back to streaming.
+				if copyBar != nil {
+					copyBar.Abort()
+				}
+				// Server-side copy failed — commonly because Azure cannot read
+				// the Hugging Face source URL (403 CannotVerifyCopySource) for
+				// LFS/Xet-backed files whose signed CDN URLs are IP-bound or
+				// short-lived. Fall back to streaming the file through this
+				// client via a temp file + size-aware block upload.
+				slog.Debug("HF→Az server-side copy failed, falling back to streaming", "src", srcChild, "error", err)
+				if !quiet {
+					lockedFprintf(os.Stderr, "sync: %s: server-side copy failed (%v); falling back to streaming\n", sPath, err)
+				}
+				reader, rerr := bbbfs.Resolve(srcChild).Read(ctx, srcChild)
+				if rerr != nil {
+					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, rerr)
+					return fmt.Errorf("sync: %s: %w", sPath, rerr)
+				}
+				var upBar *progressBar
+				if !quiet {
+					upBar = newStreamingProgressBar(path.Base(sPath), false, true)
+					if upBar != nil {
+						upBar.byteSized = true
+						if sized, ok := reader.(interface{ Size() int64 }); ok {
+							if total := sized.Size(); total > 0 {
+								upBar.SetTotal(total)
+							}
+						}
+					}
+				}
+				uerr := withReadCloser(reader, func(r io.Reader) error {
+					return bbbfs.UploadReader(ctx, dstChild, r, blockConcurrency, func(copied int64) {
+						if upBar == nil {
+							return
+						}
+						atomicMax(&upBar.bytesDone, copied)
+						atomicMax(&upBar.done, copied)
+						upBar.render(copied)
+					})
+				})
+				if uerr != nil {
+					if upBar != nil {
+						upBar.Abort()
+					}
+					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, uerr)
+					return fmt.Errorf("sync: %s: %w", sPath, uerr)
+				}
+				if upBar != nil {
+					upBar.Finish()
+				}
+				if !quiet {
+					lockedPrintf("Copied %s -> %s\n", srcChild, dstChild)
+				}
+				return nil
+			}
 			reader, err := bbbfs.Resolve(srcChild).Read(ctx, srcChild)
 			if err != nil {
 				lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)

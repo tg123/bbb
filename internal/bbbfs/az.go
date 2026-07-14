@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -242,6 +243,75 @@ func (azFS) CopyServerSide(ctx context.Context, src, dst string, concurrency int
 		return err
 	}
 	return azblob.CopyBlobServerSide(ctx, srcAP, dstAP, concurrency, sizeHint, onProgress)
+}
+
+// CopyFromURLServerSide copies a public source URL directly into an Azure blob
+// server-side, without streaming bytes through this process.
+func (azFS) CopyFromURLServerSide(ctx context.Context, sourceURL, dst string, size int64, concurrency int, onProgress CopyProgress) error {
+	dstAP, err := azblob.Parse(dst)
+	if err != nil {
+		return err
+	}
+	return azblob.CopyBlobFromURLServerSide(ctx, dstAP, sourceURL, size, concurrency, onProgress)
+}
+
+// uploadSpoolSlots bounds how many UploadReader calls may hold a full
+// spooled-to-disk temp file at once. The streaming fallback (used when a
+// server-side copy fails) spools the entire source to local temp storage
+// before uploading; without a cap, N concurrent sync workers would each spool
+// a full file, multiplying peak disk usage by N and failing syncs on
+// disk-constrained hosts. The cap is overridable via BBB_AZ_UPLOAD_SPOOL_MAX
+// (positive integer); it defaults to 4.
+var uploadSpoolSlots = make(chan struct{}, uploadSpoolMax())
+
+func uploadSpoolMax() int {
+	if v := os.Getenv("BBB_AZ_UPLOAD_SPOOL_MAX"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 4
+}
+
+// UploadReader ingests an arbitrary reader into an Azure blob by first spooling
+// it to a temporary file and then using the size-aware parallel block-staging
+// upload path (16 MiB blocks), which is more robust on real Azure than the
+// SDK's streaming uploader (whose 256 MiB block floor can trigger
+// InvalidBlobOrBlock on some accounts). onProgress, when non-nil, receives the
+// cumulative number of bytes uploaded.
+//
+// Concurrent spooling is bounded by uploadSpoolSlots so that many parallel
+// sync workers falling back to this path cannot exhaust local temp disk.
+func (azFS) UploadReader(ctx context.Context, dst string, r io.Reader, concurrency int, onProgress func(copied int64)) error {
+	ap, err := azblob.Parse(dst)
+	if err != nil {
+		return err
+	}
+	// Bound concurrent temp-file spooling to cap peak local disk usage.
+	select {
+	case uploadSpoolSlots <- struct{}{}:
+		defer func() { <-uploadSpoolSlots }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	tmp, err := os.CreateTemp("", "bbb-upload-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+	if _, err := io.Copy(tmp, r); err != nil {
+		return err
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	// UploadFile reports cumulative bytes uploaded, matching onProgress's
+	// contract, so it is forwarded directly.
+	return azblob.UploadFile(ctx, ap, tmp, concurrency, onProgress)
 }
 
 func (azFS) ListStream(ctx context.Context, p string, fn func(Entry) error) error {

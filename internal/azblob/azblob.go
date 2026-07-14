@@ -27,6 +27,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
@@ -1134,7 +1135,36 @@ func uploadInitialConcurrencyForSize(caller int, size int64) int {
 // improving, up to uploadHardConcurrencyCap (overridable via
 // BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX). The optional onProgress callback
 // receives the cumulative number of bytes staged.
+//
+// If staging is rejected with InvalidBlobOrBlock — which happens when the
+// destination retains uncommitted blocks of a different block-ID length from a
+// prior aborted upload — the poisoned blob is cleared and the upload is retried
+// once from a clean slate.
 func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) error {
+	// Guard against non-monotonic progress across the self-heal retry below,
+	// which restarts the byte counter from zero.
+	if onProgress != nil {
+		var last atomic.Int64
+		// Start below zero so a legitimate 0-byte upload (empty blob) still
+		// delivers its onProgress(0); monotonicProgress otherwise drops any
+		// value not strictly greater than the initial count.
+		last.Store(-1)
+		onProgress = monotonicProgress(&last, onProgress)
+	}
+	err := uploadFileOnce(ctx, ap, file, concurrency, onProgress)
+	if err != nil && isInvalidBlobOrBlock(err) {
+		slog.Warn("upload hit InvalidBlobOrBlock; clearing stale uncommitted blocks and retrying", "dst", ap.String())
+		if client, cerr := getAzBlobClient(ctx, ap.Account); cerr == nil {
+			clearUncommittedBlocks(ctx, client, ap)
+		}
+		err = uploadFileOnce(ctx, ap, file, concurrency, onProgress)
+	}
+	return err
+}
+
+// uploadFileOnce performs a single adaptive parallel StageBlock +
+// CommitBlockList upload pass, without any InvalidBlobOrBlock self-heal.
+func uploadFileOnce(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) error {
 	if ap.Blob == "" || strings.HasSuffix(ap.Blob, "/") {
 		return errors.New("cannot upload to directory-like path")
 	}
@@ -1154,7 +1184,7 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 	if size == 0 {
 		_, err := blockBlobClient.CommitBlockList(ctx, nil, nil)
 		if err != nil {
-			return fmt.Errorf("put failed: %v", err)
+			return fmt.Errorf("put failed: %w", err)
 		}
 		if onProgress != nil {
 			onProgress(0)
@@ -1250,7 +1280,7 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 	close(done)
 
 	if firstErr != nil {
-		return fmt.Errorf("put failed: %v", firstErr)
+		return fmt.Errorf("put failed: %w", firstErr)
 	}
 	if _, err := blockBlobClient.CommitBlockList(ctx, blockIDs, nil); err != nil {
 		return fmt.Errorf("commit block list failed: %w", err)
@@ -1516,7 +1546,7 @@ func Upload(ctx context.Context, ap AzurePath, data []byte) error {
 	blobClient := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
 	_, err = blobClient.UploadBuffer(ctx, data, nil)
 	if err != nil {
-		return fmt.Errorf("put failed: %v", err)
+		return fmt.Errorf("put failed: %w", err)
 	}
 	return nil
 }
@@ -1652,7 +1682,7 @@ func UploadStream(ctx context.Context, ap AzurePath, reader io.Reader, concurren
 		Concurrency: concurrency,
 	})
 	if err != nil {
-		return fmt.Errorf("put failed: %v", err)
+		return fmt.Errorf("put failed: %w", err)
 	}
 	return nil
 }
@@ -1698,8 +1728,41 @@ func planBlocks(totalSize int64, defaultBlockSize int64, maxBlocks int64) (block
 	return blockSize, ids, nil
 }
 
+// isInvalidBlobOrBlock reports whether err is an Azure "InvalidBlobOrBlock"
+// (HTTP 400) response. This occurs when a block blob has pre-existing
+// uncommitted blocks whose IDs differ in length from the ones being staged —
+// e.g. left behind by a prior aborted upload that used a different block
+// size/ID scheme. Azure requires every block ID for a blob to be the same
+// length, so staging new blocks on such a "poisoned" blob is rejected until the
+// stale uncommitted blocks are cleared.
+func isInvalidBlobOrBlock(err error) bool {
+	var respErr *azcore.ResponseError
+	return errors.As(err, &respErr) && respErr.ErrorCode == string(bloberror.InvalidBlobOrBlock)
+}
+
+// clearUncommittedBlocks deletes the destination blob to discard any
+// uncommitted blocks poisoning it, so a subsequent staged upload starts from a
+// clean slate. Best effort: a missing blob (BlobNotFound — nothing to clear) is
+// expected and ignored silently; any other delete error is logged at Warn for
+// diagnosis but not returned, since the caller retries the upload regardless.
+func clearUncommittedBlocks(ctx context.Context, client *azblob.Client, ap AzurePath) {
+	bbc := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
+	if _, err := bbc.Delete(ctx, nil); err != nil {
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.ErrorCode == string(bloberror.BlobNotFound) {
+			return
+		}
+		slog.Warn("clearUncommittedBlocks: delete failed (ignored)", "dst", ap.String(), "err", err)
+	}
+}
+
 // CopyProgress is called during server-side copy with the number of
 // bytes copied so far and the total size in bytes.
+//
+// It may be invoked concurrently from multiple StageBlockFromURL goroutines,
+// so implementations must be goroutine-safe. The copied value passed to a
+// single CopyProgress is already clamped to be monotonically non-decreasing,
+// even across an internal InvalidBlobOrBlock self-heal retry.
 type CopyProgress func(copied, total int64)
 
 func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concurrency int, sizeHint int64, onProgress CopyProgress) error {
@@ -1900,13 +1963,92 @@ func copyBlockSizeBytes(size int64) int64 {
 	return block
 }
 
+// CopyBlobFromURLServerSide copies an external, publicly-readable HTTP(S)
+// source URL directly into an Azure blob without streaming the bytes through
+// this client. It is used for cross-backend server-side copy (e.g. Hugging
+// Face → Azure), where the source URL is a public/signed CDN URL.
+//
+// size is the exact source size in bytes when known; pass a negative value
+// when the size is unknown. A known size uses the parallel StageBlockFromURL +
+// CommitBlockList path (which must plan block IDs up front); an unknown size
+// routes to Azure's async StartCopyFromURL, which transfers the whole blob
+// server-side without a pre-known size.
+func CopyBlobFromURLServerSide(ctx context.Context, dst AzurePath, sourceURL string, size int64, concurrency int, onProgress CopyProgress) error {
+	if dst.Blob == "" || strings.HasSuffix(dst.Blob, "/") {
+		return errors.New("destination path is directory-like")
+	}
+	if sourceURL == "" {
+		return errors.New("empty source URL")
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	client, err := getAzBlobClient(ctx, dst.Account)
+	if err != nil {
+		return err
+	}
+	if size < 0 {
+		// Unknown source size: the block-staging path needs a size up front
+		// to plan block IDs, but Azure's StartCopyFromURL performs the entire
+		// transfer server-side without one (progress is polled from the
+		// service). Route straight to the async copy instead of failing, so
+		// sources lacking a reliable Content-Length/X-Linked-Size still get a
+		// server-side copy rather than a client-side streaming fallback.
+		slog.Debug("source size unknown; using async StartCopyFromURL for server-side copy", "dst", dst.String())
+		return copyBlobAsync(ctx, client, dst, sourceURL, size, onProgress)
+	}
+	// The external source URL already carries its own auth (a signed CDN
+	// query string), so no x-ms-copy-source-authorization header is sent.
+	err = copyBlobBlocks(ctx, client, dst, sourceURL, "", size, concurrency, onProgress)
+	if err != nil {
+		// StageBlockFromURL (Put Block From URL) returns 501 in emulators
+		// like Azurite. Fall back to the async StartCopyFromURL approach.
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.StatusCode == 501 {
+			slog.Debug("StageBlockFromURL not supported, falling back to StartCopyFromURL", "dst", dst.String())
+			return copyBlobAsync(ctx, client, dst, sourceURL, size, onProgress)
+		}
+		return err
+	}
+	return nil
+}
+
 // copyBlobBlocks copies a blob using parallel StageBlockFromURL + CommitBlockList.
+//
+// If staging is rejected with InvalidBlobOrBlock — which happens when the
+// destination retains uncommitted blocks of a different block-ID length from a
+// prior aborted upload — the poisoned blob is cleared and the copy is retried
+// once from a clean slate.
+func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, concurrency int, onProgress CopyProgress) error {
+	// Guard against non-monotonic progress across the self-heal retry below,
+	// which restarts the byte counter from zero.
+	if onProgress != nil {
+		orig := onProgress
+		var last atomic.Int64
+		// Seed below zero so a 0-byte copy's onProgress(0, 0) is still
+		// delivered; monotonicProgress otherwise drops any value not strictly
+		// greater than the initial count.
+		last.Store(-1)
+		emit := monotonicProgress(&last, func(copied int64) { orig(copied, totalSize) })
+		onProgress = func(copied, _ int64) { emit(copied) }
+	}
+	err := copyBlobBlocksOnce(ctx, client, dst, copySource, sourceAuth, totalSize, concurrency, onProgress)
+	if err != nil && isInvalidBlobOrBlock(err) {
+		slog.Warn("server-side copy hit InvalidBlobOrBlock; clearing stale uncommitted blocks and retrying", "dst", dst.String())
+		clearUncommittedBlocks(ctx, client, dst)
+		err = copyBlobBlocksOnce(ctx, client, dst, copySource, sourceAuth, totalSize, concurrency, onProgress)
+	}
+	return err
+}
+
+// copyBlobBlocksOnce performs a single parallel StageBlockFromURL +
+// CommitBlockList pass.
 //
 // When sourceAuth is non-empty, it is forwarded as
 // x-ms-copy-source-authorization on every StageBlockFromURL request so the
 // destination uses OAuth to read the source instead of relying on
 // SAS-embedded credentials (~8× faster intra-region on real Azure).
-func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, concurrency int, onProgress CopyProgress) error {
+func copyBlobBlocksOnce(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, concurrency int, onProgress CopyProgress) error {
 	blockBlobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
 
 	// Plan blocks and generate IDs.
@@ -2063,7 +2205,10 @@ func copyBlobAsync(ctx context.Context, client *azblob.Client, dst AzurePath, co
 	if copyStatus != blob.CopyStatusTypeSuccess {
 		return fmt.Errorf("copy failed with status %s", copyStatus)
 	}
-	if onProgress != nil {
+	// Emit a final 100% signal only when the total is known; with an unknown
+	// (negative) size, the last poll's reportCopyProgress already delivered
+	// the service-reported total.
+	if onProgress != nil && totalSize >= 0 {
 		onProgress(totalSize, totalSize)
 	}
 	return nil
