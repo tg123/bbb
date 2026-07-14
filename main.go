@@ -2450,12 +2450,15 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 						upBar.render(copied)
 					})
 				})
-				if upBar != nil {
-					upBar.Finish()
-				}
 				if uerr != nil {
+					if upBar != nil {
+						upBar.Abort()
+					}
 					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, uerr)
 					return fmt.Errorf("sync: %s: %w", sPath, uerr)
+				}
+				if upBar != nil {
+					upBar.Finish()
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", srcChild, dstChild)
