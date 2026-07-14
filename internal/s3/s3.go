@@ -370,6 +370,9 @@ func DownloadFile(ctx context.Context, sp S3Path, file *os.File, concurrency int
 
 // Touch creates an empty object at the path (no-op size 0 PutObject).
 func Touch(ctx context.Context, sp S3Path) error {
+	if sp.IsDirLike() {
+		return fmt.Errorf("cannot touch directory-like path: %s", sp.String())
+	}
 	client, err := getClient(ctx)
 	if err != nil {
 		return err

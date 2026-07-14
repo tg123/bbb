@@ -95,7 +95,7 @@ func TestS3Basic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	uploadedName := tmpFile.Name()[len(os.TempDir())+1:]
+	uploadedName := filepath.Base(tmpFile.Name())
 
 	// ls (non-recursive) returns direct children and the pseudo-directory
 	{

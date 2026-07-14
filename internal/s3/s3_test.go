@@ -1,6 +1,27 @@
 package s3
 
-import "testing"
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+func TestTouchRejectsDirLike(t *testing.T) {
+	// The guard must fire before any client/network access, so these calls
+	// return the directory-like error rather than a backend/config error.
+	for _, sp := range []S3Path{
+		{Bucket: "b"},              // bucket root, empty key
+		{Bucket: "b", Key: "dir/"}, // trailing slash
+	} {
+		err := Touch(context.Background(), sp)
+		if err == nil {
+			t.Fatalf("Touch(%s) = nil, want directory-like error", sp.String())
+		}
+		if !strings.Contains(err.Error(), "directory-like") {
+			t.Fatalf("Touch(%s) error = %v, want directory-like error", sp.String(), err)
+		}
+	}
+}
 
 func TestParse(t *testing.T) {
 	cases := []struct {
