@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,7 +66,11 @@ func (p S3Path) Child(rel string) S3Path {
 	if p.Key == "" {
 		return S3Path{Bucket: p.Bucket, Key: rel}
 	}
-	return S3Path{Bucket: p.Bucket, Key: path.Clean(p.Key + "/" + rel)}
+	// S3 keys are opaque byte strings: path.Clean would collapse "."/".."
+	// segments and duplicate slashes, misaddressing objects and breaking
+	// round-trips between listing output and subsequent operations. Join with
+	// a single boundary separator and preserve every other segment verbatim.
+	return S3Path{Bucket: p.Bucket, Key: strings.TrimSuffix(p.Key, "/") + "/" + rel}
 }
 
 // String renders the path back into its s3://bucket/key form.

@@ -112,6 +112,11 @@ func TestChild(t *testing.T) {
 		{S3Path{Bucket: "b", Key: "dir"}, "file.txt", "s3://b/dir/file.txt"},
 		{S3Path{Bucket: "b", Key: "dir/"}, "file.txt", "s3://b/dir/file.txt"},
 		{S3Path{Bucket: "b", Key: "a/b"}, "c/d", "s3://b/a/b/c/d"},
+		// S3 keys are opaque: "."/".." and duplicate slashes must be preserved,
+		// not normalized away, or listing round-trips misaddress objects.
+		{S3Path{Bucket: "b", Key: "dir"}, "../escape.txt", "s3://b/dir/../escape.txt"},
+		{S3Path{Bucket: "b", Key: "a/./b"}, "c", "s3://b/a/./b/c"},
+		{S3Path{Bucket: "b", Key: "weird//key"}, "child", "s3://b/weird//key/child"},
 	}
 	for _, c := range cases {
 		if got := c.parent.Child(c.rel).String(); got != c.want {
