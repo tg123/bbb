@@ -1698,6 +1698,163 @@ func TestDNSPinCacheReturnsSameIP(t *testing.T) {
 	}
 }
 
+// --------------- custom DNS server tests ---------------
+
+func TestParseDNSServers(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want []string
+	}{
+		{"8.8.8.8", []string{"8.8.8.8:53"}},
+		{"8.8.8.8:5353", []string{"8.8.8.8:5353"}},
+		{" 8.8.8.8 , 1.1.1.1:5353 ", []string{"8.8.8.8:53", "1.1.1.1:5353"}},
+		{"::1", []string{"[::1]:53"}},
+		{"[2001:db8::1]:5353", []string{"[2001:db8::1]:5353"}},
+		{"8.8.8.8,,1.1.1.1", []string{"8.8.8.8:53", "1.1.1.1:53"}},
+	}
+
+	for _, tc := range cases {
+		got, err := parseDNSServers(tc.raw)
+		if err != nil {
+			t.Fatalf("parseDNSServers(%q) returned error: %v", tc.raw, err)
+		}
+		if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+			t.Fatalf("parseDNSServers(%q) = %v, want %v", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestParseDNSServersInvalid(t *testing.T) {
+	for _, raw := range []string{"", "  ", ",", "dns.example.com", "8.8.8.8:notaport", "8.8.8.8:99999", "not an ip"} {
+		if got, err := parseDNSServers(raw); err == nil {
+			t.Fatalf("parseDNSServers(%q) expected error, got %v", raw, got)
+		}
+	}
+}
+
+func TestNewDNSServerResolverTriesAllServers(t *testing.T) {
+	var mu sync.Mutex
+	dialed := map[string]bool{}
+
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		mu.Lock()
+		dialed[addr] = true
+		mu.Unlock()
+		return nil, errors.New("dial refused")
+	}
+
+	r := newDNSServerResolver([]string{"10.0.0.1:53", "10.0.0.2:5353"}, dial)
+	if _, err := r.LookupHost(context.Background(), "example.com."); err == nil {
+		t.Fatal("expected lookup error when every DNS server is unreachable")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, want := range []string{"10.0.0.1:53", "10.0.0.2:5353"} {
+		if !dialed[want] {
+			t.Fatalf("expected DNS server %s to be dialled, dialled: %v", want, dialed)
+		}
+	}
+}
+
+// startTestDNSServer starts a minimal UDP DNS server that answers every A
+// query with the given IPv4 address, and returns its address.
+func startTestDNSServer(t *testing.T, ip net.IP) string {
+	t.Helper()
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot listen on udp: %v", err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			resp, ok := buildDNSResponse(buf[:n], ip)
+			if !ok {
+				continue
+			}
+			_, _ = pc.WriteTo(resp, from)
+		}
+	}()
+
+	return pc.LocalAddr().String()
+}
+
+// buildDNSResponse builds a response for a single-question DNS query. A
+// records are answered with ip; every other question type gets an empty
+// (NOERROR) answer.
+func buildDNSResponse(query []byte, ip net.IP) ([]byte, bool) {
+	if len(query) < 12 {
+		return nil, false
+	}
+
+	// Walk the QNAME label sequence to find the end of the question.
+	i := 12
+	for i < len(query) && query[i] != 0 {
+		i += int(query[i]) + 1
+	}
+	if i >= len(query) || i+5 > len(query) {
+		return nil, false
+	}
+	qEnd := i + 5 // terminating zero + QTYPE + QCLASS
+	qtype := int(query[i+1])<<8 | int(query[i+2])
+
+	resp := make([]byte, 0, 64)
+	resp = append(resp, query[0], query[1]) // ID
+	resp = append(resp, 0x81, 0x80)         // QR + RD + RA, NOERROR
+	resp = append(resp, 0x00, 0x01)         // QDCOUNT
+	if qtype == 1 {                         // A
+		resp = append(resp, 0x00, 0x01) // ANCOUNT
+	} else {
+		resp = append(resp, 0x00, 0x00)
+	}
+	resp = append(resp, 0x00, 0x00, 0x00, 0x00) // NSCOUNT, ARCOUNT
+	resp = append(resp, query[12:qEnd]...)      // question section
+
+	if qtype == 1 {
+		v4 := ip.To4()
+		if v4 == nil {
+			return nil, false
+		}
+		resp = append(resp, 0xc0, 0x0c) // name pointer to question
+		resp = append(resp, 0x00, 0x01) // TYPE A
+		resp = append(resp, 0x00, 0x01) // CLASS IN
+		resp = append(resp, 0x00, 0x00, 0x00, 0x3c)
+		resp = append(resp, 0x00, 0x04) // RDLENGTH
+		resp = append(resp, v4...)
+	}
+
+	return resp, true
+}
+
+func TestNewDNSServerResolverResolvesViaConfiguredServer(t *testing.T) {
+	addr := startTestDNSServer(t, net.IPv4(203, 0, 113, 7))
+
+	servers, err := parseDNSServers(addr)
+	if err != nil {
+		t.Fatalf("parseDNSServers(%q): %v", addr, err)
+	}
+
+	r := newDNSServerResolver(servers, (&net.Dialer{Timeout: 5 * time.Second}).DialContext)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	addrs, err := r.LookupHost(ctx, "bbb-dns-test.invalid.")
+	if err != nil {
+		t.Fatalf("LookupHost via custom DNS server failed: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0] != "203.0.113.7" {
+		t.Fatalf("expected [203.0.113.7] from custom DNS server, got %v", addrs)
+	}
+}
+
 func TestProgressBarAbortDoesNotMarkComplete(t *testing.T) {
 	p := &progressBar{}
 	p.total.Store(1000)

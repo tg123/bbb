@@ -52,6 +52,7 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BBB_LOG_LEVEL` | `info` | Same as `--loglevel` flag |
+| `BBB_DNS_SERVER` | *(system resolver)* | Comma separated DNS server IPs (e.g. `8.8.8.8,1.1.1.1:5353`) used for **all** DNS lookups in bbb. Same as `--dns-server` flag |
 | `BBB_DNS_CACHE` | *(off)* | Set to `1` or `true` to enable process-local DNS caching |
 | `BBB_DNS_PIN` | *(off)* | Set to `1` or `true` to pin DNS to a single IP (implies `BBB_DNS_CACHE=1`) |
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
@@ -173,6 +174,26 @@ bbb ls s3://mybucket/
 S3→S3 copies (within the same account/endpoint) use server-side `CopyObject`
 — with a multipart `UploadPartCopy` fallback for objects larger than 5 GiB —
 and never stream bytes through the client.
+
+### `BBB_DNS_SERVER`
+
+When set, bbb sends every DNS query to the given DNS server(s) instead of the system resolver configuration (`/etc/resolv.conf`, `systemd-resolved`, ...). This is useful when the host resolver is broken, slow, or returns endpoints you do not want to use.
+
+```bash
+BBB_DNS_SERVER=8.8.8.8 bbb cp ./data/ az://myaccount/mycontainer/data/
+
+# equivalent flag form, with a fallback server and a custom port
+bbb --dns-server 10.0.0.53,1.1.1.1:5353 ls az://myaccount/mycontainer/
+```
+
+Servers must be given as IP addresses (an unresolvable name would need a resolver itself), optionally with a port — port `53` is assumed when omitted. IPv6 literals may be written bare (`::1`) or bracketed together with a port (`[2001:db8::1]:5353`). Servers are tried in the order given; the next one is used when a server cannot be reached.
+
+The override applies to **all** DNS lookups in the bbb process (it replaces the process-wide resolver), including Azure SDK data-plane requests, OAuth token calls, Hugging Face and S3 traffic. It composes with `BBB_DNS_CACHE` / `BBB_DNS_PIN`, which cache or pin the results returned by the configured server.
+
+**Caveats:**
+
+- `AzureCLICredential` shells out to the `az` binary; DNS resolution in that child process uses the system resolver and is not affected.
+- `GODEBUG=netdns=go` only selects Go's built-in DNS client, it cannot set a DNS server address — use `BBB_DNS_SERVER` for that. Setting it is not required either: bbb already forces the pure-Go resolver (`PreferGo`) when `BBB_DNS_SERVER` is set.
 
 ### `BBB_DNS_CACHE`
 
