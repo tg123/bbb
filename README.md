@@ -193,6 +193,7 @@ The override applies to **all** DNS lookups in the bbb process (it replaces the 
 **Caveats:**
 
 - `AzureCLICredential` shells out to the `az` binary; DNS resolution in that child process uses the system resolver and is not affected.
+- `GODEBUG=netdns=go` only selects Go's built-in DNS client, it cannot set a DNS server address — use `BBB_DNS_SERVER` for that. Setting it is not required either: bbb already forces the pure-Go resolver (`PreferGo`) when `BBB_DNS_SERVER` is set.
 
 ### `BBB_DNS_CACHE`
 
