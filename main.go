@@ -106,17 +106,19 @@ func parseDNSServers(raw string) ([]string, error) {
 
 		host, port, err := net.SplitHostPort(field)
 		if err != nil {
-			// No port supplied (this also covers bare IPv6 literals).
-			host, port = field, defaultDNSPort
+			// No port supplied (this also covers bare IPv6 literals and
+			// bracketed IPv6 literals without a port).
+			host, port = strings.TrimSuffix(strings.TrimPrefix(field, "["), "]"), defaultDNSPort
 		}
-		if net.ParseIP(strings.TrimSpace(host)) == nil {
+		host, port = strings.TrimSpace(host), strings.TrimSpace(port)
+		if net.ParseIP(host) == nil {
 			return nil, fmt.Errorf("invalid DNS server %q: must be an IP address (optionally with a port)", field)
 		}
 		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
 			return nil, fmt.Errorf("invalid DNS server %q: invalid port %q", field, port)
 		}
 
-		servers = append(servers, net.JoinHostPort(strings.TrimSpace(host), port))
+		servers = append(servers, net.JoinHostPort(host, port))
 	}
 
 	if len(servers) == 0 {
