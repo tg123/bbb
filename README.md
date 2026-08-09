@@ -52,7 +52,7 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BBB_LOG_LEVEL` | `info` | Same as `--loglevel` flag |
-| `BBB_DNS_SERVER` | *(system resolver)* | Comma separated DNS server IPs (e.g. `8.8.8.8,1.1.1.1:5353`) used for **all** DNS lookups in bbb. Same as `--dns-server` flag |
+| `BBB_DNS_SERVER` | *(system resolver)* | Comma separated DNS server IPs (e.g. `8.8.8.8,1.1.1.1:5353`) used for **all** DNS lookups in bbb |
 | `BBB_DNS_CACHE` | *(off)* | Set to `1` or `true` to enable process-local DNS caching |
 | `BBB_DNS_PIN` | *(off)* | Set to `1` or `true` to pin DNS to a single IP (implies `BBB_DNS_CACHE=1`) |
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
@@ -182,8 +182,8 @@ When set, bbb sends every DNS query to the given DNS server(s) instead of the sy
 ```bash
 BBB_DNS_SERVER=8.8.8.8 bbb cp ./data/ az://myaccount/mycontainer/data/
 
-# equivalent flag form, with a fallback server and a custom port
-bbb --dns-server 10.0.0.53,1.1.1.1:5353 ls az://myaccount/mycontainer/
+# with a fallback server and a custom port
+BBB_DNS_SERVER=10.0.0.53,1.1.1.1:5353 bbb ls az://myaccount/mycontainer/
 ```
 
 Servers must be given as IP addresses (an unresolvable name would need a resolver itself), optionally with a port — port `53` is assumed when omitted. IPv6 literals may be written bare (`::1`) or bracketed together with a port (`[2001:db8::1]:5353`). Servers are tried in the order given; the next one is used when a server cannot be reached.

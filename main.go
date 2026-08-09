@@ -92,7 +92,7 @@ type lookupHostFunc func(ctx context.Context, host string) ([]string, error)
 const defaultDNSPort = "53"
 
 // parseDNSServers parses a comma separated list of DNS servers (as accepted by
-// --dns-server / BBB_DNS_SERVER) into dialable "host:port" addresses. Servers
+// BBB_DNS_SERVER) into dialable "host:port" addresses. Servers
 // must be given as IP literals (optionally with a port), since resolving a DNS
 // server name would itself require a working resolver. IPv6 literals may be
 // written bare (`::1`) or bracketed with a port (`[::1]:5353`).
@@ -270,11 +270,6 @@ func main() {
 				Value:   "info",
 				Sources: cli.EnvVars("BBB_LOG_LEVEL"),
 			},
-			&cli.StringFlag{
-				Name:    "dns-server",
-				Usage:   "Comma separated DNS server IPs (e.g. 8.8.8.8,1.1.1.1:53) used for all DNS lookups in bbb",
-				Sources: cli.EnvVars("BBB_DNS_SERVER"),
-			},
 			&cli.StringFlag{Name: "taskfile", Hidden: true},
 			&cli.StringFlag{Name: "state", Hidden: true},
 		},
@@ -302,10 +297,10 @@ func main() {
 			// and used by the dialers below, so stdlib callers, the Azure
 			// SDK, Hugging Face and S3 traffic all resolve through it.
 			resolver := net.DefaultResolver
-			if raw := strings.TrimSpace(cmd.String("dns-server")); raw != "" {
+			if raw := strings.TrimSpace(os.Getenv("BBB_DNS_SERVER")); raw != "" {
 				servers, err := parseDNSServers(raw)
 				if err != nil {
-					return ctx, fmt.Errorf("invalid dns-server %q: %w", raw, err)
+					return ctx, fmt.Errorf("invalid BBB_DNS_SERVER %q: %w", raw, err)
 				}
 				// Dial DNS servers with a plain dialer: the addresses are IP
 				// literals, so this cannot recurse back into the resolver.
