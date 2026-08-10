@@ -88,6 +88,73 @@ func dnsLoggingDialContext(baseDial dialContextFunc, resolver *net.Resolver) dia
 // lookupHostFunc is the signature for a DNS hostname lookup function.
 type lookupHostFunc func(ctx context.Context, host string) ([]string, error)
 
+// defaultDNSPort is used when a DNS server is given without an explicit port.
+const defaultDNSPort = "53"
+
+// parseDNSServers parses a comma separated list of DNS servers (as accepted by
+// BBB_DNS_SERVER) into dialable "host:port" addresses. Servers
+// must be given as IP literals (optionally with a port), since resolving a DNS
+// server name would itself require a working resolver. IPv6 literals may be
+// written bare (`::1`) or bracketed with a port (`[::1]:5353`).
+func parseDNSServers(raw string) ([]string, error) {
+	var servers []string
+	for _, field := range strings.Split(raw, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+
+		host, port, err := net.SplitHostPort(field)
+		if err != nil {
+			// No port supplied (this also covers bare IPv6 literals and
+			// bracketed IPv6 literals without a port).
+			host, port = strings.TrimSuffix(strings.TrimPrefix(field, "["), "]"), defaultDNSPort
+		}
+		host, port = strings.TrimSpace(host), strings.TrimSpace(port)
+		if net.ParseIP(host) == nil {
+			return nil, fmt.Errorf("invalid DNS server %q: must be an IP address (optionally with a port)", field)
+		}
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+			return nil, fmt.Errorf("invalid DNS server %q: invalid port %q", field, port)
+		}
+
+		servers = append(servers, net.JoinHostPort(host, port))
+	}
+
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("no DNS server specified")
+	}
+
+	return servers, nil
+}
+
+// newDNSServerResolver returns a *net.Resolver that sends every query to the
+// given DNS servers instead of the system resolver configuration. Servers are
+// tried in order, falling back to the next one when a connection cannot be
+// established. PreferGo forces Go's built-in DNS client so the custom Dial
+// hook is honoured on every platform (including when cgo is available).
+func newDNSServerResolver(servers []string, dial dialContextFunc) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var lastErr error
+			for _, server := range servers {
+				conn, err := dial(ctx, network, server)
+				if err == nil {
+					slog.Debug("DNS query sent to configured server", "server", server, "network", network)
+					return conn, nil
+				}
+				slog.Debug("DNS server unreachable", "server", server, "network", network, "error", err)
+				lastErr = err
+			}
+			if lastErr == nil {
+				lastErr = fmt.Errorf("no DNS server configured")
+			}
+			return nil, lastErr
+		},
+	}
+}
+
 // dnsCacheEntry stores resolved addresses with an expiry time.
 type dnsCacheEntry struct {
 	addrs  []string
@@ -227,6 +294,26 @@ func main() {
 			slog.SetDefault(slog.New(&barAwareHandler{inner: handler}))
 			slog.Debug("Logger initialized", "level", lvlStr)
 
+			// A custom DNS server overrides every lookup made by bbb: it is
+			// installed as the process-wide resolver (net.DefaultResolver)
+			// and used by the dialers below, so stdlib callers, the Azure
+			// SDK, Hugging Face and S3 traffic all resolve through it.
+			resolver := net.DefaultResolver
+			if raw := strings.TrimSpace(os.Getenv("BBB_DNS_SERVER")); raw != "" {
+				servers, err := parseDNSServers(raw)
+				if err != nil {
+					return ctx, fmt.Errorf("invalid BBB_DNS_SERVER %q: %w", raw, err)
+				}
+				// Dial DNS servers with a plain dialer: the addresses are IP
+				// literals, so this cannot recurse back into the resolver.
+				resolver = newDNSServerResolver(servers, (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext)
+				net.DefaultResolver = resolver
+				slog.Info("custom DNS server configured (applies to all DNS lookups in bbb)", "servers", servers)
+			}
+
 			if transport, ok := http.DefaultTransport.(*http.Transport); ok {
 				transport = transport.Clone()
 				// Go's http.DefaultTransport defaults to MaxIdleConnsPerHost=2,
@@ -246,6 +333,7 @@ func main() {
 				baseDial := (&net.Dialer{
 					Timeout:   30 * time.Second,
 					KeepAlive: 30 * time.Second,
+					Resolver:  resolver,
 				}).DialContext
 
 				dnsPin, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv("BBB_DNS_PIN")))
@@ -269,7 +357,7 @@ func main() {
 							ttl = d
 						}
 					}
-					transport.DialContext = dnsCachingDialContext(baseDial, net.DefaultResolver, ttl, dnsPin)
+					transport.DialContext = dnsCachingDialContext(baseDial, resolver, ttl, dnsPin)
 					ttlStr := "unlimited"
 					if ttl > 0 {
 						ttlStr = ttl.String()
@@ -284,7 +372,7 @@ func main() {
 						"pin", dnsPin,
 					)
 				} else {
-					transport.DialContext = dnsLoggingDialContext(baseDial, net.DefaultResolver)
+					transport.DialContext = dnsLoggingDialContext(baseDial, resolver)
 				}
 
 				http.DefaultTransport = transport
