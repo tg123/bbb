@@ -1,6 +1,6 @@
 # bbb
 
-A Go fork of [boostedblob](https://github.com/hauntsaninja/boostedblob) — a fast, concurrent CLI for working with local files, Azure Blob Storage (`az://`), Amazon S3 (`s3://`), and Hugging Face (`hf://`).
+A Go fork of [boostedblob](https://github.com/hauntsaninja/boostedblob) — a fast, concurrent CLI for working with local files, Azure Blob Storage (`az://`), Amazon S3 (`s3://`), Google Cloud Storage (`gs://`), and Hugging Face (`hf://`).
 
 ## Why a fork of boostedblob
 
@@ -22,6 +22,7 @@ go install github.com/tg123/bbb@latest
 | *(none)* | Local filesystem | `/tmp/data/`, `./file.txt` |
 | `az://` | Azure Blob Storage | `az://myaccount/mycontainer/path/to/blob` |
 | `s3://` | Amazon S3 (and S3-compatible stores) | `s3://mybucket/path/to/object` |
+| `gs://` | Google Cloud Storage | `gs://mybucket/path/to/object` |
 | `hf://` | Hugging Face Hub | `hf://meta-llama/Llama-2-7b/weights.bin`, `hf://datasets/org/repo/data.csv` |
 
 ## Global Flags
@@ -175,6 +176,38 @@ S3→S3 copies (within the same account/endpoint) use server-side `CopyObject`
 — with a multipart `UploadPartCopy` fallback for objects larger than 5 GiB —
 and never stream bytes through the client.
 
+### Google Cloud Storage (`gs://`) Authentication and Configuration
+
+GCS paths use Google's Application Default Credentials, so anything `gcloud`
+understands works out of the box: a service account key file pointed at by
+`GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default login`
+credentials, or the metadata server / workload identity on GCE, GKE and Cloud
+Run.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GOOGLE_APPLICATION_CREDENTIALS` | *(unset)* | Path to a service account key file |
+| `BBB_GS_PROJECT` / `GOOGLE_CLOUD_PROJECT` | *(unset)* | Project used when creating buckets (`bbb gs mkbucket`) |
+| `BBB_GS_ENDPOINT` | *(unset)* | Custom endpoint URL, e.g. a [fake-gcs-server](https://github.com/fsouza/fake-gcs-server) emulator. Authentication is disabled when set |
+| `STORAGE_EMULATOR_HOST` | *(unset)* | Google's standard emulator variable, used when `BBB_GS_ENDPOINT` is unset |
+
+Example using the fake-gcs-server emulator:
+
+```bash
+docker run -d -p 4443:4443 fsouza/fake-gcs-server \
+  -scheme http -port 4443 -backend memory \
+  -public-host localhost:4443 -external-url http://localhost:4443
+
+export BBB_GS_ENDPOINT=http://localhost:4443
+
+bbb gs mkbucket gs://mybucket
+bbb cp ./data.bin gs://mybucket/data.bin
+bbb ls gs://mybucket/
+```
+
+GCS→GCS copies use the server-side rewrite API — which handles objects of any
+size — and never stream bytes through the client.
+
 ### `BBB_DNS_SERVER`
 
 When set, bbb sends every DNS query to the given DNS server(s) instead of the system resolver configuration (`/etc/resolv.conf`, `systemd-resolved`, ...). This is useful when the host resolver is broken, slow, or returns endpoints you do not want to use.
@@ -188,7 +221,7 @@ BBB_DNS_SERVER=10.0.0.53,1.1.1.1:5353 bbb ls az://myaccount/mycontainer/
 
 Servers must be given as IP addresses (an unresolvable name would need a resolver itself), optionally with a port — port `53` is assumed when omitted. IPv6 literals may be written bare (`::1`) or bracketed together with a port (`[2001:db8::1]:5353`). Servers are tried in the order given; the next one is used when a server cannot be reached.
 
-The override applies to **all** DNS lookups in the bbb process (it replaces the process-wide resolver), including Azure SDK data-plane requests, OAuth token calls, Hugging Face and S3 traffic. It composes with `BBB_DNS_CACHE` / `BBB_DNS_PIN`, which cache or pin the results returned by the configured server.
+The override applies to **all** DNS lookups in the bbb process (it replaces the process-wide resolver), including Azure SDK data-plane requests, OAuth token calls, Hugging Face, S3 and Google Cloud Storage traffic. It composes with `BBB_DNS_CACHE` / `BBB_DNS_PIN`, which cache or pin the results returned by the configured server.
 
 **Caveats:**
 
@@ -685,6 +718,19 @@ bbb s3 mkbucket s3://bucket
 ```bash
 # Create a new S3 bucket
 bbb s3 mkbucket s3://newbucket
+```
+
+### `gs mkbucket` — Create a Google Cloud Storage bucket
+
+```
+bbb gs mkbucket gs://bucket
+```
+
+**Example:**
+
+```bash
+# Create a new GCS bucket (needs BBB_GS_PROJECT or GOOGLE_CLOUD_PROJECT)
+bbb gs mkbucket gs://newbucket
 ```
 
 ## Benchmark
