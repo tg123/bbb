@@ -168,6 +168,7 @@ func TestR2EndpointAndRegion(t *testing.T) {
 		wantEndpoint string
 		wantRegion   string
 		wantR2       bool
+		wantAccount  string
 	}{
 		{
 			name:         "aws default",
@@ -180,6 +181,7 @@ func TestR2EndpointAndRegion(t *testing.T) {
 			wantEndpoint: "https://abc123." + r2EndpointSuffix,
 			wantRegion:   r2Region,
 			wantR2:       true,
+			wantAccount:  "abc123",
 		},
 		{
 			name:         "explicit endpoint wins over account id",
@@ -193,6 +195,7 @@ func TestR2EndpointAndRegion(t *testing.T) {
 			wantEndpoint: "https://abc123.eu." + r2EndpointSuffix + "/",
 			wantRegion:   r2Region,
 			wantR2:       true,
+			wantAccount:  "abc123",
 		},
 		{
 			name:         "explicit region wins over auto",
@@ -200,6 +203,7 @@ func TestR2EndpointAndRegion(t *testing.T) {
 			wantEndpoint: "https://abc123." + r2EndpointSuffix,
 			wantRegion:   "wnam",
 			wantR2:       true,
+			wantAccount:  "abc123",
 		},
 		{
 			name:         "aws region ignored for r2",
@@ -207,6 +211,7 @@ func TestR2EndpointAndRegion(t *testing.T) {
 			wantEndpoint: "https://abc123." + r2EndpointSuffix,
 			wantRegion:   r2Region,
 			wantR2:       true,
+			wantAccount:  "abc123",
 		},
 		{
 			name:         "lookalike host is not r2",
@@ -231,6 +236,9 @@ func TestR2EndpointAndRegion(t *testing.T) {
 			}
 			if got := isR2(); got != c.wantR2 {
 				t.Errorf("isR2() = %v, want %v", got, c.wantR2)
+			}
+			if got := r2AccountID(); got != c.wantAccount {
+				t.Errorf("r2AccountID() = %q, want %q", got, c.wantAccount)
 			}
 		})
 	}

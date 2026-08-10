@@ -157,27 +157,39 @@ func region() string {
 	return fallback
 }
 
-// r2AccountID returns the Cloudflare account ID used to derive the R2 endpoint.
+// r2AccountID returns the Cloudflare account ID of the endpoint in use, or an
+// empty string when the endpoint does not point at R2. It is taken from the
+// endpoint host (the leftmost label), which also covers the case where the
+// endpoint was derived from BBB_R2_ACCOUNT_ID.
 func r2AccountID() string {
-	return strings.TrimSpace(os.Getenv("BBB_R2_ACCOUNT_ID"))
+	host := endpointHost(endpoint())
+	if !isR2Host(host) {
+		return ""
+	}
+	label, _, ok := strings.Cut(host, ".")
+	if !ok {
+		return ""
+	}
+	return label
+}
+
+func rawEndpoint() string {
+	return strings.TrimSpace(os.Getenv("BBB_S3_ENDPOINT"))
 }
 
 func endpoint() string {
-	if ep := strings.TrimSpace(os.Getenv("BBB_S3_ENDPOINT")); ep != "" {
+	if ep := rawEndpoint(); ep != "" {
 		return ep
 	}
-	if id := r2AccountID(); id != "" {
+	if id := strings.TrimSpace(os.Getenv("BBB_R2_ACCOUNT_ID")); id != "" {
 		return "https://" + id + "." + r2EndpointSuffix
 	}
 	return ""
 }
 
-// isR2 reports whether the configured endpoint targets Cloudflare R2.
-func isR2() bool {
-	ep := endpoint()
-	if ep == "" {
-		return false
-	}
+// endpointHost extracts the lower-cased host of an endpoint URL, without any
+// scheme, userinfo, port or path.
+func endpointHost(ep string) string {
 	host := ep
 	if i := strings.Index(host, "://"); i >= 0 {
 		host = host[i+len("://"):]
@@ -191,16 +203,25 @@ func isR2() bool {
 	if i := strings.LastIndex(host, ":"); i >= 0 && !strings.Contains(host[i+1:], "]") {
 		host = host[:i]
 	}
-	host = strings.ToLower(strings.Trim(strings.TrimSuffix(host, "."), "[]"))
+	return strings.ToLower(strings.Trim(strings.TrimSuffix(host, "."), "[]"))
+}
+
+// isR2Host reports whether host belongs to the Cloudflare R2 S3 API.
+func isR2Host(host string) bool {
 	return host == r2EndpointSuffix || strings.HasSuffix(host, "."+r2EndpointSuffix)
+}
+
+// isR2 reports whether the configured endpoint targets Cloudflare R2.
+func isR2() bool {
+	return isR2Host(endpointHost(endpoint()))
 }
 
 // IsR2 reports whether bbb is configured to talk to Cloudflare R2, either via
 // BBB_R2_ACCOUNT_ID or an explicit R2 BBB_S3_ENDPOINT.
 func IsR2() bool { return isR2() }
 
-// R2AccountID returns the configured Cloudflare account ID (BBB_R2_ACCOUNT_ID),
-// or an empty string when it is not set.
+// R2AccountID returns the Cloudflare account ID in use (from BBB_R2_ACCOUNT_ID
+// or an R2 BBB_S3_ENDPOINT), or an empty string when R2 is not configured.
 func R2AccountID() string { return r2AccountID() }
 
 // Endpoint returns the configured custom S3 endpoint (BBB_S3_ENDPOINT), or an
