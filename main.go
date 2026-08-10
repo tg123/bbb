@@ -489,11 +489,10 @@ func main() {
 							if gp.Bucket == "" || gp.Object != "" {
 								return fmt.Errorf("mkbucket: need gs://bucket")
 							}
-							bucket := gp.Bucket
 							if err := bbbfs.MkDir(ctx, target); err != nil {
 								return err
 							}
-							fmt.Printf("Created bucket %s\n", bucket)
+							fmt.Printf("Created bucket %s\n", gp.Bucket)
 							return nil
 						},
 					},
