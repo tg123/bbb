@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -18,19 +19,26 @@ func TestStreamTaskPairsEmitsBeforeEOF(t *testing.T) {
 	}
 
 	writerDone := make(chan struct{})
+	writerErr := make(chan error, 1)
 	go func() {
 		defer close(writerDone)
 		w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
 		if err != nil {
+			writerErr <- fmt.Errorf("open FIFO writer: %w", err)
 			return
 		}
 		defer func() {
 			_ = w.Close()
 		}()
-		_, _ = w.WriteString("src1 dst1\n")
+		if _, err := w.WriteString("src1 dst1\n"); err != nil {
+			writerErr <- fmt.Errorf("write first task: %w", err)
+			return
+		}
 		// Hold the pipe open; the first pair must be emitted before EOF.
 		time.Sleep(200 * time.Millisecond)
-		_, _ = w.WriteString("src2 dst2\n")
+		if _, err := w.WriteString("src2 dst2\n"); err != nil {
+			writerErr <- fmt.Errorf("write second task: %w", err)
+		}
 	}()
 
 	first := make(chan taskPair, 1)
@@ -52,6 +60,8 @@ func TestStreamTaskPairsEmitsBeforeEOF(t *testing.T) {
 		if task.src != "src1" || task.dst != "dst1" {
 			t.Fatalf("unexpected first task: %+v", task)
 		}
+	case err := <-writerErr:
+		t.Fatal(err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for first streamed task pair")
 	}
@@ -65,6 +75,11 @@ func TestStreamTaskPairsEmitsBeforeEOF(t *testing.T) {
 		t.Fatalf("streamTaskPairs failed: %v", err)
 	}
 	<-writerDone
+	select {
+	case err := <-writerErr:
+		t.Fatal(err)
+	default:
+	}
 	if len(got) != 2 || got[1].src != "src2" {
 		t.Fatalf("unexpected streamed tasks: %+v", got)
 	}

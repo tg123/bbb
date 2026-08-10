@@ -990,11 +990,34 @@ func TestDiscoverTenantIDHTTPError(t *testing.T) {
 }
 
 func TestRegisterAccountRoleStoresUpperCase(t *testing.T) {
-	defer accountRoles.Delete("testacct")
+	defer ClearAccountRole("testacct")
 	RegisterAccountRole("testacct", "src")
 	v, ok := accountRoles.Load("testacct")
 	if !ok || v.(string) != "SRC" {
 		t.Fatalf("expected SRC, got %v", v)
+	}
+}
+
+func TestAccountRoleChangesInvalidateCachedClient(t *testing.T) {
+	const account = "rolechangeacct"
+	defer ClearAccountRole(account)
+
+	blobClientCache.Store(account, "stale")
+	RegisterAccountRole(account, "SRC")
+	if _, ok := blobClientCache.Load(account); ok {
+		t.Fatal("registering a new role should invalidate the cached client")
+	}
+
+	blobClientCache.Store(account, "stale")
+	RegisterAccountRole(account, "DST")
+	if _, ok := blobClientCache.Load(account); ok {
+		t.Fatal("changing roles should invalidate the cached client")
+	}
+
+	blobClientCache.Store(account, "stale")
+	ClearAccountRole(account)
+	if _, ok := blobClientCache.Load(account); ok {
+		t.Fatal("clearing a role should invalidate the cached client")
 	}
 }
 

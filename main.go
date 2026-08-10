@@ -1068,7 +1068,6 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 // pre-authenticates accounts as new task pairs are streamed in, so a taskfile
 // can be consumed as a continuous work stream.
 type azRoleRegistrar struct {
-	mu       sync.Mutex
 	srcPaths []string
 	dstPaths []string
 	srcSeen  map[string]struct{}
@@ -1083,10 +1082,7 @@ func newAzRoleRegistrar() *azRoleRegistrar {
 // Only the first path seen per storage account is retained, so memory does
 // not grow with the number of task pairs.
 func (r *azRoleRegistrar) observe(ctx context.Context, task taskPair) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	changed := false
+	var newPaths []string
 	add := func(p string, seen map[string]struct{}, paths *[]string) {
 		if !bbbfs.IsAz(p) {
 			return
@@ -1100,11 +1096,11 @@ func (r *azRoleRegistrar) observe(ctx context.Context, task taskPair) error {
 		}
 		seen[account] = struct{}{}
 		*paths = append(*paths, p)
-		changed = true
+		newPaths = append(newPaths, p)
 	}
 	add(task.src, r.srcSeen, &r.srcPaths)
 	add(task.dst, r.dstSeen, &r.dstPaths)
-	if !changed {
+	if len(newPaths) == 0 {
 		return nil
 	}
 
@@ -1113,11 +1109,9 @@ func (r *azRoleRegistrar) observe(ctx context.Context, task taskPair) error {
 	// so accounts appearing in both roles stay untagged.
 	bbbfs.RegisterAzAccountRoles(r.srcPaths, r.dstPaths)
 	// Pre-authenticate Azure accounts before workers use them. This keeps
-	// interactive login popups sequential, one per tenant.
-	paths := make([]string, 0, len(r.srcPaths)+len(r.dstPaths))
-	paths = append(paths, r.srcPaths...)
-	paths = append(paths, r.dstPaths...)
-	return bbbfs.PreAuthenticateAz(ctx, paths...)
+	// interactive login popups sequential without re-authenticating accounts
+	// that were handled by earlier task pairs.
+	return bbbfs.PreAuthenticateAz(ctx, newPaths...)
 }
 
 // runCPTaskStream executes task pairs produced by the producer through the
@@ -1337,6 +1331,11 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 	// Consume task pairs as they are produced so copies start immediately
 	// instead of waiting for the whole taskfile to be read.
 	produceErr := produce(func(task taskPair) error {
+		select {
+		case <-workerCtx.Done():
+			return workerCtx.Err()
+		default:
+		}
 		if err := azRoles.observe(workerCtx, task); err != nil {
 			return err
 		}
