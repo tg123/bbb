@@ -160,3 +160,78 @@ func TestNormalizePrefix(t *testing.T) {
 		}
 	}
 }
+
+func TestR2EndpointAndRegion(t *testing.T) {
+	cases := []struct {
+		name         string
+		env          map[string]string
+		wantEndpoint string
+		wantRegion   string
+		wantR2       bool
+	}{
+		{
+			name:         "aws default",
+			wantEndpoint: "",
+			wantRegion:   defaultRegion,
+		},
+		{
+			name:         "account id derives endpoint and auto region",
+			env:          map[string]string{"BBB_R2_ACCOUNT_ID": "abc123"},
+			wantEndpoint: "https://abc123." + r2EndpointSuffix,
+			wantRegion:   r2Region,
+			wantR2:       true,
+		},
+		{
+			name:         "explicit endpoint wins over account id",
+			env:          map[string]string{"BBB_R2_ACCOUNT_ID": "abc123", "BBB_S3_ENDPOINT": "http://127.0.0.1:9000"},
+			wantEndpoint: "http://127.0.0.1:9000",
+			wantRegion:   defaultRegion,
+		},
+		{
+			name:         "explicit r2 endpoint detected",
+			env:          map[string]string{"BBB_S3_ENDPOINT": "https://abc123.eu." + r2EndpointSuffix + "/"},
+			wantEndpoint: "https://abc123.eu." + r2EndpointSuffix + "/",
+			wantRegion:   r2Region,
+			wantR2:       true,
+		},
+		{
+			name:         "explicit region wins over auto",
+			env:          map[string]string{"BBB_R2_ACCOUNT_ID": "abc123", "BBB_S3_REGION": "wnam"},
+			wantEndpoint: "https://abc123." + r2EndpointSuffix,
+			wantRegion:   "wnam",
+			wantR2:       true,
+		},
+		{
+			name:         "aws region ignored for r2",
+			env:          map[string]string{"BBB_R2_ACCOUNT_ID": "abc123", "AWS_REGION": "us-west-2"},
+			wantEndpoint: "https://abc123." + r2EndpointSuffix,
+			wantRegion:   r2Region,
+			wantR2:       true,
+		},
+		{
+			name:         "lookalike host is not r2",
+			env:          map[string]string{"BBB_S3_ENDPOINT": "https://notr2.cloudflarestorage.com.evil.test"},
+			wantEndpoint: "https://notr2.cloudflarestorage.com.evil.test",
+			wantRegion:   defaultRegion,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, k := range []string{"BBB_R2_ACCOUNT_ID", "BBB_S3_ENDPOINT", "BBB_S3_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"} {
+				t.Setenv(k, "")
+			}
+			for k, v := range c.env {
+				t.Setenv(k, v)
+			}
+			if got := endpoint(); got != c.wantEndpoint {
+				t.Errorf("endpoint() = %q, want %q", got, c.wantEndpoint)
+			}
+			if got := region(); got != c.wantRegion {
+				t.Errorf("region() = %q, want %q", got, c.wantRegion)
+			}
+			if got := isR2(); got != c.wantR2 {
+				t.Errorf("isR2() = %v, want %v", got, c.wantR2)
+			}
+		})
+	}
+}
