@@ -15,6 +15,39 @@ Download the latest release from the [Releases](https://github.com/tg123/bbb/rel
 go install github.com/tg123/bbb@latest
 ```
 
+## Docker
+
+Images are published to both GitHub Container Registry and Docker Hub for `linux/amd64` and `linux/arm64`:
+
+```bash
+docker pull ghcr.io/tg123/bbb:latest
+docker pull tg123/bbb:latest
+```
+
+The image is based on Alpine and, besides `bbb`, ships a small set of tools commonly needed when scripting around it (`bash`, `coreutils`, `findutils`, `curl`, `jq`, `tar`, `gzip`, `zstd`, `ca-certificates`, `tzdata`), so it can be used as a job/sidecar image rather than a bare binary. Extra packages can be added with `apk add` in a derived image.
+
+Run a command:
+
+```bash
+docker run --rm -v "$PWD:/data" ghcr.io/tg123/bbb:latest ls az://myaccount/mycontainer/
+```
+
+Run a script that uses `bbb` (override the entrypoint):
+
+```bash
+docker run --rm -v "$PWD:/data" --entrypoint bash ghcr.io/tg123/bbb:latest \
+  -c 'bbb lsr az://myaccount/mycontainer/ | head -n 10'
+```
+
+Credentials are picked up from the environment as usual, e.g.:
+
+```bash
+docker run --rm -e BBB_AZBLOB_ACCOUNTKEY -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  -v "$PWD:/data" ghcr.io/tg123/bbb:latest cp az://myaccount/mycontainer/file.bin /data/
+```
+
+To use Azure CLI / managed identity based login, mount the host credentials, e.g. `-v "$HOME/.azure:/root/.azure"`.
+
 ## Supported Path Types
 
 | Prefix | Description | Example |
