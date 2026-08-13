@@ -1346,7 +1346,7 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 			return nil
 		}
 	})
-	if produceErr != nil && workerCtx.Err() == nil {
+	if produceErr != nil {
 		setErr(produceErr)
 	}
 	close(pairCh)
