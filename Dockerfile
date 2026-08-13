@@ -31,14 +31,15 @@ RUN apk add --no-cache \
         coreutils \
         findutils \
         curl \
+        wget \
+        sed \
         jq \
         tar \
         gzip \
-        zstd \
-        tini
+        zstd
 
 COPY --from=build /out/bbb /usr/local/bin/bbb
 
 WORKDIR /data
 
-ENTRYPOINT ["/sbin/tini", "--", "bbb"]
+ENTRYPOINT ["bbb"]

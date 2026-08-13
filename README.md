@@ -17,14 +17,14 @@ go install github.com/tg123/bbb@latest
 
 ## Docker
 
-Images are published to both GitHub Container Registry and Docker Hub for `linux/amd64` and `linux/arm64`:
+Images are published to GitHub Container Registry for `linux/amd64` and `linux/arm64`. They are also published to Docker Hub when the repository's Docker Hub credentials are configured:
 
 ```bash
 docker pull ghcr.io/tg123/bbb:latest
 docker pull farmer1992/bbb:latest
 ```
 
-The image is based on Alpine and, besides `bbb`, ships a small set of tools commonly needed when scripting around it (`bash`, `coreutils`, `findutils`, `curl`, `jq`, `tar`, `gzip`, `zstd`, `ca-certificates`, `tzdata`), so it can be used as a job/sidecar image rather than a bare binary. Extra packages can be added with `apk add` in a derived image.
+The image is based on Alpine and, besides `bbb`, ships a small set of tools commonly needed when scripting around it (`bash`, `coreutils`, `findutils`, `curl`, `wget`, `sed`, `jq`, `tar`, `gzip`, `zstd`, `ca-certificates`, `tzdata`), so it can be used as a job/sidecar image rather than a bare binary. Extra packages can be added with `apk add` in a derived image.
 
 Run a command:
 
