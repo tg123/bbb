@@ -42,4 +42,3 @@ COPY --from=build /out/bbb /usr/local/bin/bbb
 WORKDIR /data
 
 ENTRYPOINT ["/sbin/tini", "--", "bbb"]
-CMD ["--help"]
