@@ -502,8 +502,9 @@ func main() {
 			{
 				Name:      "llr",
 				Usage:     "Alias for 'lstree -l' (recursive long file list)",
-				UsageText: "bbb llr [-s|--relative] [--machine] [--concurrency N] [path]",
+				UsageText: "bbb llr [--summary] [-s|--relative] [--machine] [--concurrency N] [path]",
 				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "summary", Usage: "Show only the total file count and size"},
 					&cli.BoolFlag{Name: "s", Aliases: []string{"relative"}, Usage: "Show relative paths"},
 					&cli.BoolFlag{Name: "machine", Usage: "Machine-readable (tab-separated) output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent listing requests", Value: runtime.NumCPU()},
@@ -697,6 +698,7 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	longFlag := c.Bool("l") || c.Bool("long") || longForced
 	machine := c.Bool("machine")
 	relFlag := c.Bool("s") || c.Bool("relative")
+	summary := c.Bool("summary")
 	if conc := c.Int("concurrency"); conc > 0 {
 		ctx = bbbfs.WithScanConcurrency(ctx, conc)
 	}
@@ -704,6 +706,18 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	parentPath, pattern := splitWildcard(root)
 	var count int64
 	var totalSize int64
+	countingBar := newCountingProgressBar("Counting", !summary)
+	completed := false
+	defer func() {
+		if countingBar == nil {
+			return
+		}
+		if completed {
+			countingBar.Finish()
+		} else {
+			countingBar.Abort()
+		}
+	}()
 	for result := range bbbfs.ListRecursive(ctx, parentPath) {
 		if result.Err != nil {
 			return result.Err
@@ -728,6 +742,13 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 		}
 		count++
 		totalSize += entry.Size
+		if countingBar != nil {
+			countingBar.AddBytes(entry.Size)
+			countingBar.Increment()
+		}
+		if summary {
+			continue
+		}
 		display := entry.Path
 		if relFlag {
 			display = name
@@ -750,7 +771,14 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 			}
 		}
 	}
-	if !machine {
+	completed = true
+	if countingBar != nil {
+		countingBar.Finish()
+		countingBar = nil
+	}
+	if summary && machine {
+		fmt.Printf("%d\t%d\n", count, totalSize)
+	} else if !machine {
 		noun := "files"
 		if count == 1 {
 			noun = "file"

@@ -1059,11 +1059,87 @@ func TestFormatProgressBarIncludesSpeed(t *testing.T) {
 	}
 }
 
+func TestFormatCountingBar(t *testing.T) {
+	line := formatCountingBar("Counting", 3, 1536, 5, 200*time.Millisecond, false)
+	if line != "Counting [  >  ] 3 files (1.5 KiB) 0s" {
+		t.Fatalf("unexpected counting bar output: %s", line)
+	}
+
+	line = formatCountingBar("Counting", 1, 512, 5, 2*time.Second, true)
+	if line != "Counting [=====] 1 file (512 B) 2s" {
+		t.Fatalf("unexpected completed counting bar output: %s", line)
+	}
+}
+
 func TestFormatProgressBarClampsDoneToTotal(t *testing.T) {
 	line := formatProgressBar("cp", 7, 5, 10, 1*1024*1024, true, false, 5*time.Second)
 	if line != "cp [==========] 100% (5/5, 1.0 MB/s) 5s" {
 		t.Fatalf("unexpected clamped output: %s", line)
 	}
+}
+
+func TestLLRSummaryOnly(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "nested"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nested", "b.txt"), []byte("12345"), 0o644); err != nil {
+		t.Fatalf("write b.txt: %v", err)
+	}
+
+	app := &cli.Command{
+		Action: func(ctx context.Context, c *cli.Command) error {
+			return runListTree(ctx, c, true)
+		},
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "summary"},
+			&cli.BoolFlag{Name: "machine"},
+			&cli.BoolFlag{Name: "s", Aliases: []string{"relative"}},
+			&cli.IntFlag{Name: "concurrency", Value: 1},
+		},
+	}
+
+	output := captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"llr", "--summary", "--concurrency", "4", root})
+	})
+	if output != "Listed 2 files summing to 8 B (8 bytes)\n" {
+		t.Fatalf("unexpected summary output: %q", output)
+	}
+
+	output = captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"llr", "--summary", "--machine", root})
+	})
+	if output != "2\t8\n" {
+		t.Fatalf("unexpected machine summary output: %q", output)
+	}
+}
+
+func captureStdout(t *testing.T, run func() error) string {
+	t.Helper()
+	original := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stdout: %v", err)
+	}
+	os.Stdout = w
+	runErr := run()
+	closeErr := w.Close()
+	os.Stdout = original
+	output, readErr := io.ReadAll(r)
+	_ = r.Close()
+	if runErr != nil {
+		t.Fatalf("command failed: %v", runErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close stdout: %v", closeErr)
+	}
+	if readErr != nil {
+		t.Fatalf("read stdout: %v", readErr)
+	}
+	return string(output)
 }
 
 func TestFormatProgressBarNormalizesWidth(t *testing.T) {

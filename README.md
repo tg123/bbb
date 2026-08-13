@@ -383,6 +383,7 @@ bbb lstree [flags] [path]
 | `-l`, `--long` | Show file type, size, and modification time |
 | `-s`, `--relative` | Show relative paths |
 | `--machine` | Machine-readable tab-separated output |
+| `--concurrency N` | Number of concurrent listing requests |
 
 **Examples:**
 
@@ -406,13 +407,18 @@ bbb llr [flags] [path]
 
 | Flag | Description |
 |------|-------------|
+| `--summary` | Show only the total file count and size, with progress while counting |
 | `-s`, `--relative` | Show relative paths |
 | `--machine` | Machine-readable tab-separated output |
+| `--concurrency N` | Number of concurrent listing requests |
 
 **Example:**
 
 ```bash
 bbb llr az://myaccount/mycontainer/
+
+# Count a large folder without printing every file
+bbb llr --summary --concurrency 32 az://myaccount/mycontainer/
 ```
 
 ---
