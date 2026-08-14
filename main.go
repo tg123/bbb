@@ -713,24 +713,19 @@ func cmdDU(ctx context.Context, c *cli.Command) error {
 	}
 	for _, root := range roots {
 		if c.Bool("summarize") {
-			if !strings.Contains(root, "://") {
-				usages, err := collectDiskUsage(ctx, root)
-				if err != nil {
-					return err
-				}
-				usage := usages[len(usages)-1]
-				printDiskUsage(usage, root, c.Bool("machine"))
+			bar := newCountingProgressBar("Counting", c.Bool("machine"))
+			result, err := bbbfs.SummarizeRecursive(ctx, root, func(count, size int64) {
+				bar.SetCountAndBytes(count, size)
+			})
+			if err != nil {
+				bar.Abort()
+				return err
+			}
+			bar.Finish()
+			if c.Bool("machine") {
+				fmt.Printf("%d\t%d\n", result.FileCount, result.TotalSize)
 			} else {
-				bar := newCountingProgressBar("Counting", false)
-				result, err := bbbfs.SummarizeRecursive(ctx, root, func(count, size int64) {
-					bar.SetCountAndBytes(count, size)
-				})
-				if err != nil {
-					bar.Abort()
-					return err
-				}
-				bar.Finish()
-				printDiskUsage(diskUsage{allocated: result.TotalSize, apparent: result.TotalSize}, root, c.Bool("machine"))
+				printListSummary(result.FileCount, result.TotalSize)
 			}
 			continue
 		}

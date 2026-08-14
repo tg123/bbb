@@ -376,8 +376,8 @@ bbb du -s --concurrency 32 az://myaccount/mycontainer/data/
 
 | Flag | Description |
 |------|-------------|
-| `-s`, `--summarize` | Display only a total for each argument |
-| `--machine` | Machine-readable tab-separated apparent bytes |
+| `-s`, `--summarize` | Display only the total file count and size |
+| `--machine` | Machine-readable `count<TAB>bytes` summary with `-s` |
 | `--concurrency N` | Number of concurrent listing requests |
 
 ---

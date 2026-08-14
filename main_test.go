@@ -1139,14 +1139,14 @@ func TestDUSummaryIsRecursive(t *testing.T) {
 	output := captureStdout(t, func() error {
 		return app.Run(context.Background(), []string{"du", "-s", root})
 	})
-	if !strings.HasSuffix(output, "\t"+root+"\n") {
+	if output != "Listed 2 files summing to 8 B (8 bytes)\n" {
 		t.Fatalf("unexpected du summary output: %q", output)
 	}
 
 	output = captureStdout(t, func() error {
 		return app.Run(context.Background(), []string{"du", "--machine", "-s", root})
 	})
-	if output != "8\t"+root+"\n" {
+	if output != "2\t8\n" {
 		t.Fatalf("unexpected machine du summary output: %q", output)
 	}
 }
@@ -1182,7 +1182,7 @@ func TestDUDefaultPrintsDirectoriesPostOrder(t *testing.T) {
 	output = captureStdout(t, func() error {
 		return app.Run(context.Background(), []string{"du", "--machine", "-s", root})
 	})
-	if output != "8\t"+root+"\n" {
+	if output != "2\t8\n" {
 		t.Fatalf("unexpected machine du output: %q", output)
 	}
 }
