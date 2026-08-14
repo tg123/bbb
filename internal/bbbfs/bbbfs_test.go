@@ -70,6 +70,26 @@ func TestListRecursiveLocalNestedPaths(t *testing.T) {
 	}
 }
 
+func TestSummarizeRecursiveLocal(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sub", "b"), []byte("12345"), 0o644); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	summary, err := SummarizeRecursive(context.Background(), root, nil)
+	if err != nil {
+		t.Fatalf("SummarizeRecursive: %v", err)
+	}
+	if summary.FileCount != 2 || summary.TotalSize != 8 {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+}
+
 func TestProvidersImplementRecursiveLister(t *testing.T) {
 	if _, ok := any(azFS{}).(recursiveLister); !ok {
 		t.Fatalf("azFS should implement recursiveLister")

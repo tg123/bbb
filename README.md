@@ -348,8 +348,6 @@ bbb ls -s hf://meta-llama/Llama-2-7b/
 
 ### `ll` — Long listing (alias for `ls -l`)
 
-Aliases: `du`
-
 ```
 bbb ll [flags] [path]
 ```
@@ -368,6 +366,22 @@ bbb ll az://myaccount/mycontainer/models/
 
 ---
 
+### `du` — Estimate recursive file space usage
+
+Recursively prints human-readable cumulative usage for each directory, followed by the root. For object stores, usage is based on apparent blob size.
+
+```bash
+bbb du -s --concurrency 32 az://myaccount/mycontainer/data/
+```
+
+| Flag | Description |
+|------|-------------|
+| `-s`, `--summarize` | Display only the total file count and size |
+| `--machine` | Machine-readable `count<TAB>bytes` summary with `-s` |
+| `--concurrency N` | Number of concurrent listing requests |
+
+---
+
 ### `lstree` — Recursively list all files
 
 Aliases: `lsr`
@@ -383,6 +397,7 @@ bbb lstree [flags] [path]
 | `-l`, `--long` | Show file type, size, and modification time |
 | `-s`, `--relative` | Show relative paths |
 | `--machine` | Machine-readable tab-separated output |
+| `--concurrency N` | Number of concurrent listing requests |
 
 **Examples:**
 
@@ -406,13 +421,18 @@ bbb llr [flags] [path]
 
 | Flag | Description |
 |------|-------------|
-| `-s`, `--relative` | Show relative paths |
+| `-s`, `--summary` | Show only the total file count and size, with progress while counting |
+| `--relative` | Show relative paths |
 | `--machine` | Machine-readable tab-separated output |
+| `--concurrency N` | Number of concurrent listing requests |
 
 **Example:**
 
 ```bash
 bbb llr az://myaccount/mycontainer/
+
+# Count a large folder without printing every file
+bbb llr -s --concurrency 32 az://myaccount/mycontainer/
 ```
 
 ---
