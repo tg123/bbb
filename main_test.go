@@ -1118,10 +1118,6 @@ func TestLLRSummaryOnly(t *testing.T) {
 }
 
 func TestDUSummaryIsRecursive(t *testing.T) {
-	originalHelpFlag := cli.HelpFlag
-	cli.HelpFlag = &cli.BoolFlag{Name: "help", Usage: "Show help", HideDefault: true, Local: true}
-	defer func() { cli.HelpFlag = originalHelpFlag }()
-
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "nested"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -1136,8 +1132,7 @@ func TestDUSummaryIsRecursive(t *testing.T) {
 		Action: cmdDU,
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "summarize", Aliases: []string{"s"}},
-			&cli.BoolFlag{Name: "human-readable", Aliases: []string{"h"}},
-			&cli.BoolFlag{Name: "bytes", Aliases: []string{"b"}},
+			&cli.BoolFlag{Name: "machine"},
 			&cli.IntFlag{Name: "concurrency", Value: 1},
 		},
 	}
@@ -1149,17 +1144,10 @@ func TestDUSummaryIsRecursive(t *testing.T) {
 	}
 
 	output = captureStdout(t, func() error {
-		return app.Run(context.Background(), []string{"du", "-h", "-s", root})
+		return app.Run(context.Background(), []string{"du", "--machine", "-s", root})
 	})
-	if !strings.HasSuffix(output, "\t"+root+"\n") {
-		t.Fatalf("unexpected human-readable du summary output: %q", output)
-	}
-
-	output = captureStdout(t, func() error {
-		return app.Run(context.Background(), []string{"du", "-b", "-s", root})
-	})
-	if !strings.HasSuffix(output, "\t"+root+"\n") {
-		t.Fatalf("unexpected byte du summary output: %q", output)
+	if output != "8\t"+root+"\n" {
+		t.Fatalf("unexpected machine du summary output: %q", output)
 	}
 }
 
@@ -1179,8 +1167,7 @@ func TestDUDefaultPrintsDirectoriesPostOrder(t *testing.T) {
 		Action: cmdDU,
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "summarize", Aliases: []string{"s"}},
-			&cli.BoolFlag{Name: "human-readable", Aliases: []string{"h"}},
-			&cli.BoolFlag{Name: "bytes", Aliases: []string{"b"}},
+			&cli.BoolFlag{Name: "machine"},
 			&cli.IntFlag{Name: "concurrency", Value: 1},
 		},
 	}
@@ -1193,10 +1180,10 @@ func TestDUDefaultPrintsDirectoriesPostOrder(t *testing.T) {
 	}
 
 	output = captureStdout(t, func() error {
-		return app.Run(context.Background(), []string{"du", "-b", "-s", root})
+		return app.Run(context.Background(), []string{"du", "--machine", "-s", root})
 	})
-	if !strings.HasSuffix(output, "\t"+root+"\n") {
-		t.Fatalf("unexpected du byte output: %q", output)
+	if output != "8\t"+root+"\n" {
+		t.Fatalf("unexpected machine du output: %q", output)
 	}
 }
 
@@ -1206,6 +1193,7 @@ func TestFormatDiskUsageSize(t *testing.T) {
 		want  string
 	}{
 		{0, "0"},
+		{8, "8B"},
 		{4 * 1024, "4.0K"},
 		{16 * 1024, "16K"},
 		{3992 * 1024, "3.9M"},

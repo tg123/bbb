@@ -260,8 +260,6 @@ func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl 
 }
 
 func main() {
-	// Reserve -h for command-specific human-readable flags such as du -h.
-	cli.HelpFlag = &cli.BoolFlag{Name: "help", Usage: "Show help", HideDefault: true, Local: true}
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
 		Name:    "bbb",
@@ -490,11 +488,10 @@ func main() {
 			{
 				Name:      "du",
 				Usage:     "Estimate recursive file space usage",
-				UsageText: "bbb du [-s|--summarize] [-h|--human-readable] [-b|--bytes] [--concurrency N] [path ...]",
+				UsageText: "bbb du [-s|--summarize] [--machine] [--concurrency N] [path ...]",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "summarize", Aliases: []string{"s"}, Usage: "Display only a total for each argument"},
-					&cli.BoolFlag{Name: "human-readable", Aliases: []string{"h"}, Usage: "Print sizes in human-readable form"},
-					&cli.BoolFlag{Name: "bytes", Aliases: []string{"b"}, Usage: "Print apparent sizes in bytes"},
+					&cli.BoolFlag{Name: "machine", Usage: "Machine-readable (tab-separated) output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent listing requests", Value: runtime.NumCPU()},
 				},
 				Action: cmdDU,
@@ -707,9 +704,6 @@ type diskUsage struct {
 }
 
 func cmdDU(ctx context.Context, c *cli.Command) error {
-	if c.Bool("human-readable") && c.Bool("bytes") {
-		return errors.New("du: --human-readable and --bytes are mutually exclusive")
-	}
 	if conc := c.Int("concurrency"); conc > 0 {
 		ctx = bbbfs.WithScanConcurrency(ctx, conc)
 	}
@@ -725,7 +719,7 @@ func cmdDU(ctx context.Context, c *cli.Command) error {
 					return err
 				}
 				usage := usages[len(usages)-1]
-				printDiskUsage(usage, root, c.Bool("human-readable"), c.Bool("bytes"))
+				printDiskUsage(usage, root, c.Bool("machine"))
 			} else {
 				bar := newCountingProgressBar("Counting", false)
 				result, err := bbbfs.SummarizeRecursive(ctx, root, func(count, size int64) {
@@ -736,7 +730,7 @@ func cmdDU(ctx context.Context, c *cli.Command) error {
 					return err
 				}
 				bar.Finish()
-				printDiskUsage(diskUsage{allocated: result.TotalSize, apparent: result.TotalSize}, root, c.Bool("human-readable"), c.Bool("bytes"))
+				printDiskUsage(diskUsage{allocated: result.TotalSize, apparent: result.TotalSize}, root, c.Bool("machine"))
 			}
 			continue
 		}
@@ -745,7 +739,7 @@ func cmdDU(ctx context.Context, c *cli.Command) error {
 			return err
 		}
 		for _, usage := range usages {
-			printDiskUsage(usage, diskUsagePath(root, usage.relative), c.Bool("human-readable"), c.Bool("bytes"))
+			printDiskUsage(usage, diskUsagePath(root, usage.relative), c.Bool("machine"))
 		}
 	}
 	return nil
@@ -864,21 +858,20 @@ func diskUsagePath(root, relative string) string {
 	return filepath.Join(root, filepath.FromSlash(relative))
 }
 
-func printDiskUsage(usage diskUsage, name string, humanReadable, bytes bool) {
-	switch {
-	case humanReadable:
-		fmt.Printf("%s\t%s\n", formatDiskUsageSize(usage.allocated), name)
-	case bytes:
+func printDiskUsage(usage diskUsage, name string, machine bool) {
+	if machine {
 		fmt.Printf("%d\t%s\n", usage.apparent, name)
-	default:
-		blocks := (usage.allocated + 1023) / 1024
-		fmt.Printf("%d\t%s\n", blocks, name)
+		return
 	}
+	fmt.Printf("%s\t%s\n", formatDiskUsageSize(usage.allocated), name)
 }
 
 func formatDiskUsageSize(bytes int64) string {
 	if bytes <= 0 {
 		return "0"
+	}
+	if bytes < 1024 {
+		return fmt.Sprintf("%dB", bytes)
 	}
 	const unit = 1024.0
 	suffixes := [...]string{"K", "M", "G", "T", "P", "E"}

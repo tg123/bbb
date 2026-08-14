@@ -368,7 +368,7 @@ bbb ll az://myaccount/mycontainer/models/
 
 ### `du` — Estimate recursive file space usage
 
-Recursively prints cumulative usage for each directory, followed by the root. Sizes use 1 KiB units by default. For object stores, usage is based on apparent blob size.
+Recursively prints human-readable cumulative usage for each directory, followed by the root. For object stores, usage is based on apparent blob size.
 
 ```bash
 bbb du -s --concurrency 32 az://myaccount/mycontainer/data/
@@ -377,8 +377,7 @@ bbb du -s --concurrency 32 az://myaccount/mycontainer/data/
 | Flag | Description |
 |------|-------------|
 | `-s`, `--summarize` | Display only a total for each argument |
-| `-h`, `--human-readable` | Print human-readable sizes |
-| `-b`, `--bytes` | Print apparent sizes in bytes |
+| `--machine` | Machine-readable tab-separated apparent bytes |
 | `--concurrency N` | Number of concurrent listing requests |
 
 ---
