@@ -260,6 +260,8 @@ func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl 
 }
 
 func main() {
+	// Reserve -h for command-specific human-readable flags such as du -h.
+	cli.HelpFlag = &cli.BoolFlag{Name: "help", Usage: "Show help", HideDefault: true, Local: true}
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
 		Name:    "bbb",
@@ -477,7 +479,6 @@ func main() {
 			},
 			{
 				Name:      "ll",
-				Aliases:   []string{"du"},
 				Usage:     "Alias for 'ls -l' (long listing)",
 				UsageText: "bbb ll [-s|--relative] [--machine] [path]",
 				Flags: []cli.Flag{
@@ -485,6 +486,18 @@ func main() {
 					&cli.BoolFlag{Name: "machine", Usage: "Machine-readable (tab-separated) output"},
 				},
 				Action: cmdLL,
+			},
+			{
+				Name:      "du",
+				Usage:     "Estimate recursive file space usage",
+				UsageText: "bbb du [-s|--summarize] [-h|--human-readable] [-b|--bytes] [--concurrency N] [path ...]",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "summarize", Aliases: []string{"s"}, Usage: "Display only a total for each argument"},
+					&cli.BoolFlag{Name: "human-readable", Aliases: []string{"h"}, Usage: "Print sizes in human-readable form"},
+					&cli.BoolFlag{Name: "bytes", Aliases: []string{"b"}, Usage: "Print apparent sizes in bytes"},
+					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent listing requests", Value: runtime.NumCPU()},
+				},
+				Action: cmdDU,
 			},
 			{
 				Name:      "lstree",
@@ -502,10 +515,10 @@ func main() {
 			{
 				Name:      "llr",
 				Usage:     "Alias for 'lstree -l' (recursive long file list)",
-				UsageText: "bbb llr [--summary] [-s|--relative] [--machine] [--concurrency N] [path]",
+				UsageText: "bbb llr [-s|--summary] [--relative] [--machine] [--concurrency N] [path]",
 				Flags: []cli.Flag{
-					&cli.BoolFlag{Name: "summary", Usage: "Show only the total file count and size"},
-					&cli.BoolFlag{Name: "s", Aliases: []string{"relative"}, Usage: "Show relative paths"},
+					&cli.BoolFlag{Name: "summary", Aliases: []string{"s"}, Usage: "Show only the total file count and size"},
+					&cli.BoolFlag{Name: "relative", Usage: "Show relative paths"},
 					&cli.BoolFlag{Name: "machine", Usage: "Machine-readable (tab-separated) output"},
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent listing requests", Value: runtime.NumCPU()},
 				},
@@ -614,7 +627,7 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 		target = c.Args().Get(0)
 	}
 	machine := c.Bool("machine")
-	relFlag := c.Bool("s")
+	relFlag := c.Bool("s") || c.Bool("relative")
 	parentPath, pattern := splitWildcard(target)
 	fs := bbbfs.Resolve(parentPath)
 	entries, err := fs.List(ctx, parentPath)
@@ -687,6 +700,203 @@ func cmdLS(ctx context.Context, c *cli.Command) error {
 
 func cmdLSTree(ctx context.Context, c *cli.Command) error { return runListTree(ctx, c, false) }
 
+type diskUsage struct {
+	relative  string
+	allocated int64
+	apparent  int64
+}
+
+func cmdDU(ctx context.Context, c *cli.Command) error {
+	if c.Bool("human-readable") && c.Bool("bytes") {
+		return errors.New("du: --human-readable and --bytes are mutually exclusive")
+	}
+	if conc := c.Int("concurrency"); conc > 0 {
+		ctx = bbbfs.WithScanConcurrency(ctx, conc)
+	}
+	roots := c.Args().Slice()
+	if len(roots) == 0 {
+		roots = []string{"."}
+	}
+	for _, root := range roots {
+		if c.Bool("summarize") {
+			if !strings.Contains(root, "://") {
+				usages, err := collectDiskUsage(ctx, root)
+				if err != nil {
+					return err
+				}
+				usage := usages[len(usages)-1]
+				printDiskUsage(usage, root, c.Bool("human-readable"), c.Bool("bytes"))
+			} else {
+				bar := newCountingProgressBar("Counting", false)
+				result, err := bbbfs.SummarizeRecursive(ctx, root, func(count, size int64) {
+					bar.SetCountAndBytes(count, size)
+				})
+				if err != nil {
+					bar.Abort()
+					return err
+				}
+				bar.Finish()
+				printDiskUsage(diskUsage{allocated: result.TotalSize, apparent: result.TotalSize}, root, c.Bool("human-readable"), c.Bool("bytes"))
+			}
+			continue
+		}
+		usages, err := collectDiskUsage(ctx, root)
+		if err != nil {
+			return err
+		}
+		for _, usage := range usages {
+			printDiskUsage(usage, diskUsagePath(root, usage.relative), c.Bool("human-readable"), c.Bool("bytes"))
+		}
+	}
+	return nil
+}
+
+func collectDiskUsage(ctx context.Context, root string) ([]diskUsage, error) {
+	sizes := map[string]diskUsage{"": {}}
+	if strings.Contains(root, "://") {
+		for result := range bbbfs.ListRecursive(ctx, root) {
+			if result.Err != nil {
+				return nil, result.Err
+			}
+			entry := result.Entry
+			if entry.Name == "" || entry.IsDir {
+				continue
+			}
+			addDiskUsage(sizes, path.Dir(filepath.ToSlash(entry.Name)), entry.Size, entry.Size)
+		}
+	} else {
+		err := filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			relative, err := filepath.Rel(root, current)
+			if err != nil {
+				return err
+			}
+			relative = filepath.ToSlash(relative)
+			if relative == "." {
+				relative = ""
+			}
+			if entry.IsDir() {
+				if _, ok := sizes[relative]; !ok {
+					sizes[relative] = diskUsage{}
+				}
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			dir := path.Dir(relative)
+			apparent := info.Size()
+			if entry.IsDir() {
+				dir = relative
+				apparent = 0
+			}
+			addDiskUsage(sizes, dir, fileAllocatedSize(info), apparent)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	children := make(map[string][]string)
+	for dir := range sizes {
+		if dir == "" {
+			continue
+		}
+		parent := path.Dir(dir)
+		if parent == "." {
+			parent = ""
+		}
+		children[parent] = append(children[parent], dir)
+	}
+	for parent := range children {
+		sort.Strings(children[parent])
+	}
+	usages := make([]diskUsage, 0, len(sizes))
+	var appendPostOrder func(string)
+	appendPostOrder = func(dir string) {
+		for _, child := range children[dir] {
+			appendPostOrder(child)
+		}
+		usage := sizes[dir]
+		usage.relative = dir
+		usages = append(usages, usage)
+	}
+	appendPostOrder("")
+	return usages, nil
+}
+
+func addDiskUsage(sizes map[string]diskUsage, dir string, allocated, apparent int64) {
+	if dir == "." {
+		dir = ""
+	}
+	for {
+		usage := sizes[dir]
+		usage.allocated += allocated
+		usage.apparent += apparent
+		sizes[dir] = usage
+		if dir == "" {
+			return
+		}
+		parent := path.Dir(dir)
+		if parent == "." {
+			parent = ""
+		}
+		dir = parent
+	}
+}
+
+func diskUsagePath(root, relative string) string {
+	if relative == "" {
+		return root
+	}
+	if strings.Contains(root, "://") {
+		return strings.TrimSuffix(root, "/") + "/" + relative
+	}
+	if root == "." {
+		return "." + string(filepath.Separator) + filepath.FromSlash(relative)
+	}
+	return filepath.Join(root, filepath.FromSlash(relative))
+}
+
+func printDiskUsage(usage diskUsage, name string, humanReadable, bytes bool) {
+	switch {
+	case humanReadable:
+		fmt.Printf("%s\t%s\n", formatDiskUsageSize(usage.allocated), name)
+	case bytes:
+		fmt.Printf("%d\t%s\n", usage.apparent, name)
+	default:
+		blocks := (usage.allocated + 1023) / 1024
+		fmt.Printf("%d\t%s\n", blocks, name)
+	}
+}
+
+func formatDiskUsageSize(bytes int64) string {
+	if bytes <= 0 {
+		return "0"
+	}
+	const unit = 1024.0
+	suffixes := [...]string{"K", "M", "G", "T", "P", "E"}
+	value := float64(bytes)
+	suffix := ""
+	for _, candidate := range suffixes {
+		value /= unit
+		suffix = candidate
+		if value < unit {
+			break
+		}
+	}
+	if value < 10 {
+		return fmt.Sprintf("%.1f%s", value, suffix)
+	}
+	return fmt.Sprintf("%.0f%s", value, suffix)
+}
+
 // runListTree implements recursive file-only listing for lstree and llr.
 // longForced is true for llr alias to imply -l.
 func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
@@ -697,8 +907,8 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	}
 	longFlag := c.Bool("l") || c.Bool("long") || longForced
 	machine := c.Bool("machine")
-	relFlag := c.Bool("s") || c.Bool("relative")
 	summary := c.Bool("summary")
+	relFlag := c.Bool("relative") || (c.Bool("s") && !summary)
 	if conc := c.Int("concurrency"); conc > 0 {
 		ctx = bbbfs.WithScanConcurrency(ctx, conc)
 	}

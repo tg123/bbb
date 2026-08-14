@@ -348,8 +348,6 @@ bbb ls -s hf://meta-llama/Llama-2-7b/
 
 ### `ll` — Long listing (alias for `ls -l`)
 
-Aliases: `du`
-
 ```
 bbb ll [flags] [path]
 ```
@@ -365,6 +363,23 @@ bbb ll [flags] [path]
 # Show sizes and timestamps of blobs in a container
 bbb ll az://myaccount/mycontainer/models/
 ```
+
+---
+
+### `du` — Estimate recursive file space usage
+
+Recursively prints cumulative usage for each directory, followed by the root. Sizes use 1 KiB units by default. For object stores, usage is based on apparent blob size.
+
+```bash
+bbb du -s --concurrency 32 az://myaccount/mycontainer/data/
+```
+
+| Flag | Description |
+|------|-------------|
+| `-s`, `--summarize` | Display only a total for each argument |
+| `-h`, `--human-readable` | Print human-readable sizes |
+| `-b`, `--bytes` | Print apparent sizes in bytes |
+| `--concurrency N` | Number of concurrent listing requests |
 
 ---
 
@@ -407,8 +422,8 @@ bbb llr [flags] [path]
 
 | Flag | Description |
 |------|-------------|
-| `--summary` | Show only the total file count and size, with progress while counting |
-| `-s`, `--relative` | Show relative paths |
+| `-s`, `--summary` | Show only the total file count and size, with progress while counting |
+| `--relative` | Show relative paths |
 | `--machine` | Machine-readable tab-separated output |
 | `--concurrency N` | Number of concurrent listing requests |
 
@@ -418,7 +433,7 @@ bbb llr [flags] [path]
 bbb llr az://myaccount/mycontainer/
 
 # Count a large folder without printing every file
-bbb llr --summary --concurrency 32 az://myaccount/mycontainer/
+bbb llr -s --concurrency 32 az://myaccount/mycontainer/
 ```
 
 ---

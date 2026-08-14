@@ -1095,15 +1095,15 @@ func TestLLRSummaryOnly(t *testing.T) {
 			return runListTree(ctx, c, true)
 		},
 		Flags: []cli.Flag{
-			&cli.BoolFlag{Name: "summary"},
+			&cli.BoolFlag{Name: "summary", Aliases: []string{"s"}},
 			&cli.BoolFlag{Name: "machine"},
-			&cli.BoolFlag{Name: "s", Aliases: []string{"relative"}},
+			&cli.BoolFlag{Name: "relative"},
 			&cli.IntFlag{Name: "concurrency", Value: 1},
 		},
 	}
 
 	output := captureStdout(t, func() error {
-		return app.Run(context.Background(), []string{"llr", "--summary", "--concurrency", "4", root})
+		return app.Run(context.Background(), []string{"llr", "-s", "--concurrency", "4", root})
 	})
 	if output != "Listed 2 files summing to 8 B (8 bytes)\n" {
 		t.Fatalf("unexpected summary output: %q", output)
@@ -1114,6 +1114,106 @@ func TestLLRSummaryOnly(t *testing.T) {
 	})
 	if output != "2\t8\n" {
 		t.Fatalf("unexpected machine summary output: %q", output)
+	}
+}
+
+func TestDUSummaryIsRecursive(t *testing.T) {
+	originalHelpFlag := cli.HelpFlag
+	cli.HelpFlag = &cli.BoolFlag{Name: "help", Usage: "Show help", HideDefault: true, Local: true}
+	defer func() { cli.HelpFlag = originalHelpFlag }()
+
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "nested"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nested", "b"), []byte("12345"), 0o644); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	app := &cli.Command{
+		Action: cmdDU,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "summarize", Aliases: []string{"s"}},
+			&cli.BoolFlag{Name: "human-readable", Aliases: []string{"h"}},
+			&cli.BoolFlag{Name: "bytes", Aliases: []string{"b"}},
+			&cli.IntFlag{Name: "concurrency", Value: 1},
+		},
+	}
+	output := captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"du", "-s", root})
+	})
+	if !strings.HasSuffix(output, "\t"+root+"\n") {
+		t.Fatalf("unexpected du summary output: %q", output)
+	}
+
+	output = captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"du", "-h", "-s", root})
+	})
+	if !strings.HasSuffix(output, "\t"+root+"\n") {
+		t.Fatalf("unexpected human-readable du summary output: %q", output)
+	}
+
+	output = captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"du", "-b", "-s", root})
+	})
+	if !strings.HasSuffix(output, "\t"+root+"\n") {
+		t.Fatalf("unexpected byte du summary output: %q", output)
+	}
+}
+
+func TestDUDefaultPrintsDirectoriesPostOrder(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "b"), []byte("12345"), 0o644); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	app := &cli.Command{
+		Action: cmdDU,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "summarize", Aliases: []string{"s"}},
+			&cli.BoolFlag{Name: "human-readable", Aliases: []string{"h"}},
+			&cli.BoolFlag{Name: "bytes", Aliases: []string{"b"}},
+			&cli.IntFlag{Name: "concurrency", Value: 1},
+		},
+	}
+	output := captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"du", root})
+	})
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], "\t"+sub) || !strings.HasSuffix(lines[1], "\t"+root) {
+		t.Fatalf("unexpected du output: %q", output)
+	}
+
+	output = captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"du", "-b", "-s", root})
+	})
+	if !strings.HasSuffix(output, "\t"+root+"\n") {
+		t.Fatalf("unexpected du byte output: %q", output)
+	}
+}
+
+func TestFormatDiskUsageSize(t *testing.T) {
+	tests := []struct {
+		bytes int64
+		want  string
+	}{
+		{0, "0"},
+		{4 * 1024, "4.0K"},
+		{16 * 1024, "16K"},
+		{3992 * 1024, "3.9M"},
+	}
+	for _, test := range tests {
+		if got := formatDiskUsageSize(test.bytes); got != test.want {
+			t.Errorf("formatDiskUsageSize(%d) = %q, want %q", test.bytes, got, test.want)
+		}
 	}
 }
 
