@@ -704,6 +704,35 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	}
 
 	parentPath, pattern := splitWildcard(root)
+	if summary && pattern == "" {
+		countingBar := newCountingProgressBar("Counting", machine)
+		completed := false
+		defer func() {
+			if countingBar == nil {
+				return
+			}
+			if completed {
+				countingBar.Finish()
+			} else {
+				countingBar.Abort()
+			}
+		}()
+		result, err := bbbfs.SummarizeRecursive(ctx, parentPath, func(count, size int64) {
+			countingBar.SetCountAndBytes(count, size)
+		})
+		if err != nil {
+			return err
+		}
+		completed = true
+		countingBar.Finish()
+		countingBar = nil
+		if machine {
+			fmt.Printf("%d\t%d\n", result.FileCount, result.TotalSize)
+		} else {
+			printListSummary(result.FileCount, result.TotalSize)
+		}
+		return nil
+	}
 	var count int64
 	var totalSize int64
 	countingBar := newCountingProgressBar("Counting", !summary)
@@ -779,13 +808,17 @@ func runListTree(ctx context.Context, c *cli.Command, longForced bool) error {
 	if summary && machine {
 		fmt.Printf("%d\t%d\n", count, totalSize)
 	} else if !machine {
-		noun := "files"
-		if count == 1 {
-			noun = "file"
-		}
-		fmt.Printf("Listed %d %s summing to %s (%d bytes)\n", count, noun, formatSize(totalSize), totalSize)
+		printListSummary(count, totalSize)
 	}
 	return nil
+}
+
+func printListSummary(count, totalSize int64) {
+	noun := "files"
+	if count == 1 {
+		noun = "file"
+	}
+	fmt.Printf("Listed %d %s summing to %s (%d bytes)\n", count, noun, formatSize(totalSize), totalSize)
 }
 
 func splitWildcard(target string) (string, string) {

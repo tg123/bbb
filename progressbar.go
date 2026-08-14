@@ -350,6 +350,15 @@ func (p *progressBar) AddBytes(n int64) {
 	p.bytesDone.Add(n)
 }
 
+func (p *progressBar) SetCountAndBytes(count, bytes int64) {
+	if p == nil {
+		return
+	}
+	atomicMax(&p.done, count)
+	atomicMax(&p.bytesDone, bytes)
+	p.render(p.done.Load())
+}
+
 // atomicMax updates an atomic.Int64 to val if val is greater than the current
 // value. It is safe for concurrent use.
 func atomicMax(a *atomic.Int64, val int64) {

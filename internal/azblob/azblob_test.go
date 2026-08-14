@@ -798,6 +798,68 @@ func TestNormalizeRootPrefixNestedPath(t *testing.T) {
 	}
 }
 
+func TestSummarizeBlobItems(t *testing.T) {
+	items := []*container.BlobItem{
+		nil,
+		{Name: nil},
+		{Name: strPtr("root/"), Properties: &container.BlobProperties{ContentLength: int64Ptr(0)}},
+		{Name: strPtr("root/a"), Properties: &container.BlobProperties{ContentLength: int64Ptr(10)}},
+		{Name: strPtr("root/b"), Properties: &container.BlobProperties{ContentLength: int64Ptr(25)}},
+		{Name: strPtr("root/no-size"), Properties: &container.BlobProperties{}},
+	}
+	count, size := summarizeBlobItems(items)
+	if count != 2 || size != 35 {
+		t.Fatalf("unexpected summary: count=%d size=%d", count, size)
+	}
+}
+
+func TestSummarizePrefixSetAggregatesMonotonicProgress(t *testing.T) {
+	type point struct {
+		count int64
+		size  int64
+	}
+	series := map[string][]point{
+		"a/": {{count: 2, size: 20}, {count: 3, size: 30}},
+		"b/": {{count: 1, size: 5}},
+		"c/": nil,
+	}
+	var progressMu sync.Mutex
+	var progress []point
+	count, size, partitionCount, err := summarizePrefixSet(
+		context.Background(),
+		[]string{"a/", "b/", "c/"},
+		2,
+		1,
+		7,
+		func(count, size int64) {
+			progressMu.Lock()
+			progress = append(progress, point{count: count, size: size})
+			progressMu.Unlock()
+		},
+		func(_ context.Context, prefix string, onProgress func(count, size int64)) (int64, int64, error) {
+			for _, p := range series[prefix] {
+				onProgress(p.count, p.size)
+			}
+			if len(series[prefix]) == 0 {
+				return 0, 0, nil
+			}
+			last := series[prefix][len(series[prefix])-1]
+			return last.count, last.size, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("summarizePrefixSet: %v", err)
+	}
+	if count != 5 || size != 42 || partitionCount != 4 {
+		t.Fatalf("unexpected totals: count=%d size=%d partitionCount=%d", count, size, partitionCount)
+	}
+	for i := 1; i < len(progress); i++ {
+		if progress[i].count < progress[i-1].count || progress[i].size < progress[i-1].size {
+			t.Fatalf("non-monotonic progress at %d: %+v", i, progress)
+		}
+	}
+}
+
 // --- ListRecursiveStream context cancellation test ---
 
 func TestListRecursiveStreamCancelledContext(t *testing.T) {
