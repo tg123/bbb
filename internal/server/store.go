@@ -165,11 +165,20 @@ func (s *Store) DeleteJob(ctx context.Context, id string) error {
 	if !JobDone(job.State) {
 		return fmt.Errorf("job %s is %s, cancel it first", id, job.State)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM tasks WHERE job_id = ?`, id); err != nil {
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `DELETE FROM jobs WHERE id = ?`, id)
-	return err
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE job_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CancelJob requests cancellation of a job. Pending tasks are cancelled
