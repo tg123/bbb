@@ -15,6 +15,39 @@ Download the latest release from the [Releases](https://github.com/tg123/bbb/rel
 go install github.com/tg123/bbb@latest
 ```
 
+## Docker
+
+Images are published to GitHub Container Registry for `linux/amd64` and `linux/arm64`. They are also published to Docker Hub when the repository's Docker Hub credentials are configured:
+
+```bash
+docker pull ghcr.io/tg123/bbb:latest
+docker pull farmer1992/bbb:latest
+```
+
+The image is based on Alpine and, besides `bbb`, ships a small set of tools commonly needed when scripting around it (`bash`, `coreutils`, `findutils`, `curl`, `wget`, `sed`, `jq`, `tar`, `gzip`, `zstd`, `ca-certificates`, `tzdata`), so it can be used as a job/sidecar image rather than a bare binary. Extra packages can be added with `apk add` in a derived image.
+
+Run a command:
+
+```bash
+docker run --rm -v "$PWD:/data" ghcr.io/tg123/bbb:latest ls az://myaccount/mycontainer/
+```
+
+Run a script that uses `bbb` (override the entrypoint):
+
+```bash
+docker run --rm -v "$PWD:/data" --entrypoint bash ghcr.io/tg123/bbb:latest \
+  -c 'bbb lsr az://myaccount/mycontainer/ | head -n 10'
+```
+
+Credentials are picked up from the environment as usual, e.g.:
+
+```bash
+docker run --rm -e BBB_AZBLOB_ACCOUNTKEY -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  -v "$PWD:/data" ghcr.io/tg123/bbb:latest cp az://myaccount/mycontainer/file.bin /data/
+```
+
+To use Azure CLI / managed identity based login, mount the host credentials, e.g. `-v "$HOME/.azure:/root/.azure"`.
+
 ## Supported Path Types
 
 | Prefix | Description | Example |
@@ -348,8 +381,6 @@ bbb ls -s hf://meta-llama/Llama-2-7b/
 
 ### `ll` — Long listing (alias for `ls -l`)
 
-Aliases: `du`
-
 ```
 bbb ll [flags] [path]
 ```
@@ -368,6 +399,22 @@ bbb ll az://myaccount/mycontainer/models/
 
 ---
 
+### `du` — Estimate recursive file space usage
+
+Recursively prints human-readable cumulative usage for each directory, followed by the root. For object stores, usage is based on apparent blob size.
+
+```bash
+bbb du -s --concurrency 32 az://myaccount/mycontainer/data/
+```
+
+| Flag | Description |
+|------|-------------|
+| `-s`, `--summarize` | Display only the total file count and size |
+| `--machine` | Machine-readable `count<TAB>bytes` summary with `-s` |
+| `--concurrency N` | Number of concurrent listing requests |
+
+---
+
 ### `lstree` — Recursively list all files
 
 Aliases: `lsr`
@@ -383,6 +430,7 @@ bbb lstree [flags] [path]
 | `-l`, `--long` | Show file type, size, and modification time |
 | `-s`, `--relative` | Show relative paths |
 | `--machine` | Machine-readable tab-separated output |
+| `--concurrency N` | Number of concurrent listing requests |
 
 **Examples:**
 
@@ -406,13 +454,18 @@ bbb llr [flags] [path]
 
 | Flag | Description |
 |------|-------------|
-| `-s`, `--relative` | Show relative paths |
+| `-s`, `--summary` | Show only the total file count and size, with progress while counting |
+| `--relative` | Show relative paths |
 | `--machine` | Machine-readable tab-separated output |
+| `--concurrency N` | Number of concurrent listing requests |
 
 **Example:**
 
 ```bash
 bbb llr az://myaccount/mycontainer/
+
+# Count a large folder without printing every file
+bbb llr -s --concurrency 32 az://myaccount/mycontainer/
 ```
 
 ---
