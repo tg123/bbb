@@ -31,6 +31,7 @@ import (
 	"github.com/tg123/bbb/internal/azblob"
 	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/fsops"
+	gspkg "github.com/tg123/bbb/internal/gs"
 	"github.com/tg123/bbb/internal/hf"
 	s3pkg "github.com/tg123/bbb/internal/s3"
 )
@@ -390,6 +391,7 @@ func main() {
 				azblob.SetHTTPTransport(transport)
 				hf.SetHTTPClient(&http.Client{Transport: transport})
 				s3pkg.SetHTTPClient(&http.Client{Transport: transport})
+				gspkg.SetHTTPClient(&http.Client{Transport: transport})
 			}
 
 			return ctx, nil
@@ -458,6 +460,39 @@ func main() {
 								return err
 							}
 							fmt.Printf("Created bucket %s\n", bucket)
+							return nil
+						},
+					},
+				},
+			},
+			{
+				Name:      "gs",
+				Usage:     "Google Cloud Storage related commands",
+				UsageText: "bbb gs <command>",
+				Commands: []*cli.Command{
+					{
+						Name:      "mkbucket",
+						Usage:     "Create a Google Cloud Storage bucket",
+						UsageText: "bbb gs mkbucket gs://bucket",
+						Action: func(ctx context.Context, c *cli.Command) error {
+							if c.Args().Len() != 1 {
+								return fmt.Errorf("mkbucket: need gs://bucket")
+							}
+							target := c.Args().Get(0)
+							if !bbbfs.IsGS(target) {
+								return fmt.Errorf("mkbucket: only gs:// paths supported")
+							}
+							gp, err := gspkg.Parse(target)
+							if err != nil {
+								return fmt.Errorf("mkbucket: %w", err)
+							}
+							if gp.Bucket == "" || gp.Object != "" {
+								return fmt.Errorf("mkbucket: need gs://bucket")
+							}
+							if err := bbbfs.MkDir(ctx, target); err != nil {
+								return err
+							}
+							fmt.Printf("Created bucket %s\n", gp.Bucket)
 							return nil
 						},
 					},
@@ -2479,6 +2514,22 @@ func cmdShare(ctx context.Context, c *cli.Command) error {
 			return nil
 		}
 		fmt.Println("S3 Console:", console)
+		fmt.Println("Direct Object (if public):", direct)
+		return nil
+	}
+	if bbbfs.IsGS(p) {
+		console, direct, err := bbbfs.ParseShareInfo(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "share: %s: %v\n", p, err)
+			return err
+		}
+		if console == direct {
+			// Emulators (e.g. fake-gcs-server) have no separate web console,
+			// so ShareInfo returns the same object URL for both.
+			fmt.Println("Object URL:", direct)
+			return nil
+		}
+		fmt.Println("Google Cloud Console:", console)
 		fmt.Println("Direct Object (if public):", direct)
 		return nil
 	}

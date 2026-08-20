@@ -117,16 +117,21 @@ func IsS3(path string) bool {
 	return s3Provider.Match(path)
 }
 
+// IsGS returns true if the path targets a Google Cloud Storage backend.
+func IsGS(path string) bool {
+	return gsProvider.Match(path)
+}
+
 // IsObjectStore returns true if the path targets a remote object-store backend
 // with virtual-directory semantics, chunked transfer and Stat-based existence
-// checks (Azure Blob Storage or Amazon S3).
+// checks (Azure Blob Storage, Amazon S3 or Google Cloud Storage).
 func IsObjectStore(path string) bool {
-	return IsAz(path) || IsS3(path)
+	return IsAz(path) || IsS3(path) || IsGS(path)
 }
 
 // IsRemote returns true if the path targets a remote (non-local) backend.
 func IsRemote(path string) bool {
-	return IsAz(path) || IsHF(path) || IsS3(path)
+	return IsAz(path) || IsHF(path) || IsS3(path) || IsGS(path)
 }
 
 // dirChecker is an optional FS extension for checking whether a path is directory-like.
@@ -249,7 +254,7 @@ type serverSideCopier interface {
 
 // CanCopyServerSide returns true when both src and dst can use server-side copy.
 // Server-side copy is only valid within the same provider (Azure→Azure or
-// S3→S3), never across providers.
+// S3→S3, GCS→GCS), never across providers.
 func CanCopyServerSide(src, dst string) bool {
 	srcFS := Resolve(src)
 	dstFS := Resolve(dst)
@@ -262,6 +267,9 @@ func CanCopyServerSide(src, dst string) bool {
 		return true
 	}
 	if IsS3(src) && IsS3(dst) {
+		return true
+	}
+	if IsGS(src) && IsGS(dst) {
 		return true
 	}
 	return false

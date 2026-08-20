@@ -43,6 +43,7 @@ var (
 	providersMu     sync.RWMutex
 	azProvider      = azFS{}
 	s3Provider      = s3FS{}
+	gsProvider      = gsFS{}
 	hfProvider      = hfFS{}
 	localFSProvider = localFS{}
 )
@@ -52,6 +53,7 @@ func init() {
 	Register(hfProvider)
 	Register(azProvider)
 	Register(s3Provider)
+	Register(gsProvider)
 	Register(localFSProvider)
 }
 
