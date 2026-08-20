@@ -6,6 +6,8 @@ import (
 	"crypto/md5"
 	"errors"
 	"fmt"
+	"github.com/creack/pty"
+	"github.com/tg123/bbb/internal/hf"
 	"io"
 	"log"
 	"net"
@@ -18,10 +20,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"uuid"
-
-	"github.com/creack/pty"
-	"github.com/tg123/bbb/internal/hf"
 )
 
 const (
@@ -350,7 +348,7 @@ func TestBasic(t *testing.T) {
 			t.Fatal(err)
 		}
 		taskfile := filepath.Join(taskDir, "cp.tasks")
-		dstPrefix := fmt.Sprintf("az://%s/test/taskfile-%s/", azuriteAccount, uuid.New())
+		dstPrefix := fmt.Sprintf("az://%s/test/taskfile-%d/", azuriteAccount, time.Now().UnixNano())
 		t.Cleanup(func() {
 			cleanFolder(t, dstPrefix)
 		})
@@ -385,7 +383,7 @@ func TestBasic(t *testing.T) {
 			t.Fatal(err)
 		}
 		taskfile := filepath.Join(taskDir, "cp-recovery.tasks")
-		dstPrefix := fmt.Sprintf("az://%s/test/taskfile-recovery-%s/", azuriteAccount, uuid.New())
+		dstPrefix := fmt.Sprintf("az://%s/test/taskfile-recovery-%d/", azuriteAccount, time.Now().UnixNano())
 		t.Cleanup(func() {
 			cleanFolder(t, dstPrefix)
 		})
@@ -538,7 +536,7 @@ func TestBasic(t *testing.T) {
 
 	// ls subdirectory-only prefix: files exist only in nested paths
 	t.Run("ls returns subdirectory when only nested files exist", func(t *testing.T) {
-		prefix := fmt.Sprintf("az://%s/test/lsonly-%s", azuriteAccount, uuid.New())
+		prefix := fmt.Sprintf("az://%s/test/lsonly-%d", azuriteAccount, time.Now().UnixNano())
 		t.Cleanup(func() {
 			cleanFolder(t, prefix)
 		})
