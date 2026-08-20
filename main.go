@@ -605,6 +605,23 @@ func main() {
 				UsageText: "bbb md5sum paths [paths ...]",
 				Action:    cmdMD5Sum,
 			},
+			{
+				Name:      "server",
+				Usage:     "Run bbb as a copy server (REST API) or as a follower of a leader",
+				UsageText: "bbb server [--listen addr] [--db file] | bbb server --leader http://leader:8080",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "listen", Usage: "Address the REST API listens on (leader only)", Value: "127.0.0.1:8080", Sources: cli.EnvVars("BBB_SERVER_LISTEN")},
+					&cli.StringFlag{Name: "db", Usage: "SQLite database `file` used to persist jobs (leader only)", Value: "bbb-server.db", Sources: cli.EnvVars("BBB_SERVER_DB")},
+					&cli.StringFlag{Name: "leader", Usage: "Run in follower mode and pull tasks from this leader `url`", Sources: cli.EnvVars("BBB_SERVER_LEADER")},
+					&cli.StringFlag{Name: "token", Usage: "Shared bearer `token` required by the API", Sources: cli.EnvVars("BBB_SERVER_TOKEN")},
+					&cli.StringFlag{Name: "worker-id", Usage: "Worker `id` reported to the cluster", Sources: cli.EnvVars("BBB_SERVER_WORKER_ID")},
+					&cli.IntFlag{Name: "workers", Usage: "Number of files copied concurrently by this process (0 disables copying on the leader)", Value: runtime.NumCPU()},
+					&cli.IntFlag{Name: "concurrency", Usage: "Default number of concurrent requests per file", Value: runtime.NumCPU()},
+					&cli.DurationFlag{Name: "lease", Usage: "Task lease duration, a task is re-queued when its worker stops reporting", Value: time.Minute},
+					&cli.DurationFlag{Name: "poll-interval", Usage: "How often workers poll for new tasks", Value: time.Second},
+				},
+				Action: cmdServer,
+			},
 		},
 	}
 
