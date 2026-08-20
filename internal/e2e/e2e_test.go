@@ -6,8 +6,6 @@ import (
 	"crypto/md5"
 	"errors"
 	"fmt"
-	"github.com/creack/pty"
-	"github.com/tg123/bbb/internal/hf"
 	"io"
 	"log"
 	"net"
@@ -20,6 +18,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/creack/pty"
+	"github.com/tg123/bbb/internal/hf"
 )
 
 const (
