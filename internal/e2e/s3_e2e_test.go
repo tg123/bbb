@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
+	"uuid"
 )
 
 const (
@@ -293,7 +293,7 @@ func TestS3Basic(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		dstPrefix := s3Path(fmt.Sprintf("sync-%d", time.Now().UnixNano())) + "/"
+		dstPrefix := s3Path(fmt.Sprintf("sync-%s", uuid.New())) + "/"
 		t.Cleanup(func() {
 			cleanFolder(t, dstPrefix)
 		})
@@ -320,7 +320,7 @@ func TestS3Basic(t *testing.T) {
 
 	// rmtree removes a whole prefix
 	t.Run("rmtree prefix", func(t *testing.T) {
-		prefix := s3Path(fmt.Sprintf("rmtree-%d", time.Now().UnixNano()))
+		prefix := s3Path(fmt.Sprintf("rmtree-%s", uuid.New()))
 		if _, err := runBBB("cp", tmpFile.Name(), prefix+"/a.txt"); err != nil {
 			t.Fatal(err)
 		}
