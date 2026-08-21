@@ -1136,10 +1136,8 @@ func uploadInitialConcurrencyForSize(caller int, size int64) int {
 // BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX). The optional onProgress callback
 // receives the cumulative number of bytes staged.
 //
-// If staging is rejected with InvalidBlobOrBlock — which happens when the
-// destination retains uncommitted blocks of a different block-ID length from a
-// prior aborted upload — the poisoned blob is cleared and the upload is retried
-// once from a clean slate.
+// If staging is rejected because stale uncommitted blocks poison the
+// destination, the blob is cleared and the upload is retried once.
 func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) error {
 	// Guard against non-monotonic progress across the self-heal retry below,
 	// which restarts the byte counter from zero.
@@ -1152,10 +1150,14 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 		onProgress = monotonicProgress(&last, onProgress)
 	}
 	err := uploadFileOnce(ctx, ap, file, concurrency, onProgress)
-	if err != nil && isInvalidBlobOrBlock(err) {
-		slog.Warn("upload hit InvalidBlobOrBlock; clearing stale uncommitted blocks and retrying", "dst", ap.String())
-		if client, cerr := getAzBlobClient(ctx, ap.Account); cerr == nil {
-			clearUncommittedBlocks(ctx, client, ap)
+	if err != nil && isStaleUncommittedBlockError(err) {
+		slog.Warn("upload hit stale uncommitted blocks; clearing destination and retrying", "dst", ap.String())
+		client, clientErr := getAzBlobClient(ctx, ap.Account)
+		if clientErr != nil {
+			return errors.Join(err, fmt.Errorf("get client to clear stale uncommitted blocks: %w", clientErr))
+		}
+		if clearErr := clearUncommittedBlocks(ctx, client, ap); clearErr != nil {
+			return errors.Join(err, clearErr)
 		}
 		err = uploadFileOnce(ctx, ap, file, concurrency, onProgress)
 	}
@@ -1728,32 +1730,35 @@ func planBlocks(totalSize int64, defaultBlockSize int64, maxBlocks int64) (block
 	return blockSize, ids, nil
 }
 
-// isInvalidBlobOrBlock reports whether err is an Azure "InvalidBlobOrBlock"
-// (HTTP 400) response. This occurs when a block blob has pre-existing
-// uncommitted blocks whose IDs differ in length from the ones being staged —
-// e.g. left behind by a prior aborted upload that used a different block
-// size/ID scheme. Azure requires every block ID for a blob to be the same
-// length, so staging new blocks on such a "poisoned" blob is rejected until the
-// stale uncommitted blocks are cleared.
-func isInvalidBlobOrBlock(err error) bool {
+// isStaleUncommittedBlockError reports errors caused by orphaned blocks from
+// prior interrupted uploads. Those blocks can either use an incompatible ID
+// length or accumulate past Azure's 100,000-uncommitted-block limit.
+func isStaleUncommittedBlockError(err error) bool {
 	var respErr *azcore.ResponseError
-	return errors.As(err, &respErr) && respErr.ErrorCode == string(bloberror.InvalidBlobOrBlock)
+	if !errors.As(err, &respErr) {
+		return false
+	}
+	return respErr.ErrorCode == string(bloberror.InvalidBlobOrBlock) ||
+		respErr.ErrorCode == "BlockCountExceedsLimit"
 }
 
-// clearUncommittedBlocks deletes the destination blob to discard any
-// uncommitted blocks poisoning it, so a subsequent staged upload starts from a
-// clean slate. Best effort: a missing blob (BlobNotFound — nothing to clear) is
-// expected and ignored silently; any other delete error is logged at Warn for
-// diagnosis but not returned, since the caller retries the upload regardless.
-func clearUncommittedBlocks(ctx context.Context, client *azblob.Client, ap AzurePath) {
+// clearUncommittedBlocks commits an empty block list to discard every orphaned
+// block, then deletes the temporary empty blob. Delete alone is insufficient
+// when no committed blob exists: Azure returns BlobNotFound but retains the
+// uncommitted blocks.
+func clearUncommittedBlocks(ctx context.Context, client *azblob.Client, ap AzurePath) error {
 	bbc := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
+	if _, err := bbc.CommitBlockList(ctx, nil, nil); err != nil {
+		return fmt.Errorf("clear stale uncommitted blocks for %s: %w", ap.String(), err)
+	}
 	if _, err := bbc.Delete(ctx, nil); err != nil {
 		var respErr *azcore.ResponseError
 		if errors.As(err, &respErr) && respErr.ErrorCode == string(bloberror.BlobNotFound) {
-			return
+			return nil
 		}
-		slog.Warn("clearUncommittedBlocks: delete failed (ignored)", "dst", ap.String(), "err", err)
+		return fmt.Errorf("delete cleared blob %s: %w", ap.String(), err)
 	}
+	return nil
 }
 
 // CopyProgress is called during server-side copy with the number of
@@ -2015,10 +2020,8 @@ func CopyBlobFromURLServerSide(ctx context.Context, dst AzurePath, sourceURL str
 
 // copyBlobBlocks copies a blob using parallel StageBlockFromURL + CommitBlockList.
 //
-// If staging is rejected with InvalidBlobOrBlock — which happens when the
-// destination retains uncommitted blocks of a different block-ID length from a
-// prior aborted upload — the poisoned blob is cleared and the copy is retried
-// once from a clean slate.
+// If staging is rejected because stale uncommitted blocks poison the
+// destination, the blob is cleared and the copy is retried once.
 func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, concurrency int, onProgress CopyProgress) error {
 	// Guard against non-monotonic progress across the self-heal retry below,
 	// which restarts the byte counter from zero.
@@ -2033,9 +2036,11 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 		onProgress = func(copied, _ int64) { emit(copied) }
 	}
 	err := copyBlobBlocksOnce(ctx, client, dst, copySource, sourceAuth, totalSize, concurrency, onProgress)
-	if err != nil && isInvalidBlobOrBlock(err) {
-		slog.Warn("server-side copy hit InvalidBlobOrBlock; clearing stale uncommitted blocks and retrying", "dst", dst.String())
-		clearUncommittedBlocks(ctx, client, dst)
+	if err != nil && isStaleUncommittedBlockError(err) {
+		slog.Warn("server-side copy hit stale uncommitted blocks; clearing destination and retrying", "dst", dst.String())
+		if clearErr := clearUncommittedBlocks(ctx, client, dst); clearErr != nil {
+			return errors.Join(err, clearErr)
+		}
 		err = copyBlobBlocksOnce(ctx, client, dst, copySource, sourceAuth, totalSize, concurrency, onProgress)
 	}
 	return err
