@@ -31,7 +31,11 @@ func parseTaskPairLine(line string, lineNo int) (taskPair, error) {
 	return taskPair{src: parts[0], dst: parts[1]}, nil
 }
 
-func loadTaskPairs(taskfile string) ([]taskPair, error) {
+// streamTaskPairs reads task pairs from taskfile (or stdin when taskfile is
+// `-`) and calls emit for each pair as soon as its line is read, so a taskfile
+// can be consumed as a continuous work stream instead of being buffered until
+// EOF. Returning a non-nil error from emit stops reading.
+func streamTaskPairs(taskfile string, emit func(taskPair) error) error {
 	var (
 		reader io.Reader
 		file   *os.File
@@ -42,7 +46,7 @@ func loadTaskPairs(taskfile string) ([]taskPair, error) {
 	} else {
 		file, err = os.Open(taskfile)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		defer func() {
 			_ = file.Close()
@@ -50,7 +54,6 @@ func loadTaskPairs(taskfile string) ([]taskPair, error) {
 		reader = file
 	}
 
-	var tasks []taskPair
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxTaskfileLineSize)
 	for lineNo := 1; scanner.Scan(); lineNo++ {
@@ -58,13 +61,24 @@ func loadTaskPairs(taskfile string) ([]taskPair, error) {
 		if line == "" {
 			continue
 		}
-		task, err := parseTaskPairLine(line, lineNo)
-		if err != nil {
-			return nil, err
+		task, perr := parseTaskPairLine(line, lineNo)
+		if perr != nil {
+			return perr
 		}
-		tasks = append(tasks, task)
+		if eerr := emit(task); eerr != nil {
+			return eerr
+		}
 	}
-	if err := scanner.Err(); err != nil {
+	return scanner.Err()
+}
+
+// loadTaskPairs reads all task pairs from taskfile into memory.
+func loadTaskPairs(taskfile string) ([]taskPair, error) {
+	var tasks []taskPair
+	if err := streamTaskPairs(taskfile, func(t taskPair) error {
+		tasks = append(tasks, t)
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	return tasks, nil

@@ -516,7 +516,12 @@ func PreAuthenticate(ctx context.Context, accounts ...string) error {
 // interactive browser login. This makes authentication machine-friendly for
 // CI/CD and multi-tenant environments.
 func RegisterAccountRole(account, role string) {
-	accountRoles.Store(account, strings.ToUpper(role))
+	role = strings.ToUpper(role)
+	if current, ok := accountRoles.Load(account); ok && current.(string) == role {
+		return
+	}
+	accountRoles.Store(account, role)
+	blobClientCache.Delete(account)
 }
 
 // AccountRole returns the role ("SRC" or "DST") registered for the given
@@ -529,10 +534,12 @@ func AccountRole(account string) (string, bool) {
 	return v.(string), true
 }
 
-// ClearAccountRole removes the role registration for the given account.
-// This is used in tests to reset state between subtests.
+// ClearAccountRole removes the role registration and any client created with
+// its role-scoped credentials, so future requests use the unscoped flow.
 func ClearAccountRole(account string) {
-	accountRoles.Delete(account)
+	if _, loaded := accountRoles.LoadAndDelete(account); loaded {
+		blobClientCache.Delete(account)
+	}
 }
 
 // roleEnvVars lists all Azure identity environment variables that are

@@ -29,6 +29,18 @@ func TestIsAzHTTPS(t *testing.T) {
 	}
 }
 
+func TestRunCPTaskStreamPropagatesCanceledProducer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := runCPTaskStream(ctx, func(func(taskPair) error) error {
+		return ctx.Err()
+	}, false, true, 1, 0, "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runCPTaskStream error = %v, want context.Canceled", err)
+	}
+}
+
 func TestIsAzHTTPEdgeCases(t *testing.T) {
 	if !bbbfs.IsAz("http://MYACCT.blob.core.windows.net:8080/container/blob.txt?sv=2021#frag") {
 		t.Fatalf("expected blob url with port/query/fragment to be az path")
