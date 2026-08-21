@@ -3,7 +3,7 @@
 # py-bbb/boostedblob and azcopy) together with the certificate tooling. The
 # Azurite emulator itself runs as its own Compose service (see
 # docker-compose.yaml), so it is not installed here.
-FROM golang:1.26-trixie
+FROM golang:1.27-trixie
 
 ENV DEBIAN_FRONTEND=noninteractive
 
