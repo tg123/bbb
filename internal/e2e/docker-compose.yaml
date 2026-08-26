@@ -16,6 +16,13 @@ services:
     depends_on:
       - azurite
 
+  fake-gcs-server:
+    image: fsouza/fake-gcs-server:1.52.2
+    network_mode: service:azurite # share azurite netns so bbb reaches it on localhost
+    command: ["-scheme", "http", "-port", "4443", "-backend", "memory", "-public-host", "localhost:4443", "-external-url", "http://localhost:4443"]
+    depends_on:
+      - azurite
+
   bbb:
     network_mode: service:azurite
     build:
@@ -29,9 +36,12 @@ services:
       - BBB_S3_REGION=us-east-1
       - AWS_ACCESS_KEY_ID=minioadmin
       - AWS_SECRET_ACCESS_KEY=minioadmin
+      - BBB_GS_ENDPOINT=http://localhost:4443
+      - BBB_GS_PROJECT=bbb-test
     depends_on:
       - azurite
       - minio
+      - fake-gcs-server
     volumes:
       - ../..:/src
     working_dir: /src/internal/e2e
