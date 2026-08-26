@@ -12,6 +12,42 @@ type recursiveLister interface {
 	ListRecursive(ctx context.Context, root string, emit func(Entry) error) error
 }
 
+type recursiveSummarizer interface {
+	SummarizeRecursive(ctx context.Context, root string, onProgress func(count, size int64)) (RecursiveSummary, error)
+}
+
+// RecursiveSummary contains aggregate metadata for a recursive file listing.
+type RecursiveSummary struct {
+	FileCount int64
+	TotalSize int64
+}
+
+// SummarizeRecursive returns aggregate file count and size without retaining
+// individual entries. Backends may optimize this operation independently.
+func SummarizeRecursive(ctx context.Context, root string, onProgress func(count, size int64)) (RecursiveSummary, error) {
+	if summarizer, ok := Resolve(root).(recursiveSummarizer); ok {
+		return summarizer.SummarizeRecursive(ctx, root, onProgress)
+	}
+	var summary RecursiveSummary
+	for result := range ListRecursive(ctx, root) {
+		if result.Err != nil {
+			return summary, result.Err
+		}
+		if result.Entry.Name == "" || result.Entry.IsDir {
+			continue
+		}
+		summary.FileCount++
+		summary.TotalSize += result.Entry.Size
+		if onProgress != nil && summary.FileCount%4096 == 0 {
+			onProgress(summary.FileCount, summary.TotalSize)
+		}
+	}
+	if onProgress != nil {
+		onProgress(summary.FileCount, summary.TotalSize)
+	}
+	return summary, nil
+}
+
 // ListRecursive returns a channel that streams all files under the path.
 // Entries are emitted as they are discovered; any listing error is sent as a
 // ListResult with Err set. The channel is closed when listing completes or

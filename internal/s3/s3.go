@@ -40,6 +40,12 @@ const (
 
 	// deleteBatchSize is the maximum number of keys per DeleteObjects request.
 	deleteBatchSize = 1000
+
+	// r2EndpointSuffix is the host suffix of Cloudflare R2 S3 endpoints.
+	r2EndpointSuffix = "r2.cloudflarestorage.com"
+
+	// r2Region is the only region name accepted by Cloudflare R2.
+	r2Region = "auto"
 )
 
 // S3Path represents an s3:// path (bucket/key).
@@ -134,20 +140,92 @@ func forcePathStyle() bool {
 }
 
 func region() string {
-	for _, env := range []string{"BBB_S3_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"} {
+	envs := []string{"BBB_S3_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"}
+	fallback := defaultRegion
+	if isR2() {
+		// Cloudflare R2 signs requests with the pseudo-region "auto", so an
+		// unrelated AWS_REGION in the environment must not leak into it. Only
+		// the bbb-specific override is honoured.
+		envs = envs[:1]
+		fallback = r2Region
+	}
+	for _, env := range envs {
 		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
 			return v
 		}
 	}
-	return defaultRegion
+	return fallback
 }
 
-func endpoint() string {
+// r2AccountID returns the Cloudflare account ID of the endpoint in use, or an
+// empty string when the endpoint does not point at R2. It is taken from the
+// endpoint host (the leftmost label), which also covers the case where the
+// endpoint was derived from BBB_R2_ACCOUNT_ID.
+func r2AccountID() string {
+	host := endpointHost(endpoint())
+	if !isR2Host(host) {
+		return ""
+	}
+	label, _, ok := strings.Cut(host, ".")
+	if !ok {
+		return ""
+	}
+	return label
+}
+
+func rawEndpoint() string {
 	return strings.TrimSpace(os.Getenv("BBB_S3_ENDPOINT"))
 }
 
-// Endpoint returns the configured custom S3 endpoint (BBB_S3_ENDPOINT), or an
-// empty string when targeting AWS.
+func endpoint() string {
+	if ep := rawEndpoint(); ep != "" {
+		return ep
+	}
+	if id := strings.TrimSpace(os.Getenv("BBB_R2_ACCOUNT_ID")); id != "" {
+		return "https://" + id + "." + r2EndpointSuffix
+	}
+	return ""
+}
+
+// endpointHost extracts the lower-cased host of an endpoint URL, without any
+// scheme, userinfo, port or path.
+func endpointHost(ep string) string {
+	host := ep
+	if i := strings.Index(host, "://"); i >= 0 {
+		host = host[i+len("://"):]
+	}
+	if i := strings.IndexAny(host, "/?#"); i >= 0 {
+		host = host[:i]
+	}
+	if i := strings.LastIndex(host, "@"); i >= 0 {
+		host = host[i+1:]
+	}
+	if i := strings.LastIndex(host, ":"); i >= 0 && !strings.Contains(host[i+1:], "]") {
+		host = host[:i]
+	}
+	return strings.ToLower(strings.Trim(strings.TrimSuffix(host, "."), "[]"))
+}
+
+// isR2Host reports whether host belongs to the Cloudflare R2 S3 API.
+func isR2Host(host string) bool {
+	return host == r2EndpointSuffix || strings.HasSuffix(host, "."+r2EndpointSuffix)
+}
+
+// isR2 reports whether the configured endpoint targets Cloudflare R2.
+func isR2() bool {
+	return isR2Host(endpointHost(endpoint()))
+}
+
+// IsR2 reports whether bbb is configured to talk to Cloudflare R2, either via
+// BBB_R2_ACCOUNT_ID or an explicit R2 BBB_S3_ENDPOINT.
+func IsR2() bool { return isR2() }
+
+// R2AccountID returns the Cloudflare account ID in use (from BBB_R2_ACCOUNT_ID
+// or an R2 BBB_S3_ENDPOINT), or an empty string when R2 is not configured.
+func R2AccountID() string { return r2AccountID() }
+
+// Endpoint returns the configured custom S3 endpoint (BBB_S3_ENDPOINT), an R2
+// endpoint synthesized from BBB_R2_ACCOUNT_ID, or an empty string for AWS.
 func Endpoint() string { return endpoint() }
 
 // ForcePathStyle reports whether path-style addressing is forced
@@ -160,13 +238,7 @@ func ForcePathStyle() bool { return forcePathStyle() }
 // for S3-compatible stores via BBB_S3_ENDPOINT and BBB_S3_FORCE_PATH_STYLE.
 func getClient(ctx context.Context) (*awss3.Client, error) {
 	cachedClientOnce.Do(func() {
-		opts := []func(*awsconfig.LoadOptions) error{
-			awsconfig.WithRegion(region()),
-		}
-		if c := sharedHTTPClient.Load(); c != nil {
-			opts = append(opts, awsconfig.WithHTTPClient(c))
-		}
-		cfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+		cfg, err := awsconfig.LoadDefaultConfig(ctx, clientLoadOptions()...)
 		if err != nil {
 			cachedClientErr = err
 			return
@@ -183,6 +255,24 @@ func getClient(ctx context.Context) (*awss3.Client, error) {
 		})
 	})
 	return cachedClient, cachedClientErr
+}
+
+func clientLoadOptions() []func(*awsconfig.LoadOptions) error {
+	opts := []func(*awsconfig.LoadOptions) error{
+		awsconfig.WithRegion(region()),
+	}
+	if c := sharedHTTPClient.Load(); c != nil {
+		opts = append(opts, awsconfig.WithHTTPClient(c))
+	}
+	if isR2() {
+		// R2 does not implement AWS flexible checksums; the SDK default
+		// (when_supported) makes it reject uploads with a trailing CRC32.
+		opts = append(opts,
+			awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+			awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
+		)
+	}
+	return opts
 }
 
 // --- Errors ---
@@ -407,13 +497,7 @@ func MkBucket(ctx context.Context, bucket string) error {
 	if err != nil {
 		return err
 	}
-	input := &awss3.CreateBucketInput{Bucket: aws.String(bucket)}
-	// Outside us-east-1 a LocationConstraint is required.
-	if r := region(); r != "" && r != defaultRegion {
-		input.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
-			LocationConstraint: s3types.BucketLocationConstraint(r),
-		}
-	}
+	input := createBucketInput(bucket)
 	_, err = client.CreateBucket(ctx, input)
 	if err != nil {
 		var ae smithy.APIError
@@ -434,6 +518,18 @@ func MkBucket(ctx context.Context, bucket string) error {
 		return err
 	}
 	return nil
+}
+
+func createBucketInput(bucket string) *awss3.CreateBucketInput {
+	input := &awss3.CreateBucketInput{Bucket: aws.String(bucket)}
+	// Outside us-east-1 a LocationConstraint is required. R2 is the exception:
+	// it only knows the pseudo-region "auto" and rejects any constraint.
+	if r := region(); r != "" && r != defaultRegion && !isR2() {
+		input.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
+			LocationConstraint: s3types.BucketLocationConstraint(r),
+		}
+	}
+	return input
 }
 
 // --- Listing ---

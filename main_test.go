@@ -1071,11 +1071,175 @@ func TestFormatProgressBarIncludesSpeed(t *testing.T) {
 	}
 }
 
+func TestFormatCountingBar(t *testing.T) {
+	line := formatCountingBar("Counting", 3, 1536, 5, 200*time.Millisecond, false)
+	if line != "Counting [  >  ] 3 files (1.5 KiB) 0s" {
+		t.Fatalf("unexpected counting bar output: %s", line)
+	}
+
+	line = formatCountingBar("Counting", 1, 512, 5, 2*time.Second, true)
+	if line != "Counting [=====] 1 file (512 B) 2s" {
+		t.Fatalf("unexpected completed counting bar output: %s", line)
+	}
+}
+
 func TestFormatProgressBarClampsDoneToTotal(t *testing.T) {
 	line := formatProgressBar("cp", 7, 5, 10, 1*1024*1024, true, false, 5*time.Second)
 	if line != "cp [==========] 100% (5/5, 1.0 MB/s) 5s" {
 		t.Fatalf("unexpected clamped output: %s", line)
 	}
+}
+
+func TestLLRSummaryOnly(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "nested"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nested", "b.txt"), []byte("12345"), 0o644); err != nil {
+		t.Fatalf("write b.txt: %v", err)
+	}
+
+	app := &cli.Command{
+		Action: func(ctx context.Context, c *cli.Command) error {
+			return runListTree(ctx, c, true)
+		},
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "summary", Aliases: []string{"s"}},
+			&cli.BoolFlag{Name: "machine"},
+			&cli.BoolFlag{Name: "relative"},
+			&cli.IntFlag{Name: "concurrency", Value: 1},
+		},
+	}
+
+	output := captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"llr", "-s", "--concurrency", "4", root})
+	})
+	if output != "Listed 2 files summing to 8 B (8 bytes)\n" {
+		t.Fatalf("unexpected summary output: %q", output)
+	}
+
+	output = captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"llr", "--summary", "--machine", root})
+	})
+	if output != "2\t8\n" {
+		t.Fatalf("unexpected machine summary output: %q", output)
+	}
+}
+
+func TestDUSummaryIsRecursive(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "nested"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nested", "b"), []byte("12345"), 0o644); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	app := &cli.Command{
+		Action: cmdDU,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "summarize", Aliases: []string{"s"}},
+			&cli.BoolFlag{Name: "machine"},
+			&cli.IntFlag{Name: "concurrency", Value: 1},
+		},
+	}
+	output := captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"du", "-s", root})
+	})
+	if output != "Listed 2 files summing to 8 B (8 bytes)\n" {
+		t.Fatalf("unexpected du summary output: %q", output)
+	}
+
+	output = captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"du", "--machine", "-s", root})
+	})
+	if output != "2\t8\n" {
+		t.Fatalf("unexpected machine du summary output: %q", output)
+	}
+}
+
+func TestDUDefaultPrintsDirectoriesPostOrder(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "b"), []byte("12345"), 0o644); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	app := &cli.Command{
+		Action: cmdDU,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "summarize", Aliases: []string{"s"}},
+			&cli.BoolFlag{Name: "machine"},
+			&cli.IntFlag{Name: "concurrency", Value: 1},
+		},
+	}
+	output := captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"du", root})
+	})
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], "\t"+sub) || !strings.HasSuffix(lines[1], "\t"+root) {
+		t.Fatalf("unexpected du output: %q", output)
+	}
+
+	output = captureStdout(t, func() error {
+		return app.Run(context.Background(), []string{"du", "--machine", "-s", root})
+	})
+	if output != "2\t8\n" {
+		t.Fatalf("unexpected machine du output: %q", output)
+	}
+}
+
+func TestFormatDiskUsageSize(t *testing.T) {
+	tests := []struct {
+		bytes int64
+		want  string
+	}{
+		{0, "0"},
+		{8, "8B"},
+		{4 * 1024, "4.0K"},
+		{16 * 1024, "16K"},
+		{3992 * 1024, "3.9M"},
+	}
+	for _, test := range tests {
+		if got := formatDiskUsageSize(test.bytes); got != test.want {
+			t.Errorf("formatDiskUsageSize(%d) = %q, want %q", test.bytes, got, test.want)
+		}
+	}
+}
+
+func captureStdout(t *testing.T, run func() error) string {
+	t.Helper()
+	original := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stdout: %v", err)
+	}
+	os.Stdout = w
+	runErr := run()
+	closeErr := w.Close()
+	os.Stdout = original
+	output, readErr := io.ReadAll(r)
+	_ = r.Close()
+	if runErr != nil {
+		t.Fatalf("command failed: %v", runErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close stdout: %v", closeErr)
+	}
+	if readErr != nil {
+		t.Fatalf("read stdout: %v", readErr)
+	}
+	return string(output)
 }
 
 func TestFormatProgressBarNormalizesWidth(t *testing.T) {

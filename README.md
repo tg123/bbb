@@ -191,6 +191,7 @@ IAM instance/task roles.
 | `BBB_S3_REGION` | *(unset)* | Overrides the region for bbb only (takes precedence over `AWS_REGION`) |
 | `BBB_S3_ENDPOINT` | *(unset)* | Custom endpoint URL for S3-compatible stores (e.g. MinIO, Cloudflare R2, Wasabi) |
 | `BBB_S3_FORCE_PATH_STYLE` | `0` | Set to `1`/`true` to use path-style addressing (required by most S3-compatible servers) |
+| `BBB_R2_ACCOUNT_ID` | *(unset)* | Cloudflare account ID; derives the R2 endpoint `https://<account-id>.r2.cloudflarestorage.com` and uses the `auto` region (`AWS_REGION` is ignored for R2; override with `BBB_S3_REGION`) |
 
 Example using an S3-compatible server (MinIO):
 
@@ -207,6 +208,31 @@ bbb ls s3://mybucket/
 S3→S3 copies (within the same account/endpoint) use server-side `CopyObject`
 — with a multipart `UploadPartCopy` fallback for objects larger than 5 GiB —
 and never stream bytes through the client.
+
+#### Cloudflare R2
+
+Cloudflare R2 is accessed through the same `s3://` paths. Set `BBB_R2_ACCOUNT_ID`
+(with an R2 API token's access key pair) and bbb configures the R2 endpoint, the
+`auto` region, and the R2-specific protocol quirks automatically:
+
+```bash
+export AWS_ACCESS_KEY_ID=<r2-access-key-id>
+export AWS_SECRET_ACCESS_KEY=<r2-secret-access-key>
+export BBB_R2_ACCOUNT_ID=<cloudflare-account-id>
+
+bbb cp ./data.bin s3://mybucket/data.bin
+bbb ls s3://mybucket/
+```
+
+Notes:
+
+* `BBB_S3_ENDPOINT` still takes precedence, so jurisdiction-specific endpoints
+  (e.g. `https://<account-id>.eu.r2.cloudflarestorage.com`) can be set directly;
+  they are detected as R2 as well.
+* R2 does not implement AWS flexible checksums, so bbb requests checksums only
+  when required instead of the SDK default (`when_supported`).
+* `bbb s3 mkbucket` omits the `LocationConstraint` on R2, which only accepts the
+  pseudo-region `auto` for request signing.
 
 ### `BBB_DNS_SERVER`
 
@@ -349,8 +375,6 @@ bbb ls -s hf://meta-llama/Llama-2-7b/
 
 ### `ll` — Long listing (alias for `ls -l`)
 
-Aliases: `du`
-
 ```
 bbb ll [flags] [path]
 ```
@@ -369,6 +393,22 @@ bbb ll az://myaccount/mycontainer/models/
 
 ---
 
+### `du` — Estimate recursive file space usage
+
+Recursively prints human-readable cumulative usage for each directory, followed by the root. For object stores, usage is based on apparent blob size.
+
+```bash
+bbb du -s --concurrency 32 az://myaccount/mycontainer/data/
+```
+
+| Flag | Description |
+|------|-------------|
+| `-s`, `--summarize` | Display only the total file count and size |
+| `--machine` | Machine-readable `count<TAB>bytes` summary with `-s` |
+| `--concurrency N` | Number of concurrent listing requests |
+
+---
+
 ### `lstree` — Recursively list all files
 
 Aliases: `lsr`
@@ -384,6 +424,7 @@ bbb lstree [flags] [path]
 | `-l`, `--long` | Show file type, size, and modification time |
 | `-s`, `--relative` | Show relative paths |
 | `--machine` | Machine-readable tab-separated output |
+| `--concurrency N` | Number of concurrent listing requests |
 
 **Examples:**
 
@@ -407,13 +448,18 @@ bbb llr [flags] [path]
 
 | Flag | Description |
 |------|-------------|
-| `-s`, `--relative` | Show relative paths |
+| `-s`, `--summary` | Show only the total file count and size, with progress while counting |
+| `--relative` | Show relative paths |
 | `--machine` | Machine-readable tab-separated output |
+| `--concurrency N` | Number of concurrent listing requests |
 
 **Example:**
 
 ```bash
 bbb llr az://myaccount/mycontainer/
+
+# Count a large folder without printing every file
+bbb llr -s --concurrency 32 az://myaccount/mycontainer/
 ```
 
 ---

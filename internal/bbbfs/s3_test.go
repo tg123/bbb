@@ -29,6 +29,7 @@ func TestEscapeS3KeyPath(t *testing.T) {
 func TestS3ShareInfoEndpointPathPrefix(t *testing.T) {
 	// Virtual-host style: endpoint path prefix must be preserved between the
 	// bucket host and the key.
+	t.Setenv("BBB_R2_ACCOUNT_ID", "")
 	t.Setenv("BBB_S3_ENDPOINT", "https://proxy.example.com/minio")
 	t.Setenv("BBB_S3_FORCE_PATH_STYLE", "")
 	portal, direct, err := s3FS{}.ShareInfo("s3://mybucket/a b.txt")
@@ -55,6 +56,7 @@ func TestS3ShareInfoEndpointPathPrefix(t *testing.T) {
 
 func TestS3ShareInfoAWSEscaping(t *testing.T) {
 	// Force the AWS branch (no custom endpoint).
+	t.Setenv("BBB_R2_ACCOUNT_ID", "")
 	t.Setenv("BBB_S3_ENDPOINT", "")
 
 	portal, direct, err := s3FS{}.ShareInfo("s3://mybucket/a b/c#d.bin")
@@ -80,6 +82,44 @@ func TestS3ShareInfoAWSEscaping(t *testing.T) {
 	}
 	if direct != "https://mybucket.s3.amazonaws.com" {
 		t.Errorf("bucket direct = %q", direct)
+	}
+}
+
+func TestS3ShareInfoR2(t *testing.T) {
+	cases := []struct {
+		name       string
+		accountID  string
+		endpoint   string
+		wantDirect string
+	}{
+		{
+			name:       "account id",
+			accountID:  "abc123",
+			wantDirect: "https://mybucket.abc123.r2.cloudflarestorage.com/a%20b.txt",
+		},
+		{
+			name:       "jurisdiction endpoint",
+			endpoint:   "https://abc123.eu.r2.cloudflarestorage.com",
+			wantDirect: "https://mybucket.abc123.eu.r2.cloudflarestorage.com/a%20b.txt",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("BBB_R2_ACCOUNT_ID", c.accountID)
+			t.Setenv("BBB_S3_ENDPOINT", c.endpoint)
+			t.Setenv("BBB_S3_FORCE_PATH_STYLE", "")
+			portal, direct, err := s3FS{}.ShareInfo("s3://mybucket/a b.txt")
+			if err != nil {
+				t.Fatalf("ShareInfo error: %v", err)
+			}
+			wantPortal := "https://dash.cloudflare.com/abc123/r2/default/buckets/mybucket"
+			if portal != wantPortal {
+				t.Errorf("portal = %q, want %q", portal, wantPortal)
+			}
+			if direct != c.wantDirect {
+				t.Errorf("direct = %q, want %q", direct, c.wantDirect)
+			}
+		})
 	}
 }
 

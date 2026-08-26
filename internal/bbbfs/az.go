@@ -163,6 +163,15 @@ func (azFS) ListRecursive(ctx context.Context, target string, emit func(Entry) e
 	})
 }
 
+func (azFS) SummarizeRecursive(ctx context.Context, target string, onProgress func(count, size int64)) (RecursiveSummary, error) {
+	ap, err := azblob.Parse(target)
+	if err != nil {
+		return RecursiveSummary{}, err
+	}
+	count, size, err := azblob.SummarizeRecursive(ctx, ap, ScanConcurrency(ctx), onProgress)
+	return RecursiveSummary{FileCount: count, TotalSize: size}, err
+}
+
 func azChildPath(ap azblob.AzurePath, name string) string {
 	trimmed := strings.TrimSuffix(name, "/")
 	return ap.Child(trimmed).String()

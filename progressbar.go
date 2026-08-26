@@ -263,6 +263,7 @@ type progressBar struct {
 	lastDone  atomic.Int64
 	lastTotal atomic.Int64
 	finished  atomic.Bool
+	counting  bool // if true, render an indeterminate bar with live item/byte counts
 	pinBottom bool // if true, renders at the bottom of the bar stack
 }
 
@@ -316,6 +317,24 @@ func newStreamingProgressBar(label string, quiet bool, showSpeed bool) *progress
 	return bar
 }
 
+func newCountingProgressBar(label string, quiet bool) *progressBar {
+	if quiet || !isTerminal(os.Stderr) {
+		return nil
+	}
+	bar := &progressBar{
+		label:     label,
+		width:     28,
+		counting:  true,
+		startedAt: time.Now(),
+	}
+	bar.total.Store(1)
+	bar.lastDone.Store(progressUninitialized)
+	bar.lastTotal.Store(progressUninitialized)
+	startElapsedTicker()
+	bar.render(0)
+	return bar
+}
+
 func (p *progressBar) Increment() {
 	if p == nil {
 		return
@@ -329,6 +348,15 @@ func (p *progressBar) AddBytes(n int64) {
 		return
 	}
 	p.bytesDone.Add(n)
+}
+
+func (p *progressBar) SetCountAndBytes(count, bytes int64) {
+	if p == nil {
+		return
+	}
+	atomicMax(&p.done, count)
+	atomicMax(&p.bytesDone, bytes)
+	p.render(p.done.Load())
 }
 
 // atomicMax updates an atomic.Int64 to val if val is greater than the current
@@ -385,7 +413,9 @@ func (p *progressBar) Finish() {
 		total = 1
 		p.total.Store(total)
 	}
-	p.done.Store(total)
+	if !p.counting {
+		p.done.Store(total)
+	}
 	outputMu.Lock()
 	clearActiveBars()
 	removeActiveBar(p)
@@ -439,8 +469,21 @@ func (p *progressBar) renderAligned(labelWidth int) {
 	if total <= 0 {
 		return
 	}
-	done, total = clampProgress(done, total)
 	elapsedDur := time.Since(p.startedAt)
+	if p.counting {
+		if done < 0 {
+			done = 0
+		}
+		if isTerminal(os.Stderr) {
+			line := formatFancyCountingBar(p.label, done, p.bytesDone.Load(), p.width, elapsedDur, p.finished.Load())
+			fmt.Fprintf(os.Stderr, "\r"+ansiClear+"%s", line)
+		} else {
+			line := formatCountingBar(p.label, done, p.bytesDone.Load(), p.width, elapsedDur, p.finished.Load())
+			fmt.Fprintf(os.Stderr, "\r%s", line)
+		}
+		return
+	}
+	done, total = clampProgress(done, total)
 	elapsed := elapsedDur.Seconds()
 	speed := 0.0
 	if p.showSpeed && elapsed > 0 {
@@ -477,7 +520,13 @@ func (p *progressBar) render(done int64) {
 	if total <= 0 {
 		return
 	}
-	done, total = clampProgress(done, total)
+	if p.counting {
+		if done < 0 {
+			done = 0
+		}
+	} else {
+		done, total = clampProgress(done, total)
+	}
 	if p.lastDone.Load() == done && p.lastTotal.Load() == total {
 		return
 	}
@@ -500,6 +549,42 @@ func (p *progressBar) render(done int64) {
 		return // another goroutine won the race
 	}
 	redrawActiveBars()
+}
+
+func formatCountingBar(label string, count, bytes int64, width int, elapsed time.Duration, complete bool) string {
+	if width < 1 {
+		width = 1
+	}
+	bar := strings.Repeat("=", width)
+	if !complete {
+		position := int(elapsed/(100*time.Millisecond)) % width
+		bar = strings.Repeat(" ", position) + ">" + strings.Repeat(" ", width-position-1)
+	}
+	noun := "files"
+	if count == 1 {
+		noun = "file"
+	}
+	return fmt.Sprintf("%s [%s] %d %s (%s) %s", label, bar, count, noun, formatSize(bytes), formatElapsed(elapsed))
+}
+
+func formatFancyCountingBar(label string, count, bytes int64, width int, elapsed time.Duration, complete bool) string {
+	if width < 1 {
+		width = 1
+	}
+	bar := ansiGreen + strings.Repeat("━", width) + ansiReset
+	suffix := " " + ansiGreen + "✓" + ansiReset
+	if !complete {
+		position := int(elapsed/(100*time.Millisecond)) % width
+		bar = ansiGray + strings.Repeat("━", position) + ansiGreen + "╸" +
+			ansiGray + strings.Repeat("━", width-position-1) + ansiReset
+		suffix = ""
+	}
+	noun := "files"
+	if count == 1 {
+		noun = "file"
+	}
+	return fmt.Sprintf(ansiBold+"%s"+ansiReset+" %s %d %s (%s) %s%s",
+		label, bar, count, noun, formatSize(bytes), formatElapsed(elapsed), suffix)
 }
 
 func formatProgressBar(label string, done, total int64, width int, speed float64, showSpeed bool, byteSized bool, elapsed time.Duration) string {
