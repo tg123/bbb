@@ -74,10 +74,7 @@ func (p *Pool) Run(ctx context.Context) error {
 		p.heartbeatLoop(ctx)
 	}()
 
-	for {
-		if ctx.Err() != nil {
-			break
-		}
+	for ctx.Err() == nil {
 		free := p.opts.Slots - int(inflight.Load())
 		var leases []Lease
 		if free > 0 {

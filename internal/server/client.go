@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -70,6 +71,85 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// CreateJob submits a copy job.
+func (c *Client) CreateJob(ctx context.Context, req CreateJobRequest) (Job, error) {
+	var job Job
+	err := c.do(ctx, http.MethodPost, "/api/v1/jobs", req, &job)
+	return job, err
+}
+
+// ListJobs returns jobs, optionally filtered by state.
+func (c *Client) ListJobs(ctx context.Context, state string, limit int) ([]Job, error) {
+	query := url.Values{}
+	if state != "" {
+		query.Set("state", state)
+	}
+	if limit > 0 {
+		query.Set("limit", fmt.Sprint(limit))
+	}
+	path := "/api/v1/jobs"
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var out struct {
+		Jobs []Job `json:"jobs"`
+	}
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	if out.Jobs == nil {
+		out.Jobs = []Job{}
+	}
+	return out.Jobs, nil
+}
+
+// GetJob returns one job by ID.
+func (c *Client) GetJob(ctx context.Context, id string) (Job, error) {
+	var job Job
+	err := c.do(ctx, http.MethodGet, "/api/v1/jobs/"+url.PathEscape(id), nil, &job)
+	return job, err
+}
+
+// ListTasks returns a job's file tasks, optionally filtered by state.
+func (c *Client) ListTasks(ctx context.Context, jobID, state string, limit, offset int) ([]Task, error) {
+	query := url.Values{}
+	if state != "" {
+		query.Set("state", state)
+	}
+	if limit > 0 {
+		query.Set("limit", fmt.Sprint(limit))
+	}
+	if offset > 0 {
+		query.Set("offset", fmt.Sprint(offset))
+	}
+	path := "/api/v1/jobs/" + url.PathEscape(jobID) + "/tasks"
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var out struct {
+		Tasks []Task `json:"tasks"`
+	}
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	if out.Tasks == nil {
+		out.Tasks = []Task{}
+	}
+	return out.Tasks, nil
+}
+
+// CancelJob requests cancellation and returns the updated job.
+func (c *Client) CancelJob(ctx context.Context, id string) (Job, error) {
+	var job Job
+	err := c.do(ctx, http.MethodPost, "/api/v1/jobs/"+url.PathEscape(id)+"/cancel", nil, &job)
+	return job, err
+}
+
+// DeleteJob deletes a terminal job and its tasks.
+func (c *Client) DeleteJob(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/api/v1/jobs/"+url.PathEscape(id), nil, nil)
 }
 
 // Claim implements TaskSource.

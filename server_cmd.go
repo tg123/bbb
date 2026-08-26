@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,6 +35,189 @@ func (cliRunner) Copy(ctx context.Context, src, dst string, opts server.CopyOpti
 		concurrency = runtime.NumCPU()
 	}
 	return cmdCPPaths(ctx, opts.Overwrite, true, concurrency, opts.RetryCount, []string{src}, dst, 0, false, onBytes)
+}
+
+func cmdCPAction(ctx context.Context, c *cli.Command) error {
+	if strings.TrimSpace(c.Root().String("server")) != "" {
+		return cmdServerCP(ctx, c)
+	}
+	return cmdCP(ctx, c)
+}
+
+func remoteServerClient(c *cli.Command, command string) (*server.Client, error) {
+	baseURL := strings.TrimSpace(c.Root().String("server"))
+	if baseURL == "" {
+		return nil, fmt.Errorf("%s: --server is required", command)
+	}
+	return server.NewClient(baseURL, c.Root().String("server-token")), nil
+}
+
+func cmdServerCP(ctx context.Context, c *cli.Command) error {
+	if stateFile := c.String("state"); stateFile != "" || c.Root().String("state") != "" {
+		return errors.New("cp: --state is not supported with --server")
+	}
+	tasks, err := cpTaskPairs(c)
+	if err != nil {
+		return err
+	}
+	client, err := remoteServerClient(c, "cp")
+	if err != nil {
+		return err
+	}
+	concurrency := 0
+	if c.IsSet("concurrency") {
+		concurrency = c.Int("concurrency")
+	}
+	for _, task := range tasks {
+		job, err := client.CreateJob(ctx, server.CreateJobRequest{
+			Src:         task.src,
+			Dst:         task.dst,
+			Overwrite:   c.Bool("f"),
+			Concurrency: concurrency,
+			RetryCount:  c.Int("retry-count"),
+		})
+		if err != nil {
+			return fmt.Errorf("cp: submit %s -> %s: %w", task.src, task.dst, err)
+		}
+		fmt.Println(job.ID)
+	}
+	return nil
+}
+
+func serverJobCommand() *cli.Command {
+	return &cli.Command{
+		Name:      "job",
+		Usage:     "Manage copy jobs on --server",
+		UsageText: "bbb --server URL job <list|get|tasks|cancel|delete>",
+		Commands: []*cli.Command{
+			{
+				Name:  "list",
+				Usage: "List jobs",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "state", Usage: "Filter by job `state`"},
+					&cli.IntFlag{Name: "limit", Usage: "Maximum jobs to return", Value: 100},
+				},
+				Action: cmdJobList,
+			},
+			{
+				Name:      "get",
+				Usage:     "Get a job",
+				UsageText: "bbb --server URL job get ID",
+				Action:    cmdJobGet,
+			},
+			{
+				Name:      "tasks",
+				Usage:     "List a job's file tasks",
+				UsageText: "bbb --server URL job tasks [--state STATE] [--limit N] [--offset N] ID",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "state", Usage: "Filter by task `state`"},
+					&cli.IntFlag{Name: "limit", Usage: "Maximum tasks to return", Value: 100},
+					&cli.IntFlag{Name: "offset", Usage: "Number of tasks to skip"},
+				},
+				Action: cmdJobTasks,
+			},
+			{
+				Name:      "cancel",
+				Usage:     "Cancel a job",
+				UsageText: "bbb --server URL job cancel ID",
+				Action:    cmdJobCancel,
+			},
+			{
+				Name:      "delete",
+				Usage:     "Delete a terminal job and its tasks",
+				UsageText: "bbb --server URL job delete ID",
+				Action:    cmdJobDelete,
+			},
+		},
+	}
+}
+
+func writeCommandJSON(value any) error {
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(value)
+}
+
+func requireJobID(c *cli.Command, command string) (string, error) {
+	if c.Args().Len() != 1 {
+		return "", fmt.Errorf("job %s: need exactly one job ID", command)
+	}
+	return c.Args().Get(0), nil
+}
+
+func cmdJobList(ctx context.Context, c *cli.Command) error {
+	if c.Args().Len() != 0 {
+		return errors.New("job list: does not accept positional arguments")
+	}
+	client, err := remoteServerClient(c, "job list")
+	if err != nil {
+		return err
+	}
+	jobs, err := client.ListJobs(ctx, c.String("state"), c.Int("limit"))
+	if err != nil {
+		return err
+	}
+	return writeCommandJSON(jobs)
+}
+
+func cmdJobGet(ctx context.Context, c *cli.Command) error {
+	id, err := requireJobID(c, "get")
+	if err != nil {
+		return err
+	}
+	client, err := remoteServerClient(c, "job get")
+	if err != nil {
+		return err
+	}
+	job, err := client.GetJob(ctx, id)
+	if err != nil {
+		return err
+	}
+	return writeCommandJSON(job)
+}
+
+func cmdJobTasks(ctx context.Context, c *cli.Command) error {
+	id, err := requireJobID(c, "tasks")
+	if err != nil {
+		return err
+	}
+	client, err := remoteServerClient(c, "job tasks")
+	if err != nil {
+		return err
+	}
+	tasks, err := client.ListTasks(ctx, id, c.String("state"), c.Int("limit"), c.Int("offset"))
+	if err != nil {
+		return err
+	}
+	return writeCommandJSON(tasks)
+}
+
+func cmdJobCancel(ctx context.Context, c *cli.Command) error {
+	id, err := requireJobID(c, "cancel")
+	if err != nil {
+		return err
+	}
+	client, err := remoteServerClient(c, "job cancel")
+	if err != nil {
+		return err
+	}
+	job, err := client.CancelJob(ctx, id)
+	if err != nil {
+		return err
+	}
+	return writeCommandJSON(job)
+}
+
+func cmdJobDelete(ctx context.Context, c *cli.Command) error {
+	id, err := requireJobID(c, "delete")
+	if err != nil {
+		return err
+	}
+	client, err := remoteServerClient(c, "job delete")
+	if err != nil {
+		return err
+	}
+	return client.DeleteJob(ctx, id)
 }
 
 func defaultWorkerID() string {

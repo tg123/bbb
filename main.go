@@ -274,6 +274,8 @@ func main() {
 			},
 			&cli.StringFlag{Name: "taskfile", Hidden: true},
 			&cli.StringFlag{Name: "state", Hidden: true},
+			&cli.StringFlag{Name: "server", Usage: "Submit supported commands to this bbb server `url`", Sources: cli.EnvVars("BBB_SERVER_URL")},
+			&cli.StringFlag{Name: "server-token", Usage: "Bearer `token` for --server", Sources: cli.EnvVars("BBB_SERVER_TOKEN")},
 		},
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
 			lvlStr := cmd.String("loglevel")
@@ -546,8 +548,9 @@ func main() {
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
 				},
-				Action: cmdCP,
+				Action: cmdCPAction,
 			},
+			serverJobCommand(),
 			{
 				Name:   "edit",
 				Usage:  "Open file in $EDITOR (creates if missing)",
@@ -1297,38 +1300,47 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	concurrency := c.Int("concurrency")
 	ctx = bbbfs.WithScanConcurrency(ctx, concurrency)
 	retryCount := c.Int("retry-count")
-	taskfile := c.String("taskfile")
-	if taskfile == "" {
-		taskfile = c.Root().String("taskfile")
-	}
 	stateFile := c.String("state")
 	if stateFile == "" {
 		stateFile = c.Root().String("state")
 	}
 
+	tasks, err := cpTaskPairs(c)
+	if err != nil {
+		return err
+	}
+
+	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
+}
+
+func cpTaskPairs(c *cli.Command) ([]taskPair, error) {
+	taskfile := c.String("taskfile")
+	if taskfile == "" {
+		taskfile = c.Root().String("taskfile")
+	}
+
 	var tasks []taskPair
 	if taskfile != "" {
 		if c.Args().Len() != 0 {
-			return fmt.Errorf("cp: cannot use positional args with --taskfile")
+			return nil, fmt.Errorf("cp: cannot use positional args with --taskfile")
 		}
 		var err error
 		tasks, err = loadTaskPairs(taskfile)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		// Convert positional args into task pairs so both modes share the
 		// same execution path (expansion, state tracking, progress bars).
 		if c.Args().Len() < 2 {
-			return fmt.Errorf("cp: need srcs dst")
+			return nil, fmt.Errorf("cp: need srcs dst")
 		}
 		dst := c.Args().Get(c.Args().Len() - 1)
 		for i := 0; i < c.Args().Len()-1; i++ {
 			tasks = append(tasks, taskPair{src: c.Args().Get(i), dst: dst})
 		}
 	}
-
-	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
+	return tasks, nil
 }
 
 // runCPTasks executes a list of task pairs through the unified expansion +

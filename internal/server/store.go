@@ -204,8 +204,16 @@ func (s *Store) CancelJob(ctx context.Context, id string) (Job, error) {
 			TaskCancelled, now, id, TaskPending); err != nil {
 			return Job{}, err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET cancel_requested = 1, updated_at = ? WHERE id = ?`, now, id); err != nil {
-			return Job{}, err
+		if state == JobPending {
+			if _, err := tx.ExecContext(ctx, `
+UPDATE jobs SET state = ?, cancel_requested = 1, finished_at = ?, updated_at = ? WHERE id = ?`,
+				JobCancelled, now, now, id); err != nil {
+				return Job{}, err
+			}
+		} else {
+			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET cancel_requested = 1, updated_at = ? WHERE id = ?`, now, id); err != nil {
+				return Job{}, err
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -276,7 +284,8 @@ func (s *Store) NextJobToExpand(ctx context.Context) (job Job, ok bool, err erro
 	defer func() { _ = tx.Rollback() }()
 
 	var id string
-	err = tx.QueryRowContext(ctx, `SELECT id FROM jobs WHERE state = ? ORDER BY created_at LIMIT 1`, JobPending).Scan(&id)
+	err = tx.QueryRowContext(ctx, `
+SELECT id FROM jobs WHERE state = ? AND cancel_requested = 0 ORDER BY created_at LIMIT 1`, JobPending).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, nil
 	}

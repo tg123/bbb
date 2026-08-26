@@ -765,6 +765,30 @@ bbb server --leader http://leader:8080        # follower (workers only)
 | `--lease` | Task lease duration; a task is re-queued when its worker stops reporting (default `1m`) |
 | `--poll-interval` | How often workers poll for new tasks (default `1s`) |
 
+**Client mode**
+
+Set the global `--server` flag (or `BBB_SERVER_URL`) to submit `cp` work
+instead of copying in the local process. The command returns immediately and
+prints one job ID per source. Use `--server-token` or `BBB_SERVER_TOKEN` when
+the leader requires authentication.
+
+```bash
+JOB_ID=$(bbb --server http://leader:8080 --server-token "$TOKEN" \
+  cp az://acct/src/data az://acct/dst/data)
+
+bbb --server http://leader:8080 --server-token "$TOKEN" job list
+bbb --server http://leader:8080 --server-token "$TOKEN" job get "$JOB_ID"
+bbb --server http://leader:8080 --server-token "$TOKEN" job tasks "$JOB_ID"
+bbb --server http://leader:8080 --server-token "$TOKEN" job cancel "$JOB_ID"
+bbb --server http://leader:8080 --server-token "$TOKEN" job delete "$JOB_ID"
+```
+
+`job list` accepts `--state` and `--limit`; `job tasks` accepts `--state`,
+`--limit` and `--offset`. Management command output is JSON. Remote `cp`
+supports positional sources and `--taskfile`; each source/destination pair is
+submitted as a separate job. Because submission is asynchronous, `--state`
+is not supported with `--server`.
+
 **REST API**
 
 All endpoints below are prefixed with `/api/v1` and require
@@ -806,6 +830,10 @@ curl -s http://leader:8080/api/v1/jobs/<id> -H 'Authorization: Bearer $TOKEN'
 curl -sX POST http://leader:8080/api/v1/jobs/<id>/cancel -H 'Authorization: Bearer $TOKEN'
 ```
 
+For Kubernetes, [`examples/kubernetes/server.yaml`](examples/kubernetes/server.yaml)
+runs one scheduler-only leader with a persistent database and one follower with
+one copy worker. Scale the `bbb-worker` Deployment to add worker processes.
+
 **Persistence**
 
 The leader database ([`internal/server/schema.sql`](internal/server/schema.sql))
@@ -821,6 +849,10 @@ holds four tables:
 Tasks are handed out as leases. A worker keeps its lease alive by reporting
 progress; if it dies, the lease expires and the leader re-queues the file to
 another worker, so a job survives worker crashes and leader restarts.
+
+SQLite is provided by the pure-Go `modernc.org/sqlite` driver, so server mode
+does not introduce a C compiler or CGO requirement. Release and container
+builds continue to use `CGO_ENABLED=0`.
 
 ## Benchmark
 

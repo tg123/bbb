@@ -221,6 +221,25 @@ func TestCancelRunningJob(t *testing.T) {
 	}
 }
 
+func TestCancelPendingJob(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.CreateJob(ctx, Job{ID: "pending", Src: "src", Dst: "dst"}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	job, err := store.CancelJob(ctx, "pending")
+	if err != nil {
+		t.Fatalf("cancel job: %v", err)
+	}
+	if job.State != JobCancelled || !job.CancelRequested || job.FinishedAt == nil {
+		t.Fatalf("cancelled job = %+v", job)
+	}
+	if _, ok, err := store.NextJobToExpand(ctx); err != nil || ok {
+		t.Fatalf("cancelled job selected for expansion: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestFollowerCopiesTasks(t *testing.T) {
 	runner := newFakeRunner(
 		FileTask{Src: "az://acct/src/a", Dst: "az://acct/dst/a", Size: 10},
