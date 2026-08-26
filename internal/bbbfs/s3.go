@@ -369,7 +369,11 @@ func (s3FS) ShareInfo(p string) (portal, direct string, err error) {
 			direct = joinURLPath(base+"/"+sp.Bucket, escapedPath)
 		}
 		// S3-compatible endpoints have no vendor-agnostic web console, so
-		// surface the object URL for both.
+		// surface the object URL for both. Cloudflare R2 is an exception: its
+		// dashboard has a stable per-bucket URL when the account ID is known.
+		if id := s3pkg.R2AccountID(); id != "" {
+			return fmt.Sprintf("https://dash.cloudflare.com/%s/r2/default/buckets/%s", url.PathEscape(id), url.PathEscape(sp.Bucket)), direct, nil
+		}
 		return direct, direct, nil
 	}
 	portal = "https://s3.console.aws.amazon.com/s3/object/" + sp.Bucket
