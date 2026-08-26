@@ -62,11 +62,11 @@ func (p *serverProcess) stop() {
 	<-p.done
 }
 
-func (p *serverProcess) result() (error, string) {
+func (p *serverProcess) result() (string, error) {
 	<-p.done
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.err, p.output.String()
+	return p.output.String(), p.err
 }
 
 func reserveTCPAddress(t *testing.T) string {
@@ -89,7 +89,7 @@ func waitForServerHealth(t *testing.T, process *serverProcess, baseURL string) {
 	for time.Now().Before(deadline) {
 		select {
 		case <-process.done:
-			err, output := process.result()
+			output, err := process.result()
 			t.Fatalf("leader exited before becoming healthy: %v\n%s", err, output)
 		default:
 		}
@@ -104,7 +104,7 @@ func waitForServerHealth(t *testing.T, process *serverProcess, baseURL string) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	process.stop()
-	err, output := process.result()
+	output, err := process.result()
 	t.Fatalf("leader did not become healthy: %v\n%s", err, output)
 }
 
@@ -130,7 +130,7 @@ func serverRequest(ctx context.Context, method, url, token string, input, output
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("%s %s: status %d: %s", method, url, resp.StatusCode, message)
@@ -159,7 +159,7 @@ func waitForFollower(t *testing.T, leaderURL, token string, process *serverProce
 	for time.Now().Before(deadline) {
 		select {
 		case <-process.done:
-			err, output := process.result()
+			output, err := process.result()
 			t.Fatalf("follower exited before registering: %v\n%s", err, output)
 		default:
 		}
@@ -179,7 +179,7 @@ func waitForFollower(t *testing.T, leaderURL, token string, process *serverProce
 		time.Sleep(50 * time.Millisecond)
 	}
 	process.stop()
-	err, output := process.result()
+	output, err := process.result()
 	t.Fatalf("follower did not register: %v\n%s", err, output)
 }
 
@@ -202,8 +202,8 @@ func waitForServerJob(t *testing.T, leaderURL, token, jobID string, leader, foll
 
 	follower.stop()
 	leader.stop()
-	leaderErr, leaderOutput := leader.result()
-	followerErr, followerOutput := follower.result()
+	leaderOutput, leaderErr := leader.result()
+	followerOutput, followerErr := follower.result()
 	t.Fatalf(
 		"job %s did not finish (last state %q)\nleader: %v\n%s\nfollower: %v\n%s",
 		jobID, job.State, leaderErr, leaderOutput, followerErr, followerOutput,
