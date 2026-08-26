@@ -4,6 +4,9 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 )
 
 func TestTouchRejectsDirLike(t *testing.T) {
@@ -242,4 +245,74 @@ func TestR2EndpointAndRegion(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClientLoadOptionsChecksums(t *testing.T) {
+	cases := []struct {
+		name         string
+		endpoint     string
+		wantRequest  aws.RequestChecksumCalculation
+		wantResponse aws.ResponseChecksumValidation
+	}{
+		{
+			name:         "aws keeps SDK defaults",
+			wantRequest:  aws.RequestChecksumCalculationUnset,
+			wantResponse: aws.ResponseChecksumValidationUnset,
+		},
+		{
+			name:         "non-r2 endpoint keeps SDK defaults",
+			endpoint:     "http://127.0.0.1:9000",
+			wantRequest:  aws.RequestChecksumCalculationUnset,
+			wantResponse: aws.ResponseChecksumValidationUnset,
+		},
+		{
+			name:         "r2 uses checksums only when required",
+			endpoint:     "https://abc123." + r2EndpointSuffix,
+			wantRequest:  aws.RequestChecksumCalculationWhenRequired,
+			wantResponse: aws.ResponseChecksumValidationWhenRequired,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("BBB_R2_ACCOUNT_ID", "")
+			t.Setenv("BBB_S3_ENDPOINT", c.endpoint)
+			var got awsconfig.LoadOptions
+			for _, option := range clientLoadOptions() {
+				if err := option(&got); err != nil {
+					t.Fatalf("applying client option: %v", err)
+				}
+			}
+			if got.RequestChecksumCalculation != c.wantRequest {
+				t.Errorf("request checksum mode = %v, want %v", got.RequestChecksumCalculation, c.wantRequest)
+			}
+			if got.ResponseChecksumValidation != c.wantResponse {
+				t.Errorf("response checksum mode = %v, want %v", got.ResponseChecksumValidation, c.wantResponse)
+			}
+		})
+	}
+}
+
+func TestCreateBucketInputLocationConstraint(t *testing.T) {
+	t.Run("aws non-default region includes constraint", func(t *testing.T) {
+		t.Setenv("BBB_R2_ACCOUNT_ID", "")
+		t.Setenv("BBB_S3_ENDPOINT", "")
+		t.Setenv("BBB_S3_REGION", "us-west-2")
+		input := createBucketInput("bucket")
+		if input.CreateBucketConfiguration == nil {
+			t.Fatal("CreateBucketConfiguration = nil, want location constraint")
+		}
+		if got := input.CreateBucketConfiguration.LocationConstraint; got != "us-west-2" {
+			t.Errorf("LocationConstraint = %q, want %q", got, "us-west-2")
+		}
+	})
+
+	t.Run("r2 omits constraint", func(t *testing.T) {
+		t.Setenv("BBB_R2_ACCOUNT_ID", "abc123")
+		t.Setenv("BBB_S3_ENDPOINT", "")
+		t.Setenv("BBB_S3_REGION", "")
+		input := createBucketInput("bucket")
+		if input.CreateBucketConfiguration != nil {
+			t.Errorf("CreateBucketConfiguration = %+v, want nil", input.CreateBucketConfiguration)
+		}
+	})
 }

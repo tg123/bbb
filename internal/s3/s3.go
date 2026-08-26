@@ -224,8 +224,8 @@ func IsR2() bool { return isR2() }
 // or an R2 BBB_S3_ENDPOINT), or an empty string when R2 is not configured.
 func R2AccountID() string { return r2AccountID() }
 
-// Endpoint returns the configured custom S3 endpoint (BBB_S3_ENDPOINT), or an
-// empty string when targeting AWS.
+// Endpoint returns the configured custom S3 endpoint (BBB_S3_ENDPOINT), an R2
+// endpoint synthesized from BBB_R2_ACCOUNT_ID, or an empty string for AWS.
 func Endpoint() string { return endpoint() }
 
 // ForcePathStyle reports whether path-style addressing is forced
@@ -238,21 +238,7 @@ func ForcePathStyle() bool { return forcePathStyle() }
 // for S3-compatible stores via BBB_S3_ENDPOINT and BBB_S3_FORCE_PATH_STYLE.
 func getClient(ctx context.Context) (*awss3.Client, error) {
 	cachedClientOnce.Do(func() {
-		opts := []func(*awsconfig.LoadOptions) error{
-			awsconfig.WithRegion(region()),
-		}
-		if c := sharedHTTPClient.Load(); c != nil {
-			opts = append(opts, awsconfig.WithHTTPClient(c))
-		}
-		if isR2() {
-			// R2 does not implement AWS flexible checksums; the SDK default
-			// (when_supported) makes it reject uploads with a trailing CRC32.
-			opts = append(opts,
-				awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
-				awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
-			)
-		}
-		cfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+		cfg, err := awsconfig.LoadDefaultConfig(ctx, clientLoadOptions()...)
 		if err != nil {
 			cachedClientErr = err
 			return
@@ -269,6 +255,24 @@ func getClient(ctx context.Context) (*awss3.Client, error) {
 		})
 	})
 	return cachedClient, cachedClientErr
+}
+
+func clientLoadOptions() []func(*awsconfig.LoadOptions) error {
+	opts := []func(*awsconfig.LoadOptions) error{
+		awsconfig.WithRegion(region()),
+	}
+	if c := sharedHTTPClient.Load(); c != nil {
+		opts = append(opts, awsconfig.WithHTTPClient(c))
+	}
+	if isR2() {
+		// R2 does not implement AWS flexible checksums; the SDK default
+		// (when_supported) makes it reject uploads with a trailing CRC32.
+		opts = append(opts,
+			awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+			awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
+		)
+	}
+	return opts
 }
 
 // --- Errors ---
@@ -493,14 +497,7 @@ func MkBucket(ctx context.Context, bucket string) error {
 	if err != nil {
 		return err
 	}
-	input := &awss3.CreateBucketInput{Bucket: aws.String(bucket)}
-	// Outside us-east-1 a LocationConstraint is required. R2 is the exception:
-	// it only knows the pseudo-region "auto" and rejects any constraint.
-	if r := region(); r != "" && r != defaultRegion && !isR2() {
-		input.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
-			LocationConstraint: s3types.BucketLocationConstraint(r),
-		}
-	}
+	input := createBucketInput(bucket)
 	_, err = client.CreateBucket(ctx, input)
 	if err != nil {
 		var ae smithy.APIError
@@ -521,6 +518,18 @@ func MkBucket(ctx context.Context, bucket string) error {
 		return err
 	}
 	return nil
+}
+
+func createBucketInput(bucket string) *awss3.CreateBucketInput {
+	input := &awss3.CreateBucketInput{Bucket: aws.String(bucket)}
+	// Outside us-east-1 a LocationConstraint is required. R2 is the exception:
+	// it only knows the pseudo-region "auto" and rejects any constraint.
+	if r := region(); r != "" && r != defaultRegion && !isR2() {
+		input.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
+			LocationConstraint: s3types.BucketLocationConstraint(r),
+		}
+	}
+	return input
 }
 
 // --- Listing ---
