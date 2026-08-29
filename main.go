@@ -2086,9 +2086,13 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					}
 					return sendOp(ctx, pending, ssOp{name: entry.Name})
 				})
-			}, func(work ssOp) error {
+			}, func(work ssOp) (retErr error) {
 				if copyTreeProgress != nil {
-					defer copyTreeProgress.Increment()
+					defer func() {
+						if retErr == nil {
+							copyTreeProgress.Increment()
+						}
+					}()
 				}
 				srcChild := bbbfs.ChildPath(src, work.name)
 				dstChild := bbbfs.ChildPath(dst, work.name)
@@ -2128,7 +2132,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				return nil
 			})
 			if copyTreeProgress != nil {
-				copyTreeProgress.Finish()
+				if poolErr != nil {
+					copyTreeProgress.Abort()
+				} else {
+					copyTreeProgress.Finish()
+				}
 			}
 			return poolErr
 		}
@@ -2748,9 +2756,13 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			}
 			return nil
 		}
-		workerErr := runOpPoolWithRetry(ctx, syncWorkers, retryCount, producer, func(f item) error {
+		workerErr := runOpPoolWithRetry(ctx, syncWorkers, retryCount, producer, func(f item) (retErr error) {
 			if syncProgress != nil {
-				defer syncProgress.Increment()
+				defer func() {
+					if retErr == nil {
+						syncProgress.Increment()
+					}
+				}()
 			}
 			sPath := f.rel
 			srcChild := bbbfs.ChildPath(src, sPath)
@@ -2905,7 +2917,11 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			return nil
 		})
 		if syncProgress != nil {
-			syncProgress.Finish()
+			if workerErr != nil {
+				syncProgress.Abort()
+			} else {
+				syncProgress.Finish()
+			}
 		}
 		// delete phase not implemented for cloud combos yet
 		return workerErr

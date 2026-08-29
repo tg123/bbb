@@ -1743,9 +1743,9 @@ func isStaleUncommittedBlockError(err error) bool {
 }
 
 // clearUncommittedBlocks commits an empty block list to discard every orphaned
-// block, then deletes the temporary empty blob. Delete alone is insufficient
-// when no committed blob exists: Azure returns BlobNotFound but retains the
-// uncommitted blocks.
+// block, then best-effort deletes the temporary empty blob. Delete alone is
+// insufficient when no committed blob exists: Azure returns BlobNotFound but
+// retains the uncommitted blocks.
 func clearUncommittedBlocks(ctx context.Context, client *azblob.Client, ap AzurePath) error {
 	bbc := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
 	if _, err := bbc.CommitBlockList(ctx, nil, nil); err != nil {
@@ -1756,7 +1756,7 @@ func clearUncommittedBlocks(ctx context.Context, client *azblob.Client, ap Azure
 		if errors.As(err, &respErr) && respErr.ErrorCode == string(bloberror.BlobNotFound) {
 			return nil
 		}
-		return fmt.Errorf("delete cleared blob %s: %w", ap.String(), err)
+		slog.Warn("delete cleared blob failed (ignored)", "dst", ap.String(), "err", err)
 	}
 	return nil
 }

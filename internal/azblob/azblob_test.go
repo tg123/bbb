@@ -1806,6 +1806,84 @@ func TestCopyBlobFromURLServerSideSelfHealsStaleBlocks(t *testing.T) {
 	}
 }
 
+func TestUploadFileSelfHealsStaleBlocksWithoutDeletePermission(t *testing.T) {
+	for _, errorCode := range []string{string(bloberror.InvalidBlobOrBlock), "BlockCountExceedsLimit"} {
+		t.Run(errorCode, func(t *testing.T) {
+			prev := sharedHTTPClient.Load()
+			t.Cleanup(func() { sharedHTTPClient.Store(prev) })
+
+			account := "uploadselfhealcheck"
+			blobClientCache.Delete(account)
+			t.Cleanup(func() { blobClientCache.Delete(account) })
+
+			t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "dGVzdGtleQ==") // base64("testkey")
+
+			file, err := os.CreateTemp(t.TempDir(), "upload")
+			if err != nil {
+				t.Fatalf("create upload file: %v", err)
+			}
+			t.Cleanup(func() { _ = file.Close() })
+			if _, err := file.WriteString("payload"); err != nil {
+				t.Fatalf("write upload file: %v", err)
+			}
+
+			var stageCalls, commitCalls, deleteCalls atomic.Int64
+			var cleared atomic.Bool
+			nopBody := func() io.ReadCloser { return io.NopCloser(strings.NewReader("")) }
+			SetHTTPTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				comp := req.URL.Query().Get("comp")
+				switch {
+				case req.Method == http.MethodDelete:
+					deleteCalls.Add(1)
+					return &http.Response{
+						StatusCode: http.StatusForbidden,
+						Header:     http.Header{"X-Ms-Error-Code": []string{"AuthorizationPermissionMismatch"}},
+						Body:       io.NopCloser(strings.NewReader(`<?xml version="1.0"?><Error><Code>AuthorizationPermissionMismatch</Code></Error>`)),
+						Request:    req,
+					}, nil
+				case req.Method == http.MethodPut && comp == "block":
+					stageCalls.Add(1)
+					if !cleared.Load() {
+						status := http.StatusBadRequest
+						if errorCode == "BlockCountExceedsLimit" {
+							status = http.StatusConflict
+						}
+						return &http.Response{
+							StatusCode: status,
+							Header:     http.Header{"X-Ms-Error-Code": []string{errorCode}},
+							Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`<?xml version="1.0"?><Error><Code>%s</Code><Message>poisoned</Message></Error>`, errorCode))),
+							Request:    req,
+						}, nil
+					}
+					return &http.Response{StatusCode: http.StatusCreated, Header: http.Header{}, Body: nopBody(), Request: req}, nil
+				case req.Method == http.MethodPut && comp == "blocklist":
+					if commitCalls.Add(1) == 1 {
+						cleared.Store(true)
+					}
+					return &http.Response{StatusCode: http.StatusCreated, Header: http.Header{}, Body: nopBody(), Request: req}, nil
+				default:
+					return &http.Response{StatusCode: http.StatusCreated, Header: http.Header{}, Body: nopBody(), Request: req}, nil
+				}
+			}))
+			t.Cleanup(func() { SetHTTPTransport(nil) })
+
+			dst := AzurePath{Account: account, Container: "c", Blob: "poisoned.bin"}
+			if err := UploadFile(context.Background(), dst, file, 1, nil); err != nil {
+				t.Fatalf("UploadFile should recover without delete permission, got: %v", err)
+			}
+			if got := stageCalls.Load(); got < 2 {
+				t.Fatalf("expected at least 2 stage attempts, got %d", got)
+			}
+			if got := commitCalls.Load(); got != 2 {
+				t.Fatalf("expected empty cleanup commit and final data commit, got %d", got)
+			}
+			if got := deleteCalls.Load(); got != 1 {
+				t.Fatalf("expected one best-effort delete, got %d", got)
+			}
+		})
+	}
+}
+
 // TestCopyBlobFromURLServerSideUnknownSizeUsesAsyncCopy verifies that when the
 // source size is unknown (negative), the server-side copy does not hard-fail
 // but instead routes to the async StartCopyFromURL path, which does not need a
