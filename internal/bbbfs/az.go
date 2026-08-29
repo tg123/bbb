@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -455,6 +456,56 @@ func RegisterAzAccountRoles(srcPaths, dstPaths []string) {
 		}
 		azblob.RegisterAccountRole(acct, "DST")
 	}
+}
+
+// azRoleConflicts records accounts that two different copies want to tag with
+// opposite roles. Role tagging is process wide, so no single tag can be correct
+// for both; such accounts permanently fall back to the neutral credential flow
+// instead of silently authenticating with the wrong role's credentials.
+var azRoleConflicts sync.Map // map[string]struct{}
+
+// RegisterAzAccountRolesForCopy tags the accounts of one src→dst pair with their
+// credential roles, as RegisterAzAccountRoles does for a whole CLI invocation.
+// It exists for long-running processes (bbb server) that copy many independent
+// pairs through the same process-wide role map.
+//
+// Note that Azure clients are cached per account for the process lifetime, so a
+// role registered here only affects accounts whose client has not been built yet.
+func RegisterAzAccountRolesForCopy(src, dst string) {
+	srcAccount := azAccountOf(src)
+	dstAccount := azAccountOf(dst)
+	if srcAccount != "" && srcAccount == dstAccount {
+		return // account is both src and dst — skip role tagging
+	}
+	registerAzAccountRole(srcAccount, "SRC")
+	registerAzAccountRole(dstAccount, "DST")
+}
+
+func azAccountOf(path string) string {
+	if !IsAz(path) {
+		return ""
+	}
+	ap, err := azblob.Parse(path)
+	if err != nil {
+		return ""
+	}
+	return ap.Account
+}
+
+func registerAzAccountRole(account, role string) {
+	if account == "" {
+		return
+	}
+	if _, conflicting := azRoleConflicts.Load(account); conflicting {
+		return
+	}
+	if current, ok := azblob.AccountRole(account); ok && current != role {
+		azRoleConflicts.Store(account, struct{}{})
+		azblob.ClearAccountRole(account)
+		slog.Debug("azure account used in both roles, using neutral credentials", "account", account)
+		return
+	}
+	azblob.RegisterAccountRole(account, role)
 }
 
 // PreAuthenticateAz eagerly authenticates to the storage accounts referenced

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/server"
 	"github.com/urfave/cli/v3"
 )
@@ -24,6 +25,10 @@ import (
 type cliRunner struct{}
 
 func (cliRunner) Expand(ctx context.Context, src, dst string, emit func(server.FileTask) error) error {
+	bbbfs.RegisterAzAccountRolesForCopy(src, dst)
+	if err := bbbfs.PreAuthenticateAz(ctx, src, dst); err != nil {
+		return err
+	}
 	return expandCPTask(ctx, taskPair{src: src, dst: dst}, func(task cpTask) error {
 		return emit(server.FileTask{Src: task.src, Dst: task.dst, Size: task.size})
 	})
@@ -34,7 +39,18 @@ func (cliRunner) Copy(ctx context.Context, src, dst string, opts server.CopyOpti
 	if concurrency <= 0 {
 		concurrency = runtime.NumCPU()
 	}
-	return cmdCPPaths(ctx, opts.Overwrite, true, concurrency, opts.RetryCount, []string{src}, dst, 0, false, onBytes)
+	// Followers never run Expand, so tag the credential roles here too;
+	// otherwise an untagged destination account authenticates with the source
+	// role's credentials.
+	bbbfs.RegisterAzAccountRolesForCopy(src, dst)
+	if err := bbbfs.PreAuthenticateAz(ctx, src, dst); err != nil {
+		return err
+	}
+	// Retries belong to the persisted task layer, which re-queues a failed task
+	// up to the job's retry_count. Retrying inside this call as well would
+	// multiply the attempts per file and re-count the bytes already reported by
+	// the failed attempt.
+	return cmdCPPaths(ctx, opts.Overwrite, true, concurrency, 0, []string{src}, dst, 0, false, onBytes)
 }
 
 func cmdCPAction(ctx context.Context, c *cli.Command) error {
@@ -310,20 +326,33 @@ func runLeader(ctx context.Context, c *cli.Command, workerID string, workers int
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	runDone := make(chan struct{})
+	// Surface a scheduler failure instead of leaving a process that still
+	// answers /healthz but no longer expands, leases or reconciles anything.
+	runErrCh := make(chan error, 1)
 	go func() {
-		defer close(runDone)
-		_ = srv.Run(runCtx)
+		runErrCh <- srv.Run(runCtx)
 	}()
 
-	var runErr error
+	var (
+		runErr    error
+		runExited bool
+	)
 	select {
 	case <-ctx.Done():
 	case runErr = <-serveErr:
+	case runErr = <-runErrCh:
+		runExited = true
 	}
 
 	cancel()
-	<-runDone
+	if !runExited {
+		if err := <-runErrCh; runErr == nil {
+			runErr = err
+		}
+	}
+	if errors.Is(runErr, context.Canceled) {
+		runErr = nil
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer shutdownCancel()

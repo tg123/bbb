@@ -827,7 +827,7 @@ All endpoints below are prefixed with `/api/v1` and require
 | `GET /jobs/{id}` | Job status and progress (`state`, `total_tasks`, `done_tasks`, `failed_tasks`, `total_bytes`, `copied_bytes`) |
 | `GET /jobs/{id}/tasks` | Per file progress (`?state=failed&limit=&offset=`) |
 | `POST /jobs/{id}/cancel` | Cancel a job: pending files are dropped, running files are aborted |
-| `DELETE /jobs/{id}` | Delete a finished job and its files |
+| `DELETE /jobs/{id}` | Delete a finished job and its task records (copied destination files are left untouched) |
 | `GET /workers` | List cluster members (leader and followers) with their last heartbeat |
 | `GET /healthz` | Liveness probe |
 
@@ -846,14 +846,14 @@ bbb server --leader http://leader:8080 --token "$TOKEN" --workers 8
 
 # Submit a container-to-container copy
 curl -sX POST http://leader:8080/api/v1/jobs \
-  -H 'Authorization: Bearer $TOKEN' \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"src":"az://acct/src/data","dst":"az://acct/dst/data","overwrite":true}'
 
 # Track it
-curl -s http://leader:8080/api/v1/jobs/<id> -H 'Authorization: Bearer $TOKEN'
+curl -s http://leader:8080/api/v1/jobs/<id> -H "Authorization: Bearer $TOKEN"
 
 # Cancel it
-curl -sX POST http://leader:8080/api/v1/jobs/<id>/cancel -H 'Authorization: Bearer $TOKEN'
+curl -sX POST http://leader:8080/api/v1/jobs/<id>/cancel -H "Authorization: Bearer $TOKEN"
 ```
 
 For Kubernetes, [`examples/kubernetes/server.yaml`](examples/kubernetes/server.yaml)

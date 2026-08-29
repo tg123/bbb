@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -89,7 +90,17 @@ func (s *Server) Run(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.schedulerLoop(ctx)
+		var loops sync.WaitGroup
+		loops.Add(2)
+		go func() {
+			defer loops.Done()
+			s.maintenanceLoop(ctx)
+		}()
+		go func() {
+			defer loops.Done()
+			s.expandLoop(ctx)
+		}()
+		loops.Wait()
 	}()
 
 	if s.opts.Workers > 0 {
@@ -109,11 +120,24 @@ func (s *Server) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (s *Server) schedulerLoop(ctx context.Context) {
+// expandLoop turns pending jobs into file tasks. It runs independently from
+// maintenanceLoop so that a slow or hung recursive listing cannot delay lease
+// requeueing or job finalization for the whole cluster.
+func (s *Server) expandLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.opts.PollInterval)
 	defer ticker.Stop()
 	for {
-		s.scheduleOnce(ctx)
+		for ctx.Err() == nil {
+			job, ok, err := s.store.NextJobToExpand(ctx)
+			if err != nil {
+				slog.Warn("bbb server: pick job failed", "error", err)
+				break
+			}
+			if !ok {
+				break
+			}
+			s.expandJob(ctx, job)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -122,20 +146,22 @@ func (s *Server) schedulerLoop(ctx context.Context) {
 	}
 }
 
-func (s *Server) scheduleOnce(ctx context.Context) {
+func (s *Server) maintenanceLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.opts.PollInterval)
+	defer ticker.Stop()
+	for {
+		s.maintainOnce(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) maintainOnce(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
-	}
-	for {
-		job, ok, err := s.store.NextJobToExpand(ctx)
-		if err != nil {
-			slog.Warn("bbb server: pick job failed", "error", err)
-			break
-		}
-		if !ok {
-			break
-		}
-		s.expandJob(ctx, job)
 	}
 	if _, err := s.store.RequeueExpiredLeases(ctx); err != nil {
 		slog.Warn("bbb server: requeue expired leases failed", "error", err)
@@ -285,9 +311,10 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	req.Src = strings.TrimSpace(req.Src)
-	req.Dst = strings.TrimSpace(req.Dst)
-	if req.Src == "" || req.Dst == "" {
+	// Only test for an all-whitespace value: trailing spaces are legal in a
+	// filesystem path, and rewriting them would silently copy a different file
+	// than the one the caller asked for.
+	if strings.TrimSpace(req.Src) == "" || strings.TrimSpace(req.Dst) == "" {
 		writeError(w, http.StatusBadRequest, errors.New("src and dst are required"))
 		return
 	}

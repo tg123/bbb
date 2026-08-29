@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -237,6 +238,197 @@ func TestCancelPendingJob(t *testing.T) {
 	}
 	if _, ok, err := store.NextJobToExpand(ctx); err != nil || ok {
 		t.Fatalf("cancelled job selected for expansion: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestExpiredLeaseOfCancelledJobIsNotRequeued(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, Job{ID: "job1", Src: "az://a/src", Dst: "az://a/dst"}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, _, err := store.NextJobToExpand(ctx); err != nil {
+		t.Fatalf("next job: %v", err)
+	}
+	if err := store.AddTasks(ctx, "job1", []Task{{Src: "az://a/src/f", Dst: "az://a/dst/f", Size: 5}}); err != nil {
+		t.Fatalf("add tasks: %v", err)
+	}
+	if err := store.FinishExpansion(ctx, "job1", nil); err != nil {
+		t.Fatalf("finish expansion: %v", err)
+	}
+
+	// a worker leases the task with an already expired lease, then dies
+	if leases, err := store.ClaimTasks(ctx, "w1", 10, -time.Second); err != nil || len(leases) != 1 {
+		t.Fatalf("claim: %v %d", err, len(leases))
+	}
+	if _, err := store.CancelJob(ctx, "job1"); err != nil {
+		t.Fatalf("cancel job: %v", err)
+	}
+	if _, err := store.RequeueExpiredLeases(ctx); err != nil {
+		t.Fatalf("requeue: %v", err)
+	}
+
+	tasks, err := store.ListTasks(ctx, "job1", "", 10, 0)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("list tasks: %v %d", err, len(tasks))
+	}
+	// requeueing as pending would strand the job: claims skip cancelled jobs
+	if tasks[0].State != TaskCancelled {
+		t.Fatalf("task state = %s, want %s", tasks[0].State, TaskCancelled)
+	}
+	if err := store.ReconcileJobs(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job1")
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if job.State != JobCancelled {
+		t.Fatalf("job state = %s, want %s", job.State, JobCancelled)
+	}
+}
+
+func TestFailedTaskAfterCancelIsNotRequeued(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, Job{ID: "job1", Src: "az://a/src", Dst: "az://a/dst", RetryCount: 5}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, _, err := store.NextJobToExpand(ctx); err != nil {
+		t.Fatalf("next job: %v", err)
+	}
+	if err := store.AddTasks(ctx, "job1", []Task{{Src: "az://a/src/f", Dst: "az://a/dst/f"}}); err != nil {
+		t.Fatalf("add tasks: %v", err)
+	}
+	if err := store.FinishExpansion(ctx, "job1", nil); err != nil {
+		t.Fatalf("finish expansion: %v", err)
+	}
+	leases, err := store.ClaimTasks(ctx, "w1", 1, time.Minute)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("claim: %v %d", err, len(leases))
+	}
+
+	// the job is cancelled while the worker is still finishing with an error
+	if _, err := store.CancelJob(ctx, "job1"); err != nil {
+		t.Fatalf("cancel job: %v", err)
+	}
+	if err := store.CompleteTask(ctx, "w1", leases[0].Task.ID, TaskFailed, 0, "boom"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	tasks, err := store.ListTasks(ctx, "job1", "", 10, 0)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("list tasks: %v %d", err, len(tasks))
+	}
+	if tasks[0].State != TaskCancelled {
+		t.Fatalf("task state = %s, want %s", tasks[0].State, TaskCancelled)
+	}
+	if err := store.ReconcileJobs(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job1")
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if job.State != JobCancelled {
+		t.Fatalf("job state = %s, want %s", job.State, JobCancelled)
+	}
+}
+
+func TestAddTasksTotalsCountOnlyInsertedRows(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, Job{ID: "job1", Src: "az://a/src", Dst: "az://a/dst"}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, _, err := store.NextJobToExpand(ctx); err != nil {
+		t.Fatalf("next job: %v", err)
+	}
+	if err := store.AddTasks(ctx, "job1", []Task{
+		{Src: "az://a/src/f1", Dst: "az://a/dst/f1", Size: 10},
+		{Src: "az://a/src/f2", Dst: "az://a/dst/f2", Size: 20},
+	}); err != nil {
+		t.Fatalf("add tasks: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job1")
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if job.TotalTasks != 2 || job.TotalBytes != 30 {
+		t.Fatalf("after first batch: %d tasks, %d bytes", job.TotalTasks, job.TotalBytes)
+	}
+
+	// re-emitting a known file (expansion is idempotent) must not double count
+	if err := store.AddTasks(ctx, "job1", []Task{
+		{Src: "az://a/src/f2", Dst: "az://a/dst/f2", Size: 20},
+		{Src: "az://a/src/f3", Dst: "az://a/dst/f3", Size: 5},
+	}); err != nil {
+		t.Fatalf("add tasks: %v", err)
+	}
+	job, err = store.GetJob(ctx, "job1")
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if job.TotalTasks != 3 || job.TotalBytes != 35 {
+		t.Fatalf("after second batch: %d tasks, %d bytes", job.TotalTasks, job.TotalBytes)
+	}
+}
+
+func TestProgressIntervalFollowsLeaderLease(t *testing.T) {
+	pool := NewPool(nil, nil, PoolOptions{ProgressInterval: 20 * time.Second})
+
+	// without a lease expiry the worker-local interval is used
+	if got := pool.progressInterval(Lease{}); got != 20*time.Second {
+		t.Fatalf("no expiry: got %s", got)
+	}
+	// a shorter leader lease must win, otherwise the lease expires mid copy
+	got := pool.progressInterval(Lease{Expires: time.Now().Add(3 * time.Second)})
+	if got > 1100*time.Millisecond || got < 500*time.Millisecond {
+		t.Fatalf("short lease: got %s, want about 1s", got)
+	}
+	// an expired or skewed lease must not turn into a tight loop
+	if got := pool.progressInterval(Lease{Expires: time.Now().Add(-time.Minute)}); got != minProgressInterval {
+		t.Fatalf("expired lease: got %s", got)
+	}
+}
+
+// flakySource fails the first failures Complete calls, then succeeds.
+type flakySource struct {
+	failures int
+	calls    int
+}
+
+func (f *flakySource) Claim(context.Context, string, int) ([]Lease, error) { return nil, nil }
+
+func (f *flakySource) Progress(context.Context, string, int64, int64) (bool, error) {
+	return false, nil
+}
+
+func (f *flakySource) Complete(_ context.Context, _ string, _ int64, _ string, _ int64, _ string) error {
+	f.calls++
+	if f.calls <= f.failures {
+		return errors.New("transient")
+	}
+	return nil
+}
+
+func (f *flakySource) Heartbeat(context.Context, Worker) error { return nil }
+
+func TestCompleteIsRetriedAfterTransientFailure(t *testing.T) {
+	source := &flakySource{failures: 2}
+	pool := NewPool(source, newFakeRunner(), PoolOptions{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := pool.completeWithRetry(ctx, Lease{Task: Task{ID: 1}}, TaskSucceeded, 10, ""); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	// losing the report would leave the task leased and copy the file twice
+	if source.calls != 3 {
+		t.Fatalf("Complete called %d times, want 3", source.calls)
 	}
 }
 

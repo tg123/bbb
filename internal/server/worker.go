@@ -140,7 +140,7 @@ func (p *Pool) execute(ctx context.Context, lease Lease) {
 	reporting.Add(1)
 	go func() {
 		defer reporting.Done()
-		ticker := time.NewTicker(p.opts.ProgressInterval)
+		ticker := time.NewTicker(p.progressInterval(lease))
 		defer ticker.Stop()
 		for {
 			select {
@@ -192,10 +192,73 @@ func (p *Pool) execute(ctx context.Context, lease Lease) {
 		}
 	}
 
-	completeCtx, completeCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	// Keep retrying inside the lease window: once the lease expires the task
+	// belongs to another worker and this report is rejected anyway.
+	completeWait := maxCompleteWait
+	if !lease.Expires.IsZero() {
+		if remaining := time.Until(lease.Expires); remaining < completeWait {
+			completeWait = remaining
+		}
+	}
+	if completeWait < time.Second {
+		completeWait = time.Second
+	}
+	completeCtx, completeCancel := context.WithTimeout(context.WithoutCancel(ctx), completeWait)
 	defer completeCancel()
-	if err := p.source.Complete(completeCtx, p.opts.WorkerID, lease.Task.ID, state, copied.Load(), taskErr); err != nil {
+	if err := p.completeWithRetry(completeCtx, lease, state, copied.Load(), taskErr); err != nil {
 		slog.Warn("bbb server: task completion failed", "task", lease.Task.ID, "error", err)
+	}
+}
+
+// minProgressInterval bounds how often a worker reports progress, so a short or
+// already-expired lease cannot turn into a tight request loop.
+const minProgressInterval = 100 * time.Millisecond
+
+// maxCompleteWait bounds how long a worker keeps retrying a completion report.
+const maxCompleteWait = 30 * time.Second
+
+// progressInterval derives the reporting cadence from the lease the leader
+// actually granted. The leader owns the lease duration, so deriving the cadence
+// from a worker-local setting lets the lease expire mid-copy: the task is then
+// requeued and copied a second time concurrently. The worker-local interval is
+// still honoured as an upper bound. Clock skew only makes the computed remaining
+// time shorter or longer, which at worst costs extra progress calls.
+func (p *Pool) progressInterval(lease Lease) time.Duration {
+	interval := p.opts.ProgressInterval
+	if lease.Expires.IsZero() {
+		return interval
+	}
+	if remaining := time.Until(lease.Expires); remaining/3 < interval {
+		interval = remaining / 3
+	}
+	if interval < minProgressInterval {
+		interval = minProgressInterval
+	}
+	return interval
+}
+
+// completeWithRetry reports a terminal task state, retrying transient failures.
+// Dropping this report leaves the task leased until it expires and is copied a
+// second time; with overwrite=false that retry usually fails because the first
+// copy already created the destination, failing a job that actually succeeded.
+// Reporting a terminal state is idempotent, so retrying is safe.
+func (p *Pool) completeWithRetry(ctx context.Context, lease Lease, state string, copied int64, taskErr string) error {
+	backoff := 100 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		err := p.source.Complete(ctx, p.opts.WorkerID, lease.Task.ID, state, copied, taskErr)
+		if err == nil || ctx.Err() != nil {
+			return err
+		}
+		slog.Warn("bbb server: task completion failed, retrying",
+			"task", lease.Task.ID, "attempt", attempt, "error", err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(backoff):
+		}
+		if backoff < 2*time.Second {
+			backoff *= 2
+		}
 	}
 }
 

@@ -329,16 +329,36 @@ ON CONFLICT (job_id, src, dst) DO NOTHING`)
 	}
 	defer func() { _ = stmt.Close() }()
 
+	// Counting only the rows actually inserted keeps expansion linear. Deriving
+	// the totals from a full COUNT(*)/SUM(size) over the job on every batch
+	// would make a job of N files do quadratic aggregate work while holding the
+	// single SQLite connection.
+	var (
+		addedTasks int64
+		addedBytes int64
+	)
 	for _, task := range tasks {
-		if _, err := stmt.ExecContext(ctx, jobID, task.Src, task.Dst, task.Size, TaskPending, now, now); err != nil {
+		res, err := stmt.ExecContext(ctx, jobID, task.Src, task.Dst, task.Size, TaskPending, now, now)
+		if err != nil {
 			return err
 		}
+		inserted, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if inserted > 0 {
+			addedTasks++
+			addedBytes += task.Size
+		}
+	}
+	if addedTasks == 0 {
+		return tx.Commit()
 	}
 	if _, err := tx.ExecContext(ctx, `
-UPDATE jobs SET total_tasks = (SELECT COUNT(*) FROM tasks WHERE job_id = ?),
-                total_bytes = (SELECT COALESCE(SUM(size), 0) FROM tasks WHERE job_id = ?),
+UPDATE jobs SET total_tasks = total_tasks + ?,
+                total_bytes = total_bytes + ?,
                 updated_at = ?
-WHERE id = ?`, jobID, jobID, now, jobID); err != nil {
+WHERE id = ?`, addedTasks, addedBytes, now, jobID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -477,16 +497,24 @@ func (s *Store) CompleteTask(ctx context.Context, workerID string, taskID int64,
 		var (
 			attempts   int
 			retryCount int
+			cancelled  int
 		)
 		err := s.db.QueryRowContext(ctx, `
-SELECT t.attempts, j.retry_count FROM tasks t JOIN jobs j ON j.id = t.job_id WHERE t.id = ?`, taskID).Scan(&attempts, &retryCount)
+SELECT t.attempts, j.retry_count, j.cancel_requested FROM tasks t JOIN jobs j ON j.id = t.job_id WHERE t.id = ?`,
+			taskID).Scan(&attempts, &retryCount, &cancelled)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
 			return err
 		}
-		if attempts <= retryCount {
+		// Requeueing after cancellation would add a pending task that no worker
+		// may claim, leaving the job permanently unfinished. Finalize the
+		// attempt as cancelled instead.
+		if cancelled != 0 {
+			state = TaskCancelled
+			taskErr = "cancelled"
+		} else if attempts <= retryCount {
 			_, err := s.db.ExecContext(ctx, `
 UPDATE tasks SET state = ?, worker_id = '', lease_expire = 0, copied_bytes = 0, error = ?, updated_at = ?
 WHERE id = ? AND worker_id = ? AND state = ?`, TaskPending, taskErr, now, taskID, workerID, TaskRunning)
@@ -503,14 +531,38 @@ WHERE id = ? AND worker_id = ? AND state = ?`, state, copiedBytes, taskErr, now,
 // pending pool so another worker can pick them up.
 func (s *Store) RequeueExpiredLeases(ctx context.Context) (int64, error) {
 	now := unixMilli(time.Now())
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Tasks of a cancelled job must not go back to the pending pool: ClaimTasks
+	// skips cancelled jobs and ReconcileJobs refuses to finalize while a pending
+	// task remains, so requeueing here would strand the job in `running`.
+	if _, err := tx.ExecContext(ctx, `
+UPDATE tasks SET state = ?, worker_id = '', lease_expire = 0, error = 'cancelled', updated_at = ?
+WHERE state = ? AND lease_expire < ?
+  AND job_id IN (SELECT id FROM jobs WHERE cancel_requested = 1)`,
+		TaskCancelled, now, TaskRunning, now); err != nil {
+		return 0, err
+	}
+
+	res, err := tx.ExecContext(ctx, `
 UPDATE tasks SET state = ?, worker_id = '', lease_expire = 0, copied_bytes = 0,
                  error = 'lease expired', updated_at = ?
 WHERE state = ? AND lease_expire < ?`, TaskPending, now, TaskRunning, now)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	requeued, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return requeued, nil
 }
 
 // ReconcileJobs refreshes job counters and finalizes jobs whose tasks are all

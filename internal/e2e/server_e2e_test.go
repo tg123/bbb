@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -394,5 +395,98 @@ func TestServerLeaderFollower(t *testing.T) {
 		); err != nil {
 			t.Fatalf("delete job %s: %v", id, err)
 		}
+	}
+}
+
+// TestServerS3PrefixExpandsPerFile checks that an s3:// prefix is expanded into
+// one task per file rather than a single task for the whole prefix: only then
+// can the files be distributed, leased, tracked and cancelled independently.
+func TestServerS3PrefixExpandsPerFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e tests in short mode")
+	}
+	if !waitForEndpointReady(s3Host) {
+		t.Skipf("minio endpoint %s not reachable", s3Host)
+	}
+
+	bin := os.Getenv("BBB_TEST_BIN_PATH")
+	if bin == "" {
+		bin = "bbb"
+	}
+	resolvedBin, err := exec.LookPath(bin)
+	if err != nil {
+		t.Skipf("bbb test binary not found: %v", err)
+	}
+	if _, err := runBBB("s3", "mkbucket", s3Path()); err != nil {
+		t.Fatal(err)
+	}
+
+	srcPrefix := s3Path("server-src")
+	dstPrefix := s3Path("server-dst")
+	cleanFolder(t, srcPrefix)
+	cleanFolder(t, dstPrefix)
+
+	root := t.TempDir()
+	files := map[string]string{
+		"first.txt":                           "s3 first",
+		filepath.Join("nested", "second.txt"): "s3 second",
+	}
+	if err := os.MkdirAll(filepath.Join(root, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := runBBB("cpr", root, srcPrefix+"/"); err != nil {
+		t.Fatalf("seed s3 source: %v", err)
+	}
+
+	addr := reserveTCPAddress(t)
+	leaderURL := "http://" + addr
+	token := "e2e-s3-token"
+	leader := startServerProcess(
+		t,
+		resolvedBin,
+		"server",
+		"--listen", addr,
+		"--db", filepath.Join(t.TempDir(), "server.db"),
+		"--workers", "2",
+		"--token", token,
+		"--poll-interval", "20ms",
+		"--lease", "10s",
+	)
+	waitForServerHealth(t, leader, leaderURL)
+
+	output, err := runServerCLI(
+		resolvedBin,
+		"--server", leaderURL,
+		"--server-token", token,
+		"cp", srcPrefix, dstPrefix+"/",
+	)
+	if err != nil {
+		t.Fatalf("submit s3 job: %v", err)
+	}
+	jobID := strings.TrimSpace(string(output))
+
+	job := waitForServerJob(t, leaderURL, token, jobID, leader, leader)
+	if job.State != server.JobSucceeded {
+		t.Fatalf("s3 job = %+v", job)
+	}
+	// one task per file, not a single task for the whole prefix
+	if job.TotalTasks != int64(len(files)) || job.DoneTasks != int64(len(files)) {
+		t.Fatalf("s3 job tasks = %d done %d, want %d", job.TotalTasks, job.DoneTasks, len(files))
+	}
+
+	copied, err := bbbLs(dstPrefix, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{dstPrefix + "/first.txt", dstPrefix + "/nested/second.txt"}
+	sort.Strings(copied)
+	sort.Strings(want)
+	if !slices.Equal(copied, want) {
+		t.Fatalf("copied files = %v, want %v", copied, want)
 	}
 }
