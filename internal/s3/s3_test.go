@@ -4,6 +4,9 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 )
 
 func TestTouchRejectsDirLike(t *testing.T) {
@@ -159,4 +162,157 @@ func TestNormalizePrefix(t *testing.T) {
 			t.Errorf("normalizePrefix(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
+}
+
+func TestR2EndpointAndRegion(t *testing.T) {
+	cases := []struct {
+		name         string
+		env          map[string]string
+		wantEndpoint string
+		wantRegion   string
+		wantR2       bool
+		wantAccount  string
+	}{
+		{
+			name:         "aws default",
+			wantEndpoint: "",
+			wantRegion:   defaultRegion,
+		},
+		{
+			name:         "account id derives endpoint and auto region",
+			env:          map[string]string{"BBB_R2_ACCOUNT_ID": "abc123"},
+			wantEndpoint: "https://abc123." + r2EndpointSuffix,
+			wantRegion:   r2Region,
+			wantR2:       true,
+			wantAccount:  "abc123",
+		},
+		{
+			name:         "explicit endpoint wins over account id",
+			env:          map[string]string{"BBB_R2_ACCOUNT_ID": "abc123", "BBB_S3_ENDPOINT": "http://127.0.0.1:9000"},
+			wantEndpoint: "http://127.0.0.1:9000",
+			wantRegion:   defaultRegion,
+		},
+		{
+			name:         "explicit r2 endpoint detected",
+			env:          map[string]string{"BBB_S3_ENDPOINT": "https://abc123.eu." + r2EndpointSuffix + "/"},
+			wantEndpoint: "https://abc123.eu." + r2EndpointSuffix + "/",
+			wantRegion:   r2Region,
+			wantR2:       true,
+			wantAccount:  "abc123",
+		},
+		{
+			name:         "explicit region wins over auto",
+			env:          map[string]string{"BBB_R2_ACCOUNT_ID": "abc123", "BBB_S3_REGION": "wnam"},
+			wantEndpoint: "https://abc123." + r2EndpointSuffix,
+			wantRegion:   "wnam",
+			wantR2:       true,
+			wantAccount:  "abc123",
+		},
+		{
+			name:         "aws region ignored for r2",
+			env:          map[string]string{"BBB_R2_ACCOUNT_ID": "abc123", "AWS_REGION": "us-west-2"},
+			wantEndpoint: "https://abc123." + r2EndpointSuffix,
+			wantRegion:   r2Region,
+			wantR2:       true,
+			wantAccount:  "abc123",
+		},
+		{
+			name:         "lookalike host is not r2",
+			env:          map[string]string{"BBB_S3_ENDPOINT": "https://notr2.cloudflarestorage.com.evil.test"},
+			wantEndpoint: "https://notr2.cloudflarestorage.com.evil.test",
+			wantRegion:   defaultRegion,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, k := range []string{"BBB_R2_ACCOUNT_ID", "BBB_S3_ENDPOINT", "BBB_S3_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"} {
+				t.Setenv(k, "")
+			}
+			for k, v := range c.env {
+				t.Setenv(k, v)
+			}
+			if got := endpoint(); got != c.wantEndpoint {
+				t.Errorf("endpoint() = %q, want %q", got, c.wantEndpoint)
+			}
+			if got := region(); got != c.wantRegion {
+				t.Errorf("region() = %q, want %q", got, c.wantRegion)
+			}
+			if got := isR2(); got != c.wantR2 {
+				t.Errorf("isR2() = %v, want %v", got, c.wantR2)
+			}
+			if got := r2AccountID(); got != c.wantAccount {
+				t.Errorf("r2AccountID() = %q, want %q", got, c.wantAccount)
+			}
+		})
+	}
+}
+
+func TestClientLoadOptionsChecksums(t *testing.T) {
+	cases := []struct {
+		name         string
+		endpoint     string
+		wantRequest  aws.RequestChecksumCalculation
+		wantResponse aws.ResponseChecksumValidation
+	}{
+		{
+			name:         "aws keeps SDK defaults",
+			wantRequest:  aws.RequestChecksumCalculationUnset,
+			wantResponse: aws.ResponseChecksumValidationUnset,
+		},
+		{
+			name:         "non-r2 endpoint keeps SDK defaults",
+			endpoint:     "http://127.0.0.1:9000",
+			wantRequest:  aws.RequestChecksumCalculationUnset,
+			wantResponse: aws.ResponseChecksumValidationUnset,
+		},
+		{
+			name:         "r2 uses checksums only when required",
+			endpoint:     "https://abc123." + r2EndpointSuffix,
+			wantRequest:  aws.RequestChecksumCalculationWhenRequired,
+			wantResponse: aws.ResponseChecksumValidationWhenRequired,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("BBB_R2_ACCOUNT_ID", "")
+			t.Setenv("BBB_S3_ENDPOINT", c.endpoint)
+			var got awsconfig.LoadOptions
+			for _, option := range clientLoadOptions() {
+				if err := option(&got); err != nil {
+					t.Fatalf("applying client option: %v", err)
+				}
+			}
+			if got.RequestChecksumCalculation != c.wantRequest {
+				t.Errorf("request checksum mode = %v, want %v", got.RequestChecksumCalculation, c.wantRequest)
+			}
+			if got.ResponseChecksumValidation != c.wantResponse {
+				t.Errorf("response checksum mode = %v, want %v", got.ResponseChecksumValidation, c.wantResponse)
+			}
+		})
+	}
+}
+
+func TestCreateBucketInputLocationConstraint(t *testing.T) {
+	t.Run("aws non-default region includes constraint", func(t *testing.T) {
+		t.Setenv("BBB_R2_ACCOUNT_ID", "")
+		t.Setenv("BBB_S3_ENDPOINT", "")
+		t.Setenv("BBB_S3_REGION", "us-west-2")
+		input := createBucketInput("bucket")
+		if input.CreateBucketConfiguration == nil {
+			t.Fatal("CreateBucketConfiguration = nil, want location constraint")
+		}
+		if got := input.CreateBucketConfiguration.LocationConstraint; got != "us-west-2" {
+			t.Errorf("LocationConstraint = %q, want %q", got, "us-west-2")
+		}
+	})
+
+	t.Run("r2 omits constraint", func(t *testing.T) {
+		t.Setenv("BBB_R2_ACCOUNT_ID", "abc123")
+		t.Setenv("BBB_S3_ENDPOINT", "")
+		t.Setenv("BBB_S3_REGION", "")
+		input := createBucketInput("bucket")
+		if input.CreateBucketConfiguration != nil {
+			t.Errorf("CreateBucketConfiguration = %+v, want nil", input.CreateBucketConfiguration)
+		}
+	})
 }
