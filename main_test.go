@@ -217,6 +217,47 @@ func TestCmdCPTaskfileStateRecovery(t *testing.T) {
 	}
 }
 
+func TestRunCPTasksFlushesStateBeforeReturningError(t *testing.T) {
+	dir := t.TempDir()
+	srcOK := filepath.Join(dir, "ok.txt")
+	srcMissing := filepath.Join(dir, "missing.txt")
+	dstDir := filepath.Join(dir, "dst")
+	stateFile := filepath.Join(dir, "tasks.state")
+	if err := os.WriteFile(srcOK, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	if err := os.Mkdir(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+
+	err := runCPTasks(context.Background(), []taskPair{
+		{src: srcOK, dst: dstDir},
+		{src: srcMissing, dst: dstDir},
+	}, true, true, 1, 0, stateFile)
+	if err == nil {
+		t.Fatal("expected copy error")
+	}
+
+	stateData, readErr := os.ReadFile(stateFile)
+	if readErr != nil {
+		t.Fatalf("read statefile: %v", readErr)
+	}
+	if want := taskStateKey(srcOK, dstDir); !strings.Contains(string(stateData), want) {
+		t.Fatalf("statefile does not contain completed copy %q: %q", want, stateData)
+	}
+}
+
+func TestRunCPTasksReturnsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	stateFile := filepath.Join(t.TempDir(), "tasks.state")
+	err := runCPTasks(ctx, []taskPair{{src: "unused", dst: "unused"}}, true, true, 1, 0, stateFile)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runCPTasks error = %v, want context.Canceled", err)
+	}
+}
+
 func TestLoadTaskPairsLongLine(t *testing.T) {
 	dir := t.TempDir()
 	longSrc := strings.Repeat("a", 70*1024)

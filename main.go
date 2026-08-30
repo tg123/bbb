@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -260,6 +261,10 @@ func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl 
 }
 
 func main() {
+	os.Exit(run(os.Args))
+}
+
+func run(args []string) int {
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
 		Name:    "bbb",
@@ -608,11 +613,19 @@ func main() {
 		},
 	}
 
-	if err := app.Run(context.Background(), os.Args); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop() // Restore default handling so a second Ctrl+C forces termination.
+	}()
+
+	if err := app.Run(ctx, args); err != nil {
 		slog.Error("App error", "err", err)
-		os.Exit(1)
+		return 1
 	}
 	// Remove any stray cli.Before assignment
+	return 0
 }
 
 func cmdLS(ctx context.Context, c *cli.Command) error {
@@ -1245,13 +1258,17 @@ func runOpPoolWithRetryProgress[T any](ctx context.Context, concurrency int, ret
 	progress := newProgressBar(total, label, quiet, false)
 	err := runOpPoolWithRetry(ctx, concurrency, retryCount, producer, func(op T) error {
 		err := worker(op)
-		if progress != nil {
+		if progress != nil && err == nil {
 			progress.Increment()
 		}
 		return err
 	})
 	if progress != nil {
-		progress.Finish()
+		if err != nil {
+			progress.Abort()
+		} else {
+			progress.Finish()
+		}
 	}
 	return err
 }
@@ -1268,7 +1285,11 @@ func runOpPoolWithRetryProgressBytes[T any](ctx context.Context, concurrency int
 		return err
 	})
 	if progress != nil {
-		progress.Finish()
+		if err != nil {
+			progress.Abort()
+		} else {
+			progress.Finish()
+		}
 	}
 	return err
 }
@@ -1318,7 +1339,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 // parallel copy pipeline. Both taskfile mode and positional-arg mode convert
 // their inputs to []taskPair and call this function, ensuring a single code
 // path for state tracking, progress bars, and concurrency control.
-func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, concurrency, retryCount int, stateFile string) error {
+func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, concurrency, retryCount int, stateFile string) (retErr error) {
 	// Register account roles for multi-tenant env var support (SRC_AZURE_* / DST_AZURE_*).
 	{
 		var srcPaths, dstPaths []string
@@ -1353,7 +1374,11 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	}
 	defer func() {
 		if taskProgress != nil {
-			taskProgress.Finish()
+			if retErr != nil {
+				taskProgress.Abort()
+			} else {
+				taskProgress.Finish()
+			}
 		}
 	}()
 	seen := make(map[string]struct{}, len(state)+len(tasks))
@@ -1364,6 +1389,7 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	if err != nil {
 		return err
 	}
+	defer closeTaskStateAppender(stateAppender, &retErr)
 
 	workers := concurrency
 	if workers < 1 {
@@ -1403,7 +1429,6 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	var firstErr error
 	var firstErrMu sync.Mutex
 	var totalPending atomic.Int64
-	var queued atomic.Bool
 
 	setErr := func(err error) {
 		firstErrMu.Lock()
@@ -1519,7 +1544,6 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 							return workerCtx.Err()
 						case taskCh <- expandedTask:
 							slog.Debug("cp: queued", "src", expandedTask.src, "dst", expandedTask.dst)
-							queued.Store(true)
 							if taskProgress != nil {
 								taskProgress.SetTotal(totalPending.Add(1))
 							}
@@ -1568,21 +1592,10 @@ enqueueLoop:
 	}
 	close(taskCh)
 	wg.Wait()
-	if !queued.Load() && firstErr == nil {
-		if err := stateAppender.close(); err != nil {
-			return err
-		}
-		return nil
-	}
-
 	if firstErr != nil {
-		_ = stateAppender.close()
 		return firstErr
 	}
-	if err := stateAppender.close(); err != nil {
-		return err
-	}
-	return nil
+	return ctx.Err()
 }
 
 func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, srcSize int64, showCopyBar bool, onBytes func(int64)) error {
@@ -1750,7 +1763,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				copyBar.render(copied)
 			}); err != nil {
 				if copyBar != nil {
-					copyBar.Finish()
+					copyBar.Abort()
 				}
 				// When S2S is forced, do not fall back to client-side
 				// streaming. Return the error so the operation is retried
@@ -1789,7 +1802,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				reader, readErr := bbbfs.Resolve(op.src).Read(ctx, op.src)
 				if readErr != nil {
 					if copyBar != nil {
-						copyBar.Finish()
+						copyBar.Abort()
 					}
 					return 0, fmt.Errorf("cp: client-side fallback read: %w", readErr)
 				}
@@ -1820,11 +1833,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 					})
 					return bbbfs.Resolve(op.dst).Write(uploadCtx, op.dst, pr)
 				})
+				if writeErr != nil {
+					if copyBar != nil {
+						copyBar.Abort()
+					}
+					return 0, fmt.Errorf("cp: client-side fallback write: %w", writeErr)
+				}
 				if copyBar != nil {
 					copyBar.Finish()
-				}
-				if writeErr != nil {
-					return 0, fmt.Errorf("cp: client-side fallback write: %w", writeErr)
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s (client-side)\n", op.src, op.dst)
@@ -1884,11 +1900,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 						copyBar.render(copied)
 					}
 				})
+				if err != nil {
+					if copyBar != nil {
+						copyBar.Abort()
+					}
+					return 0, err
+				}
 				if copyBar != nil {
 					copyBar.Finish()
-				}
-				if err != nil {
-					return 0, err
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
@@ -1933,11 +1952,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 						copyBar.render(copied)
 					}
 				})
+				if err != nil {
+					if copyBar != nil {
+						copyBar.Abort()
+					}
+					return 0, err
+				}
 				if copyBar != nil {
 					copyBar.Finish()
-				}
-				if err != nil {
-					return 0, err
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
@@ -1960,7 +1982,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			reader, err := bbbfs.Resolve(op.src).Read(ctx, op.src)
 			if err != nil {
 				if copyBar != nil {
-					copyBar.Finish()
+					copyBar.Abort()
 				}
 				return 0, err
 			}
@@ -2001,7 +2023,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				return bbbfs.Resolve(op.dst).Write(writeCtx, op.dst, pr)
 			}); err != nil {
 				if copyBar != nil {
-					copyBar.Finish()
+					copyBar.Abort()
 				}
 				return 0, err
 			}
@@ -2064,9 +2086,13 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					}
 					return sendOp(ctx, pending, ssOp{name: entry.Name})
 				})
-			}, func(work ssOp) error {
+			}, func(work ssOp) (retErr error) {
 				if copyTreeProgress != nil {
-					defer copyTreeProgress.Increment()
+					defer func() {
+						if retErr == nil {
+							copyTreeProgress.Increment()
+						}
+					}()
 				}
 				srcChild := bbbfs.ChildPath(src, work.name)
 				dstChild := bbbfs.ChildPath(dst, work.name)
@@ -2092,7 +2118,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					copyBar.render(copied)
 				}); err != nil {
 					if copyBar != nil {
-						copyBar.Finish()
+						copyBar.Abort()
 					}
 					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 					return err
@@ -2106,7 +2132,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				return nil
 			})
 			if copyTreeProgress != nil {
-				copyTreeProgress.Finish()
+				if poolErr != nil {
+					copyTreeProgress.Abort()
+				} else {
+					copyTreeProgress.Finish()
+				}
 			}
 			return poolErr
 		}
@@ -2196,7 +2226,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			reader, err := bbbfs.Resolve(srcPath).Read(ctx, srcPath)
 			if err != nil {
 				if copyBar != nil {
-					copyBar.Finish()
+					copyBar.Abort()
 				}
 				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 				return err
@@ -2221,7 +2251,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				return bbbfs.Resolve(dstPath).Write(writeCtx, dstPath, pr)
 			}); err != nil {
 				if copyBar != nil {
-					copyBar.Finish()
+					copyBar.Abort()
 				}
 				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 				return err
@@ -2511,7 +2541,7 @@ func filterExclude(files []string, excludeMatch func(string) bool) []string {
 	return out
 }
 
-func cmdSync(ctx context.Context, c *cli.Command) error {
+func cmdSync(ctx context.Context, c *cli.Command) (retErr error) {
 	slog.Debug("cmdSync called", "args", c.Args().Slice())
 	dry := c.Bool("dry-run")
 	del := c.Bool("delete")
@@ -2547,6 +2577,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			if err != nil {
 				return err
 			}
+			defer closeTaskStateAppender(stateAppender, &retErr)
 		}
 		for _, task := range tasks {
 			cpKey := taskCheckpointKey(task.src, task.dst)
@@ -2557,20 +2588,12 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				continue
 			}
 			if err := cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, task.src, task.dst); err != nil {
-				if stateAppender != nil {
-					_ = stateAppender.close()
-				}
 				return err
 			}
 			if stateAppender != nil {
 				if err := stateAppender.appendCheckpoint(cpKey); err != nil {
 					return err
 				}
-			}
-		}
-		if stateAppender != nil {
-			if err := stateAppender.close(); err != nil {
-				return err
 			}
 		}
 		return nil
@@ -2599,10 +2622,11 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			if err != nil {
 				return err
 			}
+			defer closeTaskStateAppender(stateAppender, &retErr)
 			if err := stateAppender.append(key); err != nil {
 				return err
 			}
-			return stateAppender.close()
+			return nil
 		}
 		return nil
 	}
@@ -2732,9 +2756,13 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			}
 			return nil
 		}
-		workerErr := runOpPoolWithRetry(ctx, syncWorkers, retryCount, producer, func(f item) error {
+		workerErr := runOpPoolWithRetry(ctx, syncWorkers, retryCount, producer, func(f item) (retErr error) {
 			if syncProgress != nil {
-				defer syncProgress.Increment()
+				defer func() {
+					if retErr == nil {
+						syncProgress.Increment()
+					}
+				}()
 			}
 			sPath := f.rel
 			srcChild := bbbfs.ChildPath(src, sPath)
@@ -2763,7 +2791,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 					copyBar.render(copied)
 				}); err != nil {
 					if copyBar != nil {
-						copyBar.Finish()
+						copyBar.Abort()
 					}
 					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 					return fmt.Errorf("sync: %s: %w", sPath, err)
@@ -2889,7 +2917,11 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			return nil
 		})
 		if syncProgress != nil {
-			syncProgress.Finish()
+			if workerErr != nil {
+				syncProgress.Abort()
+			} else {
+				syncProgress.Finish()
+			}
 		}
 		// delete phase not implemented for cloud combos yet
 		return workerErr
