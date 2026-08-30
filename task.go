@@ -139,13 +139,16 @@ func newTaskStateAppender(path string) (*taskStateAppender, error) {
 }
 
 func (a *taskStateAppender) append(taskKey string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.file == nil {
 		return nil
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 
 	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
+		return a.closeOnError(err)
+	}
+	if err := a.file.Sync(); err != nil {
 		return a.closeOnError(err)
 	}
 
@@ -153,21 +156,7 @@ func (a *taskStateAppender) append(taskKey string) error {
 }
 
 func (a *taskStateAppender) appendCheckpoint(taskKey string) error {
-	if a.file == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
-		return a.closeOnError(err)
-	}
-
-	if err := a.file.Sync(); err != nil {
-		return a.closeOnError(err)
-	}
-
-	return nil
+	return a.append(taskKey)
 }
 
 func (a *taskStateAppender) closeOnError(err error) error {
@@ -188,14 +177,19 @@ func (a *taskStateAppender) close() error {
 	if a.file == nil {
 		return nil
 	}
-	if serr := a.file.Sync(); serr != nil {
-		_ = a.file.Close()
-		a.file = nil
-		return serr
-	}
-	err := a.file.Close()
+	syncErr := a.file.Sync()
+	closeErr := a.file.Close()
 	a.file = nil
-	return err
+	return errors.Join(syncErr, closeErr)
+}
+
+func closeTaskStateAppender(a *taskStateAppender, retErr *error) {
+	if a == nil {
+		return
+	}
+	if err := a.close(); err != nil {
+		*retErr = errors.Join(*retErr, fmt.Errorf("flush state file: %w", err))
+	}
 }
 
 const taskCheckpointPrefix = "TASK\t"
