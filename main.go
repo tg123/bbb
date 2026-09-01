@@ -279,6 +279,8 @@ func run(args []string) int {
 			},
 			&cli.StringFlag{Name: "taskfile", Hidden: true},
 			&cli.StringFlag{Name: "state", Hidden: true},
+			&cli.StringFlag{Name: "server", Usage: "Submit supported commands to this bbb server `url`", Sources: cli.EnvVars("BBB_SERVER_URL")},
+			&cli.StringFlag{Name: "server-token", Usage: "Bearer `token` for --server", Sources: cli.EnvVars("BBB_SERVER_TOKEN")},
 		},
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
 			lvlStr := cmd.String("loglevel")
@@ -551,8 +553,9 @@ func run(args []string) int {
 					&cli.IntFlag{Name: "concurrency", Usage: "Number of concurrent requests to use", Value: runtime.NumCPU()},
 					&cli.IntFlag{Name: "retry-count", Usage: "Retry operations on error", Value: 0},
 				},
-				Action: cmdCP,
+				Action: cmdCPAction,
 			},
+			serverJobCommand(),
 			{
 				Name:   "edit",
 				Usage:  "Open file in $EDITOR (creates if missing)",
@@ -609,6 +612,23 @@ func run(args []string) int {
 				Usage:     "Compute MD5 checksums (for integrity verification only)",
 				UsageText: "bbb md5sum paths [paths ...]",
 				Action:    cmdMD5Sum,
+			},
+			{
+				Name:      "server",
+				Usage:     "Run bbb as a copy server (REST API) or as a follower of a leader",
+				UsageText: "bbb server [--listen addr] [--db file] | bbb server --leader http://leader:8080",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "listen", Usage: "Address the REST API listens on (leader only)", Value: "127.0.0.1:8080", Sources: cli.EnvVars("BBB_SERVER_LISTEN")},
+					&cli.StringFlag{Name: "db", Usage: "SQLite database `file` used to persist jobs (leader only)", Value: "bbb-server.db", Sources: cli.EnvVars("BBB_SERVER_DB")},
+					&cli.StringFlag{Name: "leader", Usage: "Run in follower mode and pull tasks from this leader `url`", Sources: cli.EnvVars("BBB_SERVER_LEADER")},
+					&cli.StringFlag{Name: "token", Usage: "Shared bearer `token` required by the API", Sources: cli.EnvVars("BBB_SERVER_TOKEN")},
+					&cli.StringFlag{Name: "worker-id", Usage: "Worker `id` reported to the cluster", Sources: cli.EnvVars("BBB_SERVER_WORKER_ID")},
+					&cli.IntFlag{Name: "workers", Usage: "Number of files copied concurrently by this process (0 disables copying on the leader)", Value: runtime.NumCPU()},
+					&cli.IntFlag{Name: "concurrency", Usage: "Default number of concurrent requests per file", Value: runtime.NumCPU()},
+					&cli.DurationFlag{Name: "lease", Usage: "Task lease duration, a task is re-queued when its worker stops reporting", Value: time.Minute},
+					&cli.DurationFlag{Name: "poll-interval", Usage: "How often workers poll for new tasks", Value: time.Second},
+				},
+				Action: cmdServer,
 			},
 		},
 	}
@@ -1301,38 +1321,47 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	concurrency := c.Int("concurrency")
 	ctx = bbbfs.WithScanConcurrency(ctx, concurrency)
 	retryCount := c.Int("retry-count")
-	taskfile := c.String("taskfile")
-	if taskfile == "" {
-		taskfile = c.Root().String("taskfile")
-	}
 	stateFile := c.String("state")
 	if stateFile == "" {
 		stateFile = c.Root().String("state")
 	}
 
+	tasks, err := cpTaskPairs(c)
+	if err != nil {
+		return err
+	}
+
+	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
+}
+
+func cpTaskPairs(c *cli.Command) ([]taskPair, error) {
+	taskfile := c.String("taskfile")
+	if taskfile == "" {
+		taskfile = c.Root().String("taskfile")
+	}
+
 	var tasks []taskPair
 	if taskfile != "" {
 		if c.Args().Len() != 0 {
-			return fmt.Errorf("cp: cannot use positional args with --taskfile")
+			return nil, fmt.Errorf("cp: cannot use positional args with --taskfile")
 		}
 		var err error
 		tasks, err = loadTaskPairs(taskfile)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		// Convert positional args into task pairs so both modes share the
 		// same execution path (expansion, state tracking, progress bars).
 		if c.Args().Len() < 2 {
-			return fmt.Errorf("cp: need srcs dst")
+			return nil, fmt.Errorf("cp: need srcs dst")
 		}
 		dst := c.Args().Get(c.Args().Len() - 1)
 		for i := 0; i < c.Args().Len()-1; i++ {
 			tasks = append(tasks, taskPair{src: c.Args().Get(i), dst: dst})
 		}
 	}
-
-	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
+	return tasks, nil
 }
 
 // runCPTasks executes a list of task pairs through the unified expansion +

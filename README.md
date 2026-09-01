@@ -766,6 +766,129 @@ bbb s3 mkbucket s3://bucket
 bbb s3 mkbucket s3://newbucket
 ```
 
+### `server` — Run bbb as a copy server (leader) or follower
+
+Server mode turns `bbb` into a long running service: copy jobs (for example
+`az://` to `az://`) are submitted over a REST API, persisted in a SQLite
+database, executed by a pool of workers, tracked while they run and can be
+cancelled at any time. Starting more `bbb server --leader ...` processes forms a
+distributed copying cluster: the leader schedules, followers copy.
+
+```
+bbb server [--listen addr] [--db file]        # leader (API + scheduler + workers)
+bbb server --leader http://leader:8080        # follower (workers only)
+```
+
+| Flag | Description |
+|------|-------------|
+| `--listen` | Address the REST API listens on (leader only, default `127.0.0.1:8080`, env `BBB_SERVER_LISTEN`) |
+| `--db` | SQLite database file used to persist jobs (leader only, default `bbb-server.db`, env `BBB_SERVER_DB`) |
+| `--leader` | Run in follower mode and pull tasks from this leader URL (env `BBB_SERVER_LEADER`) |
+| `--token` | Shared bearer token required by the API (env `BBB_SERVER_TOKEN`) |
+| `--worker-id` | Worker id reported to the cluster (default `hostname-random`, env `BBB_SERVER_WORKER_ID`) |
+| `--workers` | Number of files copied concurrently by this process (`0` on the leader means schedule only) |
+| `--concurrency` | Default number of concurrent requests per file |
+| `--lease` | Task lease duration; a task is re-queued when its worker stops reporting (default `1m`) |
+| `--poll-interval` | How often workers poll for new tasks (default `1s`) |
+
+**Client mode**
+
+Set the global `--server` flag (or `BBB_SERVER_URL`) to submit `cp` work
+instead of copying in the local process. The command returns immediately and
+prints one job ID per source. Use `--server-token` or `BBB_SERVER_TOKEN` when
+the leader requires authentication.
+
+```bash
+JOB_ID=$(bbb --server http://leader:8080 --server-token "$TOKEN" \
+  cp az://acct/src/data az://acct/dst/data)
+
+bbb --server http://leader:8080 --server-token "$TOKEN" job list
+bbb --server http://leader:8080 --server-token "$TOKEN" job get "$JOB_ID"
+bbb --server http://leader:8080 --server-token "$TOKEN" job tasks "$JOB_ID"
+bbb --server http://leader:8080 --server-token "$TOKEN" job cancel "$JOB_ID"
+bbb --server http://leader:8080 --server-token "$TOKEN" job delete "$JOB_ID"
+```
+
+`job list` accepts `--state` and `--limit`; `job tasks` accepts `--state`,
+`--limit` and `--offset`. Management command output is JSON. Remote `cp`
+supports positional sources and `--taskfile`; each source/destination pair is
+submitted as a separate job. Because submission is asynchronous, `--state`
+is not supported with `--server`.
+
+**REST API**
+
+All endpoints below are prefixed with `/api/v1` and require
+`Authorization: Bearer <token>` when `--token` is set (`/healthz` never does).
+
+| Method & path | Description |
+|---------------|-------------|
+| `POST /jobs` | Submit a copy job: `{"src":"az://acct/c1/data","dst":"az://acct/c2/data","overwrite":true,"concurrency":16,"retry_count":3}` |
+| `GET /jobs` | List jobs (`?state=running&limit=100`) |
+| `GET /jobs/{id}` | Job status and progress (`state`, `total_tasks`, `done_tasks`, `failed_tasks`, `total_bytes`, `copied_bytes`) |
+| `GET /jobs/{id}/tasks` | Per file progress (`?state=failed&limit=&offset=`) |
+| `POST /jobs/{id}/cancel` | Cancel a job: pending files are dropped, running files are aborted |
+| `DELETE /jobs/{id}` | Delete a finished job and its task records (copied destination files are left untouched) |
+| `GET /workers` | List cluster members (leader and followers) with their last heartbeat |
+| `GET /healthz` | Liveness probe |
+
+A job moves through `pending` → `expanding` → `running` → `succeeded` /
+`failed` / `cancelled`; every file is a task in `pending` / `running` /
+`succeeded` / `failed` / `cancelled`.
+
+**Examples:**
+
+```bash
+# Start the leader with 8 local copy workers
+bbb server --listen 0.0.0.0:8080 --db /var/lib/bbb/server.db --workers 8 --token "$TOKEN"
+
+# Join the cluster from another machine (copying only, no API)
+bbb server --leader http://leader:8080 --token "$TOKEN" --workers 8
+
+# Submit a container-to-container copy
+curl -sX POST http://leader:8080/api/v1/jobs \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"src":"az://acct/src/data","dst":"az://acct/dst/data","overwrite":true}'
+
+# Track it
+curl -s http://leader:8080/api/v1/jobs/<id> -H "Authorization: Bearer $TOKEN"
+
+# Cancel it
+curl -sX POST http://leader:8080/api/v1/jobs/<id>/cancel -H "Authorization: Bearer $TOKEN"
+```
+
+For Kubernetes, [`examples/kubernetes/server.yaml`](examples/kubernetes/server.yaml)
+runs one scheduler-only leader with a persistent database and one follower with
+one copy worker. Scale the `bbb-worker` Deployment to add worker processes.
+
+**Persistence**
+
+The leader database ([`internal/server/schema.sql`](internal/server/schema.sql))
+holds four tables:
+
+| Table | Purpose |
+|-------|---------|
+| `jobs` | Submitted requests: `src`, `dst`, options, state, aggregated progress counters, timestamps |
+| `tasks` | One row per file: `job_id`, `src`, `dst`, `size`, state, `attempts`, `copied_bytes`, owning `worker_id` and lease expiry |
+| `workers` | Cluster members with mode (`leader`/`follower`), capacity and last heartbeat |
+| `meta` | Schema version |
+
+Tasks are handed out as leases. A worker keeps its lease alive by reporting
+progress; if it dies, the lease expires and the leader re-queues the file to
+another worker, so a job survives worker crashes and leader restarts.
+
+A re-queued file is copied again from scratch (its `copied_bytes` is reset), and
+crashes share the job's `retry_count` budget with reported failures, so a file
+that repeatedly kills its worker eventually fails instead of being handed out
+forever. Because a dead attempt may have left partial data at the destination,
+the next attempt is allowed to overwrite that leftover output even when the job
+did not request `overwrite` — otherwise the retry could never succeed. This only
+applies once an attempt has actually written bytes: a job with `overwrite` unset
+whose destination already exists still fails without touching the existing data.
+
+SQLite is provided by the pure-Go `modernc.org/sqlite` driver, so server mode
+does not introduce a C compiler or CGO requirement. Release and container
+builds continue to use `CGO_ENABLED=0`.
+
 ## Benchmark
 
 The [`Benchmark`](.github/workflows/benchmark.yml) workflow compares `bbb`'s
