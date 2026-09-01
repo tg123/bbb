@@ -437,17 +437,23 @@ WHERE id = ? AND state = ?`, TaskRunning, workerID, unixMilli(expire), unixMilli
 			return nil, err
 		}
 		var (
-			overwrite   int
-			concurrency int
-			retryCount  int
+			overwrite      int
+			concurrency    int
+			retryCount     int
+			forceOverwrite int
 		)
-		if err := tx.QueryRowContext(ctx, `SELECT overwrite, concurrency, retry_count FROM jobs WHERE id = ?`, task.JobID).
-			Scan(&overwrite, &concurrency, &retryCount); err != nil {
+		if err := tx.QueryRowContext(ctx, `
+SELECT j.overwrite, j.concurrency, j.retry_count, t.force_overwrite
+FROM jobs j JOIN tasks t ON t.job_id = j.id WHERE t.id = ?`, id).
+			Scan(&overwrite, &concurrency, &retryCount, &forceOverwrite); err != nil {
 			return nil, err
 		}
 		leases = append(leases, Lease{
-			Task:        task,
-			Overwrite:   overwrite != 0,
+			Task: task,
+			// A retry that follows a partially written attempt must be allowed
+			// to replace that leftover output, otherwise the copy can never
+			// succeed once the destination holds the dead attempt's bytes.
+			Overwrite:   overwrite != 0 || forceOverwrite != 0,
 			Concurrency: concurrency,
 			RetryCount:  retryCount,
 			Expires:     expire,
@@ -515,9 +521,20 @@ SELECT t.attempts, j.retry_count, j.cancel_requested FROM tasks t JOIN jobs j ON
 			state = TaskCancelled
 			taskErr = "cancelled"
 		} else if attempts <= retryCount {
+			// Bytes already reached the destination, so the next attempt has to
+			// replace that partial output. When nothing was copied (for example
+			// an overwrite=false job that fast-failed because the destination
+			// already existed) the flag stays clear and the job's overwrite
+			// setting keeps protecting pre-existing data.
+			forceOverwrite := 0
+			if copiedBytes > 0 {
+				forceOverwrite = 1
+			}
 			_, err := s.db.ExecContext(ctx, `
-UPDATE tasks SET state = ?, worker_id = '', lease_expire = 0, copied_bytes = 0, error = ?, updated_at = ?
-WHERE id = ? AND worker_id = ? AND state = ?`, TaskPending, taskErr, now, taskID, workerID, TaskRunning)
+UPDATE tasks SET state = ?, worker_id = '', lease_expire = 0, copied_bytes = 0,
+                 force_overwrite = MAX(force_overwrite, ?), error = ?, updated_at = ?
+WHERE id = ? AND worker_id = ? AND state = ?`,
+				TaskPending, forceOverwrite, taskErr, now, taskID, workerID, TaskRunning)
 			return err
 		}
 	}
@@ -528,7 +545,8 @@ WHERE id = ? AND worker_id = ? AND state = ?`, state, copiedBytes, taskErr, now,
 }
 
 // RequeueExpiredLeases returns tasks whose worker stopped reporting back to the
-// pending pool so another worker can pick them up.
+// pending pool so another worker can pick them up. Tasks that have exhausted
+// their job's retry budget are failed instead of being handed out again.
 func (s *Store) RequeueExpiredLeases(ctx context.Context) (int64, error) {
 	now := unixMilli(time.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -548,9 +566,21 @@ WHERE state = ? AND lease_expire < ?
 		return 0, err
 	}
 
-	res, err := tx.ExecContext(ctx, `
+	// Retries are a single budget shared with the failure path in CompleteTask:
+	// a task that kills its worker would otherwise be handed out forever,
+	// crashing every worker that claims it while the job never finishes.
+	if _, err := tx.ExecContext(ctx, `
 UPDATE tasks SET state = ?, worker_id = '', lease_expire = 0, copied_bytes = 0,
                  error = 'lease expired', updated_at = ?
+WHERE state = ? AND lease_expire < ?
+  AND attempts > (SELECT retry_count FROM jobs WHERE jobs.id = tasks.job_id)`,
+		TaskFailed, now, TaskRunning, now); err != nil {
+		return 0, err
+	}
+
+	res, err := tx.ExecContext(ctx, `
+UPDATE tasks SET state = ?, worker_id = '', lease_expire = 0, copied_bytes = 0,
+                 force_overwrite = 1, error = 'lease expired', updated_at = ?
 WHERE state = ? AND lease_expire < ?`, TaskPending, now, TaskRunning, now)
 	if err != nil {
 		return 0, err

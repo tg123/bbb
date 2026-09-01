@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     state        TEXT    NOT NULL, -- pending|running|succeeded|failed|cancelled
     attempts     INTEGER NOT NULL DEFAULT 0,
     copied_bytes INTEGER NOT NULL DEFAULT 0,
+    -- Set when a previous attempt may have written partial data to dst (worker
+    -- crash, or a failure after bytes were copied). The next attempt is then
+    -- allowed to overwrite that leftover output even when the job did not ask
+    -- for --overwrite, since it is clobbering this job's own partial file
+    -- rather than pre-existing data.
+    force_overwrite INTEGER NOT NULL DEFAULT 0,
     worker_id    TEXT    NOT NULL DEFAULT '',
     lease_expire INTEGER NOT NULL DEFAULT 0,
     error        TEXT    NOT NULL DEFAULT '',

@@ -432,6 +432,155 @@ func TestCompleteIsRetriedAfterTransientFailure(t *testing.T) {
 	}
 }
 
+func TestCrashRequeueIsCappedByRetryCount(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// retry_count 1 => one crash is retried, the second exhausts the budget
+	if _, err := store.CreateJob(ctx, Job{ID: "job1", Src: "az://a/src", Dst: "az://a/dst", RetryCount: 1}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, _, err := store.NextJobToExpand(ctx); err != nil {
+		t.Fatalf("next job: %v", err)
+	}
+	if err := store.AddTasks(ctx, "job1", []Task{{Src: "az://a/src/f", Dst: "az://a/dst/f"}}); err != nil {
+		t.Fatalf("add tasks: %v", err)
+	}
+	if err := store.FinishExpansion(ctx, "job1", nil); err != nil {
+		t.Fatalf("finish expansion: %v", err)
+	}
+
+	// first worker claims and crashes (lease already expired)
+	if leases, err := store.ClaimTasks(ctx, "w1", 1, -time.Second); err != nil || len(leases) != 1 {
+		t.Fatalf("claim: %v %d", err, len(leases))
+	}
+	requeued, err := store.RequeueExpiredLeases(ctx)
+	if err != nil || requeued != 1 {
+		t.Fatalf("first requeue = %d, %v", requeued, err)
+	}
+
+	// second worker claims and crashes as well, exhausting the budget
+	if leases, err := store.ClaimTasks(ctx, "w2", 1, -time.Second); err != nil || len(leases) != 1 {
+		t.Fatalf("re-claim: %v %d", err, len(leases))
+	}
+	requeued, err = store.RequeueExpiredLeases(ctx)
+	if err != nil {
+		t.Fatalf("second requeue: %v", err)
+	}
+	// handing the task out again would crash a third worker, and so on forever
+	if requeued != 0 {
+		t.Fatalf("second requeue = %d, want 0", requeued)
+	}
+
+	tasks, err := store.ListTasks(ctx, "job1", "", 10, 0)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("list tasks: %v %d", err, len(tasks))
+	}
+	if tasks[0].State != TaskFailed || tasks[0].Error != "lease expired" {
+		t.Fatalf("task = %+v", tasks[0])
+	}
+	if leases, err := store.ClaimTasks(ctx, "w3", 1, time.Minute); err != nil || len(leases) != 0 {
+		t.Fatalf("exhausted task was claimed again: %v %d", err, len(leases))
+	}
+	if err := store.ReconcileJobs(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job1")
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if job.State != JobFailed {
+		t.Fatalf("job state = %s, want %s", job.State, JobFailed)
+	}
+}
+
+func TestRetryAfterCrashMayOverwritePartialOutput(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// the job itself did not ask for --overwrite
+	if _, err := store.CreateJob(ctx, Job{ID: "job1", Src: "az://a/src", Dst: "az://a/dst", RetryCount: 3}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, _, err := store.NextJobToExpand(ctx); err != nil {
+		t.Fatalf("next job: %v", err)
+	}
+	if err := store.AddTasks(ctx, "job1", []Task{{Src: "az://a/src/f", Dst: "az://a/dst/f"}}); err != nil {
+		t.Fatalf("add tasks: %v", err)
+	}
+	if err := store.FinishExpansion(ctx, "job1", nil); err != nil {
+		t.Fatalf("finish expansion: %v", err)
+	}
+
+	leases, err := store.ClaimTasks(ctx, "w1", 1, -time.Second)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("claim: %v %d", err, len(leases))
+	}
+	if leases[0].Overwrite {
+		t.Fatal("first attempt must honour the job's overwrite setting")
+	}
+
+	// the worker dies mid copy, leaving partial data at the destination
+	if _, err := store.RequeueExpiredLeases(ctx); err != nil {
+		t.Fatalf("requeue: %v", err)
+	}
+	leases, err = store.ClaimTasks(ctx, "w2", 1, time.Minute)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("re-claim: %v %d", err, len(leases))
+	}
+	// without this the retry fails forever: the destination already exists
+	if !leases[0].Overwrite {
+		t.Fatal("retry after a crash must be allowed to overwrite its own partial output")
+	}
+}
+
+func TestRetryAfterFailureWithoutCopiedBytesKeepsOverwriteOff(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := store.CreateJob(ctx, Job{ID: "job1", Src: "az://a/src", Dst: "az://a/dst", RetryCount: 3}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, _, err := store.NextJobToExpand(ctx); err != nil {
+		t.Fatalf("next job: %v", err)
+	}
+	if err := store.AddTasks(ctx, "job1", []Task{{Src: "az://a/src/f", Dst: "az://a/dst/f"}}); err != nil {
+		t.Fatalf("add tasks: %v", err)
+	}
+	if err := store.FinishExpansion(ctx, "job1", nil); err != nil {
+		t.Fatalf("finish expansion: %v", err)
+	}
+
+	leases, err := store.ClaimTasks(ctx, "w1", 1, time.Minute)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("claim: %v %d", err, len(leases))
+	}
+	// an overwrite=false job whose destination already exists fails before
+	// copying anything, so pre-existing data must stay protected on retry
+	if err := store.CompleteTask(ctx, "w1", leases[0].Task.ID, TaskFailed, 0, "cp: destination exists"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	leases, err = store.ClaimTasks(ctx, "w1", 1, time.Minute)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("retry claim: %v %d", err, len(leases))
+	}
+	if leases[0].Overwrite {
+		t.Fatal("retry must not clobber a pre-existing destination")
+	}
+
+	// a failure reported after bytes were copied does force an overwrite
+	if err := store.CompleteTask(ctx, "w1", leases[0].Task.ID, TaskFailed, 512, "connection reset"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	leases, err = store.ClaimTasks(ctx, "w1", 1, time.Minute)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("retry claim: %v %d", err, len(leases))
+	}
+	if !leases[0].Overwrite {
+		t.Fatal("retry after a partial write must be allowed to overwrite")
+	}
+}
+
 func TestFollowerCopiesTasks(t *testing.T) {
 	runner := newFakeRunner(
 		FileTask{Src: "az://acct/src/a", Dst: "az://acct/dst/a", Size: 10},

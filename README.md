@@ -876,6 +876,15 @@ Tasks are handed out as leases. A worker keeps its lease alive by reporting
 progress; if it dies, the lease expires and the leader re-queues the file to
 another worker, so a job survives worker crashes and leader restarts.
 
+A re-queued file is copied again from scratch (its `copied_bytes` is reset), and
+crashes share the job's `retry_count` budget with reported failures, so a file
+that repeatedly kills its worker eventually fails instead of being handed out
+forever. Because a dead attempt may have left partial data at the destination,
+the next attempt is allowed to overwrite that leftover output even when the job
+did not request `overwrite` — otherwise the retry could never succeed. This only
+applies once an attempt has actually written bytes: a job with `overwrite` unset
+whose destination already exists still fails without touching the existing data.
+
 SQLite is provided by the pure-Go `modernc.org/sqlite` driver, so server mode
 does not introduce a C compiler or CGO requirement. Release and container
 builds continue to use `CGO_ENABLED=0`.
