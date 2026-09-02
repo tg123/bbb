@@ -899,7 +899,7 @@ func getCredential() (azcore.TokenCredential, error) {
 	credOnce.Do(func() {
 		opts := &azidentity.DefaultAzureCredentialOptions{}
 		if c := sharedClient.Load(); c != nil {
-			opts.ClientOptions.Transport = c
+			opts.Transport = c
 		}
 		cred, credErr = azidentity.NewDefaultAzureCredential(opts)
 	})
