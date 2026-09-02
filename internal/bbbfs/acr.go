@@ -48,7 +48,7 @@ func (acrFS) List(ctx context.Context, target string) ([]Entry, error) {
 		names = append(names, f.Name)
 		sizes[f.Name] = f.Size
 	}
-	entries := hfListEntries(names, prefix)
+	entries := listEntriesByPrefix(names, prefix)
 	out := make([]Entry, 0, len(entries))
 	for _, name := range entries {
 		trimmed := strings.TrimSuffix(name, "/")
@@ -111,7 +111,7 @@ func (acrFS) ListRecursive(ctx context.Context, target string, emit func(Entry) 
 		names = append(names, f.Name)
 		sizes[f.Name] = f.Size
 	}
-	filtered := hfFilterFiles(names, prefix)
+	filtered := filterFilesByPrefix(names, prefix)
 	sort.Strings(filtered)
 	for _, name := range filtered {
 		if name == "" {

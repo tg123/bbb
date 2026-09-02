@@ -44,9 +44,14 @@ const DefaultTag = "latest"
 // defaultSuffix is appended to bare registry names (e.g. "myregistry").
 const defaultSuffix = ".azurecr.io"
 
-// aadScope is the Entra ID scope used to obtain a token that is then
-// exchanged for an ACR refresh token.
-const aadScope = "https://management.azure.com/.default"
+// aadScopes are the Entra ID scopes tried, in order, to obtain a token that is
+// then exchanged for a registry refresh token. Registries accept a token with
+// the container registry audience; the ARM audience is kept as a fallback for
+// clouds/credentials where the former cannot be issued.
+var aadScopes = []string{
+	"https://containerregistry.azure.net/.default",
+	"https://management.azure.com/.default",
+}
 
 var manifestAcceptTypes = []string{
 	"application/vnd.oci.image.manifest.v1+json",
@@ -206,15 +211,17 @@ type manifest struct {
 // maxIndexDepth bounds how many nested image indexes are followed.
 const maxIndexDepth = 4
 
-// ListFiles returns the files (layers) contained in the artifact referenced by p.
+// ListFiles returns the files (layers) contained in the artifact referenced by
+// p. For a multi-platform artifact (image index) the layers of every
+// referenced manifest are merged.
 func ListFiles(ctx context.Context, p Path) ([]File, error) {
-	m, err := fetchManifest(ctx, p, p.Reference, 0)
+	layers, err := fetchLayers(ctx, p, p.Reference, 0)
 	if err != nil {
 		return nil, err
 	}
-	files := make([]File, 0, len(m.Layers))
-	seen := make(map[string]struct{}, len(m.Layers))
-	for _, layer := range m.Layers {
+	files := make([]File, 0, len(layers))
+	seen := make(map[string]struct{}, len(layers))
+	for _, layer := range layers {
 		name := layer.Annotations[TitleAnnotation]
 		if name == "" {
 			name = strings.ReplaceAll(layer.Digest, ":", "-")
@@ -293,6 +300,38 @@ func (d downloadReadCloser) Size() int64 {
 	return d.size
 }
 
+// fetchLayers returns the layers of the manifest referenced by reference,
+// recursively merging the layers of every manifest referenced by an image
+// index. Layers with a digest that was already collected are skipped.
+func fetchLayers(ctx context.Context, p Path, reference string, depth int) ([]descriptor, error) {
+	m, err := fetchManifest(ctx, p, reference, depth)
+	if err != nil {
+		return nil, err
+	}
+	if len(m.Layers) > 0 || len(m.Manifests) == 0 {
+		return m.Layers, nil
+	}
+	var layers []descriptor
+	seen := map[string]struct{}{}
+	for _, child := range m.Manifests {
+		if child.Digest == "" {
+			continue
+		}
+		childLayers, err := fetchLayers(ctx, p, child.Digest, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		for _, layer := range childLayers {
+			if _, dup := seen[layer.Digest]; dup {
+				continue
+			}
+			seen[layer.Digest] = struct{}{}
+			layers = append(layers, layer)
+		}
+	}
+	return layers, nil
+}
+
 func fetchManifest(ctx context.Context, p Path, reference string, depth int) (*manifest, error) {
 	if depth > maxIndexDepth {
 		return nil, errors.New("acr: too many nested image indexes")
@@ -316,10 +355,6 @@ func fetchManifest(ctx context.Context, p Path, reference string, depth int) (*m
 	var m manifest
 	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
 		return nil, err
-	}
-	if len(m.Layers) == 0 && len(m.Manifests) > 0 {
-		// Image index: follow the first referenced manifest.
-		return fetchManifest(ctx, p, m.Manifests[0].Digest, depth+1)
 	}
 	return &m, nil
 }
@@ -484,24 +519,35 @@ func entraToken(ctx context.Context, registry, realm, service, scope string) (st
 	if err != nil {
 		return "", err
 	}
-	aadToken, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{aadScope}})
-	if err != nil {
-		return "", err
+	var lastErr error
+	for _, audience := range aadScopes {
+		aadToken, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{audience}})
+		if err != nil {
+			lastErr = err
+			slog.Debug("acr: Entra ID token request failed", "audience", audience, "error", err)
+			continue
+		}
+		refreshToken, err := postForm(ctx, fmt.Sprintf("https://%s/oauth2/exchange", registry), url.Values{
+			"grant_type":   {"access_token"},
+			"service":      {service},
+			"access_token": {aadToken.Token},
+		}, "refresh_token")
+		if err != nil {
+			lastErr = err
+			slog.Debug("acr: registry token exchange failed", "audience", audience, "error", err)
+			continue
+		}
+		return postForm(ctx, realm, url.Values{
+			"grant_type":    {"refresh_token"},
+			"service":       {service},
+			"scope":         {scope},
+			"refresh_token": {refreshToken},
+		}, "access_token")
 	}
-	refreshToken, err := postForm(ctx, fmt.Sprintf("https://%s/oauth2/exchange", registry), url.Values{
-		"grant_type":   {"access_token"},
-		"service":      {service},
-		"access_token": {aadToken.Token},
-	}, "refresh_token")
-	if err != nil {
-		return "", err
+	if lastErr == nil {
+		lastErr = errors.New("acr: no Entra ID audience configured")
 	}
-	return postForm(ctx, realm, url.Values{
-		"grant_type":    {"refresh_token"},
-		"service":       {service},
-		"scope":         {scope},
-		"refresh_token": {refreshToken},
-	}, "access_token")
+	return "", lastErr
 }
 
 var (

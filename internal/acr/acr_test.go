@@ -204,7 +204,7 @@ func TestListFilesAndDownload(t *testing.T) {
 	}
 }
 
-func TestListFilesFollowsIndex(t *testing.T) {
+func TestListFilesMergesIndexManifests(t *testing.T) {
 	tokenCacheMu.Lock()
 	tokenCache = map[string]string{}
 	tokenCacheMu.Unlock()
@@ -214,12 +214,23 @@ func TestListFilesFollowsIndex(t *testing.T) {
 		case "/v2/models/manifests/v1":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"mediaType": "application/vnd.oci.image.index.v1+json",
-				"manifests": []map[string]any{{"digest": "sha256:child"}},
+				"manifests": []map[string]any{
+					{"digest": "sha256:child1"},
+					{"digest": "sha256:child2"},
+				},
 			})
-		case "/v2/models/manifests/" + url.PathEscape("sha256:child"):
+		case "/v2/models/manifests/" + url.PathEscape("sha256:child1"):
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"layers": []map[string]any{
 					{"digest": "sha256:abc", "size": 5, "annotations": map[string]string{TitleAnnotation: "a.txt"}},
+					{"digest": "sha256:shared", "size": 1, "annotations": map[string]string{TitleAnnotation: "shared.txt"}},
+				},
+			})
+		case "/v2/models/manifests/" + url.PathEscape("sha256:child2"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"layers": []map[string]any{
+					{"digest": "sha256:shared", "size": 1, "annotations": map[string]string{TitleAnnotation: "shared.txt"}},
+					{"digest": "sha256:def", "size": 7, "annotations": map[string]string{TitleAnnotation: "b.txt"}},
 				},
 			})
 		default:
@@ -235,7 +246,20 @@ func TestListFilesFollowsIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListFiles failed: %v", err)
 	}
-	if len(files) != 1 || files[0].Name != "a.txt" || files[0].Size != 5 {
-		t.Fatalf("unexpected files: %#v", files)
+	var names []string
+	for _, f := range files {
+		names = append(names, f.Name)
+	}
+	want := []string{"a.txt", "shared.txt", "b.txt"}
+	if len(names) != len(want) {
+		t.Fatalf("unexpected files: %#v", names)
+	}
+	for i, name := range want {
+		if names[i] != name {
+			t.Fatalf("unexpected file at %d: %#v", i, names)
+		}
+	}
+	if files[2].Size != 7 {
+		t.Fatalf("unexpected size: %#v", files[2])
 	}
 }
