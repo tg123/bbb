@@ -20,6 +20,14 @@ func TestStreamTaskPairsEmitsBeforeEOF(t *testing.T) {
 
 	writerDone := make(chan struct{})
 	writerErr := make(chan error, 1)
+	continueWriter := make(chan struct{})
+	defer func() {
+		select {
+		case <-continueWriter:
+		default:
+			close(continueWriter)
+		}
+	}()
 	go func() {
 		defer close(writerDone)
 		w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
@@ -35,7 +43,7 @@ func TestStreamTaskPairsEmitsBeforeEOF(t *testing.T) {
 			return
 		}
 		// Hold the pipe open; the first pair must be emitted before EOF.
-		time.Sleep(200 * time.Millisecond)
+		<-continueWriter
 		if _, err := w.WriteString("src2 dst2\n"); err != nil {
 			writerErr <- fmt.Errorf("write second task: %w", err)
 		}
@@ -70,6 +78,7 @@ func TestStreamTaskPairsEmitsBeforeEOF(t *testing.T) {
 		t.Fatal("first task pair was only emitted after the writer finished")
 	default:
 	}
+	close(continueWriter)
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("streamTaskPairs failed: %v", err)

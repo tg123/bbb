@@ -280,6 +280,43 @@ func TestRunCPTaskStreamReturnsCancellation(t *testing.T) {
 	}
 }
 
+func TestRunCPTaskStreamDoesNotWaitForBlockedProducerAfterWorkerError(t *testing.T) {
+	dir := t.TempDir()
+	producerBlocked := make(chan struct{})
+	releaseProducer := make(chan struct{})
+	defer close(releaseProducer)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runCPTaskStream(context.Background(), func(emit func(taskPair) error) error {
+			if err := emit(taskPair{
+				src: filepath.Join(dir, "missing.txt"),
+				dst: filepath.Join(dir, "dst"),
+			}); err != nil {
+				return err
+			}
+			close(producerBlocked)
+			<-releaseProducer
+			return nil
+		}, true, true, 1, 0, "")
+	}()
+
+	select {
+	case <-producerBlocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("producer did not block after emitting the task")
+	}
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected worker error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runCPTaskStream waited for the blocked producer")
+	}
+}
+
 func TestLoadTaskPairsLongLine(t *testing.T) {
 	dir := t.TempDir()
 	longSrc := strings.Repeat("a", 70*1024)

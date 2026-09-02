@@ -1085,7 +1085,7 @@ func TestAccountRoleChangesInvalidateCachedClient(t *testing.T) {
 }
 
 func TestAccountKeyRolePrefixedTakesPrecedence(t *testing.T) {
-	defer accountRoles.Delete("acctkey1")
+	defer ClearAccountRole("acctkey1")
 	RegisterAccountRole("acctkey1", "SRC")
 	t.Setenv("SRC_BBB_AZBLOB_ACCOUNTKEY", "src-key-123")
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "global-key")
@@ -1095,7 +1095,7 @@ func TestAccountKeyRolePrefixedTakesPrecedence(t *testing.T) {
 }
 
 func TestAccountKeyFallsBackToGlobal(t *testing.T) {
-	defer accountRoles.Delete("acctkey2")
+	defer ClearAccountRole("acctkey2")
 	RegisterAccountRole("acctkey2", "DST")
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "global-key")
 	// No DST_BBB_AZBLOB_ACCOUNTKEY set

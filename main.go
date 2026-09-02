@@ -1612,27 +1612,40 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 		}()
 	}
 	// Consume task pairs as they are produced so copies start immediately
-	// instead of waiting for the whole taskfile to be read.
-	produceErr := produce(func(task taskPair) error {
-		select {
-		case <-workerCtx.Done():
-			return workerCtx.Err()
-		default:
+	// instead of waiting for the whole taskfile to be read. Production runs in
+	// its own goroutine so a blocked stdin/FIFO read cannot prevent worker
+	// failures or cancellation from shutting down the pipeline.
+	produceDone := make(chan error, 1)
+	go func() {
+		produceDone <- produce(func(task taskPair) error {
+			select {
+			case <-workerCtx.Done():
+				return workerCtx.Err()
+			default:
+			}
+			if err := azRoles.observe(workerCtx, task); err != nil {
+				return err
+			}
+			select {
+			case <-workerCtx.Done():
+				return workerCtx.Err()
+			case pairCh <- task:
+				return nil
+			}
+		})
+	}()
+	producerFinished := false
+	select {
+	case produceErr := <-produceDone:
+		producerFinished = true
+		if produceErr != nil {
+			setErr(produceErr)
 		}
-		if err := azRoles.observe(workerCtx, task); err != nil {
-			return err
-		}
-		select {
-		case <-workerCtx.Done():
-			return workerCtx.Err()
-		case pairCh <- task:
-			return nil
-		}
-	})
-	if produceErr != nil {
-		setErr(produceErr)
+	case <-workerCtx.Done():
 	}
-	close(pairCh)
+	if producerFinished {
+		close(pairCh)
+	}
 	expandWG.Wait()
 	// Set the final total now that expansion is complete so the bar
 	// can reach 100% once all workers finish.

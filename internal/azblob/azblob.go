@@ -534,8 +534,8 @@ func AccountRole(account string) (string, bool) {
 	return v.(string), true
 }
 
-// ClearAccountRole removes the role registration and any client created with
-// its role-scoped credentials, so future requests use the unscoped flow.
+// ClearAccountRole removes the role registration and invalidates any cached
+// client created while that registration was active.
 func ClearAccountRole(account string) {
 	if _, loaded := accountRoles.LoadAndDelete(account); loaded {
 		blobClientCache.Delete(account)
