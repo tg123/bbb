@@ -206,6 +206,12 @@ type cpTask struct {
 // emit for each discovered file; for file-like sources it emits a single task.
 // Returning a non-nil error from emit stops expansion early.
 func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) error {
+	// An ACR destination is one atomic OCI artifact. Keep a directory source as
+	// one task so its files become layers under a single published manifest.
+	if bbbfs.IsACR(task.dst) {
+		return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+	}
+
 	// Check if source is a single file (not a directory)
 	if bbbfs.IsHF(task.src) || bbbfs.IsAz(task.src) {
 		dirLike, err := bbbfs.IsDirLike(ctx, task.src)

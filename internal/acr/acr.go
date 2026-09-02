@@ -1,5 +1,5 @@
-// Package acr provides read-only access to OCI artifacts stored in an Azure
-// Container Registry (or any registry implementing the OCI distribution spec).
+// Package acr provides access to OCI artifacts stored in an Azure Container
+// Registry (or any registry implementing the OCI distribution spec).
 //
 // Paths use the form:
 //
@@ -12,11 +12,15 @@
 package acr
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log/slog"
 	"net/http"
@@ -40,6 +44,12 @@ const TitleAnnotation = "org.opencontainers.image.title"
 
 // DefaultTag is used when a path does not specify a tag or digest.
 const DefaultTag = "latest"
+
+const (
+	manifestMediaType = "application/vnd.oci.image.manifest.v1+json"
+	configMediaType   = "application/vnd.unknown.config.v1+json"
+	layerMediaType    = "application/octet-stream"
+)
 
 // defaultSuffix is appended to bare registry names (e.g. "myregistry").
 const defaultSuffix = ".azurecr.io"
@@ -83,6 +93,18 @@ func httpClient() *http.Client {
 	return http.DefaultClient
 }
 
+func registryURL(registry, suffix string) string {
+	base := "https://" + registry
+	if endpoint := strings.TrimSpace(os.Getenv("BBB_ACR_ENDPOINT")); endpoint != "" {
+		if strings.Contains(endpoint, "%s") {
+			base = fmt.Sprintf(endpoint, registry)
+		} else {
+			base = endpoint
+		}
+	}
+	return strings.TrimRight(base, "/") + suffix
+}
+
 var doRequest = func(req *http.Request) (*http.Response, error) {
 	return httpClient().Do(req)
 }
@@ -92,6 +114,9 @@ type HTTPStatusError struct {
 	StatusCode int
 	Status     string
 }
+
+// ErrArtifactExists indicates that a tag already exists and overwrite was not requested.
+var ErrArtifactExists = errors.New("acr: destination artifact already exists")
 
 func (e *HTTPStatusError) Error() string {
 	return e.Status
@@ -180,6 +205,13 @@ func cleanFile(file string) (string, error) {
 	if file == "" {
 		return "", errors.New("missing file path")
 	}
+	// Layer titles come from the registry and are untrusted. path.Clean treats
+	// a backslash as an ordinary character, but it separates path elements on
+	// Windows, so a name such as `..\..\outside` would survive the checks below
+	// and then escape the destination once joined with filepath.Join.
+	if strings.Contains(file, `\`) {
+		return "", errors.New("invalid file path: backslash is not allowed")
+	}
 	if strings.HasPrefix(file, "/") {
 		return "", errors.New("invalid file path")
 	}
@@ -198,14 +230,18 @@ type File struct {
 }
 
 type descriptor struct {
+	MediaType   string            `json:"mediaType,omitempty"`
 	Digest      string            `json:"digest"`
 	Size        int64             `json:"size"`
-	Annotations map[string]string `json:"annotations"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 type manifest struct {
-	Layers    []descriptor `json:"layers"`
-	Manifests []descriptor `json:"manifests"`
+	SchemaVersion int          `json:"schemaVersion,omitempty"`
+	MediaType     string       `json:"mediaType,omitempty"`
+	Config        descriptor   `json:"config,omitempty"`
+	Layers        []descriptor `json:"layers"`
+	Manifests     []descriptor `json:"manifests,omitempty"`
 }
 
 // maxIndexDepth bounds how many nested image indexes are followed.
@@ -274,7 +310,7 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	blobURL := fmt.Sprintf("https://%s/v2/%s/blobs/%s", p.Registry, p.Repository, url.PathEscape(f.Digest))
+	blobURL := registryURL(p.Registry, fmt.Sprintf("/v2/%s/blobs/%s", p.Repository, url.PathEscape(f.Digest)))
 	resp, err := authorizedGet(ctx, p, blobURL, nil)
 	if err != nil {
 		return nil, err
@@ -288,6 +324,281 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 		size = resp.ContentLength
 	}
 	return downloadReadCloser{ReadCloser: resp.Body, size: size}, nil
+}
+
+// UploadFile describes one layer to publish in an OCI artifact. Open must
+// return a fresh reader on every call so an interrupted request can be retried.
+type UploadFile struct {
+	Name string
+	Size int64
+	Open func() (io.ReadCloser, error)
+}
+
+// PushOptions controls publishing an OCI artifact.
+type PushOptions struct {
+	Concurrency int
+	Overwrite   bool
+	OnProgress  func(int64)
+}
+
+// Push uploads files as OCI layers and publishes one manifest at p.Reference.
+// Blob uploads may run concurrently, but the manifest is published only after
+// every layer succeeds.
+func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) error {
+	if p.File != "" {
+		return errors.New("acr: push destination must be an artifact, not a file")
+	}
+	if strings.Contains(p.Reference, ":") {
+		return errors.New("acr: push destination must use a tag, not a digest")
+	}
+	if !opts.Overwrite {
+		exists, err := ManifestExists(ctx, p)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return fmt.Errorf("%w: %s", ErrArtifactExists, p.String())
+		}
+	}
+	if len(files) == 0 {
+		return errors.New("acr: no files to push")
+	}
+
+	names := make(map[string]struct{}, len(files))
+	for i := range files {
+		cleaned, err := cleanFile(files[i].Name)
+		if err != nil {
+			return fmt.Errorf("acr: invalid upload file name %q: %w", files[i].Name, err)
+		}
+		if _, exists := names[cleaned]; exists {
+			return fmt.Errorf("acr: duplicate upload file name %q", cleaned)
+		}
+		if files[i].Open == nil {
+			return fmt.Errorf("acr: upload file %q has no reader", cleaned)
+		}
+		names[cleaned] = struct{}{}
+		files[i].Name = cleaned
+	}
+
+	configData := []byte("{}")
+	config, err := uploadBlob(ctx, p, UploadFile{
+		Name: "config.json",
+		Size: int64(len(configData)),
+		Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(configData)), nil
+		},
+	}, configMediaType, nil)
+	if err != nil {
+		return fmt.Errorf("acr config upload failed: %w", err)
+	}
+
+	layers := make([]descriptor, len(files))
+	concurrency := opts.Concurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > len(files) && len(files) > 0 {
+		concurrency = len(files)
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	var firstErr error
+	var errMu sync.Mutex
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				layer, err := uploadBlob(workerCtx, p, files[i], layerMediaType, opts.OnProgress)
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("acr layer upload %q failed: %w", files[i].Name, err)
+						cancel()
+					}
+					errMu.Unlock()
+					continue
+				}
+				layer.Annotations = map[string]string{TitleAnnotation: files[i].Name}
+				layers[i] = layer
+			}
+		}()
+	}
+sendFiles:
+	for i := range files {
+		select {
+		case jobs <- i:
+		case <-workerCtx.Done():
+			break sendFiles
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	payload, err := json.Marshal(manifest{
+		SchemaVersion: 2,
+		MediaType:     manifestMediaType,
+		Config:        config,
+		Layers:        layers,
+	})
+	if err != nil {
+		return err
+	}
+	manifestURL := registryURL(p.Registry, fmt.Sprintf("/v2/%s/manifests/%s", p.Repository, url.PathEscape(p.Reference)))
+	headers := http.Header{"Content-Type": []string{manifestMediaType}}
+	if !opts.Overwrite {
+		headers.Set("If-None-Match", "*")
+	}
+	resp, err := authorizedRequest(ctx, p, http.MethodPut, manifestURL, headers,
+		fmt.Sprintf("repository:%s:pull,push", p.Repository),
+		func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(payload)), nil
+		}, int64(len(payload)))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("acr manifest push failed: %w", &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status})
+	}
+	return nil
+}
+
+// ManifestExists reports whether p.Reference currently resolves to a manifest.
+func ManifestExists(ctx context.Context, p Path) (bool, error) {
+	manifestURL := registryURL(p.Registry, fmt.Sprintf("/v2/%s/manifests/%s", p.Repository, url.PathEscape(p.Reference)))
+	resp, err := authorizedRequest(ctx, p, http.MethodHead, manifestURL, http.Header{
+		"Accept": []string{strings.Join(manifestAcceptTypes, ", ")},
+	}, fmt.Sprintf("repository:%s:pull", p.Repository), nil, 0)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return false, nil
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return true, nil
+	default:
+		return false, fmt.Errorf("acr manifest check failed: %w", &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status})
+	}
+}
+
+type uploadReadCloser struct {
+	source     io.ReadCloser
+	hasher     hash.Hash
+	size       int64
+	onProgress func(int64)
+}
+
+func (r *uploadReadCloser) Read(p []byte) (int, error) {
+	n, err := r.source.Read(p)
+	if n > 0 {
+		_, _ = r.hasher.Write(p[:n])
+		r.size += int64(n)
+		if r.onProgress != nil {
+			r.onProgress(int64(n))
+		}
+	}
+	return n, err
+}
+
+func (r *uploadReadCloser) Close() error {
+	return r.source.Close()
+}
+
+func uploadBlob(ctx context.Context, p Path, file UploadFile, mediaType string, onProgress func(int64)) (descriptor, error) {
+	scope := fmt.Sprintf("repository:%s:pull,push", p.Repository)
+	startURL := registryURL(p.Registry, fmt.Sprintf("/v2/%s/blobs/uploads/", p.Repository))
+	resp, err := authorizedRequest(ctx, p, http.MethodPost, startURL, nil, scope, nil, 0)
+	if err != nil {
+		return descriptor{}, err
+	}
+	location := resp.Header.Get("Location")
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return descriptor{}, fmt.Errorf("acr blob upload start failed: %w", &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status})
+	}
+	if location == "" {
+		return descriptor{}, errors.New("acr blob upload start failed: missing Location header")
+	}
+	location, err = resolveLocation(startURL, location)
+	if err != nil {
+		return descriptor{}, err
+	}
+
+	var uploaded *uploadReadCloser
+	resp, err = authorizedRequest(ctx, p, http.MethodPatch, location, http.Header{
+		"Content-Type": []string{"application/octet-stream"},
+	}, scope, func() (io.ReadCloser, error) {
+		source, err := file.Open()
+		if err != nil {
+			return nil, err
+		}
+		uploaded = &uploadReadCloser{
+			source:     source,
+			hasher:     sha256.New(),
+			onProgress: onProgress,
+		}
+		return uploaded, nil
+	}, file.Size)
+	if err != nil {
+		return descriptor{}, err
+	}
+	nextLocation := resp.Header.Get("Location")
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return descriptor{}, fmt.Errorf("acr blob upload failed: %w", &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status})
+	}
+	if uploaded == nil {
+		return descriptor{}, errors.New("acr blob upload failed: request body was not read")
+	}
+	if file.Size >= 0 && uploaded.size != file.Size {
+		return descriptor{}, fmt.Errorf("acr blob upload failed: read %d bytes, expected %d", uploaded.size, file.Size)
+	}
+	if nextLocation != "" {
+		location, err = resolveLocation(location, nextLocation)
+		if err != nil {
+			return descriptor{}, err
+		}
+	}
+	digest := "sha256:" + hex.EncodeToString(uploaded.hasher.Sum(nil))
+	completeURL, err := url.Parse(location)
+	if err != nil {
+		return descriptor{}, err
+	}
+	query := completeURL.Query()
+	query.Set("digest", digest)
+	completeURL.RawQuery = query.Encode()
+	resp, err = authorizedRequest(ctx, p, http.MethodPut, completeURL.String(), nil, scope, nil, 0)
+	if err != nil {
+		return descriptor{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return descriptor{}, fmt.Errorf("acr blob upload completion failed: %w", &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status})
+	}
+	return descriptor{MediaType: mediaType, Digest: digest, Size: uploaded.size}, nil
+}
+
+func resolveLocation(base, location string) (string, error) {
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	locationURL, err := url.Parse(location)
+	if err != nil {
+		return "", err
+	}
+	return baseURL.ResolveReference(locationURL).String(), nil
 }
 
 type downloadReadCloser struct {
@@ -339,7 +650,7 @@ func fetchManifest(ctx context.Context, p Path, reference string, depth int) (*m
 	if p.Repository == "" {
 		return nil, errors.New("acr: missing repository")
 	}
-	manifestURL := fmt.Sprintf("https://%s/v2/%s/manifests/%s", p.Registry, p.Repository, url.PathEscape(reference))
+	manifestURL := registryURL(p.Registry, fmt.Sprintf("/v2/%s/manifests/%s", p.Repository, url.PathEscape(reference)))
 	resp, err := authorizedGet(ctx, p, manifestURL, http.Header{
 		"Accept": []string{strings.Join(manifestAcceptTypes, ", ")},
 	})
@@ -360,10 +671,38 @@ func fetchManifest(ctx context.Context, p Path, reference string, depth int) (*m
 }
 
 func authorizedGet(ctx context.Context, p Path, target string, header http.Header) (*http.Response, error) {
+	return authorizedRequest(ctx, p, http.MethodGet, target, header,
+		fmt.Sprintf("repository:%s:pull", p.Repository), nil, 0)
+}
+
+func authorizedRequest(
+	ctx context.Context,
+	p Path,
+	method string,
+	target string,
+	header http.Header,
+	scope string,
+	bodyFactory func() (io.ReadCloser, error),
+	contentLength int64,
+) (*http.Response, error) {
 	newRequest := func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		var body io.ReadCloser
+		var err error
+		if bodyFactory != nil {
+			body, err = bodyFactory()
+			if err != nil {
+				return nil, err
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, method, target, body)
 		if err != nil {
+			if body != nil {
+				_ = body.Close()
+			}
 			return nil, err
+		}
+		if body != nil && contentLength >= 0 {
+			req.ContentLength = contentLength
 		}
 		for k, values := range header {
 			for _, v := range values {
@@ -372,7 +711,6 @@ func authorizedGet(ctx context.Context, p Path, target string, header http.Heade
 		}
 		return req, nil
 	}
-	scope := fmt.Sprintf("repository:%s:pull", p.Repository)
 	req, err := newRequest()
 	if err != nil {
 		return nil, err
@@ -393,6 +731,7 @@ func authorizedGet(ctx context.Context, p Path, target string, header http.Heade
 	if err != nil {
 		return nil, err
 	}
+	storeToken(p.Registry, scope, token)
 	req, err = newRequest()
 	if err != nil {
 		return nil, err
@@ -470,7 +809,7 @@ func splitChallengeParams(s string) []string {
 func acquireToken(ctx context.Context, registry, scope, challenge string) (string, error) {
 	realm, service, challengeScope := parseChallenge(challenge)
 	if realm == "" {
-		realm = fmt.Sprintf("https://%s/oauth2/token", registry)
+		realm = registryURL(registry, "/oauth2/token")
 	}
 	if service == "" {
 		service = registry
@@ -527,7 +866,7 @@ func entraToken(ctx context.Context, registry, realm, service, scope string) (st
 			slog.Debug("acr: Entra ID token request failed", "audience", audience, "error", err)
 			continue
 		}
-		refreshToken, err := postForm(ctx, fmt.Sprintf("https://%s/oauth2/exchange", registry), url.Values{
+		refreshToken, err := postForm(ctx, registryURL(registry, "/oauth2/exchange"), url.Values{
 			"grant_type":   {"access_token"},
 			"service":      {service},
 			"access_token": {aadToken.Token},

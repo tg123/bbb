@@ -2,12 +2,16 @@ package acr
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -43,6 +47,8 @@ func TestParse(t *testing.T) {
 		{name: "empty tag", raw: "acr://myreg.azurecr.io/models:", wantErr: true},
 		{name: "digest without algorithm", raw: "acr://myreg.azurecr.io/models@abc", wantErr: true},
 		{name: "escaping file path", raw: "acr://myreg.azurecr.io/models:v1/../../etc/passwd", wantErr: true},
+		{name: "backslash escaping file path", raw: `acr://myreg.azurecr.io/models:v1/..\..\outside`, wantErr: true},
+		{name: "backslash in file path", raw: `acr://myreg.azurecr.io/models:v1/sub\file.bin`, wantErr: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -236,6 +242,7 @@ func TestListFilesMergesIndexManifests(t *testing.T) {
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
+
 	})
 
 	p, err := Parse("acr://reg.azurecr.io/models:v1")
@@ -261,5 +268,192 @@ func TestListFilesMergesIndexManifests(t *testing.T) {
 	}
 	if files[2].Size != 7 {
 		t.Fatalf("unexpected size: %#v", files[2])
+	}
+}
+
+func TestPushPublishesManifestAfterUploadingLayers(t *testing.T) {
+	t.Setenv("BBB_ACR_USERNAME", "user")
+	t.Setenv("BBB_ACR_PASSWORD", "pass")
+	tokenCacheMu.Lock()
+	tokenCache = map[string]string{}
+	tokenCacheMu.Unlock()
+
+	var nextUpload atomic.Int64
+	var progress atomic.Int64
+	var mu sync.Mutex
+	staged := map[string][]byte{}
+	blobs := map[string][]byte{}
+	var pushed manifest
+	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth2/token" {
+			if got := r.URL.Query().Get("scope"); got != "repository:models:pull,push" {
+				t.Errorf("unexpected token scope: %s", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "push-token"})
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer push-token" {
+			w.Header().Set("Www-Authenticate", `Bearer realm="https://reg.azurecr.io/oauth2/token",service="reg.azurecr.io",scope="repository:models:pull,push"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/models/blobs/uploads/":
+			id := fmt.Sprintf("%d", nextUpload.Add(1))
+			w.Header().Set("Location", "/uploads/"+id)
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/uploads/"):
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read upload: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			staged[r.URL.Path] = body
+			mu.Unlock()
+			w.Header().Set("Location", r.URL.Path)
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/uploads/"):
+			digest := r.URL.Query().Get("digest")
+			mu.Lock()
+			body := staged[r.URL.Path]
+			sum := sha256.Sum256(body)
+			if digest != fmt.Sprintf("sha256:%x", sum) {
+				t.Errorf("digest %q does not match uploaded body", digest)
+			}
+			blobs[digest] = body
+			mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPut && r.URL.Path == "/v2/models/manifests/v1":
+			if err := json.NewDecoder(r.Body).Decode(&pushed); err != nil {
+				t.Errorf("decode manifest: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	files := []UploadFile{
+		{Name: "a.txt", Size: 3, Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("aaa")), nil
+		}},
+		{Name: "sub/b.txt", Size: 3, Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("bbb")), nil
+		}},
+	}
+	p := Path{Registry: "reg.azurecr.io", Repository: "models", Reference: "v1"}
+	if err := Push(t.Context(), p, files, PushOptions{
+		Concurrency: 2,
+		Overwrite:   true,
+		OnProgress:  func(n int64) { progress.Add(n) },
+	}); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	if progress.Load() != 6 {
+		t.Fatalf("unexpected progress: %d", progress.Load())
+	}
+	if pushed.SchemaVersion != 2 || pushed.MediaType != manifestMediaType {
+		t.Fatalf("unexpected manifest header: %#v", pushed)
+	}
+	if len(pushed.Layers) != 2 {
+		t.Fatalf("unexpected layers: %#v", pushed.Layers)
+	}
+	if pushed.Layers[0].Annotations[TitleAnnotation] != "a.txt" ||
+		pushed.Layers[1].Annotations[TitleAnnotation] != "sub/b.txt" {
+		t.Fatalf("unexpected layer names: %#v", pushed.Layers)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if string(blobs[pushed.Layers[0].Digest]) != "aaa" ||
+		string(blobs[pushed.Layers[1].Digest]) != "bbb" {
+		t.Fatalf("manifest does not reference uploaded blobs")
+	}
+	if string(blobs[pushed.Config.Digest]) != "{}" {
+		t.Fatalf("unexpected config blob: %q", blobs[pushed.Config.Digest])
+	}
+}
+
+func TestPushRefusesExistingTagWithoutOverwrite(t *testing.T) {
+	tokenCacheMu.Lock()
+	tokenCache = map[string]string{}
+	tokenCacheMu.Unlock()
+	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && r.URL.Path == "/v2/models/manifests/v1" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	err := Push(t.Context(), Path{
+		Registry: "reg.azurecr.io", Repository: "models", Reference: "v1",
+	}, nil, PushOptions{})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected existing artifact error, got %v", err)
+	}
+}
+
+func TestPushRejectsEmptyArtifact(t *testing.T) {
+	err := Push(t.Context(), Path{
+		Registry: "reg.azurecr.io", Repository: "models", Reference: "v1",
+	}, nil, PushOptions{Overwrite: true})
+	if err == nil || !strings.Contains(err.Error(), "no files") {
+		t.Fatalf("expected no-files error, got %v", err)
+	}
+}
+
+// A registry controls layer titles, so a malicious title must not be able to
+// escape the destination directory once joined with a local path.
+func TestListFilesRejectsBackslashLayerTitle(t *testing.T) {
+	tokenCacheMu.Lock()
+	tokenCache = map[string]string{}
+	tokenCacheMu.Unlock()
+
+	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/models/manifests/v1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"layers": []map[string]any{
+					{
+						"digest":      "sha256:abc",
+						"size":        3,
+						"annotations": map[string]string{TitleAnnotation: `..\..\outside.txt`},
+					},
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	p := Path{Registry: "reg.azurecr.io", Repository: "models", Reference: "v1"}
+	if _, err := ListFiles(t.Context(), p); err == nil || !strings.Contains(err.Error(), "invalid layer name") {
+		t.Fatalf("expected invalid layer name error, got %v", err)
+	}
+}
+
+func TestPushRejectsBackslashFileName(t *testing.T) {
+	err := Push(t.Context(), Path{
+		Registry: "reg.azurecr.io", Repository: "models", Reference: "v1",
+	}, []UploadFile{{
+		Name: `..\..\outside.txt`,
+		Size: 1,
+		Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("x")), nil
+		},
+	}}, PushOptions{Overwrite: true})
+	if err == nil || !strings.Contains(err.Error(), "invalid upload file name") {
+		t.Fatalf("expected invalid upload file name error, got %v", err)
+	}
+}
+
+func TestRegistryURLOverride(t *testing.T) {
+	t.Setenv("BBB_ACR_ENDPOINT", "http://%s")
+	if got := registryURL("localhost:5000", "/v2/"); got != "http://localhost:5000/v2/" {
+		t.Fatalf("unexpected registry URL: %s", got)
 	}
 }

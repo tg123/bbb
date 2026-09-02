@@ -16,6 +16,12 @@ services:
     depends_on:
       - azurite
 
+  registry:
+    image: registry:2.8.3
+    network_mode: service:azurite
+    depends_on:
+      - azurite
+
   bbb:
     network_mode: service:azurite
     build:
@@ -29,9 +35,11 @@ services:
       - BBB_S3_REGION=us-east-1
       - AWS_ACCESS_KEY_ID=minioadmin
       - AWS_SECRET_ACCESS_KEY=minioadmin
+      - BBB_ACR_ENDPOINT=http://%s
     depends_on:
       - azurite
       - minio
+      - registry
     volumes:
       - ../..:/src
     working_dir: /src/internal/e2e

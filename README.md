@@ -56,7 +56,7 @@ To use Azure CLI / managed identity based login, mount the host credentials, e.g
 | `az://` | Azure Blob Storage | `az://myaccount/mycontainer/path/to/blob` |
 | `s3://` | Amazon S3 (and S3-compatible stores) | `s3://mybucket/path/to/object` |
 | `hf://` | Hugging Face Hub | `hf://meta-llama/Llama-2-7b/weights.bin`, `hf://datasets/org/repo/data.csv` |
-| `acr://` | Azure Container Registry (OCI artifacts, read-only) | `acr://myregistry.azurecr.io/models/llama:v1`, `acr://myregistry/models/llama:v1/weights.bin` |
+| `acr://` | Azure Container Registry (OCI artifacts) | `acr://myregistry.azurecr.io/models/llama:v1`, `acr://myregistry/models/llama:v1/weights.bin` |
 
 ### `acr://` paths
 
@@ -68,15 +68,25 @@ acr://<registry>/<repository>@<digest>[/<file>]
 acr://<registry>/<repository>              # defaults to the "latest" tag
 ```
 
-A registry name without a dot is expanded to `<name>.azurecr.io`. The "files" of an artifact are its layers; each layer's name comes from the standard `org.opencontainers.image.title` annotation, falling back to its digest (e.g. `sha256-abc...`) when the annotation is missing. Because a file name follows the tag or digest, a file can only be addressed on a path that specifies one.
+A registry name without a dot is expanded to `<name>.azurecr.io`. The "files" of an artifact are its layers; each layer's name comes from the standard `org.opencontainers.image.title` annotation, falling back to its digest (e.g. `sha256-abc...`) when the annotation is missing. Because a file name follows the tag or digest, a file can only be addressed on a path that specifies one. Layer names are validated before use: absolute paths, `..` traversal and backslashes are rejected, so a registry cannot write outside the chosen destination directory.
 
-The backend is **read-only**: `acr://` may only be used as a source for `cp` and `sync`.
+An `acr://` destination must identify an artifact tag, not an individual file or digest. Copying or syncing one local file or directory uploads each file as an OCI layer and publishes the tag only after every layer succeeds:
+
+```bash
+bbb cp ./llama-artifact/ acr://myregistry/models/llama:v1
+bbb cp ./weights.bin acr://myregistry/models/weights:v1
+bbb sync ./llama-artifact/ acr://myregistry/models/llama:v1
+```
+
+Use `-f` with `cp` to replace an existing tag. `sync` always replaces the destination tag; its exclude filter controls which files become layers.
 
 Authentication is resolved in this order:
 
 1. `BBB_ACR_USERNAME` / `BBB_ACR_PASSWORD` (registry credentials or a token, used as HTTP basic auth against the registry token endpoint)
 2. Entra ID (Azure AD) via `DefaultAzureCredential` — Azure CLI login, service principal, managed identity, workload identity — exchanged for a registry token
 3. Anonymous pull (for registries with anonymous pull enabled)
+
+Writing requires credentials with push access to the target repository.
 
 ## Global Flags
 
@@ -112,6 +122,7 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
 | `BBB_ACR_USERNAME` | | Username for `acr://` registry authentication (used with `BBB_ACR_PASSWORD`) |
 | `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
+| `BBB_ACR_ENDPOINT` | `https://%s` | Registry endpoint template; `%s` is replaced by the registry from the `acr://` path (useful for local OCI registries) |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
 | `BBB_PARALLEL_DOWNLOAD` | `1` (`true`) | Set to `0` or `false` to disable parallel ranged Azure→local single-file downloads and fall back to a single streaming connection |
@@ -534,7 +545,7 @@ bbb touch az://myaccount/mycontainer/marker.txt
 
 Aliases: `cpr`, `cptree`
 
-Copy one or more source files/directories to a destination. Supports local and Azure Blob paths in any combination. Hugging Face (`hf://`) and Azure Container Registry (`acr://`) paths are supported as a **source only** (both backends are read-only).
+Copy one or more source files/directories to a destination. Supports local and Azure Blob paths in any combination. Hugging Face (`hf://`) is source-only. Azure Container Registry (`acr://`) can be a source, or a destination when pushing one local file or directory as an OCI artifact.
 
 ```
 bbb cp [flags] src [src ...] dst
@@ -567,11 +578,14 @@ bbb cp az://myaccount/src-container/data/ az://myaccount/dst-container/data/
 # Download from Hugging Face (hf:// is source-only)
 bbb cp hf://meta-llama/Llama-2-7b/ ./llama-model/
 
-# Download an OCI artifact from Azure Container Registry (acr:// is source-only)
+# Download an OCI artifact from Azure Container Registry
 bbb cp acr://myregistry/models/llama:v1 ./llama-artifact/
 
 # Download a single file from an artifact
 bbb cp acr://myregistry/models/llama:v1/weights.bin ./weights.bin
+
+# Push a local directory as one OCI artifact
+bbb cp ./llama-artifact/ acr://myregistry/models/llama:v1
 
 # Copy multiple sources to one destination
 bbb cp file1.txt file2.txt az://myaccount/mycontainer/uploads/
@@ -681,11 +695,18 @@ bbb sync [flags] src dst
 | `--taskfile FILE` | Batch task file with one `src dst` pair per line; use `-` for stdin |
 | `--state FILE` | State file for crash recovery / resuming interrupted operations |
 | `--dry-run` | Show what would be done without making changes |
-| `--delete` | Delete destination files that don't exist in source |
+| `--delete` | Delete destination files that don't exist in source (local→local only; see note below) |
 | `-x`, `--exclude PATTERN` | Exclude files matching this regex pattern |
 | `-q`, `--quiet` | Suppress output |
 | `--concurrency N` | Number of concurrent transfers (default: CPU cores) |
 | `--retry-count N` | Number of retries on failure (default: `0`) |
+
+> **`--delete` support:** The delete phase is only implemented for local→local
+> syncs. For remote destinations (`az://`, `s3://`) `bbb` copies the source but
+> keeps stale destination files, and prints a warning saying so. With an
+> `acr://` source, `--delete` is rejected outright. An `acr://` destination
+> needs no delete phase: the push replaces the tag with a manifest listing
+> exactly the selected source files.
 
 **Examples:**
 
@@ -696,8 +717,8 @@ bbb sync ./data/ az://myaccount/mycontainer/data/
 # Sync from Azure to local
 bbb sync az://myaccount/mycontainer/data/ ./local-data/
 
-# Mirror (delete extra files at destination)
-bbb sync --delete ./source/ az://myaccount/mycontainer/dest/
+# Mirror (delete extra files at destination; local→local only)
+bbb sync --delete ./source/ ./dest/
 
 # Preview changes without applying
 bbb sync --dry-run ./data/ az://myaccount/mycontainer/data/

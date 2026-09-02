@@ -1334,6 +1334,25 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 	}
 
+	acrDestinations := make(map[string]struct{})
+	for _, task := range tasks {
+		if !bbbfs.IsACR(task.dst) {
+			continue
+		}
+		if bbbfs.IsRemote(task.src) {
+			return fmt.Errorf("cp: acr:// destinations require a local source")
+		}
+		destination, err := acr.Parse(task.dst)
+		if err != nil {
+			return fmt.Errorf("cp: %w", err)
+		}
+		key := destination.Registry + "/" + destination.Repository + "@" + destination.Reference
+		if _, duplicate := acrDestinations[key]; duplicate {
+			return fmt.Errorf("cp: multiple sources cannot target the same acr:// artifact")
+		}
+		acrDestinations[key] = struct{}{}
+	}
+
 	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
 }
 
@@ -1605,7 +1624,10 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		return fmt.Errorf("cp: hf:// only supported as source")
 	}
 	if bbbfs.IsACR(dst) {
-		return fmt.Errorf("cp: acr:// only supported as source")
+		if len(srcs) != 1 {
+			return fmt.Errorf("cp: acr:// destination requires exactly one local file or directory")
+		}
+		return pushLocalArtifact(ctx, srcs[0], dst, overwrite, quiet, showCopyBar, concurrency, retryCount, nil, onBytes)
 	}
 	dstObj := bbbfs.IsObjectStore(dst)
 	// Determine if dst is directory (local or remote object store)
@@ -2055,6 +2077,130 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		return size, nil
 	}); err != nil {
 		return fmt.Errorf("cp: file operations: %w", err)
+	}
+	return nil
+}
+
+func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.ArtifactFile, int64, error) {
+	info, err := os.Stat(src)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !info.IsDir() {
+		if !info.Mode().IsRegular() {
+			return nil, 0, fmt.Errorf("unsupported source file type: %s", src)
+		}
+		name := filepath.Base(src)
+		if exclude != nil && exclude(name) {
+			return nil, 0, nil
+		}
+		return []bbbfs.ArtifactFile{{
+			Name: name,
+			Size: info.Size(),
+			Open: func() (io.ReadCloser, error) {
+				return os.Open(src)
+			},
+		}}, info.Size(), nil
+	}
+
+	var files []bbbfs.ArtifactFile
+	var total int64
+	err = filepath.WalkDir(src, func(localPath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(src, localPath)
+		if err != nil {
+			return err
+		}
+		name := filepath.ToSlash(rel)
+		if exclude != nil && exclude(name) {
+			return nil
+		}
+		fileInfo, err := os.Stat(localPath)
+		if err != nil {
+			return err
+		}
+		if !fileInfo.Mode().IsRegular() {
+			return fmt.Errorf("unsupported source file type: %s", localPath)
+		}
+		pathToOpen := localPath
+		files = append(files, bbbfs.ArtifactFile{
+			Name: name,
+			Size: fileInfo.Size(),
+			Open: func() (io.ReadCloser, error) {
+				return os.Open(pathToOpen)
+			},
+		})
+		total += fileInfo.Size()
+		return nil
+	})
+	return files, total, err
+}
+
+func pushLocalArtifact(
+	ctx context.Context,
+	src, dst string,
+	overwrite, quiet, showProgress bool,
+	concurrency, retryCount int,
+	exclude func(string) bool,
+	onBytes func(int64),
+) error {
+	if bbbfs.IsRemote(src) {
+		return errors.New("acr:// destinations require a local source")
+	}
+	files, total, err := collectLocalArtifactFiles(src, exclude)
+	if err != nil {
+		return err
+	}
+	var bar *progressBar
+	if showProgress {
+		bar = newStreamingProgressBar(filepath.Base(src), quiet, true)
+		if bar != nil {
+			bar.byteSized = true
+			if total > 0 {
+				bar.SetTotal(total)
+			}
+		}
+	}
+	var reported atomic.Int64
+	err = retryOp(ctx, retryCount, func() error {
+		var uploaded atomic.Int64
+		return bbbfs.UploadArtifact(ctx, dst, files, concurrency, overwrite, func(delta int64) {
+			copied := uploaded.Add(delta)
+			if onBytes != nil {
+				for {
+					previous := reported.Load()
+					if copied <= previous {
+						break
+					}
+					if reported.CompareAndSwap(previous, copied) {
+						onBytes(copied - previous)
+						break
+					}
+				}
+			}
+			if bar != nil {
+				atomicMax(&bar.bytesDone, copied)
+				atomicMax(&bar.done, copied)
+				bar.render(copied)
+			}
+		})
+	})
+	if err != nil {
+		if bar != nil {
+			bar.Abort()
+		}
+		return err
+	}
+	if bar != nil {
+		bar.Finish()
+	}
+	if !quiet {
+		lockedPrintf("Pushed %s -> %s\n", src, dst)
 	}
 	return nil
 }
@@ -2645,9 +2791,6 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 	if bbbfs.IsHF(dst) {
 		return fmt.Errorf("sync: hf:// only supported as source")
 	}
-	if bbbfs.IsACR(dst) {
-		return fmt.Errorf("sync: acr:// only supported as source")
-	}
 	srcACR := bbbfs.IsACR(src)
 	if srcACR {
 		dirLike, err := bbbfs.IsDirLike(ctx, src)
@@ -2683,6 +2826,24 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		excludeMatch = func(rel string) bool { return re.MatchString(rel) }
 	} else {
 		excludeMatch = func(string) bool { return false }
+	}
+	if bbbfs.IsACR(dst) {
+		if bbbfs.IsRemote(src) {
+			return fmt.Errorf("sync: acr:// destinations require a local source")
+		}
+		if dry {
+			if !quiet {
+				lockedPrintln("PUSH", src, "->", dst)
+			}
+			return nil
+		}
+		// --delete needs no separate phase here: the pushed manifest replaces
+		// the tag and lists exactly the selected source files, so anything
+		// previously in the artifact is already gone.
+		return pushLocalArtifact(ctx, src, dst, true, quiet, !quiet, concurrency, retryCount, excludeMatch, nil)
+	}
+	if del && srcACR {
+		return errors.New("sync: --delete is not supported with an acr:// source")
 	}
 	if bbbfs.IsObjectStore(src) || bbbfs.IsObjectStore(dst) || srcHF || srcACR {
 		srcObj, dstObj := bbbfs.IsObjectStore(src), bbbfs.IsObjectStore(dst)
@@ -2941,7 +3102,12 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				syncProgress.Finish()
 			}
 		}
-		// delete phase not implemented for cloud combos yet
+		// The delete phase is not implemented for remote combinations yet.
+		// Warn instead of silently ignoring the flag, so a caller expecting a
+		// mirror knows stale destination files were kept.
+		if del && workerErr == nil {
+			lockedFprintf(os.Stderr, "sync: --delete is not implemented for %s; stale files were kept\n", dst)
+		}
 		return workerErr
 	}
 	// collect source files

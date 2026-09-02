@@ -143,6 +143,14 @@ func TestCmdSyncRejectsHFFilePath(t *testing.T) {
 	}
 }
 
+func TestCmdSyncRejectsDeleteWithACRSource(t *testing.T) {
+	err := cmdSyncPaths(context.Background(), false, true, true, "", 1, 0,
+		"acr://myreg.azurecr.io/models:v1", t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "--delete is not supported") {
+		t.Fatalf("expected --delete rejection for acr source, got %v", err)
+	}
+}
+
 func TestCPDirectoryCopiesTree(t *testing.T) {
 	dir := t.TempDir()
 	srcDir := filepath.Join(dir, "src")
@@ -168,6 +176,61 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dstDir, "sub", "file.txt")); err != nil {
 		t.Fatalf("expected copied file: %v", err)
+	}
+}
+
+func TestExpandCPTaskKeepsACRArtifactAtomic(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var expanded []cpTask
+	err := expandCPTask(t.Context(), taskPair{
+		src: source,
+		dst: "acr://registry.example.com/models:v1",
+	}, func(task cpTask) error {
+		expanded = append(expanded, task)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expandCPTask failed: %v", err)
+	}
+	if len(expanded) != 1 || expanded[0].src != source {
+		t.Fatalf("expected one artifact-level task, got %#v", expanded)
+	}
+}
+
+func TestCollectLocalArtifactFiles(t *testing.T) {
+	source := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(source, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "sub", "b.txt"), []byte("bravo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files, total, err := collectLocalArtifactFiles(source, func(name string) bool {
+		return name == "a.txt"
+	})
+	if err != nil {
+		t.Fatalf("collectLocalArtifactFiles failed: %v", err)
+	}
+	if total != 5 || len(files) != 1 || files[0].Name != "sub/b.txt" {
+		t.Fatalf("unexpected artifact files: total=%d files=%#v", total, files)
+	}
+	reader, err := files[0].Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "bravo" {
+		t.Fatalf("unexpected file content: %q", content)
 	}
 }
 

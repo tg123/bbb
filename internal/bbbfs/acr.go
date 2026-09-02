@@ -28,7 +28,29 @@ func (acrFS) Read(ctx context.Context, p string) (io.ReadCloser, error) {
 }
 
 func (acrFS) Write(_ context.Context, _ string, _ io.Reader) error {
+	// OCI manifests must be published once for the complete file set; callers
+	// use UploadArtifact rather than racing per-file Write calls.
 	return ErrWriteUnsupported
+}
+
+func (acrFS) UploadArtifact(ctx context.Context, target string, files []ArtifactFile, concurrency int, overwrite bool, onProgress func(int64)) error {
+	ap, err := acr.Parse(target)
+	if err != nil {
+		return err
+	}
+	uploadFiles := make([]acr.UploadFile, len(files))
+	for i, file := range files {
+		uploadFiles[i] = acr.UploadFile{
+			Name: file.Name,
+			Size: file.Size,
+			Open: file.Open,
+		}
+	}
+	return acr.Push(ctx, ap, uploadFiles, acr.PushOptions{
+		Concurrency: concurrency,
+		Overwrite:   overwrite,
+		OnProgress:  onProgress,
+	})
 }
 
 func (acrFS) List(ctx context.Context, target string) ([]Entry, error) {

@@ -342,6 +342,27 @@ func UploadReader(ctx context.Context, dst string, r io.Reader, concurrency int,
 	return Resolve(dst).Write(ctx, dst, r)
 }
 
+// ArtifactFile describes one file to publish in an artifact-oriented backend.
+// Open must return a fresh reader for each call.
+type ArtifactFile struct {
+	Name string
+	Size int64
+	Open func() (io.ReadCloser, error)
+}
+
+type artifactUploader interface {
+	UploadArtifact(ctx context.Context, dst string, files []ArtifactFile, concurrency int, overwrite bool, onProgress func(int64)) error
+}
+
+// UploadArtifact publishes files atomically as one backend artifact.
+func UploadArtifact(ctx context.Context, dst string, files []ArtifactFile, concurrency int, overwrite bool, onProgress func(int64)) error {
+	uploader, ok := Resolve(dst).(artifactUploader)
+	if !ok {
+		return fmt.Errorf("artifact upload not supported for %s", dst)
+	}
+	return uploader.UploadArtifact(ctx, dst, files, concurrency, overwrite, onProgress)
+}
+
 // streamLister is an optional FS extension for streaming list.
 type streamLister interface {
 	ListStream(ctx context.Context, path string, fn func(Entry) error) error
@@ -429,13 +450,19 @@ func ExistsAsBlob(ctx context.Context, p string) (bool, error) {
 // IsNonRetryableHTTPErr returns true when err is an HTTP 401, 403, or 404
 // from any supported backend, indicating a non-retryable failure.
 func IsNonRetryableHTTPErr(err error) bool {
+	if errors.Is(err, acr.ErrArtifactExists) {
+		return true
+	}
 	var hfErr *hf.HTTPStatusError
 	if errors.As(err, &hfErr) && (hfErr.StatusCode == 401 || hfErr.StatusCode == 403 || hfErr.StatusCode == 404) {
 		return true
 	}
 	var acrErr *acr.HTTPStatusError
-	if errors.As(err, &acrErr) && (acrErr.StatusCode == 401 || acrErr.StatusCode == 403 || acrErr.StatusCode == 404) {
-		return true
+	if errors.As(err, &acrErr) {
+		switch acrErr.StatusCode {
+		case 401, 403, 404, 409, 412:
+			return true
+		}
 	}
 	var azErr *azcore.ResponseError
 	if errors.As(err, &azErr) && (azErr.StatusCode == 401 || azErr.StatusCode == 403 || azErr.StatusCode == 404) {
