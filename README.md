@@ -1,6 +1,6 @@
 # bbb
 
-A Go fork of [boostedblob](https://github.com/hauntsaninja/boostedblob) — a fast, concurrent CLI for working with local files, Azure Blob Storage (`az://`), Amazon S3 (`s3://`), and Hugging Face (`hf://`).
+A Go fork of [boostedblob](https://github.com/hauntsaninja/boostedblob) — a fast, concurrent CLI for working with local files, Azure Blob Storage (`az://`), Amazon S3 (`s3://`), Hugging Face (`hf://`), and Azure Container Registry artifacts (`acr://`).
 
 ## Why a fork of boostedblob
 
@@ -56,6 +56,27 @@ To use Azure CLI / managed identity based login, mount the host credentials, e.g
 | `az://` | Azure Blob Storage | `az://myaccount/mycontainer/path/to/blob` |
 | `s3://` | Amazon S3 (and S3-compatible stores) | `s3://mybucket/path/to/object` |
 | `hf://` | Hugging Face Hub | `hf://meta-llama/Llama-2-7b/weights.bin`, `hf://datasets/org/repo/data.csv` |
+| `acr://` | Azure Container Registry (OCI artifacts, read-only) | `acr://myregistry.azurecr.io/models/llama:v1`, `acr://myregistry/models/llama:v1/weights.bin` |
+
+### `acr://` paths
+
+An `acr://` path addresses an OCI artifact in an Azure Container Registry (or any registry implementing the OCI distribution spec):
+
+```
+acr://<registry>/<repository>:<tag>[/<file>]
+acr://<registry>/<repository>@<digest>[/<file>]
+acr://<registry>/<repository>              # defaults to the "latest" tag
+```
+
+A registry name without a dot is expanded to `<name>.azurecr.io`. The "files" of an artifact are its layers; each layer's name comes from the standard `org.opencontainers.image.title` annotation, falling back to its digest (e.g. `sha256-abc...`) when the annotation is missing. Because a file name follows the tag or digest, a file can only be addressed on a path that specifies one.
+
+The backend is **read-only**: `acr://` may only be used as a source for `cp` and `sync`.
+
+Authentication is resolved in this order:
+
+1. `BBB_ACR_USERNAME` / `BBB_ACR_PASSWORD` (registry credentials or a token, used as HTTP basic auth against the registry token endpoint)
+2. Entra ID (Azure AD) via `DefaultAzureCredential` — Azure CLI login, service principal, managed identity, workload identity — exchanged for a registry token
+3. Anonymous pull (for registries with anonymous pull enabled)
 
 ## Global Flags
 
@@ -89,6 +110,8 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_DNS_CACHE` | *(off)* | Set to `1` or `true` to enable process-local DNS caching |
 | `BBB_DNS_PIN` | *(off)* | Set to `1` or `true` to pin DNS to a single IP (implies `BBB_DNS_CACHE=1`) |
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
+| `BBB_ACR_USERNAME` | | Username for `acr://` registry authentication (used with `BBB_ACR_PASSWORD`) |
+| `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
 | `BBB_PARALLEL_DOWNLOAD` | `1` (`true`) | Set to `0` or `false` to disable parallel ranged Azure→local single-file downloads and fall back to a single streaming connection |
@@ -368,6 +391,9 @@ bbb ls -l az://myaccount/mycontainer/
 
 # List Hugging Face repo files with relative paths
 bbb ls -s hf://meta-llama/Llama-2-7b/
+
+# List the files of an OCI artifact in Azure Container Registry
+bbb ls acr://myregistry/models/llama:v1
 ```
 
 ---
@@ -508,7 +534,7 @@ bbb touch az://myaccount/mycontainer/marker.txt
 
 Aliases: `cpr`, `cptree`
 
-Copy one or more source files/directories to a destination. Supports local and Azure Blob paths in any combination. Hugging Face (`hf://`) paths are supported as a **source only** (the `hf://` backend is read-only).
+Copy one or more source files/directories to a destination. Supports local and Azure Blob paths in any combination. Hugging Face (`hf://`) and Azure Container Registry (`acr://`) paths are supported as a **source only** (both backends are read-only).
 
 ```
 bbb cp [flags] src [src ...] dst
@@ -540,6 +566,12 @@ bbb cp az://myaccount/src-container/data/ az://myaccount/dst-container/data/
 
 # Download from Hugging Face (hf:// is source-only)
 bbb cp hf://meta-llama/Llama-2-7b/ ./llama-model/
+
+# Download an OCI artifact from Azure Container Registry (acr:// is source-only)
+bbb cp acr://myregistry/models/llama:v1 ./llama-artifact/
+
+# Download a single file from an artifact
+bbb cp acr://myregistry/models/llama:v1/weights.bin ./weights.bin
 
 # Copy multiple sources to one destination
 bbb cp file1.txt file2.txt az://myaccount/mycontainer/uploads/

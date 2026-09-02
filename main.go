@@ -29,6 +29,7 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/tg123/bbb/internal/acr"
 	"github.com/tg123/bbb/internal/azblob"
 	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/fsops"
@@ -268,7 +269,7 @@ func run(args []string) int {
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
 		Name:    "bbb",
-		Usage:   "filesystem helper (local + az:// / https://blob / hf://)",
+		Usage:   "filesystem helper (local + az:// / https://blob / hf:// / acr://)",
 		Version: version(),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -394,6 +395,7 @@ func run(args []string) int {
 				// early enough.
 				azblob.SetHTTPTransport(transport)
 				hf.SetHTTPClient(&http.Client{Transport: transport})
+				acr.SetHTTPClient(&http.Client{Transport: transport})
 				s3pkg.SetHTTPClient(&http.Client{Transport: transport})
 			}
 
@@ -1602,6 +1604,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	if bbbfs.IsHF(dst) {
 		return fmt.Errorf("cp: hf:// only supported as source")
 	}
+	if bbbfs.IsACR(dst) {
+		return fmt.Errorf("cp: acr:// only supported as source")
+	}
 	dstObj := bbbfs.IsObjectStore(dst)
 	// Determine if dst is directory (local or remote object store)
 	isDstDir := bbbfs.IsDirLikeFromPath(dst)
@@ -1623,7 +1628,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		src := src
 		srcObj := bbbfs.IsObjectStore(src)
 		base := bbbfs.BaseName(src)
-		if bbbfs.IsHF(src) || srcObj {
+		if bbbfs.IsHF(src) || bbbfs.IsACR(src) || srcObj {
 			dirLike, err := bbbfs.IsDirLike(ctx, src)
 			if err != nil {
 				return err
@@ -2640,6 +2645,19 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 	if bbbfs.IsHF(dst) {
 		return fmt.Errorf("sync: hf:// only supported as source")
 	}
+	if bbbfs.IsACR(dst) {
+		return fmt.Errorf("sync: acr:// only supported as source")
+	}
+	srcACR := bbbfs.IsACR(src)
+	if srcACR {
+		dirLike, err := bbbfs.IsDirLike(ctx, src)
+		if err != nil {
+			return fmt.Errorf("sync: %w", err)
+		}
+		if !dirLike {
+			return errors.New("sync: acr:// path must target an artifact, not individual files")
+		}
+	}
 	srcHF := bbbfs.IsHF(src)
 	if srcHF && !bbbfs.IsAz(dst) {
 		return fmt.Errorf("sync: hf:// only supported with az:// destination")
@@ -2666,7 +2684,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 	} else {
 		excludeMatch = func(string) bool { return false }
 	}
-	if bbbfs.IsObjectStore(src) || bbbfs.IsObjectStore(dst) || srcHF {
+	if bbbfs.IsObjectStore(src) || bbbfs.IsObjectStore(dst) || srcHF || srcACR {
 		srcObj, dstObj := bbbfs.IsObjectStore(src), bbbfs.IsObjectStore(dst)
 		// dstAz gates the HF→Az server-side copy fast path below; the HF
 		// source guard above already requires an az:// destination.
@@ -2717,9 +2735,9 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 					return sendOp(ctx, pending, item{rel: entry.Name, size: entry.Size})
 				})
 			}
-			// HF and local→remote: collect first, then feed
+			// HF, ACR and local→remote: collect first, then feed
 			var files []item
-			if srcHF {
+			if srcHF || srcACR {
 				list, err := syncRemoteFiles(ctx, src, excludeMatch)
 				if err != nil {
 					return err

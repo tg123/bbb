@@ -13,6 +13,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
+	"github.com/tg123/bbb/internal/acr"
 	"github.com/tg123/bbb/internal/hf"
 )
 
@@ -112,6 +113,11 @@ func IsHF(path string) bool {
 	return hfProvider.Match(path)
 }
 
+// IsACR returns true if the path targets an Azure Container Registry backend.
+func IsACR(path string) bool {
+	return acrProvider.Match(path)
+}
+
 // IsS3 returns true if the path targets an Amazon S3 (or S3-compatible) backend.
 func IsS3(path string) bool {
 	return s3Provider.Match(path)
@@ -126,7 +132,7 @@ func IsObjectStore(path string) bool {
 
 // IsRemote returns true if the path targets a remote (non-local) backend.
 func IsRemote(path string) bool {
-	return IsAz(path) || IsHF(path) || IsS3(path)
+	return IsAz(path) || IsHF(path) || IsS3(path) || IsACR(path)
 }
 
 // dirChecker is an optional FS extension for checking whether a path is directory-like.
@@ -425,6 +431,10 @@ func ExistsAsBlob(ctx context.Context, p string) (bool, error) {
 func IsNonRetryableHTTPErr(err error) bool {
 	var hfErr *hf.HTTPStatusError
 	if errors.As(err, &hfErr) && (hfErr.StatusCode == 401 || hfErr.StatusCode == 403 || hfErr.StatusCode == 404) {
+		return true
+	}
+	var acrErr *acr.HTTPStatusError
+	if errors.As(err, &acrErr) && (acrErr.StatusCode == 401 || acrErr.StatusCode == 403 || acrErr.StatusCode == 404) {
 		return true
 	}
 	var azErr *azcore.ResponseError
