@@ -2,6 +2,7 @@ package acr
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -70,6 +72,17 @@ func TestParse(t *testing.T) {
 		{name: "quote character", raw: `acr://myreg.azurecr.io/models:v1/a".txt`, wantErr: true},
 		{name: "angle bracket", raw: "acr://myreg.azurecr.io/models:v1/a<b.txt", wantErr: true},
 		{name: "control character", raw: "acr://myreg.azurecr.io/models:v1/a\x01b.txt", wantErr: true},
+		{name: "traversal that cleans away", raw: "acr://myreg.azurecr.io/models:v1/sub/../secret.txt", wantErr: true},
+		{
+			name: "localhost is a real registry, not an Azure short name",
+			raw:  "acr://localhost/models:v1",
+			want: Path{Registry: "localhost", Repository: "models", Reference: "v1"},
+		},
+		{
+			name: "localhost with a port is unchanged",
+			raw:  "acr://localhost:5000/models:v1",
+			want: Path{Registry: "localhost:5000", Repository: "models", Reference: "v1"},
+		},
 		{
 			name: "name merely containing a device name is fine",
 			raw:  "acr://myreg.azurecr.io/models:v1/console.log",
@@ -703,14 +716,92 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func TestValidatePushTarget(t *testing.T) {
-	if err := ValidatePushTarget(Path{Repository: "models", Reference: "v1"}); err != nil {
+	if err := ValidatePushTarget(Path{Registry: "reg.azurecr.io", Repository: "models", Reference: "v1"}); err != nil {
 		t.Fatalf("expected tag target to be valid: %v", err)
 	}
-	if err := ValidatePushTarget(Path{Repository: "models", Reference: "sha256:abc"}); err == nil {
+	if err := ValidatePushTarget(Path{Registry: "reg.azurecr.io", Repository: "models", Reference: "sha256:abc"}); err == nil {
 		t.Fatal("expected a digest target to be rejected")
 	}
-	if err := ValidatePushTarget(Path{Repository: "models", Reference: "v1", File: "a.txt"}); err == nil {
+	if err := ValidatePushTarget(Path{Registry: "reg.azurecr.io", Repository: "models", Reference: "v1", File: "a.txt"}); err == nil {
 		t.Fatal("expected a file target to be rejected")
+	}
+	// A dry run must reject what the real push would, so the target check also
+	// covers transport security and reference syntax.
+	if err := ValidatePushTarget(Path{Registry: "10.1.2.3", Repository: "models", Reference: "v1"}); err == nil {
+		t.Fatal("expected a plain-HTTP registry to be rejected")
+	}
+	if err := ValidatePushTarget(Path{Registry: "reg.azurecr.io", Repository: "Models", Reference: "v1"}); err == nil {
+		t.Fatal("expected an invalid repository name to be rejected")
+	}
+}
+
+func TestTokenExpiry(t *testing.T) {
+	encode := func(claims string) string {
+		return "h." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".s"
+	}
+	exp := time.Now().Add(3 * time.Hour)
+	got := tokenExpiry(encode(fmt.Sprintf(`{"exp":%d}`, exp.Unix())))
+	// Renewal is scheduled slightly before the token actually lapses.
+	if !got.Before(exp) || got.Before(exp.Add(-tokenRefreshMargin-time.Minute)) {
+		t.Fatalf("expiry %v is not shortly before %v", got, exp)
+	}
+	// A token that cannot be parsed, or one already expired, still yields a
+	// usable near-term refresh rather than a zero time.
+	for _, token := range []string{
+		"not-a-jwt",
+		encode(`{"exp":1}`),
+		encode("{}"),
+	} {
+		if fallback := tokenExpiry(token); !fallback.After(time.Now()) {
+			t.Errorf("tokenExpiry(%q) = %v, want a future time", token, fallback)
+		}
+	}
+}
+
+// An expired token must be re-exchanged rather than served forever.
+func TestACRAuthenticatorRefreshesExpiredToken(t *testing.T) {
+	var exchanges atomic.Int64
+	original := exchangeToken
+	exchangeToken = func(context.Context, string) (string, error) {
+		exchanges.Add(1)
+		return "fresh", nil
+	}
+	t.Cleanup(func() { exchangeToken = original })
+
+	auth := &acrAuthenticator{
+		registry: "reg.azurecr.io",
+		token:    "cached",
+		expires:  time.Now().Add(time.Hour),
+	}
+	config, err := auth.Authorization()
+	if err != nil {
+		t.Fatalf("Authorization failed: %v", err)
+	}
+	if config.Username != acrTokenUsername || config.Password != "cached" {
+		t.Fatalf("a live token should be reused, got %+v", config)
+	}
+	if exchanges.Load() != 0 {
+		t.Fatalf("expected no exchange for a live token, got %d", exchanges.Load())
+	}
+
+	auth.expires = time.Now().Add(-time.Minute)
+	config, err = auth.Authorization()
+	if err != nil {
+		t.Fatalf("Authorization after expiry failed: %v", err)
+	}
+	if config.Password != "fresh" {
+		t.Fatalf("expected the token to be re-exchanged, got %q", config.Password)
+	}
+	if exchanges.Load() != 1 {
+		t.Fatalf("expected exactly one exchange, got %d", exchanges.Load())
+	}
+
+	// The renewed token is reused until it too lapses.
+	if _, err := auth.Authorization(); err != nil {
+		t.Fatalf("Authorization failed: %v", err)
+	}
+	if exchanges.Load() != 1 {
+		t.Fatalf("expected the renewed token to be cached, got %d exchanges", exchanges.Load())
 	}
 }
 

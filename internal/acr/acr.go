@@ -148,10 +148,14 @@ func Parse(raw string) (Path, error) {
 	if !ok || registry == "" || rest == "" {
 		return Path{}, errors.New(expectedPathErr)
 	}
-	if !strings.ContainsAny(registry, ".:") {
+	registry = strings.ToLower(registry)
+	// A bare name is an Azure shorthand, but "localhost" is a real registry
+	// host that the backend supports over plain HTTP, so it must not be
+	// rewritten to localhost.azurecr.io.
+	if registry != "localhost" && !strings.ContainsAny(registry, ".:") {
 		registry += defaultSuffix
 	}
-	p := Path{Registry: strings.ToLower(registry), Reference: DefaultTag}
+	p := Path{Registry: registry, Reference: DefaultTag}
 	idx := strings.IndexAny(rest, ":@")
 	if idx < 0 {
 		p.Repository = strings.Trim(rest, "/")
@@ -372,6 +376,14 @@ func cleanFile(file string) (string, error) {
 	}
 	if strings.HasPrefix(file, "/") {
 		return "", errors.New("invalid file path")
+	}
+	// Reject traversal before cleaning. path.Clean would resolve
+	// "sub/../secret.txt" to "secret.txt", silently renaming a
+	// registry-controlled title into a different file.
+	for _, segment := range strings.Split(file, "/") {
+		if segment == ".." {
+			return "", errors.New("invalid file path: .. is not allowed")
+		}
 	}
 	cleaned := path.Clean(file)
 	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
@@ -777,6 +789,12 @@ func ValidatePushTarget(p Path) error {
 	}
 	if strings.Contains(p.Reference, ":") {
 		return errors.New("acr: push destination must use a tag, not a digest")
+	}
+	// Resolving the reference also checks repository/tag syntax and refuses a
+	// registry that would be contacted over plain HTTP, so a dry run rejects
+	// everything the real push would.
+	if _, err := p.reference(); err != nil {
+		return err
 	}
 	return nil
 }

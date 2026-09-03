@@ -2,12 +2,15 @@ package acr
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"log/slog"
 	"net"
 	"os"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -106,6 +109,79 @@ func getCredential() (azcore.TokenCredential, error) {
 	return cred, credErr
 }
 
+// acrAuthenticator supplies an ACR access token, re-exchanging it when it
+// expires.
+//
+// ACR access tokens are short-lived (about three hours). Caching one for the
+// process lifetime would make every request in a long transfer fail with 401
+// once it lapsed, because go-containerregistry can only refresh its own
+// challenge token by presenting this credential again.
+type acrAuthenticator struct {
+	registry string
+
+	mu      sync.Mutex
+	token   string
+	expires time.Time
+}
+
+// tokenRefreshMargin renews a token slightly before it actually expires, so a
+// request already in flight cannot land after the lapse.
+const tokenRefreshMargin = 5 * time.Minute
+
+// tokenExchangeTimeout bounds a renewal, which happens without a caller
+// context because authn.Authenticator takes none.
+const tokenExchangeTimeout = 2 * time.Minute
+
+// exchangeToken is indirected so tests can drive token renewal without
+// contacting Entra ID or a registry.
+var exchangeToken = exchangeEntraToken
+
+func (a *acrAuthenticator) Authorization() (*authn.AuthConfig, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.token == "" || time.Now().After(a.expires) {
+		ctx, cancel := context.WithTimeout(context.Background(), tokenExchangeTimeout)
+		defer cancel()
+		token, err := exchangeToken(ctx, a.registry)
+		if err != nil {
+			return nil, err
+		}
+		a.token = token
+		a.expires = tokenExpiry(token)
+		slog.Debug("acr: refreshed registry access token", "registry", a.registry, "expires", a.expires)
+	}
+	return &authn.AuthConfig{
+		Username: acrTokenUsername,
+		Password: a.token,
+	}, nil
+}
+
+// tokenExpiry reads the exp claim of a registry access token, falling back to a
+// conservative lifetime when it cannot be parsed. The token is not verified:
+// this only decides when to refresh, never whether to trust anything.
+func tokenExpiry(token string) time.Time {
+	const fallback = 30 * time.Minute
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Now().Add(fallback)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Now().Add(fallback)
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp == 0 {
+		return time.Now().Add(fallback)
+	}
+	expiry := time.Unix(claims.Exp, 0).Add(-tokenRefreshMargin)
+	if !expiry.After(time.Now()) {
+		return time.Now().Add(fallback)
+	}
+	return expiry
+}
+
 // authCache memoises one ACR authenticator per registry so a multi-file
 // transfer performs the Entra exchange once rather than per request. A nil
 // entry means "fall back to the Docker keychain".
@@ -130,12 +206,19 @@ func authOption(ctx context.Context, registry string) remote.Option {
 	auth, cached := authCache[registry]
 	if !cached {
 		if isACR(registry) {
+			// Exchange once up front so an unusable credential falls back to
+			// the keychain now rather than failing mid-transfer; the
+			// authenticator renews itself from then on.
 			token, err := exchangeEntraToken(ctx, registry)
 			if err != nil {
 				slog.Debug("acr: Entra ID authentication unavailable, falling back to the Docker keychain",
 					"registry", registry, "error", err)
 			} else {
-				auth = &authn.Basic{Username: acrTokenUsername, Password: token}
+				auth = &acrAuthenticator{
+					registry: registry,
+					token:    token,
+					expires:  tokenExpiry(token),
+				}
 			}
 		} else {
 			slog.Debug("acr: not an Azure Container Registry endpoint, using the Docker keychain",
