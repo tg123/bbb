@@ -716,6 +716,46 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+// go-containerregistry silently uses plain HTTP for more than loopback, so
+// anything it will not contact over TLS needs an explicit opt-in.
+func TestPlainHTTPRequiresOptIn(t *testing.T) {
+	for _, registry := range []string{
+		"10.1.2.3:5000",          // RFC1918
+		"192.168.0.5:5000",       // RFC1918
+		"registry.local:5000",    // mDNS
+		"[2001:4860:4860::1]:80", // global IPv6 that merely contains ::1
+	} {
+		p := Path{Registry: registry, Repository: "models", Reference: "v1"}
+		if _, err := p.reference(); err == nil || !strings.Contains(err.Error(), "plain HTTP") {
+			t.Errorf("expected %s to be refused, got %v", registry, err)
+		}
+	}
+
+	// Genuine loopback stays automatic: it never leaves the machine.
+	for _, registry := range []string{
+		"127.0.0.1:5000",
+		"localhost:5000",
+		"reg.localhost:5000",
+		"[::1]:5000",
+	} {
+		p := Path{Registry: registry, Repository: "models", Reference: "v1"}
+		if _, err := p.reference(); err != nil {
+			t.Errorf("expected %s to be allowed, got %v", registry, err)
+		}
+	}
+}
+
+func TestPlainHTTPOptIn(t *testing.T) {
+	p := Path{Registry: "10.1.2.3:5000", Repository: "models", Reference: "v1"}
+	if _, err := p.reference(); err == nil {
+		t.Fatal("expected the registry to be refused without an opt-in")
+	}
+	t.Setenv("BBB_ACR_INSECURE", "10.1.2.3")
+	if _, err := p.reference(); err != nil {
+		t.Fatalf("expected the opt-in to allow the registry, got %v", err)
+	}
+}
+
 func TestValidatePushTarget(t *testing.T) {
 	if err := ValidatePushTarget(Path{Registry: "reg.azurecr.io", Repository: "models", Reference: "v1"}); err != nil {
 		t.Fatalf("expected tag target to be valid: %v", err)
@@ -925,45 +965,6 @@ func TestPushRetryIsIdempotent(t *testing.T) {
 	}
 }
 
-// go-containerregistry silently uses plain HTTP for RFC1918 literals, which
-// would put registry credentials on the wire unencrypted.
-func TestPrivateAddressRequiresOptIn(t *testing.T) {
-	p := Path{Registry: "10.1.2.3:5000", Repository: "models", Reference: "v1"}
-	if _, err := p.reference(); err == nil || !strings.Contains(err.Error(), "plain HTTP") {
-		t.Fatalf("expected a private address to be refused, got %v", err)
-	}
-
-	t.Setenv("BBB_ACR_INSECURE", "10.1.2.3")
-	if _, err := p.reference(); err != nil {
-		t.Fatalf("expected the opt-in to allow the registry, got %v", err)
-	}
-
-	// Loopback stays automatic: it never leaves the machine.
-	local := Path{Registry: "127.0.0.1:5000", Repository: "models", Reference: "v1"}
-	if _, err := local.reference(); err != nil {
-		t.Fatalf("expected loopback to be allowed, got %v", err)
-	}
-}
-
-// .local is mDNS, so it resolves to a real host on the LAN even though
-// go-containerregistry downgrades it to plain HTTP like loopback.
-func TestMDNSRequiresOptIn(t *testing.T) {
-	p := Path{Registry: "registry.local:5000", Repository: "models", Reference: "v1"}
-	if _, err := p.reference(); err == nil || !strings.Contains(err.Error(), "plain HTTP") {
-		t.Fatalf("expected an mDNS host to be refused, got %v", err)
-	}
-	t.Setenv("BBB_ACR_INSECURE", "registry.local")
-	if _, err := p.reference(); err != nil {
-		t.Fatalf("expected the opt-in to allow the registry, got %v", err)
-	}
-	// .localhost remains automatic.
-	loopback := Path{Registry: "reg.localhost:5000", Repository: "models", Reference: "v1"}
-	if _, err := loopback.reference(); err != nil {
-		t.Fatalf("expected .localhost to be allowed, got %v", err)
-	}
-}
-
-// An Entra access token is a live Azure credential and must never be offered
 // to a registry that merely answers with a bearer challenge.
 func TestIsACR(t *testing.T) {
 	for _, tc := range []struct {

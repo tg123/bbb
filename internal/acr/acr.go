@@ -440,12 +440,8 @@ func insecureRegistries() []string {
 	return out
 }
 
-// isLoopback reports whether registry addresses the local machine, where
-// go-containerregistry's automatic plain HTTP carries no network exposure.
-//
-// Deliberately excludes `.local`: that is mDNS, which resolves to a real host
-// on the LAN, so it has to go through the insecure allowlist like any other
-// remote address even though go-containerregistry downgrades it too.
+// isLoopback reports whether registry genuinely addresses the local machine,
+// where plain HTTP carries no network exposure.
 func isLoopback(registry string) bool {
 	host := registryHost(registry)
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
@@ -457,31 +453,20 @@ func isLoopback(registry string) bool {
 	return false
 }
 
-// isPrivateIP reports whether registry is an RFC1918 address literal.
-func isPrivateIP(registry string) bool {
-	ip := net.ParseIP(registryHost(registry))
-	return ip != nil && ip.IsPrivate()
-}
-
-// isMDNS reports whether registry is an mDNS name, which
-// go-containerregistry also contacts over plain HTTP.
-func isMDNS(registry string) bool {
-	host := registryHost(registry)
-	return host == "local" || strings.HasSuffix(host, ".local")
-}
-
 // checkTransportSecurity refuses to contact a registry that
 // go-containerregistry would silently downgrade to plain HTTP.
 //
-// go-containerregistry picks HTTP for loopback, for any RFC1918 literal and
-// for mDNS names. Loopback is harmless, but the other two are real network
-// hops, and authOption may hand them Docker keychain credentials, so require
-// the operator to say so explicitly.
+// The decision is taken from name.Registry.Scheme() rather than by
+// re-implementing its heuristics, because those are broader and looser than
+// they appear: v0.21.5 matches "::1" unanchored, so a global IPv6 address such
+// as [2001:4860:4860::1]:5000 is downgraded too. Anything the library will not
+// contact over TLS therefore needs an explicit opt-in, except genuine loopback.
 func checkTransportSecurity(registry string) error {
-	if isLoopback(registry) {
-		return nil
+	parsed, err := name.NewRegistry(registry, name.WeakValidation)
+	if err != nil {
+		return err
 	}
-	if !isPrivateIP(registry) && !isMDNS(registry) {
+	if parsed.Scheme() == "https" || isLoopback(registry) {
 		return nil
 	}
 	host := registryHost(registry)

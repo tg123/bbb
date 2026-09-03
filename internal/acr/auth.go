@@ -36,12 +36,13 @@ var azureRegistrySuffixes = []string{
 	".azurecr.de",
 }
 
-// registryHost strips any port from a registry authority.
+// registryHost strips any port and IPv6 brackets from a registry authority.
 func registryHost(registry string) string {
 	host := registry
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
 	return strings.ToLower(strings.TrimSuffix(host, "."))
 }
 
