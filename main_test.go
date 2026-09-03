@@ -251,16 +251,34 @@ func TestArtifactFileOpenDetectsReplacement(t *testing.T) {
 		t.Fatalf("content = %q (%v)", content, err)
 	}
 
-	// Replacing the path with different content must be caught rather than
-	// silently uploaded.
+	// Replacing the path with something that is no longer the same regular
+	// file must be caught rather than silently uploaded. A directory is used
+	// because it needs no privileges and cannot alias the original, whereas
+	// deleting and recreating a file can reuse the inode on Linux.
 	if err := os.Remove(target); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(target, []byte("swapped"), 0o644); err != nil {
+	if err := os.Mkdir(target, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := files[0].Open(); err == nil || !strings.Contains(err.Error(), "changed while it was being uploaded") {
 		t.Fatalf("expected the replacement to be detected, got %v", err)
+	}
+
+	// The threat this guards against is a swap for a symlink pointing outside
+	// the source tree.
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("classified"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, target); err != nil {
+		t.Skipf("symlinks unavailable on this host: %v", err)
+	}
+	if _, err := files[0].Open(); err == nil || !strings.Contains(err.Error(), "changed while it was being uploaded") {
+		t.Fatalf("expected the symlink swap to be detected, got %v", err)
 	}
 }
 
