@@ -706,6 +706,10 @@ func TestCreateOnlyTransportMarksManifestWrites(t *testing.T) {
 		{http.MethodPut, "https://reg.example/v2/models/manifests/v1"},
 		{http.MethodPut, "https://reg.example/v2/models/blobs/uploads/abc"},
 		{http.MethodGet, "https://reg.example/v2/models/manifests/v1"},
+		// A repository may itself contain a "manifests" segment; a blob
+		// upload for it must not be given the precondition.
+		{http.MethodPut, "https://reg.example/v2/team/manifests/model/blobs/uploads/abc"},
+		{http.MethodPut, "https://reg.example/v2/team/manifests/model/manifests/v1"},
 	} {
 		req, err := http.NewRequest(target.method, target.url, nil)
 		if err != nil {
@@ -726,6 +730,12 @@ func TestCreateOnlyTransportMarksManifestWrites(t *testing.T) {
 	}
 	if strings.Contains(captured[2], "If-None-Match=*") {
 		t.Errorf("manifest GET must not be marked create-only: %s", captured[2])
+	}
+	if strings.Contains(captured[3], "If-None-Match=*") {
+		t.Errorf("blob upload under a repository named manifests must not be marked: %s", captured[3])
+	}
+	if !strings.Contains(captured[4], "If-None-Match=*") {
+		t.Errorf("manifest PUT under a repository named manifests should be marked: %s", captured[4])
 	}
 }
 

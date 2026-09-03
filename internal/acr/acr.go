@@ -901,13 +901,23 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 	}
 	if !opts.Overwrite {
 		// Registries are not required to honour If-None-Match. Confirm the tag
-		// holds what we published, so losing a race is reported rather than
-		// silently accepted.
+		// holds exactly what we published, so both losing a race and the tag
+		// disappearing are reported rather than silently accepted.
 		published, err := manifestDigest(ctx, p)
 		if err != nil {
 			return err
 		}
-		if intended, derr := image.Digest(); derr == nil && published != "" && published != intended.String() {
+		intended, err := image.Digest()
+		if err != nil {
+			return err
+		}
+		switch {
+		case published == intended.String():
+			// Published as intended.
+		case published == "":
+			// Retryable: the tag was removed between the write and the check.
+			return fmt.Errorf("acr: %s is missing after publication; it may have been removed concurrently", p.String())
+		default:
 			return fmt.Errorf("%w: %s was published concurrently by another writer", ErrArtifactExists, p.String())
 		}
 	}
@@ -924,8 +934,26 @@ type createOnlyTransport struct {
 	base http.RoundTripper
 }
 
+// isManifestWrite reports whether a request path addresses a manifest rather
+// than a blob.
+//
+// A substring test is not enough: a repository may itself contain a
+// "manifests" segment, so a blob upload for team/manifests/model would look
+// like a manifest request and be given a precondition the registry could
+// reject. Only the rightmost distribution endpoint decides, and a manifest
+// reference is a single trailing segment.
+func isManifestWrite(path string) bool {
+	const marker = "/manifests/"
+	idx := strings.LastIndex(path, marker)
+	if idx < 0 {
+		return false
+	}
+	reference := path[idx+len(marker):]
+	return reference != "" && !strings.Contains(reference, "/")
+}
+
 func (t *createOnlyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Method == http.MethodPut && strings.Contains(req.URL.Path, "/manifests/") {
+	if req.Method == http.MethodPut && isManifestWrite(req.URL.Path) {
 		req = req.Clone(req.Context())
 		req.Header.Set("If-None-Match", "*")
 	}
