@@ -508,11 +508,17 @@ func tokenExpiry(token string) time.Time {
 	return time.Unix(claims.Exp, 0).Add(-tokenRefreshMargin)
 }
 
-// authEntry memoises the credentials for one registry. A nil authenticator
-// means "fall back to the Docker keychain".
+// authEntry memoises the credentials for one registry. A nil authenticator on a
+// resolved entry means "fall back to the Docker keychain".
+//
+// The lock is held across the whole attempt, not just the bookkeeping, because
+// the attempt can open an interactive sign-in: a second caller for the same
+// registry must wait for that to finish and reuse the result rather than
+// opening a prompt of its own.
 type authEntry struct {
-	once sync.Once
-	auth authn.Authenticator
+	mu       sync.Mutex
+	resolved bool
+	auth     authn.Authenticator
 	// err records a failure that no retry can fix, so it is reported rather
 	// than replaced by an anonymous request.
 	err error
@@ -537,55 +543,67 @@ func authOption(ctx context.Context, registry string) remote.Option {
 		return remote.WithAuth(&authn.Basic{Username: user, Password: pass})
 	}
 
-	key := registryKey(registry)
-	value, _ := authCache.LoadOrStore(key, &authEntry{})
+	value, _ := authCache.LoadOrStore(registryKey(registry), &authEntry{})
 	entry := value.(*authEntry)
-	entry.once.Do(func() {
-		if !isACR(registry) {
-			slog.Debug("acr: not an Azure Container Registry endpoint, using the Docker keychain",
-				"registry", registry)
-			return
-		}
-		// Exchange once up front so an unusable credential falls back to the
-		// keychain now rather than failing mid-transfer; the authenticator
-		// renews itself from then on.
-		token, err := exchangeToken(ctx, registry)
-		if err != nil {
-			// Do not memoise the failure. A timeout or network problem would
-			// otherwise disable Entra for this registry for the rest of the
-			// run, long after it recovered; this call still falls back.
-			authCache.Delete(key)
-			if _, mismatch := rejectedTenant(err); mismatch || errors.Is(err, errTenantMismatch) {
-				// The identity is the problem, and no amount of retrying
-				// fixes it. Falling through to an anonymous request would
-				// replace this explanation with a bare 401 from the registry,
-				// so keep the error unless the keychain can actually serve
-				// this registry.
-				if keychainCanServe(registry) {
-					slog.Debug("acr: Entra rejected the tenant, using a stored registry credential",
-						"registry", registry, "error", err)
-					return
-				}
-				entry.err = err
-				return
-			}
-			slog.Debug("acr: Entra ID authentication unavailable, falling back to the Docker keychain",
-				"registry", registry, "error", err)
-			return
-		}
-		entry.auth = &acrAuthenticator{
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if !entry.resolved {
+		entry.resolve(ctx, registry)
+	}
+
+	switch {
+	case entry.err != nil:
+		return remote.WithAuth(&failedAuthenticator{err: entry.err})
+	case entry.auth != nil:
+		return remote.WithAuth(entry.auth)
+	default:
+		return remote.WithAuthFromKeychain(authn.DefaultKeychain)
+	}
+}
+
+// resolve performs the Entra exchange for registry. The caller holds e.mu.
+//
+// A transient failure deliberately leaves the entry unresolved so the next
+// attempt tries again: a timeout or network blip must not disable Entra for
+// the rest of the run, long after it recovered.
+func (e *authEntry) resolve(ctx context.Context, registry string) {
+	if !isACR(registry) {
+		slog.Debug("acr: not an Azure Container Registry endpoint, using the Docker keychain",
+			"registry", registry)
+		e.resolved = true
+		return
+	}
+	// Exchange once up front so an unusable credential falls back to the
+	// keychain now rather than failing mid-transfer; the authenticator renews
+	// itself from then on.
+	token, err := exchangeToken(ctx, registry)
+	if err == nil {
+		e.auth = &acrAuthenticator{
 			registry: registry,
 			token:    token,
 			expires:  tokenExpiry(token),
 		}
-	})
-	if entry.err != nil {
-		return remote.WithAuth(&failedAuthenticator{err: entry.err})
+		e.resolved = true
+		return
 	}
-	if entry.auth != nil {
-		return remote.WithAuth(entry.auth)
+
+	if _, rejected := rejectedTenant(err); rejected || errors.Is(err, errTenantMismatch) {
+		// The identity is wrong and retrying cannot fix it, so this is
+		// remembered: another request must not reopen the sign-in that was
+		// just declined. Falling through to an anonymous request would also
+		// replace the explanation with a bare 401 from the registry, so the
+		// error is kept unless the keychain can actually serve this registry.
+		e.resolved = true
+		if keychainCanServe(registry) {
+			slog.Debug("acr: Entra rejected the tenant, using a stored registry credential",
+				"registry", registry, "error", err)
+			return
+		}
+		e.err = err
+		return
 	}
-	return remote.WithAuthFromKeychain(authn.DefaultKeychain)
+	slog.Debug("acr: Entra ID authentication unavailable, falling back to the Docker keychain",
+		"registry", registry, "error", err)
 }
 
 // keychainCanServe reports whether a stored registry credential exists, so a

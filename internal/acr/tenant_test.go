@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -433,5 +435,68 @@ func TestExchangeDoesNotPromptForAConfiguredTenant(t *testing.T) {
 
 	if _, err := exchangeEntraToken(t.Context(), "myreg.azurecr.io"); !errors.Is(err, errTenantMismatch) {
 		t.Fatalf("error = %v, want a tenant mismatch", err)
+	}
+}
+
+// `ls -l` resolves credentials from more than one goroutine at once. Each must
+// wait for the first attempt rather than opening a sign-in of its own, and a
+// rejection must be remembered so a later request does not reopen a prompt the
+// user has already answered.
+func TestAuthOptionSerialisesTheSignIn(t *testing.T) {
+	const registry = "myreg.azurecr.io"
+	var exchanges atomic.Int64
+	original := exchangeToken
+	exchangeToken = func(context.Context, string) (string, error) {
+		exchanges.Add(1)
+		// Hold the attempt open so the other callers pile up behind it, which
+		// is exactly when a second prompt used to appear.
+		time.Sleep(50 * time.Millisecond)
+		return "", tenantMismatchError(registry, "72f988bf-86f1-41af-91ab-2d7cd011db47")
+	}
+	t.Cleanup(func() {
+		exchangeToken = original
+		authCache.Clear()
+	})
+	authCache.Clear()
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			authOption(t.Context(), registry)
+		}()
+	}
+	wg.Wait()
+
+	// A later request, after everything has settled, must reuse the answer too.
+	authOption(t.Context(), registry)
+
+	if got := exchanges.Load(); got != 1 {
+		t.Fatalf("ran %d exchanges, want exactly one shared attempt", got)
+	}
+}
+
+// A transient failure must not disable Entra for the rest of the run, so it is
+// deliberately not remembered.
+func TestAuthOptionRetriesATransientFailure(t *testing.T) {
+	const registry = "myreg.azurecr.io"
+	var exchanges atomic.Int64
+	original := exchangeToken
+	exchangeToken = func(context.Context, string) (string, error) {
+		exchanges.Add(1)
+		return "", errors.New("dial tcp: i/o timeout")
+	}
+	t.Cleanup(func() {
+		exchangeToken = original
+		authCache.Clear()
+	})
+	authCache.Clear()
+
+	authOption(t.Context(), registry)
+	authOption(t.Context(), registry)
+
+	if got := exchanges.Load(); got != 2 {
+		t.Fatalf("ran %d exchanges, want a retry after a transient failure", got)
 	}
 }
