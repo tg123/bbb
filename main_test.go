@@ -222,6 +222,48 @@ func TestExpandCPTaskKeepsACRArtifactAtomic(t *testing.T) {
 
 // A symlink inside an artifact source must not be dereferenced, or a link such
 // as `secrets -> /etc/passwd` would upload data from outside the source tree.
+// Collection only proves a path was a regular file during the walk. Each later
+// open must confirm it is still the same file, or a swap after collection would
+// be read from wherever the new path points.
+func TestArtifactFileOpenDetectsReplacement(t *testing.T) {
+	source := t.TempDir()
+	target := filepath.Join(source, "a.txt")
+	if err := os.WriteFile(target, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, _, err := collectLocalArtifactFiles(source, nil)
+	if err != nil {
+		t.Fatalf("collectLocalArtifactFiles failed: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("unexpected files: %#v", files)
+	}
+
+	// The same file still opens and reads normally.
+	reader, err := files[0].Open()
+	if err != nil {
+		t.Fatalf("open failed: %v", err)
+	}
+	content, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil || string(content) != "original" {
+		t.Fatalf("content = %q (%v)", content, err)
+	}
+
+	// Replacing the path with different content must be caught rather than
+	// silently uploaded.
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("swapped"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := files[0].Open(); err == nil || !strings.Contains(err.Error(), "changed while it was being uploaded") {
+		t.Fatalf("expected the replacement to be detected, got %v", err)
+	}
+}
+
 func TestCollectLocalArtifactFilesRejectsSymlink(t *testing.T) {
 	source := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "secret.txt")

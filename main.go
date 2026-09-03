@@ -2081,6 +2081,30 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	return nil
 }
 
+// openVerifiedRegularFile opens path and confirms it is still the same regular
+// file that the directory walk accepted.
+//
+// Layers are opened after collection, and more than once (digest, then upload),
+// so checking only at walk time leaves a window: a path swapped for a symlink
+// in between would be followed by os.Open and read from outside the source
+// tree. Comparing the opened handle closes that window.
+func openVerifiedRegularFile(path string, expected os.FileInfo) (io.ReadCloser, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || !os.SameFile(info, expected) {
+		_ = file.Close()
+		return nil, fmt.Errorf("source file changed while it was being uploaded: %s", path)
+	}
+	return file, nil
+}
+
 func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.ArtifactFile, int64, error) {
 	info, err := os.Stat(src)
 	if err != nil {
@@ -2098,7 +2122,7 @@ func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.A
 			Name: name,
 			Size: info.Size(),
 			Open: func() (io.ReadCloser, error) {
-				return os.Open(src)
+				return openVerifiedRegularFile(src, info)
 			},
 		}}, info.Size(), nil
 	}
@@ -2131,11 +2155,12 @@ func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.A
 			return fmt.Errorf("unsupported source file type: %s", localPath)
 		}
 		pathToOpen := localPath
+		expected := fileInfo
 		files = append(files, bbbfs.ArtifactFile{
 			Name: name,
 			Size: fileInfo.Size(),
 			Open: func() (io.ReadCloser, error) {
-				return os.Open(pathToOpen)
+				return openVerifiedRegularFile(pathToOpen, expected)
 			},
 		})
 		total += fileInfo.Size()
