@@ -1,6 +1,7 @@
 package acr
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -17,6 +18,7 @@ import (
 // is streamed from the opener on every read instead of being buffered, which
 // matters because bbb routinely pushes multi-gigabyte files.
 type fileLayer struct {
+	ctx    context.Context
 	open   func() (io.ReadCloser, error)
 	size   int64
 	onRead func(int64)
@@ -28,9 +30,26 @@ type fileLayer struct {
 
 var _ v1.Layer = (*fileLayer)(nil)
 
+// ctxReader aborts a read as soon as the push context is cancelled.
+type ctxReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r ctxReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
 // Digest hashes the content once and caches the result. go-containerregistry
 // asks for the digest before uploading so it can skip blobs the registry
 // already has.
+//
+// The hash pass reads the whole file, which for bbb is routinely many
+// gigabytes and happens before any registry I/O, so it honours the push
+// context rather than running to EOF after a cancellation.
 func (l *fileLayer) Digest() (v1.Hash, error) {
 	l.once.Do(func() {
 		reader, err := l.open()
@@ -41,15 +60,20 @@ func (l *fileLayer) Digest() (v1.Hash, error) {
 		defer func() {
 			_ = reader.Close()
 		}()
+		var source io.Reader = reader
+		if l.ctx != nil {
+			source = ctxReader{ctx: l.ctx, reader: reader}
+		}
 		hasher := sha256.New()
-		written, err := io.Copy(hasher, reader)
+		written, err := io.Copy(hasher, source)
 		if err != nil {
 			l.err = err
 			return
 		}
-		if l.size < 0 {
-			l.size = written
-		}
+		// Always record what was actually hashed. A declared size that no
+		// longer matches would put a length in the descriptor that disagrees
+		// with the blob it describes.
+		l.size = written
 		l.digest = v1.Hash{Algorithm: "sha256", Hex: hex.EncodeToString(hasher.Sum(nil))}
 	})
 	return l.digest, l.err
@@ -75,10 +99,9 @@ func (l *fileLayer) Uncompressed() (io.ReadCloser, error) {
 	return l.Compressed()
 }
 
+// Size reports the hashed length, so the descriptor always agrees with the
+// blob rather than with whatever size was declared at collection time.
 func (l *fileLayer) Size() (int64, error) {
-	if l.size >= 0 {
-		return l.size, nil
-	}
 	if _, err := l.Digest(); err != nil {
 		return 0, err
 	}

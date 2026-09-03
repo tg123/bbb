@@ -81,6 +81,11 @@ func TestParse(t *testing.T) {
 			want: Path{Registry: "localhost", Repository: "models", Reference: "v1"},
 		},
 		{
+			name: "default https port is canonicalised away",
+			raw:  "acr://myreg.azurecr.io:443/models:v1",
+			want: Path{Registry: "myreg.azurecr.io", Repository: "models", Reference: "v1"},
+		},
+		{
 			name: "localhost with a port is unchanged",
 			raw:  "acr://localhost:5000/models:v1",
 			want: Path{Registry: "localhost:5000", Repository: "models", Reference: "v1"},
@@ -1108,6 +1113,28 @@ func TestFileLayerDigestAndStream(t *testing.T) {
 	size, err := layer.Size()
 	if err != nil || size != 11 {
 		t.Fatalf("Size = %d (%v), want 11", size, err)
+	}
+
+	// The descriptor must describe the bytes that were hashed, even when the
+	// declared size disagrees.
+	stale := &fileLayer{
+		open: func() (io.ReadCloser, error) { return os.Open(local) },
+		size: 99,
+	}
+	if size, err := stale.Size(); err != nil || size != 11 {
+		t.Fatalf("Size = %d (%v), want the hashed length 11", size, err)
+	}
+
+	// A cancelled push must abort the hash pass rather than read to EOF.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	cancelled := &fileLayer{
+		ctx:  ctx,
+		open: func() (io.ReadCloser, error) { return os.Open(local) },
+		size: 11,
+	}
+	if _, err := cancelled.Digest(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the hash to observe cancellation, got %v", err)
 	}
 	rc, err := layer.Compressed()
 	if err != nil {

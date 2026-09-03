@@ -152,6 +152,22 @@ func (p Path) String() string {
 
 const expectedPathErr = "expected acr://registry/repository[:tag|@digest][/file]"
 
+// canonicalRegistry normalises a registry authority so equivalent spellings
+// share one key. Hostnames are case-insensitive, and an explicitly written
+// default port addresses the same endpoint as omitting it, so neither may be
+// used to slip past a cache or a duplicate-destination check.
+func canonicalRegistry(registry string) string {
+	registry = strings.ToLower(strings.TrimSpace(registry))
+	host, port, err := net.SplitHostPort(registry)
+	if err != nil || (port != "443" && port != "80") {
+		return registry
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
+}
+
 // Parse parses an acr:// path.
 func Parse(raw string) (Path, error) {
 	if !strings.HasPrefix(raw, Scheme) {
@@ -162,7 +178,7 @@ func Parse(raw string) (Path, error) {
 	if !ok || registry == "" || rest == "" {
 		return Path{}, errors.New(expectedPathErr)
 	}
-	registry = strings.ToLower(registry)
+	registry = canonicalRegistry(registry)
 	// A bare name is an Azure shorthand, but "localhost" is a real registry
 	// host that the backend supports over plain HTTP, so it must not be
 	// rewritten to localhost.azurecr.io.
@@ -841,7 +857,7 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 			return fmt.Errorf("acr: invalid upload file name %q: %w", file.Name, err)
 		}
 		adds = append(adds, mutate.Addendum{
-			Layer:       &fileLayer{open: file.Open, size: file.Size, onRead: opts.OnProgress},
+			Layer:       &fileLayer{ctx: ctx, open: file.Open, size: file.Size, onRead: opts.OnProgress},
 			MediaType:   layerMediaType,
 			Annotations: map[string]string{TitleAnnotation: cleaned},
 		})
