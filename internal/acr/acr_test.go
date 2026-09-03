@@ -1033,6 +1033,16 @@ func TestInsecureOptInForcesHTTPForHostnames(t *testing.T) {
 	if scheme := ref.Context().Scheme(); scheme != "http" {
 		t.Fatalf("expected the opt-in to select http, got %s", scheme)
 	}
+
+	// Blob requests must inherit the same decision, or listing would succeed
+	// over HTTP while every download fell back to HTTPS.
+	blob, err := p.blobReference("sha256:" + strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatalf("blobReference failed: %v", err)
+	}
+	if scheme := blob.Context().Scheme(); scheme != "http" {
+		t.Fatalf("expected the blob reference to select http, got %s", scheme)
+	}
 }
 
 // A file layer must stream from disk rather than buffer, and report a digest

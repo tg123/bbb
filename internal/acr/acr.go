@@ -470,6 +470,24 @@ func checkTransportSecurity(registry string) error {
 		registry, host)
 }
 
+// blobReference builds a digest reference for a blob in the same repository,
+// going through reference() so the transport-security decision (including an
+// explicit BBB_ACR_INSECURE opt-in) applies to blob requests too.
+func (p Path) blobReference(digest string) (name.Digest, error) {
+	blob := p
+	blob.File = ""
+	blob.Reference = digest
+	ref, err := blob.reference()
+	if err != nil {
+		return name.Digest{}, err
+	}
+	digestRef, ok := ref.(name.Digest)
+	if !ok {
+		return name.Digest{}, fmt.Errorf("acr: %q is not a digest reference", digest)
+	}
+	return digestRef, nil
+}
+
 // reference builds the go-containerregistry reference for p.
 func (p Path) reference() (name.Reference, error) {
 	if err := checkTransportSecurity(p.Registry); err != nil {
@@ -716,8 +734,7 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	// Fetch the blob with the caller's context rather than the one that
 	// resolved the manifest. The digest pins the content, so this still reads
 	// exactly the snapshot that was listed.
-	digestRef, err := name.NewDigest(
-		p.Registry+"/"+p.Repository+"@"+target.Digest, name.WeakValidation)
+	digestRef, err := p.blobReference(target.Digest)
 	if err != nil {
 		return nil, err
 	}
