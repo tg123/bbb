@@ -70,18 +70,10 @@ func registryHost(registry string) string {
 	return strings.ToLower(strings.TrimSuffix(host, "."))
 }
 
-// trustedEntraHosts returns extra registry hosts explicitly opted in via
-// BBB_ACR_ENTRA_HOSTS, for ACR deployments behind a custom domain. Entries are
-// normalised the same way as the registry being checked, so a configured
-// host:port still matches.
-func trustedEntraHosts() []string {
-	return normalisedAuthorityList(os.Getenv("BBB_ACR_ENTRA_HOSTS"))
-}
-
-// normalisedAuthorityList splits a comma separated list and canonicalises each
-// entry, preserving a non-default port so trusting host:443 does not also trust
-// another service on host:5000.
-func normalisedAuthorityList(raw string) []string {
+// authorityList splits a comma separated list and canonicalises each entry with
+// the caller's scheme semantics, so an allowlist is compared the same way the
+// endpoint it guards will actually be reached.
+func authorityList(raw string, canonical func(string) string) []string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
@@ -90,10 +82,26 @@ func normalisedAuthorityList(raw string) []string {
 	out := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry = strings.TrimSpace(entry); entry != "" {
-			out = append(out, configAuthority(entry))
+			out = append(out, canonical(entry))
 		}
 	}
 	return out
+}
+
+// httpsAuthority canonicalises for an endpoint that is always reached over
+// HTTPS, so only :443 collapses.
+func httpsAuthority(registry string) string {
+	return canonicalAuthority(registry, "https")
+}
+
+// trustedEntraHosts returns extra registry hosts explicitly opted in via
+// BBB_ACR_ENTRA_HOSTS, for ACR deployments behind a custom domain.
+//
+// Entries use HTTPS semantics because the Entra exchange always posts over
+// HTTPS, whatever BBB_ACR_INSECURE says: an entry for :80 must not collapse to
+// a bare host and thereby authorise sending a live Azure token to :443.
+func trustedEntraHosts() []string {
+	return authorityList(os.Getenv("BBB_ACR_ENTRA_HOSTS"), httpsAuthority)
 }
 
 // hasAzureSuffix reports whether host is an Azure Container Registry endpoint
@@ -115,7 +123,7 @@ func hasAzureSuffix(host string) bool {
 // a private ghcr.io repository would otherwise receive the caller's Azure
 // credential. Everything else falls through to the Docker keychain.
 func isACR(registry string) bool {
-	return slices.Contains(trustedEntraHosts(), configAuthority(registry)) ||
+	return slices.Contains(trustedEntraHosts(), httpsAuthority(registry)) ||
 		hasAzureSuffix(registryHost(registry))
 }
 
@@ -133,8 +141,11 @@ func basicCredentials(registry string) (string, string, bool) {
 		return "", "", false
 	}
 	host := registryHost(registry)
-	if scoped := normalisedAuthorityList(os.Getenv("BBB_ACR_REGISTRY")); len(scoped) > 0 {
-		if !slices.Contains(scoped, configAuthority(registry)) {
+	// Scoped with the registry's effective transport, so an insecure endpoint
+	// keeps host and host:443 distinct: over HTTP they are different services,
+	// and the password must not follow the collapse.
+	if scoped := authorityList(os.Getenv("BBB_ACR_REGISTRY"), registryKey); len(scoped) > 0 {
+		if !slices.Contains(scoped, registryKey(registry)) {
 			return "", "", false
 		}
 		return user, pass, true

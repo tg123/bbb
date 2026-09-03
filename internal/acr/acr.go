@@ -154,17 +154,17 @@ func (p Path) String() string {
 
 const expectedPathErr = "expected acr://registry/repository[:tag|@digest][/file]"
 
-// registryKey returns a comparison key for a registry authority.
+// canonicalAuthority normalises a registry authority for comparison. scheme is
+// the transport the endpoint is actually reached over, which decides the
+// default port; a non-default port is preserved, because it names a different
+// service. An empty scheme defers to go-containerregistry's own inference.
 //
 // Writing a default port explicitly addresses the same endpoint as omitting it,
 // so both must yield one key for caches and collision checks. This is
 // deliberately not applied to Path.Registry itself: the port is part of the
 // authority used for requests, and dropping it would move
 // registry.example:80 from port 80 to 443.
-// canonicalAuthority normalises a registry authority for comparison. insecure
-// says whether the endpoint is reached over HTTP, which decides the default
-// port; a non-default port is preserved, because it names a different service.
-func canonicalAuthority(registry string, insecure bool) string {
+func canonicalAuthority(registry string, scheme string) string {
 	registry = strings.ToLower(strings.TrimSpace(registry))
 	host, port, err := net.SplitHostPort(registry)
 	if err != nil {
@@ -191,11 +191,11 @@ func canonicalAuthority(registry string, insecure bool) string {
 		return bare
 	}
 	authority := net.JoinHostPort(host, port)
-	scheme := "https"
-	if insecure {
-		scheme = "http"
-	} else if parsed, perr := name.NewRegistry(authority, name.WeakValidation); perr == nil {
-		scheme = parsed.Scheme()
+	if scheme == "" {
+		scheme = "https"
+		if parsed, perr := name.NewRegistry(authority, name.WeakValidation); perr == nil {
+			scheme = parsed.Scheme()
+		}
 	}
 	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
 		return bare
@@ -203,15 +203,31 @@ func canonicalAuthority(registry string, insecure bool) string {
 	return authority
 }
 
-// configAuthority canonicalises an authority for matching against configured
-// allowlists. It deliberately does not consult those lists, which is what
-// registryKey does and would recurse here.
-func configAuthority(registry string) string {
-	return canonicalAuthority(registry, isLoopback(registry))
+// registryScheme reports the transport bbb will actually use for registry.
+func registryScheme(registry string) string {
+	if isInsecureAllowed(registry) || isLoopback(registry) {
+		return "http"
+	}
+	if parsed, err := name.NewRegistry(registry, name.WeakValidation); err == nil {
+		return parsed.Scheme()
+	}
+	return "https"
 }
 
+// insecureAuthority canonicalises for an endpoint reached over HTTP, matching
+// how BBB_ACR_INSECURE entries are normalised so a suggested value is one that
+// will actually match.
+func insecureAuthority(registry string) string {
+	return canonicalAuthority(registry, "http")
+}
+
+// registryKey identifies the endpoint a registry authority addresses. The
+// scheme is part of the key because the same authority means different things
+// under each: http://host is port 80 and https://host is port 443, so a cache
+// entry or a credential scope for one must never satisfy the other.
 func registryKey(registry string) string {
-	return canonicalAuthority(registry, isInsecureAllowed(registry) || isLoopback(registry))
+	scheme := registryScheme(registry)
+	return scheme + "://" + canonicalAuthority(registry, scheme)
 }
 
 // ArtifactKey identifies the artifact a path addresses, ignoring any file
@@ -547,22 +563,11 @@ type File struct {
 // insecureRegistries returns the registry hosts explicitly allowed to be
 // contacted over plain HTTP, from BBB_ACR_INSECURE.
 func insecureRegistries() []string {
-	raw := strings.TrimSpace(os.Getenv("BBB_ACR_INSECURE"))
-	if raw == "" {
-		return nil
-	}
-	entries := strings.Split(raw, ",")
-	out := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry = strings.TrimSpace(entry); entry != "" {
-			// Normalised with HTTP semantics, because that is how these will
-			// be reached: an entry for :443 must not collapse to a bare host,
-			// which name.Insecure would then contact on port 80 — a different
-			// service from the one that was allowed.
-			out = append(out, canonicalAuthority(entry, true))
-		}
-	}
-	return out
+	// Normalised with HTTP semantics, because that is how these will be
+	// reached: an entry for :443 must not collapse to a bare host, which
+	// name.Insecure would then contact on port 80 — a different service from
+	// the one that was allowed.
+	return authorityList(os.Getenv("BBB_ACR_INSECURE"), insecureAuthority)
 }
 
 // isLoopback reports whether registry genuinely addresses the local machine,
@@ -581,7 +586,7 @@ func isLoopback(registry string) bool {
 // isInsecureAllowed reports whether the operator explicitly allowed plain HTTP
 // for registry via BBB_ACR_INSECURE.
 func isInsecureAllowed(registry string) bool {
-	return slices.Contains(insecureRegistries(), canonicalAuthority(registry, true))
+	return slices.Contains(insecureRegistries(), canonicalAuthority(registry, "http"))
 }
 
 // checkTransportSecurity refuses to contact a registry that
@@ -602,7 +607,7 @@ func checkTransportSecurity(registry string) error {
 	}
 	return fmt.Errorf(
 		"acr: refusing to contact %s over plain HTTP; set BBB_ACR_INSECURE=%s to allow it, or address the registry by a name that resolves over HTTPS",
-		registry, configAuthority(registry))
+		registry, insecureAuthority(registry))
 }
 
 // blobReference builds a digest reference for a blob in the same repository,
@@ -660,7 +665,7 @@ func (t *httpsOnlyTransport) RoundTrip(req *http.Request) (*http.Response, error
 	if !t.permitted && !strings.EqualFold(req.URL.Scheme, "https") {
 		return nil, fmt.Errorf(
 			"acr: refusing to send a request to %s over plain HTTP; set BBB_ACR_INSECURE=%s to allow it",
-			req.URL.Host, configAuthority(req.URL.Host))
+			req.URL.Host, insecureAuthority(req.URL.Host))
 	}
 	return t.base.RoundTrip(req)
 }
@@ -898,6 +903,34 @@ func Stat(ctx context.Context, p Path) (File, error) {
 		return file, nil
 	}
 	return File{}, &notFoundError{path: p.String()}
+}
+
+// IsDir reports whether p.File addresses a directory within the artifact:
+// either the artifact root, or one of the virtual directories List synthesises
+// from layer names.
+//
+// A name that matches a layer exactly is decided by an O(1) map lookup, and
+// only an unmatched name falls back to scanning for children. Downloading an
+// N-file artifact stats every layer through here, so a linear scan per file
+// would make the whole transfer quadratic.
+func IsDir(ctx context.Context, p Path) (bool, error) {
+	if p.File == "" {
+		return true, nil
+	}
+	art, err := resolve(ctx, p)
+	if err != nil {
+		return false, err
+	}
+	if _, ok := art.byName[p.File]; ok {
+		return false, nil
+	}
+	prefix := p.File + "/"
+	for _, f := range art.files {
+		if strings.HasPrefix(f.Name, prefix) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 type notFoundError struct {

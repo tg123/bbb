@@ -64,6 +64,30 @@ func TestBasicCredentialsAreHostScoped(t *testing.T) {
 	}
 }
 
+// Scoping follows the registry's effective transport. Over HTTP, host and
+// host:443 are different services, so a scope naming one must not leak the
+// password to the other.
+func TestBasicCredentialScopeFollowsEffectiveTransport(t *testing.T) {
+	t.Setenv("BBB_ACR_USERNAME", "user")
+	t.Setenv("BBB_ACR_PASSWORD", "pass")
+	t.Setenv("BBB_ACR_REGISTRY", "registry.example.com:443")
+	t.Setenv("BBB_ACR_INSECURE", "registry.example.com")
+
+	if _, _, ok := basicCredentials("registry.example.com"); ok {
+		t.Error("a scope for :443 must not cover the plaintext host on :80")
+	}
+	if _, _, ok := basicCredentials("registry.example.com:443"); !ok {
+		t.Error("expected the scoped endpoint itself to be covered")
+	}
+
+	// With no plaintext opt-in the host is reached over HTTPS, where :443 is
+	// the default port and the two spellings are the same endpoint.
+	t.Setenv("BBB_ACR_INSECURE", "")
+	if _, _, ok := basicCredentials("registry.example.com"); !ok {
+		t.Error("expected :443 to collapse to the bare host over HTTPS")
+	}
+}
+
 // The Entra flow is the default ACR login, so a wrong service, scope or grant
 // would compile and only fail in production. Drive both exchanges directly.
 func TestExchangeEntraToken(t *testing.T) {

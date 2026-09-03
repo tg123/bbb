@@ -282,6 +282,36 @@ func TestPushReplacesTag(t *testing.T) {
 	}
 }
 
+// A whole-artifact download stats every layer through IsDir, so the exact-name
+// case must not scan the layer list or the transfer becomes quadratic.
+func TestIsDirDistinguishesFilesFromVirtualDirectories(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "models", Reference: "v1"}
+	pushTestArtifact(t, p, map[string]string{"a.txt": "a", "sub/b.txt": "b"})
+
+	for _, tc := range []struct {
+		file string
+		want bool
+	}{
+		{"", true},
+		{"sub", true},
+		{"a.txt", false},
+		{"sub/b.txt", false},
+		{"missing", false},
+		{"a.txt/nested", false},
+	} {
+		q := p
+		q.File = tc.file
+		got, err := IsDir(t.Context(), q)
+		if err != nil {
+			t.Fatalf("IsDir(%q) failed: %v", tc.file, err)
+		}
+		if got != tc.want {
+			t.Errorf("IsDir(%q) = %v, want %v", tc.file, got, tc.want)
+		}
+	}
+}
+
 func TestPushPublishesEmptyArtifact(t *testing.T) {
 	host := newTestRegistry(t)
 	p := Path{Registry: host, Repository: "models", Reference: "empty"}
@@ -1226,6 +1256,28 @@ func TestIsACR(t *testing.T) {
 	t.Setenv("BBB_ACR_ENTRA_HOSTS", "registry.corp.example:443")
 	if isACR("registry.corp.example:5000") {
 		t.Error("trusting :443 must not trust :5000 on the same host")
+	}
+}
+
+// The Entra exchange always posts over HTTPS, so the allowlist must be
+// normalised that way regardless of what BBB_ACR_INSECURE says. Otherwise an
+// entry for a plaintext endpoint collapses to a bare host and authorises
+// sending a live Azure token to :443 — a service that was never listed.
+func TestEntraHostsUseHTTPSPortSemantics(t *testing.T) {
+	t.Setenv("BBB_ACR_ENTRA_HOSTS", "10.0.0.1:80")
+	if isACR("10.0.0.1") {
+		t.Error("an entry for :80 must not trust the bare host, which is reached on :443")
+	}
+	if !isACR("10.0.0.1:80") {
+		t.Error("expected the listed endpoint itself to be trusted")
+	}
+
+	// BBB_ACR_INSECURE governs the registry transport, not where the token
+	// goes, so it must not shift how the list is interpreted.
+	t.Setenv("BBB_ACR_INSECURE", "registry.corp.example")
+	t.Setenv("BBB_ACR_ENTRA_HOSTS", "registry.corp.example:443")
+	if !isACR("registry.corp.example") {
+		t.Error("expected :443 to collapse to the bare host under HTTPS semantics")
 	}
 }
 
