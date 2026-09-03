@@ -594,10 +594,11 @@ func isInsecureAllowed(registry string) bool {
 // go-containerregistry would silently downgrade to plain HTTP.
 //
 // The decision is taken from name.Registry.Scheme() rather than by
-// re-implementing its heuristics, because those are broader and looser than
-// they appear: v0.21.5 matches "::1" unanchored, so a global IPv6 address such
-// as [2001:4860:4860::1]:5000 is downgraded too. Anything the library will not
-// contact over TLS therefore needs an explicit opt-in, except genuine loopback.
+// re-implementing its heuristics, which are looser than they appear and have
+// changed between releases: v0.21.5 matched "::1" unanchored and treated every
+// .local name as link-local, both of which v0.21.7 narrowed. Asking the
+// library keeps this correct across upgrades, so anything it will not contact
+// over TLS needs an explicit opt-in, except genuine loopback.
 func checkTransportSecurity(registry string) error {
 	parsed, err := name.NewRegistry(registry, name.WeakValidation)
 	if err != nil {

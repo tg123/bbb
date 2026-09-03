@@ -94,7 +94,7 @@ Because the Entra step posts a live Azure access token to the registry, it is on
 
 Writing requires credentials with push access to the target repository.
 
-The registry protocol is handled by [go-containerregistry](https://github.com/google/go-containerregistry), so manifest resolution, blob transfer, digest verification and auth challenges follow the same well-tested implementation used by `crane` and `ko`. Registries on `localhost` and loopback addresses are contacted over plain HTTP automatically, which is what makes a local `registry:2` container usable without extra configuration. A private (RFC1918) IP literal or an mDNS (`*.local`) name would also be downgraded to HTTP, so both must be opted in with `BBB_ACR_INSECURE`; address the registry by a name that resolves over HTTPS instead.
+The registry protocol is handled by [go-containerregistry](https://github.com/google/go-containerregistry), so manifest resolution, blob transfer, digest verification and auth challenges follow the same well-tested implementation used by `crane` and `ko`. Registries on `localhost` and loopback addresses are contacted over plain HTTP automatically, which is what makes a local `registry:2` container usable without extra configuration. A private (RFC1918) IP literal would also be downgraded to HTTP, so it must be opted in with `BBB_ACR_INSECURE`; address the registry by a name that resolves over HTTPS instead.
 
 Multi-manifest artifacts are supported: when a reference resolves to an image index, the layers of every child manifest are merged into one file listing.
 
@@ -134,7 +134,7 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
 | `BBB_ACR_REGISTRY` | *(ACR hosts)* | Comma separated hosts the `BBB_ACR_USERNAME`/`BBB_ACR_PASSWORD` credentials belong to. Without it they are only sent to `*.azurecr.io` and the other ACR suffixes. Entries match on scheme and port, so `host` over HTTP is not the same endpoint as `host:443` |
 | `BBB_ACR_ENTRA_HOSTS` | | Comma separated extra registry hosts allowed to receive Entra ID credentials, for ACR behind a custom domain. Matched with HTTPS port semantics, since the token exchange always uses HTTPS |
-| `BBB_ACR_INSECURE` | | Comma separated registry hosts that may be contacted over plain HTTP. Required for private (RFC1918) IP literals and mDNS (`*.local`) names; loopback is always allowed |
+| `BBB_ACR_INSECURE` | | Comma separated registry hosts that may be contacted over plain HTTP. Required for private (RFC1918) IP literals, and for any other host go-containerregistry will not use TLS for; loopback is always allowed |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
 | `BBB_PARALLEL_DOWNLOAD` | `1` (`true`) | Set to `0` or `false` to disable parallel ranged Azure→local single-file downloads and fall back to a single streaming connection |

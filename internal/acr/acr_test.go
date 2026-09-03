@@ -807,16 +807,36 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // go-containerregistry silently uses plain HTTP for more than loopback, so
 // anything it will not contact over TLS needs an explicit opt-in.
+//
+// Which hosts those are is the library's business and has changed between
+// releases, so the check asks Scheme() rather than restating the heuristics.
+// This test pins the resulting behaviour either way: refused, or contacted
+// over TLS. What it must never be is silently plaintext.
 func TestPlainHTTPRequiresOptIn(t *testing.T) {
 	for _, registry := range []string{
-		"10.1.2.3:5000",          // RFC1918
-		"192.168.0.5:5000",       // RFC1918
-		"registry.local:5000",    // mDNS
-		"[2001:4860:4860::1]:80", // global IPv6 that merely contains ::1
+		"10.1.2.3:5000",    // RFC1918
+		"192.168.0.5:5000", // RFC1918
 	} {
 		p := Path{Registry: registry, Repository: "models", Reference: "v1"}
 		if _, err := p.reference(); err == nil || !strings.Contains(err.Error(), "plain HTTP") {
 			t.Errorf("expected %s to be refused, got %v", registry, err)
+		}
+	}
+
+	// Hosts the library once downgraded and now resolves over TLS. They need
+	// no opt-in, but they must not end up on HTTP either.
+	for _, registry := range []string{
+		"registry.local:5000",    // mDNS: only .localhost is local
+		"[2001:4860:4860::1]:80", // global IPv6 that merely contains ::1
+	} {
+		p := Path{Registry: registry, Repository: "models", Reference: "v1"}
+		ref, err := p.reference()
+		if err != nil {
+			t.Errorf("expected %s to be allowed, got %v", registry, err)
+			continue
+		}
+		if scheme := ref.Context().Scheme(); scheme != "https" {
+			t.Errorf("%s resolved to %s, want https", registry, scheme)
 		}
 	}
 
