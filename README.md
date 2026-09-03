@@ -92,6 +92,21 @@ Authentication is resolved in this order:
 
 Because the Entra step posts a live Azure access token to the registry, it is only attempted for Azure Container Registry hosts (`*.azurecr.io`, `*.azurecr.cn`, `*.azurecr.us`, `*.azurecr.de`). Any other registry — a private `ghcr.io` repository, say — goes straight to the Docker keychain rather than being offered your Azure credential. Add custom-domain ACR hosts to `BBB_ACR_ENTRA_HOSTS` to opt them in. The Resource Manager audience follows the registry's cloud, so sovereign endpoints authenticate against their own. The exchange stops at an ACR refresh token, which is presented per request so the registry's challenge names the exact repository scope — the same flow `docker` uses after `az acr login`.
 
+#### Registries in another tenant
+
+If the registry is not in your credential's home tenant, ACR rejects the token with `unknown tenantId` and `bbb` reports which tenant was presented and how to fix it. Unlike a storage account, an ACR endpoint does not advertise its tenant — its `WWW-Authenticate` challenge carries only `realm` and `service`, and a registry in another tenant is invisible to Resource Manager until you already hold a token for it — so the tenant has to be named:
+
+```bash
+# Per registry (host form, or just the registry short name)
+export BBB_ACR_TENANT_MYREGISTRY_AZURECR_IO=<tenant-id>
+export BBB_ACR_TENANT_MYREGISTRY=<tenant-id>
+
+# Or as a default for every acr:// registry
+export BBB_ACR_TENANT=<tenant-id>
+```
+
+With a tenant set, `bbb` mirrors `az://`: it uses your Azure CLI login for that tenant, verifies the token really was issued by it — `az` can hold a token only for your home tenant and return that whatever you asked for — and otherwise signs you in interactively. A browser opens, falling back to a device code when there is no browser to open, as over SSH or inside WSL. Only one sign-in is opened per tenant no matter how many transfers are running. Running `az login --tenant <tenant-id>` beforehand avoids the prompt entirely.
+
 Writing requires credentials with push access to the target repository.
 
 The registry protocol is handled by [go-containerregistry](https://github.com/google/go-containerregistry), so manifest resolution, blob transfer, digest verification and auth challenges follow the same well-tested implementation used by `crane` and `ko`. Registries on `localhost` and loopback addresses are contacted over plain HTTP automatically, which is what makes a local `registry:2` container usable without extra configuration. A private (RFC1918) IP literal would also be downgraded to HTTP, so it must be opted in with `BBB_ACR_INSECURE`; address the registry by a name that resolves over HTTPS instead.
@@ -134,6 +149,8 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
 | `BBB_ACR_REGISTRY` | *(ACR hosts)* | Comma separated hosts the `BBB_ACR_USERNAME`/`BBB_ACR_PASSWORD` credentials belong to. Without it they are only sent to `*.azurecr.io` and the other ACR suffixes. Entries match on scheme and port, so `host` over HTTP is not the same endpoint as `host:443` |
 | `BBB_ACR_ENTRA_HOSTS` | | Comma separated extra registry hosts allowed to receive Entra ID credentials, for ACR behind a custom domain. Matched with HTTPS port semantics, since the token exchange always uses HTTPS |
+| `BBB_ACR_TENANT_<REGISTRY>` | | Entra tenant to authenticate a registry against, by host (`BBB_ACR_TENANT_MYREG_AZURECR_IO`) or short name (`BBB_ACR_TENANT_MYREG`). Needed when the registry is not in your credential's home tenant; prompts an interactive sign-in if the Azure CLI cannot serve that tenant |
+| `BBB_ACR_TENANT` | | Entra tenant for every `acr://` registry that has no host-specific setting |
 | `BBB_ACR_INSECURE` | | Comma separated registry hosts that may be contacted over plain HTTP. Required for private (RFC1918) IP literals, and for any other host go-containerregistry will not use TLS for; loopback is always allowed |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |

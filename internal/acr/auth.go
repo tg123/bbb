@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -16,6 +19,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
@@ -175,6 +179,200 @@ func getCredential() (azcore.TokenCredential, error) {
 	return cred, credErr
 }
 
+// tenantClaims is the subset of an Entra access token used to tell which
+// tenant issued it.
+type tenantClaims struct {
+	Tid string `json:"tid"`
+}
+
+// tenantIDFromAccessToken returns the tid claim of an Entra access token, or
+// "" when it cannot be read.
+//
+// The token is not verified. This only decides whether the credential we hold
+// belongs to the tenant we need, never whether to trust anything: presenting a
+// home-tenant token to a registry in another tenant is the mistake being
+// caught, and the registry still validates it properly.
+func tenantIDFromAccessToken(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims tenantClaims
+	if json.Unmarshal(payload, &claims) != nil {
+		return ""
+	}
+	return claims.Tid
+}
+
+// envAuthorityKey renders a registry authority as an environment variable
+// suffix, so a host can name its own setting.
+func envAuthorityKey(authority string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		default:
+			return '_'
+		}
+	}, authority)
+}
+
+// registryTenantID returns the Entra tenant a registry should be authenticated
+// against, or "" to use the credential's own default.
+//
+// Unlike a storage account, an ACR endpoint does not advertise its tenant: the
+// WWW-Authenticate challenge carries only realm and service, with no
+// authorization_uri to discover one from, and a registry in another tenant is
+// invisible to Resource Manager until you already hold a token for it. The
+// tenant therefore has to be configured whenever it is not the credential's
+// home tenant, which is why the mismatch is reported so explicitly below.
+//
+// The host form wins over the short name, so a specific endpoint can override
+// a broader default.
+func registryTenantID(registry string) string {
+	host := registryHost(registry)
+	keys := []string{host}
+	if short, _, found := strings.Cut(host, "."); found && short != "" {
+		keys = append(keys, short)
+	}
+	for _, key := range keys {
+		name := "BBB_ACR_TENANT_" + envAuthorityKey(key)
+		if v := strings.TrimSpace(os.Getenv(strings.ToUpper(name))); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			return v
+		}
+	}
+	return strings.TrimSpace(os.Getenv("BBB_ACR_TENANT"))
+}
+
+var (
+	// tenantCredCache holds one credential per tenant, and tenantCredInflight
+	// serialises acquisition so concurrent transfers open a single login
+	// prompt rather than one each.
+	tenantCredCache    sync.Map // map[string]azcore.TokenCredential
+	tenantCredInflight sync.Map // map[string]*sync.Mutex
+)
+
+// interactiveLogin and cliCredentialFor are indirected so tests never open a
+// browser or depend on the Azure CLI being installed.
+var (
+	interactiveLogin = browserOrDeviceCodeCredential
+	cliCredentialFor = func(tenant string) (azcore.TokenCredential, error) {
+		return azidentity.NewAzureCLICredential(&azidentity.AzureCLICredentialOptions{TenantID: tenant})
+	}
+)
+
+// credentialForRegistry returns the credential to authenticate registry with.
+//
+// Without a configured tenant this is the process default, matching how every
+// other Azure-backed path in bbb behaves. With one, it mirrors az://: try the
+// Azure CLI for that tenant, confirm the token really is for it, and otherwise
+// sign in interactively.
+func credentialForRegistry(ctx context.Context, registry string) (azcore.TokenCredential, error) {
+	tid := registryTenantID(registry)
+	if tid == "" {
+		return getCredential()
+	}
+	if cached, ok := tenantCredCache.Load(tid); ok {
+		return cached.(azcore.TokenCredential), nil
+	}
+
+	inflight, _ := tenantCredInflight.LoadOrStore(tid, &sync.Mutex{})
+	mu := inflight.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	if cached, ok := tenantCredCache.Load(tid); ok {
+		return cached.(azcore.TokenCredential), nil
+	}
+
+	scope := armScope(registry)
+	if cli, err := cliCredentialFor(tid); err == nil {
+		token, tokenErr := cli.GetToken(ctx, policyTokenRequest(scope))
+		switch {
+		case tokenErr != nil:
+			// Typically Status_InteractionRequired: az knows the account but
+			// its cached token has lapsed and it cannot refresh unattended.
+			slog.Debug("acr: the Azure CLI cannot serve this tenant, signing in interactively",
+				"registry", registry, "tenant", tid, "error", tokenErr)
+		case !tenantMatches(token.Token, tid):
+			// az can hold a token only for the home tenant and hand that back
+			// regardless of what was asked for; presenting it would fail at
+			// the registry with the same mismatch this exists to avoid.
+			slog.Debug("acr: the Azure CLI returned a token for another tenant, signing in interactively",
+				"registry", registry, "want", tid, "got", tenantIDFromAccessToken(token.Token))
+		default:
+			slog.Debug("acr: using the Azure CLI credential", "registry", registry, "tenant", tid)
+			tenantCredCache.Store(tid, cli)
+			return cli, nil
+		}
+	}
+
+	credential, err := interactiveLogin(ctx, registry, tid, scope)
+	if err != nil {
+		return nil, err
+	}
+	tenantCredCache.Store(tid, credential)
+	return credential, nil
+}
+
+// tenantMatches reports whether a token was issued by the expected tenant. An
+// unreadable tid is accepted rather than triggering a needless login: the
+// registry is the real authority, and this is only an early check.
+func tenantMatches(token, tenant string) bool {
+	got := tenantIDFromAccessToken(token)
+	return got == "" || strings.EqualFold(got, tenant)
+}
+
+// browserOrDeviceCodeCredential signs the user in for a specific tenant,
+// falling back to the device code flow when no browser can be opened. bbb is
+// routinely run over SSH and inside WSL, where the browser flow cannot
+// complete, and a device code still lets the sign-in finish.
+func browserOrDeviceCodeCredential(ctx context.Context, registry, tenant, scope string) (azcore.TokenCredential, error) {
+	fmt.Fprintf(os.Stderr, "\n  Registry %q requires an Entra sign-in to tenant %s.\n  Opening a browser...\n", registry, tenant)
+	browserOpts := &azidentity.InteractiveBrowserCredentialOptions{TenantID: tenant}
+	if c := sharedClient.Load(); c != nil {
+		browserOpts.Transport = c
+	}
+	browser, err := azidentity.NewInteractiveBrowserCredential(browserOpts)
+	if err == nil {
+		// Acquire eagerly so the prompt appears here, once, rather than from
+		// whichever parallel transfer happens to need a token first.
+		if _, tokenErr := browser.GetToken(ctx, policyTokenRequest(scope)); tokenErr == nil {
+			return browser, nil
+		} else if ctx.Err() != nil {
+			return nil, tokenErr
+		} else {
+			slog.Debug("acr: browser sign-in unavailable, falling back to a device code",
+				"registry", registry, "tenant", tenant, "error", tokenErr)
+		}
+	}
+
+	deviceOpts := &azidentity.DeviceCodeCredentialOptions{
+		TenantID: tenant,
+		UserPrompt: func(_ context.Context, message azidentity.DeviceCodeMessage) error {
+			fmt.Fprintf(os.Stderr, "\n  %s\n\n", message.Message)
+			return nil
+		},
+	}
+	if c := sharedClient.Load(); c != nil {
+		deviceOpts.Transport = c
+	}
+	device, err := azidentity.NewDeviceCodeCredential(deviceOpts)
+	if err != nil {
+		return nil, fmt.Errorf("acr: interactive sign-in for tenant %s: %w", tenant, err)
+	}
+	if _, err := device.GetToken(ctx, policyTokenRequest(scope)); err != nil {
+		return nil, fmt.Errorf("acr: interactive sign-in for tenant %s: %w", tenant, err)
+	}
+	return device, nil
+}
+
 // acrAuthenticator supplies an ACR access token, re-exchanging it when it
 // expires.
 //
@@ -268,6 +466,9 @@ func tokenExpiry(token string) time.Time {
 type authEntry struct {
 	once sync.Once
 	auth authn.Authenticator
+	// err records a failure that no retry can fix, so it is reported rather
+	// than replaced by an anonymous request.
+	err error
 }
 
 // authCache holds one entry per registry so a multi-file transfer performs the
@@ -303,12 +504,26 @@ func authOption(ctx context.Context, registry string) remote.Option {
 		// renews itself from then on.
 		token, err := exchangeToken(ctx, registry)
 		if err != nil {
-			slog.Debug("acr: Entra ID authentication unavailable, falling back to the Docker keychain",
-				"registry", registry, "error", err)
 			// Do not memoise the failure. A timeout or network problem would
 			// otherwise disable Entra for this registry for the rest of the
 			// run, long after it recovered; this call still falls back.
 			authCache.Delete(key)
+			if _, mismatch := rejectedTenant(err); mismatch || errors.Is(err, errTenantMismatch) {
+				// The identity is the problem, and no amount of retrying
+				// fixes it. Falling through to an anonymous request would
+				// replace this explanation with a bare 401 from the registry,
+				// so keep the error unless the keychain can actually serve
+				// this registry.
+				if keychainCanServe(registry) {
+					slog.Debug("acr: Entra rejected the tenant, using a stored registry credential",
+						"registry", registry, "error", err)
+					return
+				}
+				entry.err = err
+				return
+			}
+			slog.Debug("acr: Entra ID authentication unavailable, falling back to the Docker keychain",
+				"registry", registry, "error", err)
 			return
 		}
 		entry.auth = &acrAuthenticator{
@@ -317,15 +532,89 @@ func authOption(ctx context.Context, registry string) remote.Option {
 			expires:  tokenExpiry(token),
 		}
 	})
+	if entry.err != nil {
+		return remote.WithAuth(&failedAuthenticator{err: entry.err})
+	}
 	if entry.auth != nil {
 		return remote.WithAuth(entry.auth)
 	}
 	return remote.WithAuthFromKeychain(authn.DefaultKeychain)
 }
 
+// keychainCanServe reports whether a stored registry credential exists, so a
+// user who has run `docker login` is not blocked by an Entra problem that does
+// not apply to them.
+func keychainCanServe(registry string) bool {
+	parsed, err := name.NewRegistry(registry, name.WeakValidation)
+	if err != nil {
+		return false
+	}
+	auth, err := authn.DefaultKeychain.Resolve(parsed)
+	if err != nil || auth == authn.Anonymous {
+		return false
+	}
+	config, err := auth.Authorization()
+	if err != nil || config == nil {
+		return false
+	}
+	return config.Username != "" || config.Password != "" ||
+		config.Auth != "" || config.IdentityToken != "" || config.RegistryToken != ""
+}
+
+// failedAuthenticator reports why authentication could not be established.
+//
+// go-containerregistry has no way to refuse a request up front, so the reason
+// is carried here and surfaced the moment a token is needed. Without it the
+// request proceeds anonymously and the user sees the registry's 401 instead of
+// the actual cause.
+type failedAuthenticator struct{ err error }
+
+func (a *failedAuthenticator) Authorization() (*authn.AuthConfig, error) {
+	return nil, a.err
+}
+
+func (a *failedAuthenticator) AuthorizationContext(context.Context) (*authn.AuthConfig, error) {
+	return nil, a.err
+}
+
 // tokenCredential is indirected so tests can drive the exchange with a fake
 // credential instead of contacting Entra ID.
-var tokenCredential = getCredential
+var tokenCredential = credentialForRegistry
+
+// tenantMismatchRe matches the rejection ACR returns for a token issued by a
+// tenant it does not know, which is the usual outcome of running against a
+// registry outside the credential's home tenant.
+var tenantMismatchRe = regexp.MustCompile(`unknown tenant[iI]d\s*\\?"([0-9a-fA-F-]{36})\\?"`)
+
+// rejectedTenant reports the tenant a registry refused, if that is why an
+// exchange failed. The tenant named is the one that was presented, not the one
+// the registry wants: ACR never reveals which tenant it belongs to.
+func rejectedTenant(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	match := tenantMismatchRe.FindStringSubmatch(err.Error())
+	if match == nil {
+		return "", false
+	}
+	return match[1], true
+}
+
+// tenantMismatchError explains a rejected tenant in terms of what to do about
+// it, because the alternative is an anonymous request and a bare 401 from the
+// registry that says nothing about the cause.
+// errTenantMismatch marks a rejection that reflects the identity in use rather
+// than a transient problem, so callers can recognise it after formatting.
+var errTenantMismatch = errors.New("acr: registry rejected the credential's tenant")
+
+func tenantMismatchError(registry, presented string) error {
+	host := registryHost(registry)
+	return fmt.Errorf(
+		"%w: %s was sent a token issued for tenant %s, which it does not recognise.\n"+
+			"The registry belongs to a different Entra tenant, and an ACR endpoint does not advertise which one.\n"+
+			"Set BBB_ACR_TENANT_%s=<tenant-id> to have bbb sign in to it, or run: az login --tenant <tenant-id>",
+		errTenantMismatch, host, presented, strings.ToUpper(envAuthorityKey(host)))
+}
 
 // exchangeEntraToken trades an Entra ID access token for an ACR refresh token,
 // using the Azure SDK rather than a hand-rolled OAuth flow.
@@ -337,7 +626,7 @@ var tokenCredential = getCredential
 // the registry's challenge name the exact scope, which is the same flow docker
 // uses after `az acr login`.
 func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
-	credential, err := tokenCredential()
+	credential, err := tokenCredential(ctx, registry)
 	if err != nil {
 		return "", err
 	}
@@ -353,15 +642,24 @@ func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	exchange := &azcontainerregistry.AuthenticationClientExchangeAADAccessTokenForACRRefreshTokenOptions{
+		AccessToken: &aadToken.Token,
+	}
+	// Naming the tenant lets ACR resolve a guest identity, which it cannot do
+	// from the token alone.
+	if tenant := registryTenantID(registry); tenant != "" {
+		exchange.Tenant = &tenant
+	}
 	refresh, err := client.ExchangeAADAccessTokenForACRRefreshToken(
 		ctx,
 		azcontainerregistry.PostContentSchemaGrantTypeAccessToken,
 		registry,
-		&azcontainerregistry.AuthenticationClientExchangeAADAccessTokenForACRRefreshTokenOptions{
-			AccessToken: &aadToken.Token,
-		},
+		exchange,
 	)
 	if err != nil {
+		if presented, ok := rejectedTenant(err); ok {
+			return "", tenantMismatchError(registry, presented)
+		}
 		return "", err
 	}
 	if refresh.RefreshToken == nil {

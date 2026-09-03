@@ -95,7 +95,7 @@ func TestExchangeEntraToken(t *testing.T) {
 
 	credential := &fakeCredential{token: "aad-token"}
 	originalCredential := tokenCredential
-	tokenCredential = func() (azcore.TokenCredential, error) { return credential, nil }
+	tokenCredential = func(context.Context, string) (azcore.TokenCredential, error) { return credential, nil }
 	t.Cleanup(func() { tokenCredential = originalCredential })
 
 	var requests []recordedRequest
@@ -186,7 +186,7 @@ func TestARMScopeFollowsTheCloud(t *testing.T) {
 func TestExchangeEntraTokenPropagatesFailure(t *testing.T) {
 	credential := &fakeCredential{token: "aad-token"}
 	originalCredential := tokenCredential
-	tokenCredential = func() (azcore.TokenCredential, error) { return credential, nil }
+	tokenCredential = func(context.Context, string) (azcore.TokenCredential, error) { return credential, nil }
 	t.Cleanup(func() { tokenCredential = originalCredential })
 
 	var calls atomic.Int64
