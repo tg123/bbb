@@ -210,22 +210,22 @@ func TestValidateACRTasksIgnoresCompletedTasks(t *testing.T) {
 	publish := taskPair{src: "./dir", dst: "acr://myreg.azurecr.io/models:v1"}
 	read := taskPair{src: "acr://myreg.azurecr.io/models:v1", dst: "./out"}
 
-	if err := validateACRTasks([]taskPair{publish, read}, nil); err == nil {
+	if err := validateACRTasks([]taskPair{publish, read}, nil, nil); err == nil {
 		t.Fatal("expected the overlap to be rejected when both tasks are pending")
 	}
 	completed := map[string]struct{}{
 		taskCheckpointKey(publish.src, publish.dst): {},
 	}
-	if err := validateACRTasks([]taskPair{publish, read}, completed); err != nil {
+	if err := validateACRTasks([]taskPair{publish, read}, nil, completed); err != nil {
 		t.Fatalf("a completed publisher should not block the reader: %v", err)
 	}
 
 	// Duplicate destinations behave the same way.
 	other := taskPair{src: "./other", dst: "acr://myreg.azurecr.io/models:v1"}
-	if err := validateACRTasks([]taskPair{publish, other}, nil); err == nil {
+	if err := validateACRTasks([]taskPair{publish, other}, nil, nil); err == nil {
 		t.Fatal("expected duplicate destinations to be rejected")
 	}
-	if err := validateACRTasks([]taskPair{publish, other}, completed); err != nil {
+	if err := validateACRTasks([]taskPair{publish, other}, nil, completed); err != nil {
 		t.Fatalf("a completed publisher should not block another: %v", err)
 	}
 }

@@ -77,6 +77,7 @@ func TestParse(t *testing.T) {
 		{name: "angle bracket", raw: "acr://myreg.azurecr.io/models:v1/a<b.txt", wantErr: true},
 		{name: "control character", raw: "acr://myreg.azurecr.io/models:v1/a\x01b.txt", wantErr: true},
 		{name: "traversal that cleans away", raw: "acr://myreg.azurecr.io/models:v1/sub/../secret.txt", wantErr: true},
+		{name: "invalid utf-8 name", raw: "acr://myreg.azurecr.io/models:v1/bad\xff.txt", wantErr: true},
 		{
 			name: "localhost is a real registry, not an Azure short name",
 			raw:  "acr://localhost/models:v1",
@@ -804,6 +805,38 @@ func TestPlainHTTPOptIn(t *testing.T) {
 	t.Setenv("BBB_ACR_INSECURE", "10.1.2.3:5000")
 	if _, err := p.reference(); err != nil {
 		t.Fatalf("expected the opt-in to allow the registry, got %v", err)
+	}
+}
+
+// The insecure allowlist is matched with HTTP semantics, because that is how
+// an allowed endpoint is then contacted.
+func TestInsecureOptInUsesHTTPPortSemantics(t *testing.T) {
+	t.Setenv("BBB_ACR_INSECURE", "registry.example.com:443")
+
+	// The allowed endpoint itself is permitted.
+	explicit := Path{Registry: "registry.example.com:443", Repository: "models", Reference: "v1"}
+	if _, err := explicit.reference(); err != nil {
+		t.Fatalf("expected the allowed endpoint to be permitted: %v", err)
+	}
+
+	// The bare host is a different endpoint: over HTTP it is port 80, which
+	// was never allowed, so it must not inherit the opt-in.
+	if isInsecureAllowed("registry.example.com") {
+		t.Error("an entry for :443 must not allow the bare host over HTTP")
+	}
+	bare := Path{Registry: "registry.example.com", Repository: "models", Reference: "v1"}
+	ref, err := bare.reference()
+	if err != nil {
+		t.Fatalf("the bare host should still resolve over HTTPS: %v", err)
+	}
+	if scheme := ref.Context().Scheme(); scheme != "https" {
+		t.Fatalf("bare host scheme = %s, want https", scheme)
+	}
+
+	// An entry written for HTTP's default port does collapse.
+	t.Setenv("BBB_ACR_INSECURE", "registry.example.com:80")
+	if !isInsecureAllowed("registry.example.com") {
+		t.Error("an entry for :80 should cover the bare host over HTTP")
 	}
 }
 

@@ -1342,12 +1342,20 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 // validateACRTasks rejects task combinations that cannot run concurrently
 // against one artifact. Tasks already recorded as complete are excluded,
 // because a resumed run does not execute them.
-func validateACRTasks(tasks []taskPair, completed map[string]struct{}) error {
+//
+// Completion is read from both maps: an atomic ACR publish records its file
+// state before its task checkpoint, so a run interrupted between the two
+// writes is skipped during expansion while only the file record exists.
+func validateACRTasks(tasks []taskPair, state, completed map[string]struct{}) error {
 	pending := make([]taskPair, 0, len(tasks))
 	for _, task := range tasks {
-		if _, done := completed[taskCheckpointKey(task.src, task.dst)]; !done {
-			pending = append(pending, task)
+		if _, done := completed[taskCheckpointKey(task.src, task.dst)]; done {
+			continue
 		}
+		if _, done := state[taskStateKey(task.src, task.dst)]; done {
+			continue
+		}
+		pending = append(pending, task)
 	}
 
 	destinations := make(map[string]struct{})
@@ -1418,7 +1426,7 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	}
 	// Validate after the checkpoints load, so a resumed run is not blocked by
 	// a conflict with a task that has already completed and will be skipped.
-	if err := validateACRTasks(tasks, taskCheckpoints); err != nil {
+	if err := validateACRTasks(tasks, state, taskCheckpoints); err != nil {
 		return err
 	}
 	// Streaming progress bar: total starts at 0 and grows as files are

@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -488,6 +489,12 @@ func cleanFile(file string) (string, error) {
 	if strings.Contains(file, ":") {
 		return "", errors.New("invalid file path: colon is not allowed")
 	}
+	// OCI annotations are JSON strings, so a name that is not valid UTF-8
+	// would be published with replacement characters: a different title from
+	// the file pushed, and one that can collide with another mangled name.
+	if !utf8.ValidString(file) {
+		return "", errors.New("invalid file path: name is not valid UTF-8")
+	}
 	if strings.HasPrefix(file, "/") {
 		return "", errors.New("invalid file path")
 	}
@@ -540,7 +547,22 @@ type File struct {
 // insecureRegistries returns the registry hosts explicitly allowed to be
 // contacted over plain HTTP, from BBB_ACR_INSECURE.
 func insecureRegistries() []string {
-	return normalisedAuthorityList(os.Getenv("BBB_ACR_INSECURE"))
+	raw := strings.TrimSpace(os.Getenv("BBB_ACR_INSECURE"))
+	if raw == "" {
+		return nil
+	}
+	entries := strings.Split(raw, ",")
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			// Normalised with HTTP semantics, because that is how these will
+			// be reached: an entry for :443 must not collapse to a bare host,
+			// which name.Insecure would then contact on port 80 — a different
+			// service from the one that was allowed.
+			out = append(out, canonicalAuthority(entry, true))
+		}
+	}
+	return out
 }
 
 // isLoopback reports whether registry genuinely addresses the local machine,
@@ -559,7 +581,7 @@ func isLoopback(registry string) bool {
 // isInsecureAllowed reports whether the operator explicitly allowed plain HTTP
 // for registry via BBB_ACR_INSECURE.
 func isInsecureAllowed(registry string) bool {
-	return slices.Contains(insecureRegistries(), configAuthority(registry))
+	return slices.Contains(insecureRegistries(), canonicalAuthority(registry, true))
 }
 
 // checkTransportSecurity refuses to contact a registry that
