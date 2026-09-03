@@ -113,46 +113,48 @@ func TestExchangeEntraToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("exchangeEntraToken failed: %v", err)
 	}
-	if token != "registry-token" {
-		t.Fatalf("token = %q, want the registry access token", token)
+	// The refresh token is returned, not an access token: ACR access tokens are
+	// repository-scoped, so go-containerregistry asks for the exact scope from
+	// each challenge instead.
+	if token != "refresh-token" {
+		t.Fatalf("token = %q, want the registry refresh token", token)
 	}
 
-	if len(credential.scopes) != 1 || credential.scopes[0] != aadScope {
-		t.Fatalf("credential scopes = %v, want [%s]", credential.scopes, aadScope)
+	if len(credential.scopes) != 1 || credential.scopes[0] != defaultARMScope {
+		t.Fatalf("credential scopes = %v, want [%s]", credential.scopes, defaultARMScope)
 	}
-	if len(requests) != 2 {
-		t.Fatalf("expected both exchanges, got %d requests", len(requests))
+	if len(requests) != 1 {
+		t.Fatalf("expected exactly one exchange, got %d requests", len(requests))
 	}
 
 	first := requests[0]
 	if first.path != "/oauth2/exchange" {
-		t.Errorf("first request path = %s, want /oauth2/exchange", first.path)
+		t.Errorf("request path = %s, want /oauth2/exchange", first.path)
 	}
 	if got := first.form.Get("grant_type"); got != "access_token" {
-		t.Errorf("first grant_type = %q, want access_token", got)
+		t.Errorf("grant_type = %q, want access_token", got)
 	}
 	if got := first.form.Get("service"); got != registry {
-		t.Errorf("first service = %q, want %s", got, registry)
+		t.Errorf("service = %q, want %s", got, registry)
 	}
 	if got := first.form.Get("access_token"); got != "aad-token" {
 		t.Errorf("the Entra token was not forwarded, got %q", got)
 	}
+}
 
-	second := requests[1]
-	if second.path != "/oauth2/token" {
-		t.Errorf("second request path = %s, want /oauth2/token", second.path)
-	}
-	if got := second.form.Get("grant_type"); got != "refresh_token" {
-		t.Errorf("second grant_type = %q, want refresh_token", got)
-	}
-	if got := second.form.Get("refresh_token"); got != "refresh-token" {
-		t.Errorf("the refresh token was not forwarded, got %q", got)
-	}
-	if got := second.form.Get("service"); got != registry {
-		t.Errorf("second service = %q, want %s", got, registry)
-	}
-	if got := second.form.Get("scope"); got != "repository:*:pull,push" {
-		t.Errorf("second scope = %q, want a wildcard pull,push scope", got)
+// A token for the public-cloud audience is not valid in a sovereign cloud.
+func TestARMScopeFollowsTheCloud(t *testing.T) {
+	for registry, want := range map[string]string{
+		"myreg.azurecr.io":      "https://management.azure.com/.default",
+		"myreg.azurecr.cn":      "https://management.chinacloudapi.cn/.default",
+		"myreg.azurecr.us":      "https://management.usgovcloudapi.net/.default",
+		"myreg.azurecr.de":      "https://management.microsoftazure.de/.default",
+		"myreg.azurecr.io:443":  "https://management.azure.com/.default",
+		"registry.corp.example": defaultARMScope,
+	} {
+		if got := armScope(registry); got != want {
+			t.Errorf("armScope(%q) = %q, want %q", registry, got, want)
+		}
 	}
 }
 

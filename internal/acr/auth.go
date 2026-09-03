@@ -19,12 +19,36 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
-// aadScope is the scope used when requesting an Entra ID token to exchange for
-// an ACR refresh token. ACR expects a token scoped to the ARM resource.
-const aadScope = "https://management.azure.com/.default"
+// armScopes maps an Azure Container Registry suffix to the Resource Manager
+// audience of its cloud. A token for the public-cloud audience is not valid in
+// a sovereign cloud, so the advertised .cn/.us/.de hosts need their own.
+var armScopes = []struct {
+	suffix string
+	scope  string
+}{
+	{".azurecr.cn", "https://management.chinacloudapi.cn/.default"},
+	{".azurecr.us", "https://management.usgovcloudapi.net/.default"},
+	{".azurecr.de", "https://management.microsoftazure.de/.default"},
+	{".azurecr.io", "https://management.azure.com/.default"},
+}
+
+// defaultARMScope is the public-cloud audience, used for custom-domain hosts
+// opted in via BBB_ACR_ENTRA_HOSTS.
+const defaultARMScope = "https://management.azure.com/.default"
+
+// armScope returns the Resource Manager audience to request for registry.
+func armScope(registry string) string {
+	host := registryHost(registry)
+	for _, candidate := range armScopes {
+		if strings.HasSuffix(host, candidate.suffix) {
+			return candidate.scope
+		}
+	}
+	return defaultARMScope
+}
 
 // acrTokenUsername is the sentinel username ACR expects when the password is a
-// registry access token.
+// registry refresh token.
 const acrTokenUsername = "00000000-0000-0000-0000-000000000000"
 
 // azureRegistrySuffixes are the Azure Container Registry DNS suffixes across
@@ -276,9 +300,15 @@ func authOption(ctx context.Context, registry string) remote.Option {
 // credential instead of contacting Entra ID.
 var tokenCredential = getCredential
 
-// exchangeEntraToken trades an Entra ID access token for an ACR refresh token
-// and then for a registry access token, using the Azure SDK rather than a
-// hand-rolled OAuth flow.
+// exchangeEntraToken trades an Entra ID access token for an ACR refresh token,
+// using the Azure SDK rather than a hand-rolled OAuth flow.
+//
+// It deliberately stops at the refresh token. ACR access tokens are scoped to
+// specific repositories — there is no all-repository wildcard — so requesting
+// one here would either be rejected or be valid for the wrong repository.
+// go-containerregistry instead presents the refresh token per request and lets
+// the registry's challenge name the exact scope, which is the same flow docker
+// uses after `az acr login`.
 func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 	credential, err := tokenCredential()
 	if err != nil {
@@ -292,7 +322,7 @@ func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	aadToken, err := credential.GetToken(ctx, policyTokenRequest(aadScope))
+	aadToken, err := credential.GetToken(ctx, policyTokenRequest(armScope(registry)))
 	if err != nil {
 		return "", err
 	}
@@ -310,23 +340,5 @@ func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 	if refresh.RefreshToken == nil {
 		return "", errEmptyToken
 	}
-	// A wildcard scope keeps one token valid for every repository touched by a
-	// single bbb invocation.
-	grant := azcontainerregistry.TokenGrantTypeRefreshToken
-	access, err := client.ExchangeACRRefreshTokenForACRAccessToken(
-		ctx,
-		registry,
-		"repository:*:pull,push",
-		*refresh.RefreshToken,
-		&azcontainerregistry.AuthenticationClientExchangeACRRefreshTokenForACRAccessTokenOptions{
-			GrantType: &grant,
-		},
-	)
-	if err != nil {
-		return "", err
-	}
-	if access.AccessToken == nil {
-		return "", errEmptyToken
-	}
-	return *access.AccessToken, nil
+	return *refresh.RefreshToken, nil
 }
