@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"io"
 	"sync"
-	"sync/atomic"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
@@ -20,17 +19,14 @@ import (
 // matters because bbb routinely pushes multi-gigabyte files.
 type fileLayer struct {
 	ctx    context.Context
+	name   string
 	open   func() (io.ReadCloser, error)
 	size   int64
-	onRead func(int64)
+	onRead func(name string, uploaded int64)
 
 	once   sync.Once
 	digest v1.Hash
 	err    error
-
-	// reported is the high-water byte count already surfaced to onRead, so a
-	// retried upload does not count the same bytes twice.
-	reported atomic.Int64
 }
 
 var _ v1.Layer = (*fileLayer)(nil)
@@ -117,12 +113,13 @@ func (l *fileLayer) MediaType() (types.MediaType, error) {
 	return layerMediaType, nil
 }
 
-// progressReadCloser reports bytes as they are uploaded.
+// progressReadCloser reports how far this layer has been uploaded.
 //
-// go-containerregistry sets GetBody so a retried request reopens the layer, so
-// only progress beyond the layer's high-water mark is reported. Counting every
-// physical read would let a retransmission push the total past the artifact's
-// real size.
+// The count is cumulative for the layer and restarts at zero whenever the
+// content is reopened, which go-containerregistry does through GetBody when it
+// retries a request. Reporting a running total rather than a delta lets the
+// caller hold one high-water mark per layer, so neither a retransmission
+// within an attempt nor a retry of the whole push counts the same bytes twice.
 type progressReadCloser struct {
 	io.ReadCloser
 	layer *fileLayer
@@ -133,16 +130,7 @@ func (r *progressReadCloser) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	if n > 0 {
 		r.read += int64(n)
-		for {
-			previous := r.layer.reported.Load()
-			if r.read <= previous {
-				break
-			}
-			if r.layer.reported.CompareAndSwap(previous, r.read) {
-				r.layer.onRead(r.read - previous)
-				break
-			}
-		}
+		r.layer.onRead(r.layer.name, r.read)
 	}
 	return n, err
 }

@@ -33,7 +33,7 @@ func (acrFS) Write(_ context.Context, _ string, _ io.Reader) error {
 	return ErrWriteUnsupported
 }
 
-func (acrFS) UploadArtifact(ctx context.Context, target string, files []ArtifactFile, concurrency int, overwrite bool, onProgress func(int64)) error {
+func (acrFS) UploadArtifact(ctx context.Context, target string, files []ArtifactFile, concurrency int, overwrite bool, onProgress func(name string, uploaded int64)) error {
 	ap, err := acr.Parse(target)
 	if err != nil {
 		return err

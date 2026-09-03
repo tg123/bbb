@@ -205,7 +205,8 @@ func TestPushAndReadRoundTrip(t *testing.T) {
 	host := newTestRegistry(t)
 	p := Path{Registry: host, Repository: "models/llama", Reference: "v1"}
 
-	var uploaded atomic.Int64
+	var mu sync.Mutex
+	uploaded := map[string]int64{}
 	uploads := []UploadFile{
 		{Name: "a.txt", Size: 5, Open: func() (io.ReadCloser, error) {
 			return io.NopCloser(strings.NewReader("alpha")), nil
@@ -215,13 +216,19 @@ func TestPushAndReadRoundTrip(t *testing.T) {
 		}},
 	}
 	if err := Push(t.Context(), p, uploads, PushOptions{
-		Overwrite:  true,
-		OnProgress: func(n int64) { uploaded.Add(n) },
+		Overwrite: true,
+		// Progress is cumulative per layer, so the artifact total is the sum
+		// of each layer's peak rather than of every reported value.
+		OnProgress: func(name string, n int64) {
+			mu.Lock()
+			defer mu.Unlock()
+			uploaded[name] = max(uploaded[name], n)
+		},
 	}); err != nil {
 		t.Fatalf("Push failed: %v", err)
 	}
-	if uploaded.Load() < 10 {
-		t.Fatalf("expected progress for both layers, got %d bytes", uploaded.Load())
+	if uploaded["a.txt"] != 5 || uploaded["sub/b.txt"] != 5 {
+		t.Fatalf("expected 5 bytes of progress for each layer, got %#v", uploaded)
 	}
 
 	files, err := ListFiles(t.Context(), p)
@@ -1417,19 +1424,26 @@ func TestFileLayerDigestAndStream(t *testing.T) {
 	}
 }
 
-// go-containerregistry reopens a layer to retry an upload, so progress must be
-// reported against a high-water mark or a retransmission counts twice.
-func TestFileLayerProgressIsNotDoubleCounted(t *testing.T) {
+// go-containerregistry reopens a layer to retry an upload, so the layer
+// reports a running total for itself rather than deltas, letting the caller
+// hold one high-water mark and never count a retransmission twice.
+func TestFileLayerProgressIsCumulativePerLayer(t *testing.T) {
 	dir := t.TempDir()
 	local := filepath.Join(dir, "blob.bin")
 	if err := os.WriteFile(local, []byte("hello world"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	var reported atomic.Int64
+	var counts []int64
 	layer := &fileLayer{
-		open:   func() (io.ReadCloser, error) { return os.Open(local) },
-		size:   11,
-		onRead: func(n int64) { reported.Add(n) },
+		name: "blob.bin",
+		open: func() (io.ReadCloser, error) { return os.Open(local) },
+		size: 11,
+		onRead: func(name string, n int64) {
+			if name != "blob.bin" {
+				t.Errorf("progress reported for %q, want blob.bin", name)
+			}
+			counts = append(counts, n)
+		},
 	}
 
 	// A partial read, as if the request failed midway.
@@ -1442,7 +1456,8 @@ func TestFileLayerProgressIsNotDoubleCounted(t *testing.T) {
 	}
 	_ = first.Close()
 
-	// The retry reopens the layer and resends from the start.
+	// The retry reopens the layer and resends from the start, so the count
+	// restarts rather than continuing from five.
 	second, err := layer.Compressed()
 	if err != nil {
 		t.Fatal(err)
@@ -1452,8 +1467,18 @@ func TestFileLayerProgressIsNotDoubleCounted(t *testing.T) {
 	}
 	_ = second.Close()
 
-	if got := reported.Load(); got != 11 {
-		t.Fatalf("reported %d bytes for an 11 byte layer, want 11", got)
+	if len(counts) == 0 {
+		t.Fatal("expected progress to be reported")
+	}
+	if got := counts[len(counts)-1]; got != 11 {
+		t.Fatalf("final count = %d for an 11 byte layer, want 11", got)
+	}
+	var peak int64
+	for _, n := range counts {
+		peak = max(peak, n)
+	}
+	if peak != 11 {
+		t.Fatalf("peak count = %d, want 11: a retransmission must not exceed the layer size", peak)
 	}
 }
 

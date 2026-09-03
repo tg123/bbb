@@ -2262,6 +2262,40 @@ func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.A
 	}
 	return files, total, cleanup, nil
 }
+
+// artifactProgress turns per-file cumulative upload counts into a
+// monotonically increasing artifact total.
+//
+// The counts a backend reports restart at zero whenever a file is re-read, and
+// a retry re-uploads only the blobs the registry is still missing, so an
+// attempt's own total is not comparable with the previous attempt's. Holding a
+// high-water mark per file instead means bytes moved by a later attempt are
+// still counted even when that attempt transfers less overall — otherwise an
+// artifact whose layers advanced on different attempts finishes under-counted.
+type artifactProgress struct {
+	mu        sync.Mutex
+	highWater map[string]int64
+	total     int64
+}
+
+func newArtifactProgress(files int) *artifactProgress {
+	return &artifactProgress{highWater: make(map[string]int64, files)}
+}
+
+// observe records name's cumulative byte count and returns how far the
+// artifact total advanced, together with the new total. A delta of zero means
+// these bytes were already counted.
+func (p *artifactProgress) observe(name string, uploaded int64) (delta, total int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if uploaded > p.highWater[name] {
+		delta = uploaded - p.highWater[name]
+		p.highWater[name] = uploaded
+		p.total += delta
+	}
+	return delta, p.total
+}
+
 func pushLocalArtifact(
 	ctx context.Context,
 	src, dst string,
@@ -2313,31 +2347,24 @@ func pushLocalArtifact(
 			}
 		}
 	}
-	var reported atomic.Int64
 	// runOpPool clamps a non-positive limit to one; do the same here, or a
 	// zero would fall through to go-containerregistry's default of four jobs
 	// and exceed what --concurrency asked for.
 	uploadConcurrency := max(1, concurrency)
+	progress := newArtifactProgress(len(files))
 	err = retryOp(ctx, retryCount, func() error {
-		var uploaded atomic.Int64
-		return bbbfs.UploadArtifact(ctx, dst, files, uploadConcurrency, overwrite, func(delta int64) {
-			copied := uploaded.Add(delta)
+		return bbbfs.UploadArtifact(ctx, dst, files, uploadConcurrency, overwrite, func(name string, uploaded int64) {
+			delta, done := progress.observe(name, uploaded)
+			if delta == 0 {
+				return
+			}
 			if onBytes != nil {
-				for {
-					previous := reported.Load()
-					if copied <= previous {
-						break
-					}
-					if reported.CompareAndSwap(previous, copied) {
-						onBytes(copied - previous)
-						break
-					}
-				}
+				onBytes(delta)
 			}
 			if bar != nil {
-				atomicMax(&bar.bytesDone, copied)
-				atomicMax(&bar.done, copied)
-				bar.render(copied)
+				atomicMax(&bar.bytesDone, done)
+				atomicMax(&bar.done, done)
+				bar.render(done)
 			}
 		})
 	})

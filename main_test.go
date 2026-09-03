@@ -465,6 +465,40 @@ func TestCollectLocalArtifactFilesRejectsSymlink(t *testing.T) {
 	}
 }
 
+// A retry re-uploads only the blobs the registry is still missing, so an
+// attempt's own byte total is not comparable with the previous attempt's.
+// Progress has to be held per file, or an artifact whose layers advanced on
+// different attempts finishes under-counted.
+func TestArtifactProgressAcrossRetries(t *testing.T) {
+	progress := newArtifactProgress(2)
+
+	// Attempt one uploads a.bin and then fails before b.bin.
+	if delta, total := progress.observe("a.bin", 100); delta != 100 || total != 100 {
+		t.Fatalf("a.bin = (%d, %d), want (100, 100)", delta, total)
+	}
+
+	// Attempt two skips a.bin, whose blob now exists, and uploads b.bin. Its
+	// own total never exceeds the first attempt's, but the bytes are real.
+	delta, total := progress.observe("b.bin", 100)
+	if delta != 100 || total != 200 {
+		t.Fatalf("b.bin = (%d, %d), want (100, 200)", delta, total)
+	}
+
+	// Re-reading a file already counted adds nothing, so a retransmission
+	// cannot push the total past the artifact size.
+	if delta, total := progress.observe("a.bin", 40); delta != 0 || total != 200 {
+		t.Fatalf("a.bin replay = (%d, %d), want (0, 200)", delta, total)
+	}
+	if delta, total := progress.observe("a.bin", 100); delta != 0 || total != 200 {
+		t.Fatalf("a.bin resend = (%d, %d), want (0, 200)", delta, total)
+	}
+
+	// A file that got further than before contributes only the difference.
+	if delta, total := progress.observe("b.bin", 150); delta != 50 || total != 250 {
+		t.Fatalf("b.bin growth = (%d, %d), want (50, 250)", delta, total)
+	}
+}
+
 func TestCollectLocalArtifactFiles(t *testing.T) {
 	source := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(source, "sub"), 0o755); err != nil {

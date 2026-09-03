@@ -1039,7 +1039,11 @@ type UploadFile struct {
 type PushOptions struct {
 	Concurrency int
 	Overwrite   bool
-	OnProgress  func(int64)
+	// OnProgress receives a layer's file name and how many of its bytes have
+	// been uploaded so far in the current attempt. The value is cumulative per
+	// layer and can restart at zero, so callers must keep a high-water mark
+	// per name rather than summing what they are given.
+	OnProgress func(name string, uploaded int64)
 }
 
 // ValidatePushTarget reports whether p names something that can be published
@@ -1088,7 +1092,7 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 			return fmt.Errorf("acr: invalid upload file name %q: %w", file.Name, err)
 		}
 		adds = append(adds, mutate.Addendum{
-			Layer:       &fileLayer{ctx: ctx, open: file.Open, size: file.Size, onRead: opts.OnProgress},
+			Layer:       &fileLayer{ctx: ctx, name: cleaned, open: file.Open, size: file.Size, onRead: opts.OnProgress},
 			MediaType:   layerMediaType,
 			Annotations: map[string]string{TitleAnnotation: cleaned},
 		})

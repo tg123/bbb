@@ -351,11 +351,16 @@ type ArtifactFile struct {
 }
 
 type artifactUploader interface {
-	UploadArtifact(ctx context.Context, dst string, files []ArtifactFile, concurrency int, overwrite bool, onProgress func(int64)) error
+	UploadArtifact(ctx context.Context, dst string, files []ArtifactFile, concurrency int, overwrite bool, onProgress func(name string, uploaded int64)) error
 }
 
 // UploadArtifact publishes files atomically as one backend artifact.
-func UploadArtifact(ctx context.Context, dst string, files []ArtifactFile, concurrency int, overwrite bool, onProgress func(int64)) error {
+//
+// onProgress, when non-nil, receives a file's name and how many of its bytes
+// have been uploaded so far. The value is cumulative per file and may restart
+// at zero when a transfer is retried, so callers must track a high-water mark
+// per name instead of treating each call as a delta.
+func UploadArtifact(ctx context.Context, dst string, files []ArtifactFile, concurrency int, overwrite bool, onProgress func(name string, uploaded int64)) error {
 	uploader, ok := Resolve(dst).(artifactUploader)
 	if !ok {
 		return fmt.Errorf("artifact upload not supported for %s", dst)
