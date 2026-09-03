@@ -423,21 +423,10 @@ type File struct {
 	Digest string
 }
 
-// insecureRegistries returns the registry authorities explicitly allowed to be
+// insecureRegistries returns the registry hosts explicitly allowed to be
 // contacted over plain HTTP, from BBB_ACR_INSECURE.
 func insecureRegistries() []string {
-	raw := strings.TrimSpace(os.Getenv("BBB_ACR_INSECURE"))
-	if raw == "" {
-		return nil
-	}
-	entries := strings.Split(raw, ",")
-	out := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry = strings.ToLower(strings.TrimSpace(entry)); entry != "" {
-			out = append(out, entry)
-		}
-	}
-	return out
+	return normalisedHostList(os.Getenv("BBB_ACR_INSECURE"))
 }
 
 // isLoopback reports whether registry genuinely addresses the local machine,
@@ -470,10 +459,8 @@ func checkTransportSecurity(registry string) error {
 		return nil
 	}
 	host := registryHost(registry)
-	for _, allowed := range insecureRegistries() {
-		if allowed == host || allowed == strings.ToLower(registry) {
-			return nil
-		}
+	if slices.Contains(insecureRegistries(), host) {
+		return nil
 	}
 	return fmt.Errorf(
 		"acr: refusing to contact %s over plain HTTP; set BBB_ACR_INSECURE=%s to allow it, or address the registry by a name that resolves over HTTPS",
@@ -512,8 +499,9 @@ const maxIndexDepth = 4
 // had already expired. Blobs are content-addressed, so refetching by digest
 // with the caller's context returns exactly the pinned content.
 type artifact struct {
-	files []File
-	seen  *nameSet
+	files  []File
+	byName map[string]File
+	seen   *nameSet
 }
 
 // layerCacheEntry memoises one resolved artifact.
@@ -569,7 +557,7 @@ func fetchArtifact(ctx context.Context, p Path) (*artifact, error) {
 	if err != nil {
 		return nil, asStatusError(err)
 	}
-	art := &artifact{seen: newNameSet(0)}
+	art := &artifact{byName: map[string]File{}, seen: newNameSet(0)}
 	switch desc.MediaType {
 	case types.OCIImageIndex, types.DockerManifestList:
 		// Descriptor.Image() would resolve an index to the single child
@@ -653,7 +641,9 @@ func (a *artifact) addImage(image v1.Image) error {
 		// Record by name rather than by digest: two files with identical
 		// contents share a blob but are still two distinct files, and dropping
 		// the second would silently lose it.
-		a.files = append(a.files, File{Name: cleaned, Size: descriptor.Size, Digest: digest})
+		file := File{Name: cleaned, Size: descriptor.Size, Digest: digest}
+		a.files = append(a.files, file)
+		a.byName[cleaned] = file
 	}
 	return nil
 }
@@ -676,10 +666,8 @@ func Stat(ctx context.Context, p Path) (File, error) {
 	if err != nil {
 		return File{}, err
 	}
-	for _, f := range art.files {
-		if f.Name == p.File {
-			return f, nil
-		}
+	if file, ok := art.byName[p.File]; ok {
+		return file, nil
 	}
 	return File{}, &notFoundError{path: p.String()}
 }
@@ -709,11 +697,8 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 		return nil, err
 	}
 	var target File
-	for _, f := range art.files {
-		if f.Name == p.File {
-			target = f
-			break
-		}
+	if file, ok := art.byName[p.File]; ok {
+		target = file
 	}
 	if target.Name == "" {
 		return nil, &notFoundError{path: p.String()}
@@ -848,7 +833,9 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 	}
 
 	options := p.remoteOptions(ctx)
-	if opts.Concurrency > 1 {
+	if opts.Concurrency > 0 {
+		// go-containerregistry defaults to four jobs, so a requested limit of
+		// one has to be passed through rather than omitted.
 		options = append(options, remote.WithJobs(opts.Concurrency))
 	}
 	if !opts.Overwrite {

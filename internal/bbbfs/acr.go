@@ -111,6 +111,15 @@ func (acrFS) Stat(ctx context.Context, target string) (Entry, error) {
 	}
 	file, err := acr.Stat(ctx, ap)
 	if err != nil {
+		// The path may name one of the virtual directories List synthesises
+		// from layer names, which has no layer of its own.
+		if dir, dirErr := hasChildren(ctx, ap); dirErr == nil && dir {
+			return Entry{
+				Name:  path.Base(ap.File),
+				Path:  ap.String(),
+				IsDir: true,
+			}, nil
+		}
 		return Entry{}, err
 	}
 	return Entry{
@@ -160,12 +169,35 @@ func (acrFS) ListRecursive(ctx context.Context, target string, emit func(Entry) 
 	return nil
 }
 
-func (acrFS) IsDirLike(_ context.Context, p string) (bool, error) {
+// hasChildren reports whether any layer of the artifact lives under prefix,
+// which makes prefix one of the virtual directories List synthesises.
+func hasChildren(ctx context.Context, ap acr.Path) (bool, error) {
+	prefix := ap.File
+	ap.File = ""
+	files, err := acr.ListFiles(ctx, ap)
+	if err != nil {
+		return false, err
+	}
+	prefix += "/"
+	for _, f := range files {
+		if strings.HasPrefix(f.Name, prefix) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (acrFS) IsDirLike(ctx context.Context, p string) (bool, error) {
 	ap, err := acr.Parse(p)
 	if err != nil {
 		return false, err
 	}
-	return ap.File == "", nil
+	if ap.File == "" {
+		return true, nil
+	}
+	// List emits nested virtual directories such as "sub/", so a non-root path
+	// is directory-like when the artifact holds layers beneath it.
+	return hasChildren(ctx, ap)
 }
 
 func (acrFS) IsDirLikeFromPath(p string) bool {

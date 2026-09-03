@@ -992,6 +992,24 @@ func TestIsACR(t *testing.T) {
 	if isACR("other.corp.example") {
 		t.Error("opt-in must not extend to unlisted hosts")
 	}
+
+	// An entry configured with a port must still match, since the registry
+	// being checked has its port stripped first.
+	t.Setenv("BBB_ACR_ENTRA_HOSTS", "registry.corp.example:443")
+	if !isACR("registry.corp.example:443") {
+		t.Error("expected a host:port opt-in to match")
+	}
+	if !isACR("registry.corp.example") {
+		t.Error("expected a host:port opt-in to match the bare host too")
+	}
+}
+
+func TestInsecureOptInNormalisesEntries(t *testing.T) {
+	p := Path{Registry: "10.1.2.3:5000", Repository: "models", Reference: "v1"}
+	t.Setenv("BBB_ACR_INSECURE", " 10.1.2.3:5000 ")
+	if _, err := p.reference(); err != nil {
+		t.Fatalf("expected a host:port opt-in to match, got %v", err)
+	}
 }
 
 // A file layer must stream from disk rather than buffer, and report a digest

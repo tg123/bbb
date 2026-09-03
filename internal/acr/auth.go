@@ -47,17 +47,25 @@ func registryHost(registry string) string {
 }
 
 // trustedEntraHosts returns extra registry hosts explicitly opted in via
-// BBB_ACR_ENTRA_HOSTS, for ACR deployments behind a custom domain.
+// BBB_ACR_ENTRA_HOSTS, for ACR deployments behind a custom domain. Entries are
+// normalised the same way as the registry being checked, so a configured
+// host:port still matches.
 func trustedEntraHosts() []string {
-	raw := strings.TrimSpace(os.Getenv("BBB_ACR_ENTRA_HOSTS"))
+	return normalisedHostList(os.Getenv("BBB_ACR_ENTRA_HOSTS"))
+}
+
+// normalisedHostList splits a comma separated host list and reduces each entry
+// to a bare host.
+func normalisedHostList(raw string) []string {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
 	}
-	hosts := strings.Split(raw, ",")
-	out := make([]string, 0, len(hosts))
-	for _, host := range hosts {
-		if host = strings.ToLower(strings.TrimSpace(host)); host != "" {
-			out = append(out, host)
+	entries := strings.Split(raw, ",")
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			out = append(out, registryHost(entry))
 		}
 	}
 	return out
