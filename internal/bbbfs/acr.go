@@ -53,6 +53,25 @@ func (acrFS) UploadArtifact(ctx context.Context, target string, files []Artifact
 	})
 }
 
+// confirmPrefix turns an empty listing for a nested path into a not-found
+// error. The artifact itself resolved, so an empty result means the prefix
+// matched neither a layer nor a virtual directory; without this, listing a
+// path that does not exist would exit successfully with no output, unlike
+// every other backend.
+//
+// An exact layer name legitimately has no children, so the prefix is checked
+// against the artifact rather than assumed missing: that case still returns an
+// empty list for the caller to resolve through Stat.
+func confirmPrefix(ctx context.Context, ap acr.Path, prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+	probe := ap
+	probe.File = prefix
+	_, err := acr.Stat(ctx, probe)
+	return err
+}
+
 func (acrFS) List(ctx context.Context, target string) ([]Entry, error) {
 	ap, err := acr.Parse(target)
 	if err != nil {
@@ -71,6 +90,11 @@ func (acrFS) List(ctx context.Context, target string) ([]Entry, error) {
 		sizes[f.Name] = f.Size
 	}
 	entries := listEntriesByPrefix(names, prefix)
+	if len(entries) == 0 {
+		if err := confirmPrefix(ctx, ap, prefix); err != nil {
+			return nil, err
+		}
+	}
 	out := make([]Entry, 0, len(entries))
 	for _, name := range entries {
 		trimmed := strings.TrimSuffix(name, "/")
@@ -149,6 +173,11 @@ func (acrFS) ListRecursive(ctx context.Context, target string, emit func(Entry) 
 		sizes[f.Name] = f.Size
 	}
 	filtered := filterFilesByPrefix(names, prefix)
+	if len(filtered) == 0 {
+		if err := confirmPrefix(ctx, ap, prefix); err != nil {
+			return err
+		}
+	}
 	sort.Strings(filtered)
 	for _, name := range filtered {
 		if name == "" {

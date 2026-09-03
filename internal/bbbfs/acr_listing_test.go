@@ -141,6 +141,33 @@ func TestACRStatFileAndVirtualDirectory(t *testing.T) {
 	}
 }
 
+// A path that does not exist must fail, not list as an empty directory, so
+// "bbb ls acr://…:tag/missing" behaves like every other backend.
+func TestACRListMissingPrefixIsNotFound(t *testing.T) {
+	artifact := newArtifact(t, map[string]string{"a.txt": "alpha", "sub/b.txt": "bravo"})
+	fs := acrFS{}
+
+	if _, err := fs.List(t.Context(), artifact+"/missing"); err == nil {
+		t.Fatal("expected List on a missing prefix to fail")
+	}
+	err := fs.ListRecursive(t.Context(), artifact+"/missing", func(Entry) error {
+		t.Error("a missing prefix must not emit entries")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected ListRecursive on a missing prefix to fail")
+	}
+
+	// An exact file has no children, but it exists: the empty listing is left
+	// for the caller to resolve through Stat.
+	if entries, err := fs.List(t.Context(), artifact+"/a.txt"); err != nil || len(entries) != 0 {
+		t.Fatalf("List(a.txt) = %#v (%v), want an empty listing", entries, err)
+	}
+	if err := fs.ListRecursive(t.Context(), artifact+"/a.txt", func(Entry) error { return nil }); err != nil {
+		t.Fatalf("ListRecursive(a.txt) failed: %v", err)
+	}
+}
+
 func TestACREmptyArtifact(t *testing.T) {
 	artifact := newArtifact(t, nil)
 	fs := acrFS{}
