@@ -63,6 +63,11 @@ func TestParse(t *testing.T) {
 		{name: "reserved device name in a subdirectory", raw: "acr://myreg.azurecr.io/models:v1/sub/lpt1.bin", wantErr: true},
 		{name: "trailing dot", raw: "acr://myreg.azurecr.io/models:v1/a.", wantErr: true},
 		{name: "trailing space", raw: "acr://myreg.azurecr.io/models:v1/a.txt ", wantErr: true},
+		{name: "wildcard character", raw: "acr://myreg.azurecr.io/models:v1/a*.txt", wantErr: true},
+		{name: "pipe character", raw: "acr://myreg.azurecr.io/models:v1/a|b.txt", wantErr: true},
+		{name: "quote character", raw: `acr://myreg.azurecr.io/models:v1/a".txt`, wantErr: true},
+		{name: "angle bracket", raw: "acr://myreg.azurecr.io/models:v1/a<b.txt", wantErr: true},
+		{name: "control character", raw: "acr://myreg.azurecr.io/models:v1/a\x01b.txt", wantErr: true},
 		{
 			name: "name merely containing a device name is fine",
 			raw:  "acr://myreg.azurecr.io/models:v1/console.log",
@@ -525,6 +530,52 @@ func TestSameContentDifferentNamesRoundTrip(t *testing.T) {
 		if err != nil || string(got) != "identical" {
 			t.Fatalf("%s = %q (%v)", name, got, err)
 		}
+	}
+}
+
+// A file and a directory cannot share one path, so an artifact holding both
+// "a" and "a/b" can never be extracted.
+func TestAncestorAndDescendantNamesConflict(t *testing.T) {
+	reader := func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("x")), nil }
+
+	// Rejected on the write path, in either order.
+	if err := ValidateUploadNames([]UploadFile{
+		{Name: "a", Open: reader},
+		{Name: "a/b", Open: reader},
+	}); err == nil || !strings.Contains(err.Error(), "is a file") {
+		t.Fatalf("expected file-then-directory to be rejected, got %v", err)
+	}
+	if err := ValidateUploadNames([]UploadFile{
+		{Name: "a/b", Open: reader},
+		{Name: "a", Open: reader},
+	}); err == nil || !strings.Contains(err.Error(), "directory") {
+		t.Fatalf("expected directory-then-file to be rejected, got %v", err)
+	}
+	// Deeper nesting is caught too.
+	if err := ValidateUploadNames([]UploadFile{
+		{Name: "a/b", Open: reader},
+		{Name: "a/b/c/d", Open: reader},
+	}); err == nil {
+		t.Fatal("expected a nested conflict to be rejected")
+	}
+	// Siblings sharing a directory prefix remain fine.
+	if err := ValidateUploadNames([]UploadFile{
+		{Name: "a/b", Open: reader},
+		{Name: "a/c", Open: reader},
+		{Name: "ab", Open: reader},
+	}); err != nil {
+		t.Fatalf("expected sibling names to be accepted, got %v", err)
+	}
+
+	// And rejected on the read path, where the registry controls the titles.
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "models", Reference: "clash"}
+	pushRawArtifact(t, p, []layerSpec{
+		{title: "a", content: "file"},
+		{title: "a/b", content: "nested"},
+	})
+	if _, err := ListFiles(t.Context(), p); err == nil || !strings.Contains(err.Error(), "is a file") {
+		t.Fatalf("expected the artifact to be rejected, got %v", err)
 	}
 }
 

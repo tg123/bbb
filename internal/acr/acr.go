@@ -206,11 +206,25 @@ var windowsReservedNames = map[string]struct{}{
 	"lpt6": {}, "lpt7": {}, "lpt8": {}, "lpt9": {},
 }
 
+// windowsForbidden are characters Windows does not allow in a filename.
+// Backslash, colon and slash are handled separately: the first two are
+// rejected for the whole path, and the third is the separator.
+const windowsForbidden = `<>"|?*`
+
 // checkPortableSegment rejects a path element that does not name a distinct,
 // ordinary file on Windows. Layer titles are registry-controlled, so a name
-// that silently discards content (NUL) or aliases another name (a. and a)
-// would let an extraction report success while losing or overwriting data.
+// that silently discards content (NUL), aliases another name (a. and a) or
+// cannot be created at all would let an extraction report success while
+// losing or overwriting data, or fail only once bytes are already on disk.
 func checkPortableSegment(segment string) error {
+	if strings.ContainsAny(segment, windowsForbidden) {
+		return fmt.Errorf("invalid file path: %q contains a character that is not allowed in a filename", segment)
+	}
+	for _, r := range segment {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("invalid file path: %q contains a control character", segment)
+		}
+	}
 	// Windows strips trailing dots and spaces, so "a." and "a" are one file.
 	if trimmed := strings.TrimRight(segment, ". "); trimmed != segment {
 		return fmt.Errorf("invalid file path: %q ends with a dot or space", segment)
@@ -223,6 +237,66 @@ func checkPortableSegment(segment string) error {
 		return fmt.Errorf("invalid file path: %q is a reserved device name", segment)
 	}
 	return nil
+}
+
+// ancestors returns each directory prefix of a cleaned artifact file name,
+// so "a/b/c" yields "a" and "a/b".
+func ancestors(name string) []string {
+	var out []string
+	for idx := strings.IndexByte(name, '/'); idx >= 0; {
+		out = append(out, name[:idx])
+		next := strings.IndexByte(name[idx+1:], '/')
+		if next < 0 {
+			break
+		}
+		idx += next + 1
+	}
+	return out
+}
+
+// nameSet tracks accepted artifact file names and rejects any name that cannot
+// coexist with them on a filesystem.
+//
+// Comparing whole names is not enough: layers "a" and "a/b" are distinct
+// strings, but no filesystem can hold a file and a directory at one path, so
+// extraction would fail or half-succeed depending on write order.
+type nameSet struct {
+	files map[string]string
+	dirs  map[string]struct{}
+}
+
+func newNameSet(size int) *nameSet {
+	return &nameSet{
+		files: make(map[string]string, size),
+		dirs:  make(map[string]struct{}, size),
+	}
+}
+
+// digestOf returns the digest recorded for an already-accepted name.
+func (s *nameSet) digestOf(name string) (string, bool) {
+	digest, ok := s.files[name]
+	return digest, ok
+}
+
+// checkCoexists reports whether name can be added alongside everything
+// already accepted.
+func (s *nameSet) checkCoexists(name string) error {
+	if _, isDir := s.dirs[name]; isDir {
+		return fmt.Errorf("%q is also used as a directory by another file", name)
+	}
+	for _, ancestor := range ancestors(name) {
+		if _, isFile := s.files[ancestor]; isFile {
+			return fmt.Errorf("%q is nested under %q, which is a file", name, ancestor)
+		}
+	}
+	return nil
+}
+
+func (s *nameSet) add(name, digest string) {
+	s.files[name] = digest
+	for _, ancestor := range ancestors(name) {
+		s.dirs[ancestor] = struct{}{}
+	}
 }
 
 // cleanFile validates a name used as a path relative to a local destination.
@@ -265,19 +339,22 @@ func cleanFile(file string) (string, error) {
 // ValidateUploadNames checks the names of an artifact's files without
 // contacting the registry, so a dry run rejects exactly what a real push would.
 func ValidateUploadNames(files []UploadFile) error {
-	seen := make(map[string]struct{}, len(files))
+	seen := newNameSet(len(files))
 	for _, file := range files {
 		cleaned, err := cleanFile(file.Name)
 		if err != nil {
 			return fmt.Errorf("acr: invalid upload file name %q: %w", file.Name, err)
 		}
-		if _, exists := seen[cleaned]; exists {
+		if _, exists := seen.digestOf(cleaned); exists {
 			return fmt.Errorf("acr: duplicate upload file name %q", cleaned)
+		}
+		if err := seen.checkCoexists(cleaned); err != nil {
+			return fmt.Errorf("acr: cannot publish %q: %w", file.Name, err)
 		}
 		if file.Open == nil {
 			return fmt.Errorf("acr: upload file %q has no reader", cleaned)
 		}
-		seen[cleaned] = struct{}{}
+		seen.add(cleaned, "")
 	}
 	return nil
 }
@@ -388,7 +465,7 @@ const maxIndexDepth = 4
 type artifact struct {
 	files  []File
 	layers map[string]v1.Layer
-	seen   map[string]string
+	seen   *nameSet
 }
 
 // layerCacheEntry memoises one resolved artifact.
@@ -446,7 +523,7 @@ func fetchArtifact(ctx context.Context, p Path) (*artifact, error) {
 	}
 	art := &artifact{
 		layers: map[string]v1.Layer{},
-		seen:   map[string]string{},
+		seen:   newNameSet(0),
 	}
 	switch desc.MediaType {
 	case types.OCIImageIndex, types.DockerManifestList:
@@ -521,7 +598,7 @@ func (a *artifact) addImage(image v1.Image) error {
 		if err != nil {
 			return fmt.Errorf("acr: invalid layer name %q: %w", title, err)
 		}
-		if previous, dup := a.seen[cleaned]; dup {
+		if previous, dup := a.seen.digestOf(cleaned); dup {
 			// The same descriptor listed twice, typically because several
 			// manifests in an index share a layer, is one file.
 			if previous == digest {
@@ -533,6 +610,9 @@ func (a *artifact) addImage(image v1.Image) error {
 				"acr: conflicting layers named %q (%s and %s); address the artifact by digest to read a specific manifest",
 				cleaned, previous, digest)
 		}
+		if err := a.seen.checkCoexists(cleaned); err != nil {
+			return fmt.Errorf("acr: cannot extract this artifact: %w", err)
+		}
 		// Deduplicate by name rather than by digest: two files with identical
 		// contents share a blob but are still two distinct files, and dropping
 		// the second would silently lose it.
@@ -543,7 +623,7 @@ func (a *artifact) addImage(image v1.Image) error {
 			}
 			a.layers[digest] = layer
 		}
-		a.seen[cleaned] = digest
+		a.seen.add(cleaned, digest)
 		a.files = append(a.files, File{Name: cleaned, Size: descriptor.Size, Digest: digest})
 	}
 	return nil
