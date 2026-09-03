@@ -2178,6 +2178,19 @@ func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.A
 		return nil, 0, noCleanup, err
 	}
 	cleanup := func() { _ = root.Close() }
+	// OpenRoot resolves src again, so confirm the handle refers to the very
+	// directory that was stat-ed above. Otherwise a source replaced by a
+	// symlink in between would anchor the root to its target and every later
+	// check inside that root would happily succeed.
+	rootInfo, err := root.Stat(".")
+	if err != nil {
+		cleanup()
+		return nil, 0, noCleanup, err
+	}
+	if !os.SameFile(rootInfo, info) {
+		cleanup()
+		return nil, 0, noCleanup, fmt.Errorf("source directory changed while it was being read: %s", src)
+	}
 
 	var files []bbbfs.ArtifactFile
 	var total int64
