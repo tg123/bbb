@@ -75,12 +75,13 @@ func registryHost(registry string) string {
 // normalised the same way as the registry being checked, so a configured
 // host:port still matches.
 func trustedEntraHosts() []string {
-	return normalisedHostList(os.Getenv("BBB_ACR_ENTRA_HOSTS"))
+	return normalisedAuthorityList(os.Getenv("BBB_ACR_ENTRA_HOSTS"))
 }
 
-// normalisedHostList splits a comma separated host list and reduces each entry
-// to a bare host.
-func normalisedHostList(raw string) []string {
+// normalisedAuthorityList splits a comma separated list and canonicalises each
+// entry, preserving a non-default port so trusting host:443 does not also trust
+// another service on host:5000.
+func normalisedAuthorityList(raw string) []string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
@@ -89,7 +90,7 @@ func normalisedHostList(raw string) []string {
 	out := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry = strings.TrimSpace(entry); entry != "" {
-			out = append(out, registryHost(entry))
+			out = append(out, configAuthority(entry))
 		}
 	}
 	return out
@@ -114,8 +115,8 @@ func hasAzureSuffix(host string) bool {
 // a private ghcr.io repository would otherwise receive the caller's Azure
 // credential. Everything else falls through to the Docker keychain.
 func isACR(registry string) bool {
-	host := registryHost(registry)
-	return slices.Contains(trustedEntraHosts(), host) || hasAzureSuffix(host)
+	return slices.Contains(trustedEntraHosts(), configAuthority(registry)) ||
+		hasAzureSuffix(registryHost(registry))
 }
 
 // basicCredentials returns explicitly configured registry credentials for
@@ -132,8 +133,8 @@ func basicCredentials(registry string) (string, string, bool) {
 		return "", "", false
 	}
 	host := registryHost(registry)
-	if scoped := normalisedHostList(os.Getenv("BBB_ACR_REGISTRY")); len(scoped) > 0 {
-		if !slices.Contains(scoped, host) {
+	if scoped := normalisedAuthorityList(os.Getenv("BBB_ACR_REGISTRY")); len(scoped) > 0 {
+		if !slices.Contains(scoped, configAuthority(registry)) {
 			return "", "", false
 		}
 		return user, pass, true

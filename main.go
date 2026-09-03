@@ -1336,8 +1336,22 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		}
 	}
 
-	acrDestinations := make(map[string]struct{})
+	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
+}
+
+// validateACRTasks rejects task combinations that cannot run concurrently
+// against one artifact. Tasks already recorded as complete are excluded,
+// because a resumed run does not execute them.
+func validateACRTasks(tasks []taskPair, completed map[string]struct{}) error {
+	pending := make([]taskPair, 0, len(tasks))
 	for _, task := range tasks {
+		if _, done := completed[taskCheckpointKey(task.src, task.dst)]; !done {
+			pending = append(pending, task)
+		}
+	}
+
+	destinations := make(map[string]struct{})
+	for _, task := range pending {
 		if !bbbfs.IsACR(task.dst) {
 			continue
 		}
@@ -1349,15 +1363,15 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 			return fmt.Errorf("cp: %w", err)
 		}
 		key := destination.ArtifactKey()
-		if _, duplicate := acrDestinations[key]; duplicate {
+		if _, duplicate := destinations[key]; duplicate {
 			return fmt.Errorf("cp: multiple sources cannot target the same acr:// artifact")
 		}
-		acrDestinations[key] = struct{}{}
+		destinations[key] = struct{}{}
 	}
 	// Tasks run concurrently, so an artifact that is read by one task and
 	// republished by another would have its tag moved mid-transfer, leaving
 	// the reader mixing revisions.
-	for _, task := range tasks {
+	for _, task := range pending {
 		if !bbbfs.IsACR(task.src) {
 			continue
 		}
@@ -1365,12 +1379,11 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return fmt.Errorf("cp: %w", err)
 		}
-		if _, clash := acrDestinations[source.ArtifactKey()]; clash {
+		if _, clash := destinations[source.ArtifactKey()]; clash {
 			return fmt.Errorf("cp: cannot read and publish the same acr:// artifact in one run: %s", task.src)
 		}
 	}
-
-	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
+	return nil
 }
 
 // runCPTasks executes a list of task pairs through the unified expansion +
@@ -1401,6 +1414,11 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 
 	state, taskCheckpoints, err := loadTaskState(stateFile)
 	if err != nil {
+		return err
+	}
+	// Validate after the checkpoints load, so a resumed run is not blocked by
+	// a conflict with a task that has already completed and will be skipped.
+	if err := validateACRTasks(tasks, taskCheckpoints); err != nil {
 		return err
 	}
 	// Streaming progress bar: total starts at 0 and grows as files are

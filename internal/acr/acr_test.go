@@ -801,7 +801,7 @@ func TestPlainHTTPOptIn(t *testing.T) {
 	if _, err := p.reference(); err == nil {
 		t.Fatal("expected the registry to be refused without an opt-in")
 	}
-	t.Setenv("BBB_ACR_INSECURE", "10.1.2.3")
+	t.Setenv("BBB_ACR_INSECURE", "10.1.2.3:5000")
 	if _, err := p.reference(); err != nil {
 		t.Fatalf("expected the opt-in to allow the registry, got %v", err)
 	}
@@ -1179,13 +1179,20 @@ func TestIsACR(t *testing.T) {
 	}
 
 	// An entry configured with a port must still match, since the registry
-	// being checked has its port stripped first.
+	// being checked has its port normalised the same way.
 	t.Setenv("BBB_ACR_ENTRA_HOSTS", "registry.corp.example:443")
 	if !isACR("registry.corp.example:443") {
 		t.Error("expected a host:port opt-in to match")
 	}
 	if !isACR("registry.corp.example") {
-		t.Error("expected a host:port opt-in to match the bare host too")
+		t.Error("expected a default port to match the bare host")
+	}
+
+	// A non-default port names a different service and must not be trusted by
+	// an entry for another port on the same host.
+	t.Setenv("BBB_ACR_ENTRA_HOSTS", "registry.corp.example:443")
+	if isACR("registry.corp.example:5000") {
+		t.Error("trusting :443 must not trust :5000 on the same host")
 	}
 }
 
@@ -1210,7 +1217,7 @@ func TestInsecureOptInForcesHTTPForHostnames(t *testing.T) {
 		t.Fatalf("expected https without an opt-in, got %s", scheme)
 	}
 
-	t.Setenv("BBB_ACR_INSECURE", "registry.example.com")
+	t.Setenv("BBB_ACR_INSECURE", "registry.example.com:5000")
 	ref, err = p.reference()
 	if err != nil {
 		t.Fatalf("reference failed: %v", err)

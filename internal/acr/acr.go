@@ -160,7 +160,10 @@ const expectedPathErr = "expected acr://registry/repository[:tag|@digest][/file]
 // deliberately not applied to Path.Registry itself: the port is part of the
 // authority used for requests, and dropping it would move
 // registry.example:80 from port 80 to 443.
-func registryKey(registry string) string {
+// canonicalAuthority normalises a registry authority for comparison. insecure
+// says whether the endpoint is reached over HTTP, which decides the default
+// port; a non-default port is preserved, because it names a different service.
+func canonicalAuthority(registry string, insecure bool) string {
 	registry = strings.ToLower(strings.TrimSpace(registry))
 	host, port, err := net.SplitHostPort(registry)
 	if err != nil {
@@ -188,7 +191,7 @@ func registryKey(registry string) string {
 	}
 	authority := net.JoinHostPort(host, port)
 	scheme := "https"
-	if isInsecureAllowed(authority) || isLoopback(authority) {
+	if insecure {
 		scheme = "http"
 	} else if parsed, perr := name.NewRegistry(authority, name.WeakValidation); perr == nil {
 		scheme = parsed.Scheme()
@@ -197,6 +200,17 @@ func registryKey(registry string) string {
 		return bare
 	}
 	return authority
+}
+
+// configAuthority canonicalises an authority for matching against configured
+// allowlists. It deliberately does not consult those lists, which is what
+// registryKey does and would recurse here.
+func configAuthority(registry string) string {
+	return canonicalAuthority(registry, isLoopback(registry))
+}
+
+func registryKey(registry string) string {
+	return canonicalAuthority(registry, isInsecureAllowed(registry) || isLoopback(registry))
 }
 
 // ArtifactKey identifies the artifact a path addresses, ignoring any file
@@ -526,7 +540,7 @@ type File struct {
 // insecureRegistries returns the registry hosts explicitly allowed to be
 // contacted over plain HTTP, from BBB_ACR_INSECURE.
 func insecureRegistries() []string {
-	return normalisedHostList(os.Getenv("BBB_ACR_INSECURE"))
+	return normalisedAuthorityList(os.Getenv("BBB_ACR_INSECURE"))
 }
 
 // isLoopback reports whether registry genuinely addresses the local machine,
@@ -545,7 +559,7 @@ func isLoopback(registry string) bool {
 // isInsecureAllowed reports whether the operator explicitly allowed plain HTTP
 // for registry via BBB_ACR_INSECURE.
 func isInsecureAllowed(registry string) bool {
-	return slices.Contains(insecureRegistries(), registryHost(registry))
+	return slices.Contains(insecureRegistries(), configAuthority(registry))
 }
 
 // checkTransportSecurity refuses to contact a registry that
@@ -564,10 +578,9 @@ func checkTransportSecurity(registry string) error {
 	if parsed.Scheme() == "https" || isLoopback(registry) || isInsecureAllowed(registry) {
 		return nil
 	}
-	host := registryHost(registry)
 	return fmt.Errorf(
 		"acr: refusing to contact %s over plain HTTP; set BBB_ACR_INSECURE=%s to allow it, or address the registry by a name that resolves over HTTPS",
-		registry, host)
+		registry, configAuthority(registry))
 }
 
 // blobReference builds a digest reference for a blob in the same repository,
@@ -625,7 +638,7 @@ func (t *httpsOnlyTransport) RoundTrip(req *http.Request) (*http.Response, error
 	if !t.permitted && !strings.EqualFold(req.URL.Scheme, "https") {
 		return nil, fmt.Errorf(
 			"acr: refusing to send a request to %s over plain HTTP; set BBB_ACR_INSECURE=%s to allow it",
-			req.URL.Host, registryHost(req.URL.Host))
+			req.URL.Host, configAuthority(req.URL.Host))
 	}
 	return t.base.RoundTrip(req)
 }
