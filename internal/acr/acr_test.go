@@ -1021,7 +1021,7 @@ func TestInsecureOptInForcesHTTPForHostnames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("an ordinary hostname should be allowed: %v", err)
 	}
-	if scheme := ref.Context().Registry.Scheme(); scheme != "https" {
+	if scheme := ref.Context().Scheme(); scheme != "https" {
 		t.Fatalf("expected https without an opt-in, got %s", scheme)
 	}
 
@@ -1030,7 +1030,7 @@ func TestInsecureOptInForcesHTTPForHostnames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reference failed: %v", err)
 	}
-	if scheme := ref.Context().Registry.Scheme(); scheme != "http" {
+	if scheme := ref.Context().Scheme(); scheme != "http" {
 		t.Fatalf("expected the opt-in to select http, got %s", scheme)
 	}
 }
