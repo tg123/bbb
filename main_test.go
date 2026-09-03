@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/registry"
+	"github.com/tg123/bbb/internal/acr"
 	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/hf"
 	"github.com/urfave/cli/v3"
@@ -226,6 +231,63 @@ func TestCPRejectsReadAndWriteOfSameArtifact(t *testing.T) {
 	err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile})
 	if err == nil || !strings.Contains(err.Error(), "read and publish the same acr:// artifact") {
 		t.Fatalf("expected the overlap to be rejected, got %v", err)
+	}
+}
+
+// An ACR artifact source must expand into one task per file, so a download
+// gets the normal per-file concurrency and state tracking.
+func TestExpandCPTaskExpandsACRSource(t *testing.T) {
+	server := httptest.NewServer(registry.New(registry.Logger(log.New(io.Discard, "", 0))))
+	t.Cleanup(server.Close)
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	artifact := acr.Path{Registry: parsed.Host, Repository: "models", Reference: "v1"}
+	uploads := []acr.UploadFile{
+		{Name: "a.txt", Size: 5, Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("alpha")), nil
+		}},
+		{Name: "sub/b.txt", Size: 5, Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("bravo")), nil
+		}},
+	}
+	if err := acr.Push(context.Background(), artifact, uploads, acr.PushOptions{Overwrite: true}); err != nil {
+		t.Fatalf("push artifact: %v", err)
+	}
+
+	destination := t.TempDir()
+	var expanded []cpTask
+	if err := expandCPTask(context.Background(), taskPair{src: artifact.String(), dst: destination},
+		func(task cpTask) error {
+			expanded = append(expanded, task)
+			return nil
+		}); err != nil {
+		t.Fatalf("expandCPTask failed: %v", err)
+	}
+	if len(expanded) != 2 {
+		t.Fatalf("expected one task per file, got %#v", expanded)
+	}
+	for _, task := range expanded {
+		if !strings.HasPrefix(task.src, "acr://") || task.src == artifact.String() {
+			t.Fatalf("expected a per-file source, got %q", task.src)
+		}
+	}
+
+	// A path naming a single file inside the artifact stays one task.
+	single := artifact
+	single.File = "a.txt"
+	expanded = nil
+	if err := expandCPTask(context.Background(), taskPair{src: single.String(), dst: destination},
+		func(task cpTask) error {
+			expanded = append(expanded, task)
+			return nil
+		}); err != nil {
+		t.Fatalf("expandCPTask failed: %v", err)
+	}
+	if len(expanded) != 1 || expanded[0].src != single.String() {
+		t.Fatalf("expected a single task for a file path, got %#v", expanded)
 	}
 }
 

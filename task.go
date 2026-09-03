@@ -213,7 +213,7 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 	}
 
 	// Check if source is a single file (not a directory)
-	if bbbfs.IsHF(task.src) || bbbfs.IsAz(task.src) {
+	if bbbfs.IsHF(task.src) || bbbfs.IsACR(task.src) || bbbfs.IsAz(task.src) {
 		dirLike, err := bbbfs.IsDirLike(ctx, task.src)
 		if err != nil {
 			return err
@@ -221,9 +221,9 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 		if !dirLike {
 			// For Azure sources, verify the blob actually exists; if not,
 			// the path may be a virtual directory prefix — fall through to
-			// recursive listing. For HF sources, skip the Stat-based check
-			// to avoid a potentially expensive full-repo listing and emit
-			// a single-file task directly.
+			// recursive listing. Hugging Face and ACR sources skip the
+			// Stat-based check, since an artifact or repo path that is not
+			// directory-like is already known to name a single file.
 			if bbbfs.IsAz(task.src) {
 				if entry, statErr := bbbfs.Resolve(task.src).Stat(ctx, task.src); statErr == nil {
 					return emit(cpTask{

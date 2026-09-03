@@ -217,7 +217,8 @@ func authOption(ctx context.Context, registry string) remote.Option {
 		return remote.WithAuth(&authn.Basic{Username: user, Password: pass})
 	}
 
-	value, _ := authCache.LoadOrStore(registryKey(registry), &authEntry{})
+	key := registryKey(registry)
+	value, _ := authCache.LoadOrStore(key, &authEntry{})
 	entry := value.(*authEntry)
 	entry.once.Do(func() {
 		if !isACR(registry) {
@@ -232,6 +233,10 @@ func authOption(ctx context.Context, registry string) remote.Option {
 		if err != nil {
 			slog.Debug("acr: Entra ID authentication unavailable, falling back to the Docker keychain",
 				"registry", registry, "error", err)
+			// Do not memoise the failure. A timeout or network problem would
+			// otherwise disable Entra for this registry for the rest of the
+			// run, long after it recovered; this call still falls back.
+			authCache.Delete(key)
 			return
 		}
 		entry.auth = &acrAuthenticator{
