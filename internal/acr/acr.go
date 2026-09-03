@@ -507,10 +507,16 @@ func (p Path) remoteOptions(ctx context.Context) []remote.Option {
 const maxIndexDepth = 4
 
 // artifact is one resolved snapshot of an acr:// reference.
+//
+// Only immutable metadata is retained. Layer objects are deliberately not
+// cached: a go-containerregistry remote layer captures the context and
+// authenticated fetcher it was created with, so reusing one would make a later
+// download ignore its own cancellation, or fail because the resolving context
+// had already expired. Blobs are content-addressed, so refetching by digest
+// with the caller's context returns exactly the pinned content.
 type artifact struct {
-	files  []File
-	layers map[string]v1.Layer
-	seen   *nameSet
+	files []File
+	seen  *nameSet
 }
 
 // layerCacheEntry memoises one resolved artifact.
@@ -566,10 +572,7 @@ func fetchArtifact(ctx context.Context, p Path) (*artifact, error) {
 	if err != nil {
 		return nil, asStatusError(err)
 	}
-	art := &artifact{
-		layers: map[string]v1.Layer{},
-		seen:   newNameSet(0),
-	}
+	art := &artifact{seen: newNameSet(0)}
 	switch desc.MediaType {
 	case types.OCIImageIndex, types.DockerManifestList:
 		// Descriptor.Image() would resolve an index to the single child
@@ -650,16 +653,9 @@ func (a *artifact) addImage(image v1.Image) error {
 		if dup {
 			continue
 		}
-		// Deduplicate by name rather than by digest: two files with identical
+		// Record by name rather than by digest: two files with identical
 		// contents share a blob but are still two distinct files, and dropping
 		// the second would silently lose it.
-		if _, ok := a.layers[digest]; !ok {
-			layer, err := image.LayerByDigest(descriptor.Digest)
-			if err != nil {
-				return asStatusError(err)
-			}
-			a.layers[digest] = layer
-		}
 		a.files = append(a.files, File{Name: cleaned, Size: descriptor.Size, Digest: digest})
 	}
 	return nil
@@ -725,9 +721,17 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	if target.Name == "" {
 		return nil, &notFoundError{path: p.String()}
 	}
-	layer, ok := art.layers[target.Digest]
-	if !ok {
-		return nil, &notFoundError{path: p.String()}
+	// Fetch the blob with the caller's context rather than the one that
+	// resolved the manifest. The digest pins the content, so this still reads
+	// exactly the snapshot that was listed.
+	digestRef, err := name.NewDigest(
+		p.Registry+"/"+p.Repository+"@"+target.Digest, name.WeakValidation)
+	if err != nil {
+		return nil, err
+	}
+	layer, err := remote.Layer(digestRef, p.remoteOptions(ctx)...)
+	if err != nil {
+		return nil, asStatusError(err)
 	}
 	// Compressed() returns the blob exactly as stored, which is what an
 	// artifact layer is; Uncompressed() would try to gunzip it.
@@ -844,13 +848,53 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 	if opts.Concurrency > 1 {
 		options = append(options, remote.WithJobs(opts.Concurrency))
 	}
+	if !opts.Overwrite {
+		// The existence check above and this write are separate requests, so
+		// two publishers could both observe an absent tag. Ask the registry to
+		// make the manifest PUT create-only; go-containerregistry has no option
+		// for this, so the header is added in the transport.
+		options = append(options, remote.WithTransport(&createOnlyTransport{base: roundTripper()}))
+	}
 	if err := remote.Write(ref, image, options...); err != nil {
+		var terr *transport.Error
+		if errors.As(err, &terr) && terr.StatusCode == http.StatusPreconditionFailed {
+			// A registry that honours If-None-Match rejected the write because
+			// the tag appeared after our check.
+			return fmt.Errorf("%w: %s", ErrArtifactExists, p.String())
+		}
 		return asStatusError(err)
+	}
+	if !opts.Overwrite {
+		// Registries are not required to honour If-None-Match. Confirm the tag
+		// holds what we published, so losing a race is reported rather than
+		// silently accepted.
+		published, err := manifestDigest(ctx, p)
+		if err != nil {
+			return err
+		}
+		if intended, derr := image.Digest(); derr == nil && published != "" && published != intended.String() {
+			return fmt.Errorf("%w: %s was published concurrently by another writer", ErrArtifactExists, p.String())
+		}
 	}
 	// The tag now points somewhere new, so drop any snapshot this process
 	// cached for it.
 	invalidateLayers(p)
 	return nil
+}
+
+// createOnlyTransport marks manifest writes as create-only, so a registry that
+// supports conditional requests rejects a tag that appeared after the caller's
+// existence check. Registries that ignore the header are unaffected.
+type createOnlyTransport struct {
+	base http.RoundTripper
+}
+
+func (t *createOnlyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodPut && strings.Contains(req.URL.Path, "/manifests/") {
+		req = req.Clone(req.Context())
+		req.Header.Set("If-None-Match", "*")
+	}
+	return t.base.RoundTrip(req)
 }
 
 // manifestDigest returns the digest currently published at p.Reference, or an

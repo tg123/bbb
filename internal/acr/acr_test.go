@@ -1,9 +1,11 @@
 package acr
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -616,6 +618,88 @@ func TestCaseInsensitiveNamesConflict(t *testing.T) {
 	if _, err := ListFiles(t.Context(), p); err == nil || !strings.Contains(err.Error(), "differ only in case") {
 		t.Fatalf("expected the artifact to be rejected, got %v", err)
 	}
+}
+
+// The resolved snapshot must not pin the context that produced it: a later
+// download has to use its own, or it would ignore its own cancellation and
+// fail once the resolving context expired.
+func TestDownloadStreamUsesCallerContext(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "models", Reference: "v1"}
+	pushTestArtifact(t, p, map[string]string{"a.txt": "alpha"})
+	invalidateLayers(p)
+
+	resolveCtx, cancelResolve := context.WithCancel(t.Context())
+	if _, err := ListFiles(resolveCtx, p); err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	// The artifact stays resolved, but the context that resolved it is gone.
+	cancelResolve()
+
+	child := p
+	child.File = "a.txt"
+	rc, err := DownloadStream(t.Context(), child)
+	if err != nil {
+		t.Fatalf("download after the resolving context was cancelled: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil || string(got) != "alpha" {
+		t.Fatalf("content = %q (%v)", got, err)
+	}
+
+	// And the caller's own cancellation must be honoured.
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := DownloadStream(cancelled, child); err == nil {
+		t.Fatal("expected a cancelled download context to fail")
+	}
+}
+
+// A create-only push asks the registry to reject a tag that appeared after the
+// existence check.
+func TestCreateOnlyTransportMarksManifestWrites(t *testing.T) {
+	var captured []string
+	base := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		captured = append(captured, req.Method+" "+req.URL.Path+" If-None-Match="+req.Header.Get("If-None-Match"))
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+	})
+	transport := &createOnlyTransport{base: base}
+
+	for _, target := range []struct {
+		method string
+		url    string
+	}{
+		{http.MethodPut, "https://reg.example/v2/models/manifests/v1"},
+		{http.MethodPut, "https://reg.example/v2/models/blobs/uploads/abc"},
+		{http.MethodGet, "https://reg.example/v2/models/manifests/v1"},
+	} {
+		req, err := http.NewRequest(target.method, target.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	if !strings.Contains(captured[0], "If-None-Match=*") {
+		t.Errorf("manifest PUT should be create-only: %s", captured[0])
+	}
+	if strings.Contains(captured[1], "If-None-Match=*") {
+		t.Errorf("blob upload must not be marked create-only: %s", captured[1])
+	}
+	if strings.Contains(captured[2], "If-None-Match=*") {
+		t.Errorf("manifest GET must not be marked create-only: %s", captured[2])
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func TestValidatePushTarget(t *testing.T) {
