@@ -11,6 +11,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -259,6 +260,35 @@ var (
 	tenantCredInflight sync.Map // map[string]*sync.Mutex
 )
 
+// discoveredTenants records the tenant an interactive sign-in turned out to be
+// for, keyed by registry, so a token refresh later in the run goes straight to
+// the credential that worked instead of prompting again.
+var discoveredTenants sync.Map // map[string]string
+
+// promptAllowed is indirected so tests can exercise the sign-in path without a
+// terminal.
+var promptAllowed = canPrompt
+
+// canPrompt reports whether it is reasonable to ask the user to sign in.
+//
+// A sign-in that nobody can answer is worse than an error: it would hang a
+// pipeline until the credential timed out. BBB_ACR_NO_LOGIN forces the same
+// decision for an interactive shell that should never prompt.
+func canPrompt() bool {
+	if disabled, err := strconv.ParseBool(os.Getenv("BBB_ACR_NO_LOGIN")); err == nil && disabled {
+		return false
+	}
+	return isCharDevice(os.Stdin) || isCharDevice(os.Stderr)
+}
+
+func isCharDevice(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
 // interactiveLogin and cliCredentialFor are indirected so tests never open a
 // browser or depend on the Azure CLI being installed.
 var (
@@ -276,6 +306,14 @@ var (
 // sign in interactively.
 func credentialForRegistry(ctx context.Context, registry string) (azcore.TokenCredential, error) {
 	tid := registryTenantID(registry)
+	if tid == "" {
+		// A sign-in earlier in this run already established which tenant this
+		// registry answers to, so reuse it rather than repeating the exchange
+		// failure that discovered it.
+		if found, ok := discoveredTenants.Load(registryKey(registry)); ok {
+			tid = found.(string)
+		}
+	}
 	if tid == "" {
 		return getCredential()
 	}
@@ -329,12 +367,21 @@ func tenantMatches(token, tenant string) bool {
 	return got == "" || strings.EqualFold(got, tenant)
 }
 
-// browserOrDeviceCodeCredential signs the user in for a specific tenant,
-// falling back to the device code flow when no browser can be opened. bbb is
-// routinely run over SSH and inside WSL, where the browser flow cannot
-// complete, and a device code still lets the sign-in finish.
+// browserOrDeviceCodeCredential signs the user in, falling back to the device
+// code flow when no browser can be opened. bbb is routinely run over SSH and
+// inside WSL, where the browser flow cannot complete, and a device code still
+// lets the sign-in finish.
+//
+// An empty tenant means the registry's tenant is unknown, which is the normal
+// case: the sign-in then uses the default multi-tenant authority so the user
+// can pick an account that belongs to the registry's tenant.
 func browserOrDeviceCodeCredential(ctx context.Context, registry, tenant, scope string) (azcore.TokenCredential, error) {
-	fmt.Fprintf(os.Stderr, "\n  Registry %q requires an Entra sign-in to tenant %s.\n  Opening a browser...\n", registry, tenant)
+	if tenant == "" {
+		fmt.Fprintf(os.Stderr, "\n  Your Azure sign-in is not valid for %q.\n"+
+			"  Opening a browser — choose an account in the registry's tenant.\n", registry)
+	} else {
+		fmt.Fprintf(os.Stderr, "\n  Registry %q requires an Entra sign-in to tenant %s.\n  Opening a browser...\n", registry, tenant)
+	}
 	browserOpts := &azidentity.InteractiveBrowserCredentialOptions{TenantID: tenant}
 	if c := sharedClient.Load(); c != nil {
 		browserOpts.Transport = c
@@ -365,10 +412,10 @@ func browserOrDeviceCodeCredential(ctx context.Context, registry, tenant, scope 
 	}
 	device, err := azidentity.NewDeviceCodeCredential(deviceOpts)
 	if err != nil {
-		return nil, fmt.Errorf("acr: interactive sign-in for tenant %s: %w", tenant, err)
+		return nil, fmt.Errorf("acr: interactive sign-in: %w", err)
 	}
 	if _, err := device.GetToken(ctx, policyTokenRequest(scope)); err != nil {
-		return nil, fmt.Errorf("acr: interactive sign-in for tenant %s: %w", tenant, err)
+		return nil, fmt.Errorf("acr: interactive sign-in: %w", err)
 	}
 	return device, nil
 }
@@ -625,11 +672,72 @@ func tenantMismatchError(registry, presented string) error {
 // go-containerregistry instead presents the refresh token per request and lets
 // the registry's challenge name the exact scope, which is the same flow docker
 // uses after `az acr login`.
+//
+// When the registry turns out to belong to another tenant, the sign-in is
+// offered here rather than reported as an error. az:// can discover a storage
+// account's tenant from the authorization_uri in its challenge and prompt
+// before ever making a request; no ACR endpoint returns one — every challenge
+// carries only realm, service and scope — so the rejection is the first and
+// only evidence, and the prompt has to come after it.
 func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 	credential, err := tokenCredential(ctx, registry)
 	if err != nil {
 		return "", err
 	}
+	configured := registryTenantID(registry)
+	token, err := exchangeWithCredential(ctx, registry, credential, configured)
+	if err == nil {
+		return token, nil
+	}
+	presented, mismatch := rejectedTenant(err)
+	if !mismatch {
+		return "", err
+	}
+	// A tenant that was named explicitly and still rejected is a wrong
+	// setting; signing in again would only ask the same question.
+	if configured != "" {
+		return "", tenantMismatchError(registry, presented)
+	}
+	if !promptAllowed() {
+		return "", tenantMismatchError(registry, presented)
+	}
+
+	signedIn, err := interactiveLogin(ctx, registry, "", armScope(registry))
+	if err != nil {
+		return "", errors.Join(tenantMismatchError(registry, presented), err)
+	}
+	token, err = exchangeWithCredential(ctx, registry, signedIn, "")
+	if err != nil {
+		if rejected, ok := rejectedTenant(err); ok {
+			return "", tenantMismatchError(registry, rejected)
+		}
+		return "", err
+	}
+	rememberTenant(ctx, registry, signedIn)
+	return token, nil
+}
+
+// rememberTenant caches a credential obtained interactively under the tenant
+// that issued it, so a token refresh or another registry in the same tenant
+// does not prompt again, and tells the user how to skip the prompt next run.
+func rememberTenant(ctx context.Context, registry string, credential azcore.TokenCredential) {
+	token, err := credential.GetToken(ctx, policyTokenRequest(armScope(registry)))
+	if err != nil {
+		return
+	}
+	tenant := tenantIDFromAccessToken(token.Token)
+	if tenant == "" {
+		return
+	}
+	tenantCredCache.Store(tenant, credential)
+	discoveredTenants.Store(registryKey(registry), tenant)
+	fmt.Fprintf(os.Stderr, "  Signed in to tenant %s. Set BBB_ACR_TENANT_%s=%s to skip this prompt.\n\n",
+		tenant, strings.ToUpper(envAuthorityKey(registryHost(registry))), tenant)
+}
+
+// exchangeWithCredential performs the ACR half of the exchange. tenant, when
+// known, is passed along because it is how ACR resolves a guest identity.
+func exchangeWithCredential(ctx context.Context, registry string, credential azcore.TokenCredential, tenant string) (string, error) {
 	options := &azcontainerregistry.AuthenticationClientOptions{}
 	if c := sharedClient.Load(); c != nil {
 		options.Transport = c
@@ -645,9 +753,7 @@ func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 	exchange := &azcontainerregistry.AuthenticationClientExchangeAADAccessTokenForACRRefreshTokenOptions{
 		AccessToken: &aadToken.Token,
 	}
-	// Naming the tenant lets ACR resolve a guest identity, which it cannot do
-	// from the token alone.
-	if tenant := registryTenantID(registry); tenant != "" {
+	if tenant != "" {
 		exchange.Tenant = &tenant
 	}
 	refresh, err := client.ExchangeAADAccessTokenForACRRefreshToken(
@@ -657,9 +763,6 @@ func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 		exchange,
 	)
 	if err != nil {
-		if presented, ok := rejectedTenant(err); ok {
-			return "", tenantMismatchError(registry, presented)
-		}
 		return "", err
 	}
 	if refresh.RefreshToken == nil {

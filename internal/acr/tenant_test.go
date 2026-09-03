@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -251,5 +255,183 @@ func TestCredentialForRegistryWithoutATenantUsesTheDefault(t *testing.T) {
 	// environment; what matters is that this path is the one taken.
 	if _, err := credentialForRegistry(t.Context(), "myreg.azurecr.io"); err != nil {
 		t.Logf("default credential unavailable in this environment: %v", err)
+	}
+}
+
+// A sign-in that discovered the tenant is reused for the rest of the run, so a
+// token refresh does not prompt a second time.
+func TestCredentialForRegistryReusesADiscoveredTenant(t *testing.T) {
+	const tenant = "8b9ebe14-d942-49e7-ace9-14496d0caff0"
+	cli := &tenantCredentialStub{tenant: tenant}
+	stubTenantCredentials(t,
+		func(got string) (azcore.TokenCredential, error) {
+			if got != tenant {
+				t.Errorf("asked the CLI for tenant %q, want the discovered %q", got, tenant)
+			}
+			return cli, nil
+		},
+		func(context.Context, string, string, string) (azcore.TokenCredential, error) {
+			t.Error("must not sign in again once the tenant is known")
+			return nil, errors.New("unexpected")
+		})
+
+	discoveredTenants.Store(registryKey("myreg.azurecr.io"), tenant)
+	t.Cleanup(func() { discoveredTenants.Clear() })
+
+	got, err := credentialForRegistry(t.Context(), "myreg.azurecr.io")
+	if err != nil {
+		t.Fatalf("credentialForRegistry failed: %v", err)
+	}
+	if got != cli {
+		t.Fatal("expected the discovered tenant to be used")
+	}
+}
+
+// A sign-in nobody can answer would hang a pipeline until the credential timed
+// out, so it is offered only when someone is there to answer it.
+func TestCanPromptRespectsTheEnvironment(t *testing.T) {
+	t.Setenv("BBB_ACR_NO_LOGIN", "1")
+	if canPrompt() {
+		t.Error("BBB_ACR_NO_LOGIN must suppress the sign-in")
+	}
+	t.Setenv("BBB_ACR_NO_LOGIN", "false")
+	// Under `go test` the standard streams are pipes, so this reflects the
+	// no-terminal decision rather than the opt-out.
+	if canPrompt() && !isCharDevice(os.Stdin) && !isCharDevice(os.Stderr) {
+		t.Error("expected no prompt without a terminal")
+	}
+}
+
+// rejectingExchange serves a tenant rejection until sign-in happens, then a
+// refresh token, mimicking ACR's behaviour across the retry.
+func rejectingExchange(t *testing.T, accepted *string, attempts *int) {
+	t.Helper()
+	SetHTTPClient(&http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		form, _ := url.ParseQuery(string(body))
+		*attempts++
+		if *accepted == "" || form.Get("access_token") != *accepted {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body: io.NopCloser(strings.NewReader(
+					`{"errors":[{"code":"UNAUTHORIZED","message":"token validation failed: the received access token has unknown tenantId \"72f988bf-86f1-41af-91ab-2d7cd011db47\""}]}`)),
+				Request: req,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"refresh_token":"acr-refresh"}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Request:    req,
+		}, nil
+	})})
+	t.Cleanup(func() { SetHTTPClient(nil) })
+}
+
+// An ACR endpoint never says which tenant it belongs to, so the rejection is
+// the first evidence there is a problem. Rather than reporting it, offer the
+// sign-in that can fix it and retry.
+func TestExchangeSignsInWhenTheRegistryRejectsTheTenant(t *testing.T) {
+	const goodToken = "token-from-the-right-tenant"
+	accepted := goodToken
+	attempts := 0
+	rejectingExchange(t, &accepted, &attempts)
+
+	original := tokenCredential
+	tokenCredential = func(context.Context, string) (azcore.TokenCredential, error) {
+		return &fakeCredential{token: "home-tenant-token"}, nil
+	}
+	t.Cleanup(func() { tokenCredential = original })
+
+	var logins int
+	stubTenantCredentials(t,
+		func(string) (azcore.TokenCredential, error) { return nil, errors.New("no cli") },
+		func(_ context.Context, _, tenant, _ string) (azcore.TokenCredential, error) {
+			logins++
+			if tenant != "" {
+				t.Errorf("signed in to tenant %q, want the account picker", tenant)
+			}
+			return &fakeCredential{token: goodToken}, nil
+		})
+
+	originalPrompt := promptAllowed
+	promptAllowed = func() bool { return true }
+	t.Cleanup(func() { promptAllowed = originalPrompt })
+
+	token, err := exchangeEntraToken(t.Context(), "myreg.azurecr.io")
+	if err != nil {
+		t.Fatalf("exchange failed after sign-in: %v", err)
+	}
+	if token != "acr-refresh" {
+		t.Fatalf("token = %q, want the refresh token from the retry", token)
+	}
+	if logins != 1 {
+		t.Fatalf("opened %d sign-ins, want exactly one", logins)
+	}
+	if attempts < 2 {
+		t.Fatalf("made %d exchange attempts, want a retry after signing in", attempts)
+	}
+}
+
+// With no one to answer, the rejection has to be reported instead, and the
+// message must say what to set.
+func TestExchangeReportsTheMismatchWhenItCannotPrompt(t *testing.T) {
+	accepted := ""
+	attempts := 0
+	rejectingExchange(t, &accepted, &attempts)
+
+	original := tokenCredential
+	tokenCredential = func(context.Context, string) (azcore.TokenCredential, error) {
+		return &fakeCredential{token: "home-tenant-token"}, nil
+	}
+	t.Cleanup(func() { tokenCredential = original })
+
+	stubTenantCredentials(t,
+		func(string) (azcore.TokenCredential, error) { return nil, errors.New("no cli") },
+		func(context.Context, string, string, string) (azcore.TokenCredential, error) {
+			t.Error("must not sign in when prompting is unavailable")
+			return nil, errors.New("unexpected")
+		})
+
+	originalPrompt := promptAllowed
+	promptAllowed = func() bool { return false }
+	t.Cleanup(func() { promptAllowed = originalPrompt })
+
+	_, err := exchangeEntraToken(t.Context(), "myreg.azurecr.io")
+	if !errors.Is(err, errTenantMismatch) {
+		t.Fatalf("error = %v, want a tenant mismatch", err)
+	}
+	if !strings.Contains(err.Error(), "BBB_ACR_TENANT_MYREG_AZURECR_IO") {
+		t.Errorf("error should name the setting to use:\n%v", err)
+	}
+}
+
+// A tenant that was named explicitly and still rejected is a wrong setting;
+// signing in would only ask the same question again.
+func TestExchangeDoesNotPromptForAConfiguredTenant(t *testing.T) {
+	t.Setenv("BBB_ACR_TENANT_MYREG_AZURECR_IO", "8b9ebe14-d942-49e7-ace9-14496d0caff0")
+	accepted := ""
+	attempts := 0
+	rejectingExchange(t, &accepted, &attempts)
+
+	original := tokenCredential
+	tokenCredential = func(context.Context, string) (azcore.TokenCredential, error) {
+		return &fakeCredential{token: "wrong-token"}, nil
+	}
+	t.Cleanup(func() { tokenCredential = original })
+
+	stubTenantCredentials(t,
+		func(string) (azcore.TokenCredential, error) { return nil, errors.New("no cli") },
+		func(context.Context, string, string, string) (azcore.TokenCredential, error) {
+			t.Error("must not sign in when the tenant was configured explicitly")
+			return nil, errors.New("unexpected")
+		})
+
+	originalPrompt := promptAllowed
+	promptAllowed = func() bool { return true }
+	t.Cleanup(func() { promptAllowed = originalPrompt })
+
+	if _, err := exchangeEntraToken(t.Context(), "myreg.azurecr.io"); !errors.Is(err, errTenantMismatch) {
+		t.Fatalf("error = %v, want a tenant mismatch", err)
 	}
 }

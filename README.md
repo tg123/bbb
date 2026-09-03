@@ -94,7 +94,17 @@ Because the Entra step posts a live Azure access token to the registry, it is on
 
 #### Registries in another tenant
 
-If the registry is not in your credential's home tenant, ACR rejects the token with `unknown tenantId` and `bbb` reports which tenant was presented and how to fix it. Unlike a storage account, an ACR endpoint does not advertise its tenant — its `WWW-Authenticate` challenge carries only `realm` and `service`, and a registry in another tenant is invisible to Resource Manager until you already hold a token for it — so the tenant has to be named:
+If the registry is not in your credential's home tenant, ACR rejects the token with `unknown tenantId`. `bbb` then opens a browser so you can sign in with an account that does have access, retries, and reports the tenant it turned out to be:
+
+```
+  Your Azure sign-in is not valid for "myregistry.azurecr.io".
+  Opening a browser — choose an account in the registry's tenant.
+  Signed in to tenant 8b9ebe14-... Set BBB_ACR_TENANT_MYREGISTRY_AZURECR_IO=8b9ebe14-... to skip this prompt.
+```
+
+The prompt comes *after* the rejection because an ACR endpoint never reveals its tenant — every `WWW-Authenticate` challenge carries only `realm`, `service` and `scope`, with no `authorization_uri`, and a registry in another tenant is invisible to Resource Manager until you already hold a token for it. This is the one place `acr://` cannot behave like `az://`, which discovers a storage account's tenant up front and so can prompt before making a request.
+
+Naming the tenant skips the failed attempt entirely:
 
 ```bash
 # Per registry (host form, or just the registry short name)
@@ -105,9 +115,11 @@ export BBB_ACR_TENANT_MYREGISTRY=<tenant-id>
 export BBB_ACR_TENANT=<tenant-id>
 ```
 
-With a tenant set, `bbb` mirrors `az://`: it uses your Azure CLI login for that tenant, verifies the token really was issued by it — `az` can hold a token only for your home tenant and return that whatever you asked for — and otherwise signs you in interactively. A browser opens, falling back to a device code when there is no browser to open, as over SSH or inside WSL. Only one sign-in is opened per tenant no matter how many transfers are running.
+With a tenant set, `bbb` mirrors `az://`: it uses your Azure CLI login for that tenant, verifies the token really was issued by it — `az` can hold a token only for your home tenant and return that whatever you asked for — and otherwise signs you in. A browser opens, falling back to a device code when there is no browser to open, as over SSH or inside WSL. Only one sign-in is opened per tenant no matter how many transfers are running, and a tenant discovered by signing in is reused for the rest of the run.
 
-The interactive sign-in lasts for the life of the process, so prefer `az login --tenant <tenant-id>` for repeated use: that persists, and `bbb` then takes the CLI path with no prompt at all.
+Signing in requires a terminal, so a pipeline never blocks on a prompt it cannot answer; without one the rejection is reported along with the variable to set. `BBB_ACR_NO_LOGIN=1` suppresses the prompt for an interactive shell that should never show one.
+
+The sign-in lasts for the life of the process, so prefer `az login --tenant <tenant-id>` for repeated use: that persists, and `bbb` then takes the CLI path with no prompt at all.
 
 Writing requires credentials with push access to the target repository.
 
@@ -151,8 +163,9 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
 | `BBB_ACR_REGISTRY` | *(ACR hosts)* | Comma separated hosts the `BBB_ACR_USERNAME`/`BBB_ACR_PASSWORD` credentials belong to. Without it they are only sent to `*.azurecr.io` and the other ACR suffixes. Entries match on scheme and port, so `host` over HTTP is not the same endpoint as `host:443` |
 | `BBB_ACR_ENTRA_HOSTS` | | Comma separated extra registry hosts allowed to receive Entra ID credentials, for ACR behind a custom domain. Matched with HTTPS port semantics, since the token exchange always uses HTTPS |
-| `BBB_ACR_TENANT_<REGISTRY>` | | Entra tenant to authenticate a registry against, by host (`BBB_ACR_TENANT_MYREG_AZURECR_IO`) or short name (`BBB_ACR_TENANT_MYREG`). Needed when the registry is not in your credential's home tenant; prompts an interactive sign-in if the Azure CLI cannot serve that tenant |
+| `BBB_ACR_TENANT_<REGISTRY>` | | Entra tenant to authenticate a registry against, by host (`BBB_ACR_TENANT_MYREG_AZURECR_IO`) or short name (`BBB_ACR_TENANT_MYREG`). Optional: without it a cross-tenant registry prompts a sign-in and reports the tenant to set |
 | `BBB_ACR_TENANT` | | Entra tenant for every `acr://` registry that has no host-specific setting |
+| `BBB_ACR_NO_LOGIN` | `false` | Never open an interactive Entra sign-in; report the tenant mismatch instead. Prompts are already suppressed when no terminal is attached |
 | `BBB_ACR_INSECURE` | | Comma separated registry hosts that may be contacted over plain HTTP. Required for private (RFC1918) IP literals, and for any other host go-containerregistry will not use TLS for; loopback is always allowed |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
