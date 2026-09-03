@@ -105,7 +105,9 @@ export BBB_ACR_TENANT_MYREGISTRY=<tenant-id>
 export BBB_ACR_TENANT=<tenant-id>
 ```
 
-With a tenant set, `bbb` mirrors `az://`: it uses your Azure CLI login for that tenant, verifies the token really was issued by it — `az` can hold a token only for your home tenant and return that whatever you asked for — and otherwise signs you in interactively. A browser opens, falling back to a device code when there is no browser to open, as over SSH or inside WSL. Only one sign-in is opened per tenant no matter how many transfers are running. Running `az login --tenant <tenant-id>` beforehand avoids the prompt entirely.
+With a tenant set, `bbb` mirrors `az://`: it uses your Azure CLI login for that tenant, verifies the token really was issued by it — `az` can hold a token only for your home tenant and return that whatever you asked for — and otherwise signs you in interactively. A browser opens, falling back to a device code when there is no browser to open, as over SSH or inside WSL. Only one sign-in is opened per tenant no matter how many transfers are running.
+
+The interactive sign-in lasts for the life of the process, so prefer `az login --tenant <tenant-id>` for repeated use: that persists, and `bbb` then takes the CLI path with no prompt at all.
 
 Writing requires credentials with push access to the target repository.
 
