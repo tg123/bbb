@@ -1495,11 +1495,13 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 						bytesCb = taskProgress.AddBytes
 					}
 					taskConcurrency := innerConcurrency
-					if bbbfs.IsACR(task.dst) {
-						// An acr:// destination expands to exactly one atomic
-						// artifact push, so the file-level workers this budget
-						// was split for stay idle. Give the push the whole
-						// budget instead, as a lone file copy already does.
+					if bbbfs.IsACR(task.dst) && len(tasks) == 1 {
+						// A lone acr:// destination is one atomic artifact
+						// push, so the file-level workers this budget was
+						// split for stay idle and it can have the whole
+						// budget. With several tasks the split still applies,
+						// or concurrent pushes would together exceed
+						// --concurrency.
 						taskConcurrency = concurrency
 					}
 					if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, taskConcurrency, retryCount, []string{task.src}, task.dst, task.size, showCopyBars, bytesCb); err != nil {

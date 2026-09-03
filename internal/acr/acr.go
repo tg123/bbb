@@ -163,21 +163,31 @@ func registryKey(registry string) string {
 	registry = strings.ToLower(registry)
 	host, port, err := net.SplitHostPort(registry)
 	if err != nil {
-		return registry
+		host, port = strings.TrimPrefix(strings.TrimSuffix(registry, "]"), "["), ""
 	}
-	scheme := "https"
-	if isInsecureAllowed(registry) {
-		scheme = "http"
-	} else if parsed, perr := name.NewRegistry(registry, name.WeakValidation); perr == nil {
-		scheme = parsed.Scheme()
+	// An IP literal has many spellings; ParseIP().String() picks one, so
+	// [::1] and [0:0:0:0:0:0:0:1] cannot address one registry under two keys.
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
 	}
-	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+	if port != "" {
+		scheme := "https"
+		if isInsecureAllowed(registry) {
+			scheme = "http"
+		} else if parsed, perr := name.NewRegistry(registry, name.WeakValidation); perr == nil {
+			scheme = parsed.Scheme()
+		}
+		if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+			port = ""
+		}
+	}
+	if port == "" {
 		if strings.Contains(host, ":") {
 			return "[" + host + "]"
 		}
 		return host
 	}
-	return registry
+	return net.JoinHostPort(host, port)
 }
 
 // ArtifactKey identifies the artifact a path addresses, ignoring any file
@@ -930,38 +940,50 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 	if err := remote.Write(ref, image, options...); err != nil {
 		var terr *transport.Error
 		if errors.As(err, &terr) && terr.StatusCode == http.StatusPreconditionFailed {
-			// A registry that honours If-None-Match rejected the write because
-			// the tag appeared after our check.
-			return fmt.Errorf("%w: %s", ErrArtifactExists, p.String())
+			// A registry honouring If-None-Match rejected the write because the
+			// tag exists. That may be this process's own earlier attempt whose
+			// response was lost, so let the published digest decide.
+			return confirmPublished(ctx, p, image)
 		}
 		return asStatusError(err)
 	}
 	if !opts.Overwrite {
-		// Registries are not required to honour If-None-Match. Confirm the tag
-		// holds exactly what we published, so both losing a race and the tag
-		// disappearing are reported rather than silently accepted.
-		published, err := manifestDigest(ctx, p)
-		if err != nil {
+		// Registries are not required to honour If-None-Match, so confirm the
+		// tag holds exactly what we published.
+		if err := confirmPublished(ctx, p, image); err != nil {
 			return err
-		}
-		intended, err := image.Digest()
-		if err != nil {
-			return err
-		}
-		switch {
-		case published == intended.String():
-			// Published as intended.
-		case published == "":
-			// Retryable: the tag was removed between the write and the check.
-			return fmt.Errorf("acr: %s is missing after publication; it may have been removed concurrently", p.String())
-		default:
-			return fmt.Errorf("%w: %s was published concurrently by another writer", ErrArtifactExists, p.String())
 		}
 	}
 	// The tag now points somewhere new, so drop any snapshot this process
 	// cached for it.
 	invalidateLayers(p)
 	return nil
+}
+
+// confirmPublished reports whether p holds the artifact that was just written.
+//
+// An exact digest match is success, including when a retry re-published its own
+// earlier work. A different digest means another writer won the tag. A missing
+// tag is a plain error so it stays retryable, since it may have been removed
+// between the write and the check.
+func confirmPublished(ctx context.Context, p Path, image v1.Image) error {
+	published, err := manifestDigest(ctx, p)
+	if err != nil {
+		return err
+	}
+	intended, err := image.Digest()
+	if err != nil {
+		return err
+	}
+	switch {
+	case published == intended.String():
+		invalidateLayers(p)
+		return nil
+	case published == "":
+		return fmt.Errorf("acr: %s is missing after publication; it may have been removed concurrently", p.String())
+	default:
+		return fmt.Errorf("%w: %s was published concurrently by another writer", ErrArtifactExists, p.String())
+	}
 }
 
 // createOnlyTransport marks manifest writes as create-only, so a registry that

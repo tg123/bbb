@@ -833,6 +833,20 @@ func TestArtifactKeyTreatsDefaultPortAsEquivalent(t *testing.T) {
 	if http80.ArtifactKey() == bare.ArtifactKey() {
 		t.Fatal("port 80 on an https registry must produce a distinct key")
 	}
+
+	// An IP literal written differently still addresses one registry.
+	compact, err := Parse("acr://[::1]:5000/models:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expanded, err := Parse("acr://[0:0:0:0:0:0:0:1]:5000/models:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compact.ArtifactKey() != expanded.ArtifactKey() {
+		t.Fatalf("expected one key for equivalent IPv6 spellings, got %q and %q",
+			compact.ArtifactKey(), expanded.ArtifactKey())
+	}
 }
 
 func TestValidatePushTarget(t *testing.T) {
