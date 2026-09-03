@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
@@ -26,6 +27,10 @@ type fileLayer struct {
 	once   sync.Once
 	digest v1.Hash
 	err    error
+
+	// reported is the high-water byte count already surfaced to onRead, so a
+	// retried upload does not count the same bytes twice.
+	reported atomic.Int64
 }
 
 var _ v1.Layer = (*fileLayer)(nil)
@@ -92,7 +97,7 @@ func (l *fileLayer) Compressed() (io.ReadCloser, error) {
 	if l.onRead == nil {
 		return reader, nil
 	}
-	return &progressReadCloser{ReadCloser: reader, onRead: l.onRead}, nil
+	return &progressReadCloser{ReadCloser: reader, layer: l}, nil
 }
 
 func (l *fileLayer) Uncompressed() (io.ReadCloser, error) {
@@ -113,15 +118,31 @@ func (l *fileLayer) MediaType() (types.MediaType, error) {
 }
 
 // progressReadCloser reports bytes as they are uploaded.
+//
+// go-containerregistry sets GetBody so a retried request reopens the layer, so
+// only progress beyond the layer's high-water mark is reported. Counting every
+// physical read would let a retransmission push the total past the artifact's
+// real size.
 type progressReadCloser struct {
 	io.ReadCloser
-	onRead func(int64)
+	layer *fileLayer
+	read  int64
 }
 
 func (r *progressReadCloser) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	if n > 0 {
-		r.onRead(int64(n))
+		r.read += int64(n)
+		for {
+			previous := r.layer.reported.Load()
+			if r.read <= previous {
+				break
+			}
+			if r.layer.reported.CompareAndSwap(previous, r.read) {
+				r.layer.onRead(r.read - previous)
+				break
+			}
+		}
 	}
 	return n, err
 }

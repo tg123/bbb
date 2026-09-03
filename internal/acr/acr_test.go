@@ -1298,6 +1298,46 @@ func TestFileLayerDigestAndStream(t *testing.T) {
 	}
 }
 
+// go-containerregistry reopens a layer to retry an upload, so progress must be
+// reported against a high-water mark or a retransmission counts twice.
+func TestFileLayerProgressIsNotDoubleCounted(t *testing.T) {
+	dir := t.TempDir()
+	local := filepath.Join(dir, "blob.bin")
+	if err := os.WriteFile(local, []byte("hello world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var reported atomic.Int64
+	layer := &fileLayer{
+		open:   func() (io.ReadCloser, error) { return os.Open(local) },
+		size:   11,
+		onRead: func(n int64) { reported.Add(n) },
+	}
+
+	// A partial read, as if the request failed midway.
+	first, err := layer.Compressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.CopyN(io.Discard, first, 5); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.Close()
+
+	// The retry reopens the layer and resends from the start.
+	second, err := layer.Compressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, second); err != nil {
+		t.Fatal(err)
+	}
+	_ = second.Close()
+
+	if got := reported.Load(); got != 11 {
+		t.Fatalf("reported %d bytes for an 11 byte layer, want 11", got)
+	}
+}
+
 func TestAsStatusError(t *testing.T) {
 	if err := asStatusError(nil); err != nil {
 		t.Fatalf("expected nil, got %v", err)

@@ -910,12 +910,17 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	}
 	layer, err := puller.Layer(ctx, digestRef)
 	if err != nil {
+		// NewPuller does not authenticate: the fetcher is built on first use
+		// behind a sync.Once, so a failed initialisation would be replayed for
+		// the rest of the run and defeat --retry-count.
+		pullerCache.Delete(registryKey(p.Registry))
 		return nil, asStatusError(err)
 	}
 	// Compressed() returns the blob exactly as stored, which is what an
 	// artifact layer is; Uncompressed() would try to gunzip it.
 	body, err := layer.Compressed()
 	if err != nil {
+		pullerCache.Delete(registryKey(p.Registry))
 		return nil, asStatusError(err)
 	}
 	return downloadReadCloser{ReadCloser: body, size: target.Size}, nil
