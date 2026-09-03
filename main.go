@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -2103,17 +2104,31 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 }
 
 // openVerifiedRegularFile opens path and confirms it is still the same regular
-// file that the directory walk accepted.
+// file that was accepted earlier.
 //
 // Layers are opened after collection, and more than once (digest, then upload),
-// so checking only at walk time leaves a window: a path swapped for a symlink
-// in between would be followed by os.Open and read from outside the source
-// tree. Comparing the opened handle closes that window.
+// so checking only at collection time leaves a window: a path swapped for a
+// symlink in between would be followed by os.Open and read from outside the
+// source tree. Comparing the opened handle closes that window.
 func openVerifiedRegularFile(path string, expected os.FileInfo) (io.ReadCloser, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	return verifyOpenedFile(file, path, expected)
+}
+
+// openVerifiedRootFile opens name beneath root, which cannot escape it even if
+// a directory component is replaced with a symlink.
+func openVerifiedRootFile(root *os.Root, name string, expected os.FileInfo) (io.ReadCloser, error) {
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return verifyOpenedFile(file, name, expected)
+}
+
+func verifyOpenedFile(file *os.File, name string, expected os.FileInfo) (io.ReadCloser, error) {
 	info, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
@@ -2121,23 +2136,29 @@ func openVerifiedRegularFile(path string, expected os.FileInfo) (io.ReadCloser, 
 	}
 	if !info.Mode().IsRegular() || !os.SameFile(info, expected) {
 		_ = file.Close()
-		return nil, fmt.Errorf("source file changed while it was being uploaded: %s", path)
+		return nil, fmt.Errorf("source file changed while it was being uploaded: %s", name)
 	}
 	return file, nil
 }
 
-func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.ArtifactFile, int64, error) {
+// collectLocalArtifactFiles gathers the files to publish as one artifact.
+//
+// The returned cleanup must be called once the files are no longer needed: a
+// directory source is walked through an os.Root whose directory handle also
+// backs every later open.
+func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.ArtifactFile, int64, func(), error) {
+	noCleanup := func() {}
 	info, err := os.Stat(src)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, noCleanup, err
 	}
 	if !info.IsDir() {
 		if !info.Mode().IsRegular() {
-			return nil, 0, fmt.Errorf("unsupported source file type: %s", src)
+			return nil, 0, noCleanup, fmt.Errorf("unsupported source file type: %s", src)
 		}
 		name := filepath.Base(src)
 		if exclude != nil && exclude(name) {
-			return nil, 0, nil
+			return nil, 0, noCleanup, nil
 		}
 		return []bbbfs.ArtifactFile{{
 			Name: name,
@@ -2145,51 +2166,58 @@ func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.A
 			Open: func() (io.ReadCloser, error) {
 				return openVerifiedRegularFile(src, info)
 			},
-		}}, info.Size(), nil
+		}}, info.Size(), noCleanup, nil
 	}
+
+	// Walk and open through a root handle, so neither the traversal nor a
+	// later open can leave the source tree even if a subdirectory is swapped
+	// for a symlink while the walk is in progress. filepath.WalkDir re-reads
+	// each directory by path and cannot make that guarantee.
+	root, err := os.OpenRoot(src)
+	if err != nil {
+		return nil, 0, noCleanup, err
+	}
+	cleanup := func() { _ = root.Close() }
 
 	var files []bbbfs.ArtifactFile
 	var total int64
-	err = filepath.WalkDir(src, func(localPath string, entry os.DirEntry, walkErr error) error {
+	err = fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if entry.IsDir() {
 			return nil
 		}
-		rel, err := filepath.Rel(src, localPath)
-		if err != nil {
-			return err
-		}
-		name := filepath.ToSlash(rel)
 		if exclude != nil && exclude(name) {
 			return nil
 		}
-		// entry.Info() is the lstat of the walked entry. os.Stat would follow a
-		// symlink, so a link such as `secrets -> /etc/passwd` would be accepted
-		// as a regular file and upload data from outside the source tree.
+		// entry.Info() does not follow a symlink, so one is reported as an
+		// irregular file rather than as whatever it points at.
 		fileInfo, err := entry.Info()
 		if err != nil {
 			return err
 		}
 		if !fileInfo.Mode().IsRegular() {
-			return fmt.Errorf("unsupported source file type: %s", localPath)
+			return fmt.Errorf("unsupported source file type: %s", filepath.Join(src, filepath.FromSlash(name)))
 		}
-		pathToOpen := localPath
+		pathToOpen := name
 		expected := fileInfo
 		files = append(files, bbbfs.ArtifactFile{
 			Name: name,
 			Size: fileInfo.Size(),
 			Open: func() (io.ReadCloser, error) {
-				return openVerifiedRegularFile(pathToOpen, expected)
+				return openVerifiedRootFile(root, pathToOpen, expected)
 			},
 		})
 		total += fileInfo.Size()
 		return nil
 	})
-	return files, total, err
+	if err != nil {
+		cleanup()
+		return nil, 0, noCleanup, err
+	}
+	return files, total, cleanup, nil
 }
-
 func pushLocalArtifact(
 	ctx context.Context,
 	src, dst string,
@@ -2211,10 +2239,11 @@ func pushLocalArtifact(
 	if err := acr.ValidatePushTarget(target); err != nil {
 		return err
 	}
-	files, total, err := collectLocalArtifactFiles(src, exclude)
+	files, total, cleanup, err := collectLocalArtifactFiles(src, exclude)
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	// Validate the collected names too, so a dry run rejects everything the
 	// real push would rather than only the destination.
 	uploads := make([]acr.UploadFile, len(files))

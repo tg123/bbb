@@ -262,10 +262,11 @@ func TestArtifactFileOpenDetectsReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	files, _, err := collectLocalArtifactFiles(source, nil)
+	files, _, cleanup, err := collectLocalArtifactFiles(source, nil)
 	if err != nil {
 		t.Fatalf("collectLocalArtifactFiles failed: %v", err)
 	}
+	t.Cleanup(cleanup)
 	if len(files) != 1 {
 		t.Fatalf("unexpected files: %#v", files)
 	}
@@ -296,7 +297,8 @@ func TestArtifactFileOpenDetectsReplacement(t *testing.T) {
 	}
 
 	// The threat this guards against is a swap for a symlink pointing outside
-	// the source tree.
+	// the source tree. The root handle refuses to traverse out of the source,
+	// so this fails before the handle comparison is even reached.
 	outside := filepath.Join(t.TempDir(), "secret.txt")
 	if err := os.WriteFile(outside, []byte("classified"), 0o644); err != nil {
 		t.Fatal(err)
@@ -307,8 +309,51 @@ func TestArtifactFileOpenDetectsReplacement(t *testing.T) {
 	if err := os.Symlink(outside, target); err != nil {
 		t.Skipf("symlinks unavailable on this host: %v", err)
 	}
-	if _, err := files[0].Open(); err == nil || !strings.Contains(err.Error(), "changed while it was being uploaded") {
-		t.Fatalf("expected the symlink swap to be detected, got %v", err)
+	reader, err = files[0].Open()
+	if err == nil {
+		_ = reader.Close()
+		t.Fatal("expected the symlink swap to be rejected")
+	}
+}
+
+// A directory component replaced after the walk must not let a later open
+// escape the source tree, which is what the root handle guarantees and a
+// path-based walk cannot.
+func TestArtifactFileOpenRejectsDirectorySwap(t *testing.T) {
+	source := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(source, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "sub", "a.txt"), []byte("inside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "a.txt"), []byte("classified"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, _, cleanup, err := collectLocalArtifactFiles(source, nil)
+	if err != nil {
+		t.Fatalf("collectLocalArtifactFiles failed: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if len(files) != 1 || files[0].Name != "sub/a.txt" {
+		t.Fatalf("unexpected files: %#v", files)
+	}
+
+	// Swap the directory itself for a symlink to somewhere else.
+	if err := os.RemoveAll(filepath.Join(source, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(source, "sub")); err != nil {
+		t.Skipf("symlinks unavailable on this host: %v", err)
+	}
+
+	reader, err := files[0].Open()
+	if err == nil {
+		content, _ := io.ReadAll(reader)
+		_ = reader.Close()
+		t.Fatalf("expected the directory swap to be rejected, read %q", content)
 	}
 }
 
@@ -325,7 +370,8 @@ func TestCollectLocalArtifactFilesRejectsSymlink(t *testing.T) {
 		t.Skipf("symlinks unavailable on this host: %v", err)
 	}
 
-	_, _, err := collectLocalArtifactFiles(source, nil)
+	_, _, cleanup, err := collectLocalArtifactFiles(source, nil)
+	t.Cleanup(cleanup)
 	if err == nil || !strings.Contains(err.Error(), "unsupported source file type") {
 		t.Fatalf("expected the symlink to be rejected, got %v", err)
 	}
@@ -342,12 +388,13 @@ func TestCollectLocalArtifactFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, "sub", "b.txt"), []byte("bravo"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	files, total, err := collectLocalArtifactFiles(source, func(name string) bool {
+	files, total, cleanup, err := collectLocalArtifactFiles(source, func(name string) bool {
 		return name == "a.txt"
 	})
 	if err != nil {
 		t.Fatalf("collectLocalArtifactFiles failed: %v", err)
 	}
+	t.Cleanup(cleanup)
 	if total != 5 || len(files) != 1 || files[0].Name != "sub/b.txt" {
 		t.Fatalf("unexpected artifact files: total=%d files=%#v", total, files)
 	}
