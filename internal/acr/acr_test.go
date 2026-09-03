@@ -1223,6 +1223,56 @@ func TestACRAuthenticatorRefreshesExpiredToken(t *testing.T) {
 	}
 }
 
+// go-containerregistry passes the in-flight request's context to
+// AuthorizationContext, so a cancelled transfer must not stay blocked in the
+// token exchange until the two minute bound expires.
+func TestACRAuthenticatorHonoursCallerCancellation(t *testing.T) {
+	started := make(chan struct{})
+	original := exchangeToken
+	exchangeToken = func(ctx context.Context, _ string) (string, error) {
+		close(started)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	t.Cleanup(func() { exchangeToken = original })
+
+	auth := &acrAuthenticator{registry: "reg.azurecr.io"}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := auth.AuthorizationContext(ctx)
+		done <- err
+	}()
+
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected the exchange to observe cancellation, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancelling the caller did not abort the token exchange")
+	}
+
+	// The timeout still applies on top, for a caller whose context never ends.
+	deadlined := make(chan time.Time, 1)
+	exchangeToken = func(ctx context.Context, _ string) (string, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Error("expected the exchange to be bounded by a deadline")
+		}
+		deadlined <- deadline
+		return "fresh", nil
+	}
+	if _, err := auth.AuthorizationContext(t.Context()); err != nil {
+		t.Fatalf("AuthorizationContext failed: %v", err)
+	}
+	if deadline := <-deadlined; time.Until(deadline) > tokenExchangeTimeout {
+		t.Fatalf("deadline %v exceeds the %v bound", deadline, tokenExchangeTimeout)
+	}
+}
+
 func TestValidateUploadNames(t *testing.T) {
 	reader := func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("x")), nil }
 	if err := ValidateUploadNames([]UploadFile{{Name: "a.txt", Open: reader}}); err != nil {

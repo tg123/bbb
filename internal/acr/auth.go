@@ -194,19 +194,34 @@ type acrAuthenticator struct {
 // request already in flight cannot land after the lapse.
 const tokenRefreshMargin = 5 * time.Minute
 
-// tokenExchangeTimeout bounds a renewal, which happens without a caller
-// context because authn.Authenticator takes none.
+// tokenExchangeTimeout is an upper bound on a renewal, so a hung Entra or
+// registry endpoint cannot stall a transfer indefinitely. It is applied on top
+// of the caller's context rather than replacing it.
 const tokenExchangeTimeout = 2 * time.Minute
 
 // exchangeToken is indirected so tests can drive token renewal without
 // contacting Entra ID or a registry.
 var exchangeToken = exchangeEntraToken
 
+// go-containerregistry hands the in-flight request's context to
+// AuthorizationContext when an authenticator implements it, and falls back to
+// Authorization when it does not. Implementing both means a renewal triggered
+// mid-transfer is cancelled with the transfer instead of running on to the
+// timeout.
+var (
+	_ authn.Authenticator        = (*acrAuthenticator)(nil)
+	_ authn.ContextAuthenticator = (*acrAuthenticator)(nil)
+)
+
 func (a *acrAuthenticator) Authorization() (*authn.AuthConfig, error) {
+	return a.AuthorizationContext(context.Background())
+}
+
+func (a *acrAuthenticator) AuthorizationContext(ctx context.Context) (*authn.AuthConfig, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.token == "" || time.Now().After(a.expires) {
-		ctx, cancel := context.WithTimeout(context.Background(), tokenExchangeTimeout)
+		ctx, cancel := context.WithTimeout(ctx, tokenExchangeTimeout)
 		defer cancel()
 		token, err := exchangeToken(ctx, a.registry)
 		if err != nil {
