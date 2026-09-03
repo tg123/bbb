@@ -608,12 +608,76 @@ func (p Path) reference() (name.Reference, error) {
 	return name.NewTag(repo+":"+p.Reference, options...)
 }
 
+// httpsOnlyTransport refuses a plaintext request to a registry that was not
+// explicitly allowed one.
+//
+// checkTransportSecurity governs the endpoint bbb chooses, but a registry can
+// also redirect a blob upload elsewhere: go-containerregistry follows the
+// Location it returns, and forces HTTPS only while that URL stays on the
+// registry host. Without this, a secure registry could have local file
+// contents PATCHed to http://other-host/.
+type httpsOnlyTransport struct {
+	base      http.RoundTripper
+	permitted bool
+}
+
+func (t *httpsOnlyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !t.permitted && !strings.EqualFold(req.URL.Scheme, "https") {
+		return nil, fmt.Errorf(
+			"acr: refusing to send a request to %s over plain HTTP; set BBB_ACR_INSECURE=%s to allow it",
+			req.URL.Host, registryHost(req.URL.Host))
+	}
+	return t.base.RoundTrip(req)
+}
+
+// transport returns the HTTP transport for requests about p, enforcing the
+// same plaintext policy on every request the library makes, including ones
+// aimed at a host the registry chose.
+func (p Path) transport() http.RoundTripper {
+	return &httpsOnlyTransport{
+		base:      roundTripper(),
+		permitted: isInsecureAllowed(p.Registry) || isLoopback(p.Registry),
+	}
+}
+
 func (p Path) remoteOptions(ctx context.Context) []remote.Option {
 	return []remote.Option{
 		remote.WithContext(ctx),
-		remote.WithTransport(roundTripper()),
+		remote.WithTransport(p.transport()),
 		authOption(ctx, p.Registry),
 	}
+}
+
+// pullerOptions omits the context, so a cached puller is not bound to whichever
+// caller happened to create it; each read passes its own.
+func (p Path) pullerOptions(ctx context.Context) []remote.Option {
+	return []remote.Option{
+		remote.WithTransport(p.transport()),
+		authOption(ctx, p.Registry),
+	}
+}
+
+type pullerEntry struct {
+	once   sync.Once
+	puller *remote.Puller
+	err    error
+}
+
+// pullerCache keeps one authenticated puller per registry, so a whole-artifact
+// copy does not repeat the registry ping and token exchange before every blob.
+var pullerCache sync.Map
+
+func (p Path) blobPuller(ctx context.Context) (*remote.Puller, error) {
+	key := registryKey(p.Registry)
+	value, _ := pullerCache.LoadOrStore(key, &pullerEntry{})
+	entry := value.(*pullerEntry)
+	entry.once.Do(func() {
+		entry.puller, entry.err = remote.NewPuller(p.pullerOptions(ctx)...)
+		if entry.err != nil {
+			pullerCache.Delete(key)
+		}
+	})
+	return entry.puller, entry.err
 }
 
 // maxIndexDepth bounds how many nested image indexes are followed.
@@ -834,12 +898,17 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	}
 	// Fetch the blob with the caller's context rather than the one that
 	// resolved the manifest. The digest pins the content, so this still reads
-	// exactly the snapshot that was listed.
+	// exactly the snapshot that was listed, and a shared puller keeps the
+	// authentication rather than repeating it per layer.
 	digestRef, err := p.blobReference(target.Digest)
 	if err != nil {
 		return nil, err
 	}
-	layer, err := remote.Layer(digestRef, p.remoteOptions(ctx)...)
+	puller, err := p.blobPuller(ctx)
+	if err != nil {
+		return nil, asStatusError(err)
+	}
+	layer, err := puller.Layer(ctx, digestRef)
 	if err != nil {
 		return nil, asStatusError(err)
 	}
@@ -971,7 +1040,7 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 		// two publishers could both observe an absent tag. Ask the registry to
 		// make the manifest PUT create-only; go-containerregistry has no option
 		// for this, so the header is added in the transport.
-		options = append(options, remote.WithTransport(&createOnlyTransport{base: roundTripper()}))
+		options = append(options, remote.WithTransport(&createOnlyTransport{base: p.transport()}))
 	}
 	if err := remote.Write(ref, image, options...); err != nil {
 		var terr *transport.Error

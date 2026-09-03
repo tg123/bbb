@@ -163,8 +163,13 @@ func newTestRegistry(t *testing.T) string {
 	t.Helper()
 	server := httptest.NewServer(registry.New(registry.Logger(nopLogger(t))))
 	t.Cleanup(server.Close)
-	layerCache.Clear()
-	t.Cleanup(func() { layerCache.Clear() })
+	resetCaches := func() {
+		layerCache.Clear()
+		pullerCache.Clear()
+		authCache.Clear()
+	}
+	resetCaches()
+	t.Cleanup(resetCaches)
 	parsed, err := url.Parse(server.URL)
 	if err != nil {
 		t.Fatalf("parse registry url: %v", err)
@@ -910,6 +915,29 @@ func TestLoopbackAlwaysUsesHTTP(t *testing.T) {
 		if scheme := ref.Context().Scheme(); scheme != "http" {
 			t.Errorf("%s resolved to %s, want http", registry, scheme)
 		}
+	}
+}
+
+// A registry can redirect an upload to another host, so the plaintext policy
+// must apply to every request the library makes, not only to the endpoint bbb
+// selects.
+func TestTransportRejectsPlaintextRedirect(t *testing.T) {
+	secure := Path{Registry: "myreg.azurecr.io", Repository: "models", Reference: "v1"}
+	transport := secure.transport()
+
+	redirected, err := http.NewRequest(http.MethodPatch, "http://other-host/v2/models/blobs/uploads/abc", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transport.RoundTrip(redirected); err == nil || !strings.Contains(err.Error(), "plain HTTP") {
+		t.Fatalf("expected a plaintext upload location to be refused, got %v", err)
+	}
+
+	// An allowlisted registry may use HTTP, including for a redirect.
+	t.Setenv("BBB_ACR_INSECURE", "myreg.azurecr.io")
+	permitted := secure.transport()
+	if _, err := permitted.RoundTrip(redirected); err != nil && strings.Contains(err.Error(), "plain HTTP") {
+		t.Fatalf("an allowlisted registry should permit HTTP, got %v", err)
 	}
 }
 
