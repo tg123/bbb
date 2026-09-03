@@ -579,6 +579,45 @@ func TestAncestorAndDescendantNamesConflict(t *testing.T) {
 	}
 }
 
+// Names differing only in case alias on the case-insensitive filesystems
+// Windows and macOS use by default, so they cannot both be extracted.
+func TestCaseInsensitiveNamesConflict(t *testing.T) {
+	reader := func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("x")), nil }
+
+	if err := ValidateUploadNames([]UploadFile{
+		{Name: "A.txt", Open: reader},
+		{Name: "a.txt", Open: reader},
+	}); err == nil || !strings.Contains(err.Error(), "differ only in case") {
+		t.Fatalf("expected a case collision to be rejected, got %v", err)
+	}
+	// A directory prefix aliases the same way.
+	if err := ValidateUploadNames([]UploadFile{
+		{Name: "A", Open: reader},
+		{Name: "a/child", Open: reader},
+	}); err == nil {
+		t.Fatal("expected a case-insensitive file/directory clash to be rejected")
+	}
+	// Genuinely different names are still fine.
+	if err := ValidateUploadNames([]UploadFile{
+		{Name: "a.txt", Open: reader},
+		{Name: "ab.txt", Open: reader},
+		{Name: "sub/a.txt", Open: reader},
+	}); err != nil {
+		t.Fatalf("expected distinct names to be accepted, got %v", err)
+	}
+
+	// The read path rejects it too, where the registry chooses the titles.
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "models", Reference: "case"}
+	pushRawArtifact(t, p, []layerSpec{
+		{title: "A.txt", content: "upper"},
+		{title: "a.txt", content: "lower"},
+	})
+	if _, err := ListFiles(t.Context(), p); err == nil || !strings.Contains(err.Error(), "differ only in case") {
+		t.Fatalf("expected the artifact to be rejected, got %v", err)
+	}
+}
+
 func TestValidatePushTarget(t *testing.T) {
 	if err := ValidatePushTarget(Path{Repository: "models", Reference: "v1"}); err != nil {
 		t.Fatalf("expected tag target to be valid: %v", err)

@@ -257,46 +257,95 @@ func ancestors(name string) []string {
 // nameSet tracks accepted artifact file names and rejects any name that cannot
 // coexist with them on a filesystem.
 //
-// Comparing whole names is not enough: layers "a" and "a/b" are distinct
-// strings, but no filesystem can hold a file and a directory at one path, so
-// extraction would fail or half-succeed depending on write order.
+// Comparing whole names is not enough on two counts: layers "a" and "a/b" are
+// distinct strings, but no filesystem can hold a file and a directory at one
+// path; and "A.txt" and "a.txt" are distinct on Linux yet alias on the
+// case-insensitive filesystems Windows and macOS use by default. Names are
+// therefore keyed case-folded, with the original spelling kept for diagnostics.
 type nameSet struct {
-	files map[string]string
-	dirs  map[string]struct{}
+	files map[string]nameEntry
+	dirs  map[string]string
+}
+
+type nameEntry struct {
+	name   string
+	digest string
 }
 
 func newNameSet(size int) *nameSet {
 	return &nameSet{
-		files: make(map[string]string, size),
-		dirs:  make(map[string]struct{}, size),
+		files: make(map[string]nameEntry, size),
+		dirs:  make(map[string]string, size),
 	}
 }
 
-// digestOf returns the digest recorded for an already-accepted name.
-func (s *nameSet) digestOf(name string) (string, bool) {
-	digest, ok := s.files[name]
-	return digest, ok
+// foldKey returns the key under which a name is tracked. Case folding
+// approximates how a case-insensitive filesystem compares names.
+func foldKey(name string) string {
+	return strings.ToLower(name)
 }
 
-// checkCoexists reports whether name can be added alongside everything
-// already accepted.
+// checkCoexists reports whether name can be added alongside everything already
+// accepted, ignoring any entry for the name itself.
 func (s *nameSet) checkCoexists(name string) error {
-	if _, isDir := s.dirs[name]; isDir {
-		return fmt.Errorf("%q is also used as a directory by another file", name)
+	if original, isDir := s.dirs[foldKey(name)]; isDir {
+		return fmt.Errorf("%q is also used as a directory by another file (%q)", name, original)
 	}
 	for _, ancestor := range ancestors(name) {
-		if _, isFile := s.files[ancestor]; isFile {
-			return fmt.Errorf("%q is nested under %q, which is a file", name, ancestor)
+		if existing, isFile := s.files[foldKey(ancestor)]; isFile {
+			return fmt.Errorf("%q is nested under %q, which is a file", name, existing.name)
 		}
 	}
 	return nil
 }
 
-func (s *nameSet) add(name, digest string) {
-	s.files[name] = digest
+func (s *nameSet) record(name, digest string) {
+	s.files[foldKey(name)] = nameEntry{name: name, digest: digest}
 	for _, ancestor := range ancestors(name) {
-		s.dirs[ancestor] = struct{}{}
+		s.dirs[foldKey(ancestor)] = ancestor
 	}
+}
+
+// addLayer registers a layer name read from a manifest. It reports whether the
+// identical descriptor was already accepted, which happens when manifests in
+// an index share a layer and is safe to skip.
+func (s *nameSet) addLayer(name, digest string) (bool, error) {
+	if existing, ok := s.files[foldKey(name)]; ok {
+		switch {
+		case existing.name == name && existing.digest == digest:
+			return true, nil
+		case existing.name == name:
+			return false, fmt.Errorf(
+				"conflicting layers named %q (%s and %s); address the artifact by digest to read a specific manifest",
+				name, existing.digest, digest)
+		default:
+			return false, fmt.Errorf(
+				"layers %q and %q differ only in case and collide on a case-insensitive filesystem",
+				existing.name, name)
+		}
+	}
+	if err := s.checkCoexists(name); err != nil {
+		return false, err
+	}
+	s.record(name, digest)
+	return false, nil
+}
+
+// addUpload registers a name being published, where any repeat is an error.
+func (s *nameSet) addUpload(name string) error {
+	if existing, ok := s.files[foldKey(name)]; ok {
+		if existing.name == name {
+			return fmt.Errorf("duplicate upload file name %q", name)
+		}
+		return fmt.Errorf(
+			"%q and %q differ only in case and collide on a case-insensitive filesystem",
+			existing.name, name)
+	}
+	if err := s.checkCoexists(name); err != nil {
+		return err
+	}
+	s.record(name, "")
+	return nil
 }
 
 // cleanFile validates a name used as a path relative to a local destination.
@@ -345,16 +394,12 @@ func ValidateUploadNames(files []UploadFile) error {
 		if err != nil {
 			return fmt.Errorf("acr: invalid upload file name %q: %w", file.Name, err)
 		}
-		if _, exists := seen.digestOf(cleaned); exists {
-			return fmt.Errorf("acr: duplicate upload file name %q", cleaned)
-		}
-		if err := seen.checkCoexists(cleaned); err != nil {
-			return fmt.Errorf("acr: cannot publish %q: %w", file.Name, err)
-		}
 		if file.Open == nil {
 			return fmt.Errorf("acr: upload file %q has no reader", cleaned)
 		}
-		seen.add(cleaned, "")
+		if err := seen.addUpload(cleaned); err != nil {
+			return fmt.Errorf("acr: %w", err)
+		}
 	}
 	return nil
 }
@@ -598,20 +643,12 @@ func (a *artifact) addImage(image v1.Image) error {
 		if err != nil {
 			return fmt.Errorf("acr: invalid layer name %q: %w", title, err)
 		}
-		if previous, dup := a.seen.digestOf(cleaned); dup {
-			// The same descriptor listed twice, typically because several
-			// manifests in an index share a layer, is one file.
-			if previous == digest {
-				continue
-			}
-			// Two different blobs claiming one name would hide part of the
-			// artifact if the first silently won, so surface it.
-			return fmt.Errorf(
-				"acr: conflicting layers named %q (%s and %s); address the artifact by digest to read a specific manifest",
-				cleaned, previous, digest)
+		dup, err := a.seen.addLayer(cleaned, digest)
+		if err != nil {
+			return fmt.Errorf("acr: %w", err)
 		}
-		if err := a.seen.checkCoexists(cleaned); err != nil {
-			return fmt.Errorf("acr: cannot extract this artifact: %w", err)
+		if dup {
+			continue
 		}
 		// Deduplicate by name rather than by digest: two files with identical
 		// contents share a blob but are still two distinct files, and dropping
@@ -623,7 +660,6 @@ func (a *artifact) addImage(image v1.Image) error {
 			}
 			a.layers[digest] = layer
 		}
-		a.seen.add(cleaned, digest)
 		a.files = append(a.files, File{Name: cleaned, Size: descriptor.Size, Digest: digest})
 	}
 	return nil
