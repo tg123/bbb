@@ -986,21 +986,48 @@ func TestLoopbackAlwaysUsesHTTP(t *testing.T) {
 // selects.
 func TestTransportRejectsPlaintextRedirect(t *testing.T) {
 	secure := Path{Registry: "myreg.azurecr.io", Repository: "models", Reference: "v1"}
-	transport := secure.transport()
 
 	redirected, err := http.NewRequest(http.MethodPatch, "http://other-host/v2/models/blobs/uploads/abc", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := transport.RoundTrip(redirected); err == nil || !strings.Contains(err.Error(), "plain HTTP") {
+	if _, err := secure.transport().RoundTrip(redirected); err == nil || !strings.Contains(err.Error(), "plain HTTP") {
 		t.Fatalf("expected a plaintext upload location to be refused, got %v", err)
 	}
 
-	// An allowlisted registry may use HTTP, including for a redirect.
+	// Allowing the registry plaintext says nothing about wherever it chooses
+	// to redirect to, so the cross-origin request is still refused.
 	t.Setenv("BBB_ACR_INSECURE", "myreg.azurecr.io")
-	permitted := secure.transport()
-	if _, err := permitted.RoundTrip(redirected); err != nil && strings.Contains(err.Error(), "plain HTTP") {
-		t.Fatalf("an allowlisted registry should permit HTTP, got %v", err)
+	permitted, ok := secure.transport().(*httpsOnlyTransport)
+	if !ok {
+		t.Fatal("expected an httpsOnlyTransport")
+	}
+	if !permitted.plaintextAllowed(&url.URL{Scheme: "http", Host: "myreg.azurecr.io"}) {
+		t.Error("an allowlisted registry should permit HTTP to itself")
+	}
+	if _, err := permitted.RoundTrip(redirected); err == nil || !strings.Contains(err.Error(), "plain HTTP") {
+		t.Fatalf("expected the redirect target to need its own opt-in, got %v", err)
+	}
+
+	// The remediation the error names has to work: adding the redirect target
+	// to the allowlist allows it.
+	t.Setenv("BBB_ACR_INSECURE", "myreg.azurecr.io,other-host")
+	both, ok := secure.transport().(*httpsOnlyTransport)
+	if !ok {
+		t.Fatal("expected an httpsOnlyTransport")
+	}
+	if !both.plaintextAllowed(redirected.URL) {
+		t.Error("expected an explicitly allowlisted redirect target to be permitted")
+	}
+
+	// Loopback is not implicitly trusted for a redirect: a remote registry
+	// aiming an upload at the caller's own machine is what this guards against.
+	local, ok := (Path{Registry: "myreg.azurecr.io"}).transport().(*httpsOnlyTransport)
+	if !ok {
+		t.Fatal("expected an httpsOnlyTransport")
+	}
+	if local.plaintextAllowed(&url.URL{Scheme: "http", Host: "127.0.0.1:5000"}) {
+		t.Error("a redirect to loopback must still require an explicit opt-in")
 	}
 }
 

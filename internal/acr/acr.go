@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"slices"
@@ -657,17 +658,37 @@ func (p Path) reference() (name.Reference, error) {
 // registry host. Without this, a secure registry could have local file
 // contents PATCHed to http://other-host/.
 type httpsOnlyTransport struct {
-	base      http.RoundTripper
+	base http.RoundTripper
+	// registry is the endpoint the caller addressed, canonicalised, and
+	// permitted says whether plaintext was allowed for it.
+	registry  string
 	permitted bool
 }
 
 func (t *httpsOnlyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if !t.permitted && !strings.EqualFold(req.URL.Scheme, "https") {
+	if !t.plaintextAllowed(req.URL) {
 		return nil, fmt.Errorf(
 			"acr: refusing to send a request to %s over plain HTTP; set BBB_ACR_INSECURE=%s to allow it",
 			req.URL.Host, insecureAuthority(req.URL.Host))
 	}
 	return t.base.RoundTrip(req)
+}
+
+// plaintextAllowed decides per request, because the host can change mid-flight.
+//
+// A redirect off the registry needs its own entry in BBB_ACR_INSECURE:
+// loopback is deliberately not trusted here, since a remote registry pointing
+// an upload at the caller's own machine is exactly what this guards against,
+// and the caller's opt-in for the registry says nothing about wherever it
+// chose to redirect to.
+func (t *httpsOnlyTransport) plaintextAllowed(u *url.URL) bool {
+	if strings.EqualFold(u.Scheme, "https") {
+		return true
+	}
+	if t.permitted && insecureAuthority(u.Host) == t.registry {
+		return true
+	}
+	return isInsecureAllowed(u.Host)
 }
 
 // transport returns the HTTP transport for requests about p, enforcing the
@@ -676,6 +697,7 @@ func (t *httpsOnlyTransport) RoundTrip(req *http.Request) (*http.Response, error
 func (p Path) transport() http.RoundTripper {
 	return &httpsOnlyTransport{
 		base:      roundTripper(),
+		registry:  insecureAuthority(p.Registry),
 		permitted: isInsecureAllowed(p.Registry) || isLoopback(p.Registry),
 	}
 }
