@@ -2288,9 +2288,13 @@ func pushLocalArtifact(
 		}
 	}
 	var reported atomic.Int64
+	// runOpPool clamps a non-positive limit to one; do the same here, or a
+	// zero would fall through to go-containerregistry's default of four jobs
+	// and exceed what --concurrency asked for.
+	uploadConcurrency := max(1, concurrency)
 	err = retryOp(ctx, retryCount, func() error {
 		var uploaded atomic.Int64
-		return bbbfs.UploadArtifact(ctx, dst, files, concurrency, overwrite, func(delta int64) {
+		return bbbfs.UploadArtifact(ctx, dst, files, uploadConcurrency, overwrite, func(delta int64) {
 			copied := uploaded.Add(delta)
 			if onBytes != nil {
 				for {

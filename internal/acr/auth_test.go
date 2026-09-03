@@ -32,6 +32,38 @@ type recordedRequest struct {
 	form url.Values
 }
 
+// Registry credentials must not be offered to every host an invocation
+// touches, or one registry's password reaches another.
+func TestBasicCredentialsAreHostScoped(t *testing.T) {
+	t.Setenv("BBB_ACR_USERNAME", "user")
+	t.Setenv("BBB_ACR_PASSWORD", "pass")
+
+	// Unscoped credentials reach Azure Container Registry only.
+	if _, _, ok := basicCredentials("myreg.azurecr.io"); !ok {
+		t.Error("expected credentials to apply to an ACR host")
+	}
+	for _, registry := range []string{"ghcr.io", "registry.example.com", "localhost:5000"} {
+		if _, _, ok := basicCredentials(registry); ok {
+			t.Errorf("credentials must not be offered to %s", registry)
+		}
+	}
+
+	// An explicit scope moves them, rather than widening them.
+	t.Setenv("BBB_ACR_REGISTRY", "ghcr.io")
+	if _, _, ok := basicCredentials("ghcr.io"); !ok {
+		t.Error("expected the explicit scope to apply")
+	}
+	if _, _, ok := basicCredentials("myreg.azurecr.io"); ok {
+		t.Error("an explicit scope must exclude other hosts, including ACR")
+	}
+
+	// Without a password there is nothing to offer.
+	t.Setenv("BBB_ACR_PASSWORD", "")
+	if _, _, ok := basicCredentials("ghcr.io"); ok {
+		t.Error("expected incomplete credentials to be ignored")
+	}
+}
+
 // The Entra flow is the default ACR login, so a wrong service, scope or grant
 // would compile and only fail in production. Drive both exchanges directly.
 func TestExchangeEntraToken(t *testing.T) {

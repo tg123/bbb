@@ -86,7 +86,7 @@ Use `-f` with `cp` to replace an existing tag. `sync` always replaces the destin
 
 Authentication is resolved in this order:
 
-1. `BBB_ACR_USERNAME` / `BBB_ACR_PASSWORD` (registry credentials or a token)
+1. `BBB_ACR_USERNAME` / `BBB_ACR_PASSWORD` (registry credentials or a token). These are scoped: without `BBB_ACR_REGISTRY` they are only sent to Azure Container Registry hosts, so one registry's password is not offered to every other registry an invocation touches. Set `BBB_ACR_REGISTRY` to the host (or hosts) they belong to when using them elsewhere.
 2. Entra ID (Azure AD) via `DefaultAzureCredential` — Azure CLI login, service principal, managed identity, workload identity — exchanged for a registry token
 3. The Docker keychain (`~/.docker/config.json` and credential helpers), so a prior `docker login` works for any registry, including anonymous pull
 
@@ -132,6 +132,7 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
 | `BBB_ACR_USERNAME` | | Username for `acr://` registry authentication (used with `BBB_ACR_PASSWORD`) |
 | `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
+| `BBB_ACR_REGISTRY` | *(ACR hosts)* | Comma separated hosts the `BBB_ACR_USERNAME`/`BBB_ACR_PASSWORD` credentials belong to. Without it they are only sent to `*.azurecr.io` and the other ACR suffixes |
 | `BBB_ACR_ENTRA_HOSTS` | | Comma separated extra registry hosts allowed to receive Entra ID credentials, for ACR behind a custom domain |
 | `BBB_ACR_INSECURE` | | Comma separated registry hosts that may be contacted over plain HTTP. Required for private (RFC1918) IP literals and mDNS (`*.local`) names; loopback is always allowed |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |

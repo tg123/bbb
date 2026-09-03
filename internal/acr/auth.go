@@ -71,6 +71,17 @@ func normalisedHostList(raw string) []string {
 	return out
 }
 
+// hasAzureSuffix reports whether host is an Azure Container Registry endpoint
+// by DNS suffix.
+func hasAzureSuffix(host string) bool {
+	for _, suffix := range azureRegistrySuffixes {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // isACR reports whether registry is an Azure Container Registry endpoint that
 // may be offered Entra credentials.
 //
@@ -80,22 +91,32 @@ func normalisedHostList(raw string) []string {
 // credential. Everything else falls through to the Docker keychain.
 func isACR(registry string) bool {
 	host := registryHost(registry)
-	if slices.Contains(trustedEntraHosts(), host) {
-		return true
-	}
-	for _, suffix := range azureRegistrySuffixes {
-		if strings.HasSuffix(host, suffix) {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(trustedEntraHosts(), host) || hasAzureSuffix(host)
 }
 
-// basicCredentials returns explicitly configured registry credentials.
-func basicCredentials() (string, string, bool) {
+// basicCredentials returns explicitly configured registry credentials for
+// registry, if they apply to it.
+//
+// One invocation can address several registries, so these must not be offered
+// to every host: that is the same disclosure the Entra gate prevents. They are
+// scoped to the hosts in BBB_ACR_REGISTRY when set, and otherwise to Azure
+// Container Registry endpoints, matching what the variables are named for.
+func basicCredentials(registry string) (string, string, bool) {
 	user := os.Getenv("BBB_ACR_USERNAME")
 	pass := os.Getenv("BBB_ACR_PASSWORD")
 	if user == "" || pass == "" {
+		return "", "", false
+	}
+	host := registryHost(registry)
+	if scoped := normalisedHostList(os.Getenv("BBB_ACR_REGISTRY")); len(scoped) > 0 {
+		if !slices.Contains(scoped, host) {
+			return "", "", false
+		}
+		return user, pass, true
+	}
+	if !hasAzureSuffix(host) {
+		slog.Debug("acr: registry credentials are scoped to Azure Container Registry; set BBB_ACR_REGISTRY to use them elsewhere",
+			"registry", registry)
 		return "", "", false
 	}
 	return user, pass, true
@@ -213,7 +234,7 @@ var authCache sync.Map
 // keyed individually: concurrent callers for the same registry wait for one
 // exchange, while a slow login to one registry never blocks another.
 func authOption(ctx context.Context, registry string) remote.Option {
-	if user, pass, ok := basicCredentials(); ok {
+	if user, pass, ok := basicCredentials(registry); ok {
 		return remote.WithAuth(&authn.Basic{Username: user, Password: pass})
 	}
 
