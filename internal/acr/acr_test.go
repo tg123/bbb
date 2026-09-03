@@ -3,6 +3,7 @@ package acr
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -613,6 +614,24 @@ func TestCaseInsensitiveNamesConflict(t *testing.T) {
 	}); err == nil {
 		t.Fatal("expected a case-insensitive file/directory clash to be rejected")
 	}
+	// macOS normalises filenames, so an NFC name and its NFD spelling are the
+	// same file there even though the strings differ.
+	nfc := "\u00e9.txt"  // é.txt
+	nfd := "e\u0301.txt" // e + combining acute
+	if err := ValidateUploadNames([]UploadFile{
+		{Name: nfc, Open: reader},
+		{Name: nfd, Open: reader},
+	}); err == nil || !strings.Contains(err.Error(), "differ only in case") {
+		t.Fatalf("expected Unicode-equivalent names to be rejected, got %v", err)
+	}
+	// The same aliasing applies between a file and a directory prefix.
+	if err := ValidateUploadNames([]UploadFile{
+		{Name: "\u00e9", Open: reader},
+		{Name: "e\u0301/child", Open: reader},
+	}); err == nil {
+		t.Fatal("expected a Unicode-equivalent file/directory clash to be rejected")
+	}
+
 	// Genuinely different names are still fine.
 	if err := ValidateUploadNames([]UploadFile{
 		{Name: "a.txt", Open: reader},
@@ -1098,5 +1117,26 @@ func TestAsStatusError(t *testing.T) {
 	plain := fmt.Errorf("boom")
 	if got := asStatusError(plain); got != plain {
 		t.Fatalf("expected the original error, got %v", got)
+	}
+}
+
+// A missing artifact must look like a missing file, so callers such as
+// bbbfs.Exists report absence rather than failing.
+func TestHTTPStatusErrorNotFound(t *testing.T) {
+	missing := &HTTPStatusError{StatusCode: 404, Status: "Not Found"}
+	if !errors.Is(missing, os.ErrNotExist) {
+		t.Error("a 404 should match os.ErrNotExist")
+	}
+	if !missing.NotFound() {
+		t.Error("a 404 should report NotFound")
+	}
+	wrapped := fmt.Errorf("acr: %w", missing)
+	if !errors.Is(wrapped, os.ErrNotExist) {
+		t.Error("a wrapped 404 should still match os.ErrNotExist")
+	}
+
+	denied := &HTTPStatusError{StatusCode: 403, Status: "Forbidden"}
+	if errors.Is(denied, os.ErrNotExist) || denied.NotFound() {
+		t.Error("a 403 must not be reported as missing")
 	}
 }

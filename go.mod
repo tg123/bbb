@@ -16,6 +16,7 @@ require (
 	github.com/google/go-containerregistry v0.21.5
 	github.com/urfave/cli/v3 v3.11.0
 	golang.org/x/sys v0.47.0
+	golang.org/x/text v0.41.0
 )
 
 require (
@@ -51,6 +52,5 @@ require (
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 )

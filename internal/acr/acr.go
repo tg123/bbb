@@ -38,6 +38,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/types"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 // Scheme is the URI scheme prefix handled by this package.
@@ -98,6 +100,18 @@ type HTTPStatusError struct {
 
 func (e *HTTPStatusError) Error() string {
 	return e.Status
+}
+
+// NotFound reports whether the registry answered 404, so callers treating a
+// missing artifact as absent rather than as a failure can recognise it.
+func (e *HTTPStatusError) NotFound() bool {
+	return e.StatusCode == http.StatusNotFound
+}
+
+// Is lets a 404 match os.ErrNotExist, so a missing artifact behaves like a
+// missing file inside one.
+func (e *HTTPStatusError) Is(target error) bool {
+	return target == os.ErrNotExist && e.NotFound()
 }
 
 // asStatusError attaches an HTTPStatusError to a go-containerregistry
@@ -283,10 +297,14 @@ func newNameSet(size int) *nameSet {
 	}
 }
 
-// foldKey returns the key under which a name is tracked. Case folding
-// approximates how a case-insensitive filesystem compares names.
+// foldKey returns the key under which a name is tracked.
+//
+// Case folding alone is not enough: macOS stores names in a normalised form,
+// so NFC "é.txt" and NFD "e\u0301.txt" are the same file there despite being
+// different strings. Normalising first, then folding, makes both aliases and
+// case variants collide here the way they would on disk.
 func foldKey(name string) string {
-	return strings.ToLower(name)
+	return cases.Fold().String(norm.NFC.String(name))
 }
 
 // checkCoexists reports whether name can be added alongside everything already
