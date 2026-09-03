@@ -217,7 +217,7 @@ func authOption(ctx context.Context, registry string) remote.Option {
 		return remote.WithAuth(&authn.Basic{Username: user, Password: pass})
 	}
 
-	value, _ := authCache.LoadOrStore(registry, &authEntry{})
+	value, _ := authCache.LoadOrStore(registryKey(registry), &authEntry{})
 	entry := value.(*authEntry)
 	entry.once.Do(func() {
 		if !isACR(registry) {

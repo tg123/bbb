@@ -81,9 +81,9 @@ func TestParse(t *testing.T) {
 			want: Path{Registry: "localhost", Repository: "models", Reference: "v1"},
 		},
 		{
-			name: "default https port is canonicalised away",
+			name: "an explicit port is preserved, since it selects the endpoint",
 			raw:  "acr://myreg.azurecr.io:443/models:v1",
-			want: Path{Registry: "myreg.azurecr.io", Repository: "models", Reference: "v1"},
+			want: Path{Registry: "myreg.azurecr.io:443", Repository: "models", Reference: "v1"},
 		},
 		{
 			name: "localhost with a port is unchanged",
@@ -787,6 +787,51 @@ func TestPlainHTTPOptIn(t *testing.T) {
 	t.Setenv("BBB_ACR_INSECURE", "10.1.2.3")
 	if _, err := p.reference(); err != nil {
 		t.Fatalf("expected the opt-in to allow the registry, got %v", err)
+	}
+}
+
+// Equivalent spellings of one endpoint must share a key, without the port
+// being dropped from the authority actually used for requests.
+func TestArtifactKeyTreatsDefaultPortAsEquivalent(t *testing.T) {
+	bare, err := Parse("acr://myreg.azurecr.io/models:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withPort, err := Parse("acr://myreg.azurecr.io:443/models:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bare.ArtifactKey() != withPort.ArtifactKey() {
+		t.Fatalf("expected one key, got %q and %q", bare.ArtifactKey(), withPort.ArtifactKey())
+	}
+	// The request authority keeps its port.
+	if withPort.Registry != "myreg.azurecr.io:443" {
+		t.Fatalf("port must be preserved on the path, got %q", withPort.Registry)
+	}
+	ref, err := withPort.reference()
+	if err != nil {
+		t.Fatalf("reference failed: %v", err)
+	}
+	if got := ref.Context().RegistryStr(); got != "myreg.azurecr.io:443" {
+		t.Fatalf("request authority = %q, want the port preserved", got)
+	}
+
+	// A non-default port is a different endpoint and must not collapse.
+	other, err := Parse("acr://myreg.azurecr.io:5000/models:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.ArtifactKey() == bare.ArtifactKey() {
+		t.Fatal("a non-default port must produce a distinct key")
+	}
+
+	// Port 80 is not the default for an HTTPS registry, so it stays distinct.
+	http80, err := Parse("acr://myreg.azurecr.io:80/models:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if http80.ArtifactKey() == bare.ArtifactKey() {
+		t.Fatal("port 80 on an https registry must produce a distinct key")
 	}
 }
 

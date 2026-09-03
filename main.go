@@ -1347,7 +1347,7 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return fmt.Errorf("cp: %w", err)
 		}
-		key := acrArtifactKey(destination)
+		key := destination.ArtifactKey()
 		if _, duplicate := acrDestinations[key]; duplicate {
 			return fmt.Errorf("cp: multiple sources cannot target the same acr:// artifact")
 		}
@@ -1364,18 +1364,12 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return fmt.Errorf("cp: %w", err)
 		}
-		if _, clash := acrDestinations[acrArtifactKey(source)]; clash {
+		if _, clash := acrDestinations[source.ArtifactKey()]; clash {
 			return fmt.Errorf("cp: cannot read and publish the same acr:// artifact in one run: %s", task.src)
 		}
 	}
 
 	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
-}
-
-// acrArtifactKey identifies the artifact a path addresses, ignoring any file
-// within it.
-func acrArtifactKey(p acr.Path) string {
-	return p.Registry + "/" + p.Repository + "@" + p.Reference
 }
 
 // runCPTasks executes a list of task pairs through the unified expansion +

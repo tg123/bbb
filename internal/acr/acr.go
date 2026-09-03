@@ -152,20 +152,39 @@ func (p Path) String() string {
 
 const expectedPathErr = "expected acr://registry/repository[:tag|@digest][/file]"
 
-// canonicalRegistry normalises a registry authority so equivalent spellings
-// share one key. Hostnames are case-insensitive, and an explicitly written
-// default port addresses the same endpoint as omitting it, so neither may be
-// used to slip past a cache or a duplicate-destination check.
-func canonicalRegistry(registry string) string {
-	registry = strings.ToLower(strings.TrimSpace(registry))
+// registryKey returns a comparison key for a registry authority.
+//
+// Writing a default port explicitly addresses the same endpoint as omitting it,
+// so both must yield one key for caches and collision checks. This is
+// deliberately not applied to Path.Registry itself: the port is part of the
+// authority used for requests, and dropping it would move
+// registry.example:80 from port 80 to 443.
+func registryKey(registry string) string {
+	registry = strings.ToLower(registry)
 	host, port, err := net.SplitHostPort(registry)
-	if err != nil || (port != "443" && port != "80") {
+	if err != nil {
 		return registry
 	}
-	if strings.Contains(host, ":") {
-		return "[" + host + "]"
+	scheme := "https"
+	if isInsecureAllowed(registry) {
+		scheme = "http"
+	} else if parsed, perr := name.NewRegistry(registry, name.WeakValidation); perr == nil {
+		scheme = parsed.Scheme()
 	}
-	return host
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		if strings.Contains(host, ":") {
+			return "[" + host + "]"
+		}
+		return host
+	}
+	return registry
+}
+
+// ArtifactKey identifies the artifact a path addresses, ignoring any file
+// within it. Equivalent spellings of one endpoint share a key, so callers can
+// detect that two paths target the same artifact.
+func (p Path) ArtifactKey() string {
+	return registryKey(p.Registry) + "/" + p.Repository + "@" + p.Reference
 }
 
 // Parse parses an acr:// path.
@@ -178,7 +197,9 @@ func Parse(raw string) (Path, error) {
 	if !ok || registry == "" || rest == "" {
 		return Path{}, errors.New(expectedPathErr)
 	}
-	registry = canonicalRegistry(registry)
+	// Hostnames are case-insensitive, so canonicalising case cannot change the
+	// endpoint. The port is left exactly as written, because it can.
+	registry = strings.ToLower(registry)
 	// A bare name is an Azure shorthand, but "localhost" is a real registry
 	// host that the backend supports over plain HTTP, so it must not be
 	// rewritten to localhost.azurecr.io.
@@ -577,7 +598,7 @@ type layerCacheEntry struct {
 var layerCache sync.Map
 
 func layerCacheKey(p Path) string {
-	return p.Registry + "|" + p.Repository + "|" + p.Reference
+	return registryKey(p.Registry) + "|" + p.Repository + "|" + p.Reference
 }
 
 // invalidateLayers drops any cached artifact for p, so a tag republished by
