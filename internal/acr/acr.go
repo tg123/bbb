@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -150,7 +151,7 @@ func Parse(raw string) (Path, error) {
 	if !strings.ContainsAny(registry, ".:") {
 		registry += defaultSuffix
 	}
-	p := Path{Registry: registry, Reference: DefaultTag}
+	p := Path{Registry: strings.ToLower(registry), Reference: DefaultTag}
 	idx := strings.IndexAny(rest, ":@")
 	if idx < 0 {
 		p.Repository = strings.Trim(rest, "/")
@@ -197,9 +198,10 @@ func (p Path) DefaultFilename() string {
 // cleanFile validates a name used as a path relative to a local destination.
 //
 // Layer titles come from the registry and are untrusted, so reject anything
-// that denotes a location outside the destination. This is lexical only: it
-// stops a name from itself escaping, not the local write from following a
-// pre-existing symlink.
+// that denotes a location outside the destination, or that resolves to a
+// different file than it appears to. This is lexical only: it stops a name
+// from itself escaping, not the local write from following a pre-existing
+// symlink.
 func cleanFile(file string) (string, error) {
 	if file == "" {
 		return "", errors.New("missing file path")
@@ -208,6 +210,12 @@ func cleanFile(file string) (string, error) {
 	// path elements on Windows, so `..\..\outside` would otherwise survive.
 	if strings.Contains(file, `\`) {
 		return "", errors.New("invalid file path: backslash is not allowed")
+	}
+	// A colon opens a Windows alternate data stream: `a.txt::$DATA` writes to
+	// the same default stream as `a.txt`, so two layers could quietly race for
+	// one destination file.
+	if strings.Contains(file, ":") {
+		return "", errors.New("invalid file path: colon is not allowed")
 	}
 	if strings.HasPrefix(file, "/") {
 		return "", errors.New("invalid file path")
@@ -219,6 +227,26 @@ func cleanFile(file string) (string, error) {
 	return cleaned, nil
 }
 
+// ValidateUploadNames checks the names of an artifact's files without
+// contacting the registry, so a dry run rejects exactly what a real push would.
+func ValidateUploadNames(files []UploadFile) error {
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		cleaned, err := cleanFile(file.Name)
+		if err != nil {
+			return fmt.Errorf("acr: invalid upload file name %q: %w", file.Name, err)
+		}
+		if _, exists := seen[cleaned]; exists {
+			return fmt.Errorf("acr: duplicate upload file name %q", cleaned)
+		}
+		if file.Open == nil {
+			return fmt.Errorf("acr: upload file %q has no reader", cleaned)
+		}
+		seen[cleaned] = struct{}{}
+	}
+	return nil
+}
+
 // File describes a single file (layer) inside an artifact.
 type File struct {
 	Name   string
@@ -226,10 +254,69 @@ type File struct {
 	Digest string
 }
 
-// reference builds the go-containerregistry reference for p. Plain-HTTP
-// registries (localhost, loopback and RFC1918 addresses) are detected by
-// go-containerregistry itself.
+// insecureRegistries returns the registry authorities explicitly allowed to be
+// contacted over plain HTTP, from BBB_ACR_INSECURE.
+func insecureRegistries() []string {
+	raw := strings.TrimSpace(os.Getenv("BBB_ACR_INSECURE"))
+	if raw == "" {
+		return nil
+	}
+	entries := strings.Split(raw, ",")
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry = strings.ToLower(strings.TrimSpace(entry)); entry != "" {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// isLoopback reports whether registry addresses the local machine, where
+// go-containerregistry's automatic plain HTTP carries no network exposure.
+func isLoopback(registry string) bool {
+	host := registryHost(registry)
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// isPrivateIP reports whether registry is an RFC1918 address literal.
+func isPrivateIP(registry string) bool {
+	ip := net.ParseIP(registryHost(registry))
+	return ip != nil && ip.IsPrivate()
+}
+
+// checkTransportSecurity refuses to contact a registry that
+// go-containerregistry would silently downgrade to plain HTTP.
+//
+// go-containerregistry picks HTTP for loopback and for any RFC1918 literal.
+// Loopback is harmless, but a private address is a real network hop, and
+// authOption may hand it Docker keychain credentials, so require the operator
+// to say so explicitly.
+func checkTransportSecurity(registry string) error {
+	if !isPrivateIP(registry) || isLoopback(registry) {
+		return nil
+	}
+	host := registryHost(registry)
+	for _, allowed := range insecureRegistries() {
+		if allowed == host || allowed == strings.ToLower(registry) {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"acr: refusing to contact %s over plain HTTP; set BBB_ACR_INSECURE=%s to allow it, or address the registry by hostname to use HTTPS",
+		registry, host)
+}
+
+// reference builds the go-containerregistry reference for p.
 func (p Path) reference() (name.Reference, error) {
+	if err := checkTransportSecurity(p.Registry); err != nil {
+		return nil, err
+	}
 	repo := p.Registry + "/" + p.Repository
 	if strings.Contains(p.Reference, ":") {
 		return name.NewDigest(repo+"@"+p.Reference, name.WeakValidation)
@@ -245,12 +332,21 @@ func (p Path) remoteOptions(ctx context.Context) []remote.Option {
 	}
 }
 
-// layerCacheEntry memoises one artifact's resolved layer set.
+// maxIndexDepth bounds how many nested image indexes are followed.
+const maxIndexDepth = 4
+
+// artifact is one resolved snapshot of an acr:// reference.
+type artifact struct {
+	files  []File
+	layers map[string]v1.Layer
+	seen   map[string]string
+}
+
+// layerCacheEntry memoises one resolved artifact.
 type layerCacheEntry struct {
-	once  sync.Once
-	files []File
-	image v1.Image
-	err   error
+	once sync.Once
+	art  *artifact
+	err  error
 }
 
 // layerCache keys resolved artifacts by registry|repository|reference.
@@ -272,12 +368,12 @@ func invalidateLayers(p Path) {
 // manifest fetch that each subsequent Stat would otherwise repeat, this pins a
 // whole-artifact copy to a single snapshot: a tag republished mid-transfer
 // cannot leave the destination holding a mix of two revisions.
-func resolve(ctx context.Context, p Path) ([]File, v1.Image, error) {
+func resolve(ctx context.Context, p Path) (*artifact, error) {
 	key := layerCacheKey(p)
 	value, _ := layerCache.LoadOrStore(key, &layerCacheEntry{})
 	entry := value.(*layerCacheEntry)
 	entry.once.Do(func() {
-		entry.files, entry.image, entry.err = fetchArtifact(ctx, p)
+		entry.art, entry.err = fetchArtifact(ctx, p)
 		if entry.err != nil {
 			// Never memoise a failure: it would defeat --retry-count and let a
 			// cancelled context poison every later read.
@@ -285,67 +381,126 @@ func resolve(ctx context.Context, p Path) ([]File, v1.Image, error) {
 		}
 	})
 	if entry.err != nil {
-		return nil, nil, entry.err
+		return nil, entry.err
 	}
-	return entry.files, entry.image, nil
+	return entry.art, nil
 }
 
-func fetchArtifact(ctx context.Context, p Path) ([]File, v1.Image, error) {
+func fetchArtifact(ctx context.Context, p Path) (*artifact, error) {
 	ref, err := p.reference()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	desc, err := remote.Get(ref, p.remoteOptions(ctx)...)
 	if err != nil {
-		return nil, nil, asStatusError(err)
+		return nil, asStatusError(err)
 	}
-	// For an image index, Image() resolves a child manifest, matching the
-	// single flat file set an acr:// path presents.
-	image, err := desc.Image()
+	art := &artifact{
+		layers: map[string]v1.Layer{},
+		seen:   map[string]string{},
+	}
+	switch desc.MediaType {
+	case types.OCIImageIndex, types.DockerManifestList:
+		// Descriptor.Image() would resolve an index to the single child
+		// matching the current platform, and fail outright when an artifact
+		// index carries no platform metadata. Artifacts are not
+		// platform-specific, so merge every child instead.
+		index, err := desc.ImageIndex()
+		if err != nil {
+			return nil, asStatusError(err)
+		}
+		if err := art.addIndex(index, 0); err != nil {
+			return nil, err
+		}
+	default:
+		image, err := desc.Image()
+		if err != nil {
+			return nil, asStatusError(err)
+		}
+		if err := art.addImage(image); err != nil {
+			return nil, err
+		}
+	}
+	return art, nil
+}
+
+// addIndex merges the layers of every manifest an index references.
+func (a *artifact) addIndex(index v1.ImageIndex, depth int) error {
+	if depth > maxIndexDepth {
+		return errors.New("acr: too many nested image indexes")
+	}
+	manifest, err := index.IndexManifest()
 	if err != nil {
-		return nil, nil, asStatusError(err)
+		return err
 	}
+	for _, child := range manifest.Manifests {
+		switch child.MediaType {
+		case types.OCIImageIndex, types.DockerManifestList:
+			nested, err := index.ImageIndex(child.Digest)
+			if err != nil {
+				return asStatusError(err)
+			}
+			if err := a.addIndex(nested, depth+1); err != nil {
+				return err
+			}
+		default:
+			image, err := index.Image(child.Digest)
+			if err != nil {
+				return asStatusError(err)
+			}
+			if err := a.addImage(image); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// addImage merges one manifest's layers into the artifact.
+func (a *artifact) addImage(image v1.Image) error {
 	manifest, err := image.Manifest()
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
-	files := make([]File, 0, len(manifest.Layers))
-	seen := make(map[string]string, len(manifest.Layers))
-	for _, layer := range manifest.Layers {
-		digest := layer.Digest.String()
-		title := layer.Annotations[TitleAnnotation]
+	for _, descriptor := range manifest.Layers {
+		digest := descriptor.Digest.String()
+		// The same blob referenced from several manifests is one file.
+		if _, done := a.layers[digest]; done {
+			continue
+		}
+		title := descriptor.Annotations[TitleAnnotation]
 		if title == "" {
 			title = strings.ReplaceAll(digest, ":", "-")
 		}
 		cleaned, err := cleanFile(title)
 		if err != nil {
-			return nil, nil, fmt.Errorf("acr: invalid layer name %q: %w", title, err)
+			return fmt.Errorf("acr: invalid layer name %q: %w", title, err)
 		}
-		if previous, dup := seen[cleaned]; dup {
-			// One blob listed twice is redundant and safe to collapse. Two
-			// different blobs claiming the same name are not: silently keeping
-			// the first would hide part of the artifact, so surface it.
-			if previous == digest {
-				slog.Debug("acr: skipping duplicate layer", "name", cleaned, "digest", digest)
-				continue
-			}
-			return nil, nil, fmt.Errorf(
+		if previous, dup := a.seen[cleaned]; dup {
+			// Two different blobs claiming one name would hide part of the
+			// artifact if the first silently won, so surface it.
+			return fmt.Errorf(
 				"acr: conflicting layers named %q (%s and %s); address the artifact by digest to read a specific manifest",
 				cleaned, previous, digest)
 		}
-		seen[cleaned] = digest
-		files = append(files, File{Name: cleaned, Size: layer.Size, Digest: digest})
+		layer, err := image.LayerByDigest(descriptor.Digest)
+		if err != nil {
+			return asStatusError(err)
+		}
+		a.seen[cleaned] = digest
+		a.layers[digest] = layer
+		a.files = append(a.files, File{Name: cleaned, Size: descriptor.Size, Digest: digest})
 	}
-	return files, image, nil
+	return nil
 }
 
 // ListFiles returns the files (layers) contained in the artifact referenced by p.
 func ListFiles(ctx context.Context, p Path) ([]File, error) {
-	files, _, err := resolve(ctx, p)
+	art, err := resolve(ctx, p)
 	if err != nil {
 		return nil, err
 	}
-	return slices.Clone(files), nil
+	return slices.Clone(art.files), nil
 }
 
 // Stat returns metadata for the file referenced by p.File.
@@ -353,11 +508,11 @@ func Stat(ctx context.Context, p Path) (File, error) {
 	if p.File == "" {
 		return File{}, errors.New("acr: missing file path")
 	}
-	files, _, err := resolve(ctx, p)
+	art, err := resolve(ctx, p)
 	if err != nil {
 		return File{}, err
 	}
-	for _, f := range files {
+	for _, f := range art.files {
 		if f.Name == p.File {
 			return f, nil
 		}
@@ -385,12 +540,12 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	if p.File == "" {
 		return nil, errors.New("acr: missing file path")
 	}
-	files, image, err := resolve(ctx, p)
+	art, err := resolve(ctx, p)
 	if err != nil {
 		return nil, err
 	}
 	var target File
-	for _, f := range files {
+	for _, f := range art.files {
 		if f.Name == p.File {
 			target = f
 			break
@@ -399,13 +554,9 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	if target.Name == "" {
 		return nil, &notFoundError{path: p.String()}
 	}
-	digest, err := v1.NewHash(target.Digest)
-	if err != nil {
-		return nil, err
-	}
-	layer, err := image.LayerByDigest(digest)
-	if err != nil {
-		return nil, asStatusError(err)
+	layer, ok := art.layers[target.Digest]
+	if !ok {
+		return nil, &notFoundError{path: p.String()}
 	}
 	// Compressed() returns the blob exactly as stored, which is what an
 	// artifact layer is; Uncompressed() would try to gunzip it.
@@ -467,34 +618,20 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 	if err := ValidatePushTarget(p); err != nil {
 		return err
 	}
+	if err := ValidateUploadNames(files); err != nil {
+		return err
+	}
 	ref, err := p.reference()
 	if err != nil {
 		return err
 	}
-	if !opts.Overwrite {
-		exists, err := ManifestExists(ctx, p)
-		if err != nil {
-			return err
-		}
-		if exists {
-			return fmt.Errorf("%w: %s", ErrArtifactExists, p.String())
-		}
-	}
 
-	names := make(map[string]struct{}, len(files))
 	adds := make([]mutate.Addendum, 0, len(files))
 	for _, file := range files {
 		cleaned, err := cleanFile(file.Name)
 		if err != nil {
 			return fmt.Errorf("acr: invalid upload file name %q: %w", file.Name, err)
 		}
-		if _, exists := names[cleaned]; exists {
-			return fmt.Errorf("acr: duplicate upload file name %q", cleaned)
-		}
-		if file.Open == nil {
-			return fmt.Errorf("acr: upload file %q has no reader", cleaned)
-		}
-		names[cleaned] = struct{}{}
 		adds = append(adds, mutate.Addendum{
 			Layer:       &fileLayer{open: file.Open, size: file.Size, onRead: opts.OnProgress},
 			MediaType:   layerMediaType,
@@ -507,6 +644,29 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 	image, err = mutate.Append(image, adds...)
 	if err != nil {
 		return err
+	}
+
+	if !opts.Overwrite {
+		// Compare against the manifest we are about to publish rather than
+		// merely testing for existence. An outer retry re-enters Push after a
+		// committed PUT whose response was lost, and reporting failure for an
+		// artifact we ourselves just published would be wrong.
+		intended, err := image.Digest()
+		if err != nil {
+			return err
+		}
+		existing, err := manifestDigest(ctx, p)
+		switch {
+		case err != nil:
+			return err
+		case existing == intended.String():
+			slog.Debug("acr: destination already holds this exact artifact, treating the push as complete",
+				"artifact", p.String(), "digest", existing)
+			invalidateLayers(p)
+			return nil
+		case existing != "":
+			return fmt.Errorf("%w: %s", ErrArtifactExists, p.String())
+		}
 	}
 
 	options := p.remoteOptions(ctx)
@@ -522,18 +682,29 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 	return nil
 }
 
+// manifestDigest returns the digest currently published at p.Reference, or an
+// empty string when the reference does not exist.
+func manifestDigest(ctx context.Context, p Path) (string, error) {
+	ref, err := p.reference()
+	if err != nil {
+		return "", err
+	}
+	desc, err := remote.Head(ref, p.remoteOptions(ctx)...)
+	if err != nil {
+		var terr *transport.Error
+		if errors.As(err, &terr) && terr.StatusCode == http.StatusNotFound {
+			return "", nil
+		}
+		return "", asStatusError(err)
+	}
+	return desc.Digest.String(), nil
+}
+
 // ManifestExists reports whether p.Reference currently resolves to a manifest.
 func ManifestExists(ctx context.Context, p Path) (bool, error) {
-	ref, err := p.reference()
+	digest, err := manifestDigest(ctx, p)
 	if err != nil {
 		return false, err
 	}
-	if _, err := remote.Head(ref, p.remoteOptions(ctx)...); err != nil {
-		var terr *transport.Error
-		if errors.As(err, &terr) && terr.StatusCode == http.StatusNotFound {
-			return false, nil
-		}
-		return false, asStatusError(err)
-	}
-	return true, nil
+	return digest != "", nil
 }

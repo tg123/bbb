@@ -97,6 +97,12 @@ func (acrFS) Stat(ctx context.Context, target string) (Entry, error) {
 		return Entry{}, err
 	}
 	if ap.File == "" {
+		// Resolve the artifact rather than trusting the path shape, so a
+		// missing tag reports not-found instead of an existing directory.
+		// An artifact with no layers is still a valid, existing artifact.
+		if _, err := acr.ListFiles(ctx, ap); err != nil {
+			return Entry{}, err
+		}
 		return Entry{
 			Name:  ap.DefaultFilename(),
 			Path:  ap.String(),

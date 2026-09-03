@@ -2120,7 +2120,10 @@ func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.A
 		if exclude != nil && exclude(name) {
 			return nil
 		}
-		fileInfo, err := os.Stat(localPath)
+		// entry.Info() is the lstat of the walked entry. os.Stat would follow a
+		// symlink, so a link such as `secrets -> /etc/passwd` would be accepted
+		// as a regular file and upload data from outside the source tree.
+		fileInfo, err := entry.Info()
 		if err != nil {
 			return err
 		}
@@ -2164,6 +2167,15 @@ func pushLocalArtifact(
 	}
 	files, total, err := collectLocalArtifactFiles(src, exclude)
 	if err != nil {
+		return err
+	}
+	// Validate the collected names too, so a dry run rejects everything the
+	// real push would rather than only the destination.
+	uploads := make([]acr.UploadFile, len(files))
+	for i, file := range files {
+		uploads[i] = acr.UploadFile{Name: file.Name, Size: file.Size, Open: file.Open}
+	}
+	if err := acr.ValidateUploadNames(uploads); err != nil {
 		return err
 	}
 	if dryRun {

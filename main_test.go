@@ -220,6 +220,27 @@ func TestExpandCPTaskKeepsACRArtifactAtomic(t *testing.T) {
 	}
 }
 
+// A symlink inside an artifact source must not be dereferenced, or a link such
+// as `secrets -> /etc/passwd` would upload data from outside the source tree.
+func TestCollectLocalArtifactFilesRejectsSymlink(t *testing.T) {
+	source := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("classified"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "ok.txt"), []byte("fine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(source, "secrets")); err != nil {
+		t.Skipf("symlinks unavailable on this host: %v", err)
+	}
+
+	_, _, err := collectLocalArtifactFiles(source, nil)
+	if err == nil || !strings.Contains(err.Error(), "unsupported source file type") {
+		t.Fatalf("expected the symlink to be rejected, got %v", err)
+	}
+}
+
 func TestCollectLocalArtifactFiles(t *testing.T) {
 	source := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(source, "sub"), 0o755); err != nil {

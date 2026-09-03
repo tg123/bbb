@@ -8,11 +8,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/registry"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
@@ -54,6 +57,12 @@ func TestParse(t *testing.T) {
 		{name: "escaping file path", raw: "acr://myreg.azurecr.io/models:v1/../../etc/passwd", wantErr: true},
 		{name: "backslash escaping file path", raw: `acr://myreg.azurecr.io/models:v1/..\..\outside`, wantErr: true},
 		{name: "backslash in file path", raw: `acr://myreg.azurecr.io/models:v1/sub\file.bin`, wantErr: true},
+		{name: "alternate data stream", raw: "acr://myreg.azurecr.io/models:v1/a.txt::$DATA", wantErr: true},
+		{
+			name: "registry case is canonicalised",
+			raw:  "acr://MyReg.AzureCR.io/models:v1",
+			want: Path{Registry: "myreg.azurecr.io", Repository: "models", Reference: "v1"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -335,9 +344,89 @@ func TestResolveReferenceOnce(t *testing.T) {
 	if !ok {
 		t.Fatal("expected the resolved artifact to be cached")
 	}
-	if entry := value.(*layerCacheEntry); len(entry.files) != 2 {
-		t.Fatalf("unexpected cached files: %#v", entry.files)
+	if entry := value.(*layerCacheEntry); len(entry.art.files) != 2 {
+		t.Fatalf("unexpected cached files: %#v", entry.art.files)
 	}
+}
+
+// An artifact index aggregates several manifests. go-containerregistry's
+// Descriptor.Image() would resolve only the platform-matching child (and fail
+// when there is no platform metadata at all), so every child must be merged.
+func TestListFilesMergesIndexManifests(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "models", Reference: "index"}
+
+	first := buildTestImage(t, []layerSpec{
+		{title: "a.txt", content: "alpha"},
+		{title: "shared.txt", content: "shared"},
+	})
+	second := buildTestImage(t, []layerSpec{
+		// The shared layer is the same blob, so it must collapse rather than
+		// be reported as a conflict.
+		{title: "shared.txt", content: "shared"},
+		{title: "b.txt", content: "bravo"},
+	})
+	index := mutate.AppendManifests(
+		mutate.IndexMediaType(empty.Index, types.OCIImageIndex),
+		mutate.IndexAddendum{Add: first},
+		mutate.IndexAddendum{Add: second},
+	)
+	ref, err := p.reference()
+	if err != nil {
+		t.Fatalf("reference: %v", err)
+	}
+	if err := remote.WriteIndex(ref, index, remote.WithContext(t.Context())); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	invalidateLayers(p)
+
+	files, err := ListFiles(t.Context(), p)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		names = append(names, f.Name)
+	}
+	sort.Strings(names)
+	want := []string{"a.txt", "b.txt", "shared.txt"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("index files = %v, want %v", names, want)
+	}
+
+	// Every merged child's blobs must be readable, not just the first.
+	for name, content := range map[string]string{"a.txt": "alpha", "b.txt": "bravo", "shared.txt": "shared"} {
+		child := p
+		child.File = name
+		rc, err := DownloadStream(t.Context(), child)
+		if err != nil {
+			t.Fatalf("DownloadStream(%s) failed: %v", name, err)
+		}
+		got, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil || string(got) != content {
+			t.Fatalf("%s = %q (%v), want %q", name, got, err, content)
+		}
+	}
+}
+
+func buildTestImage(t *testing.T, layers []layerSpec) v1.Image {
+	t.Helper()
+	image := mutate.MediaType(empty.Image, types.OCIManifestSchema1)
+	image = mutate.ConfigMediaType(image, configMediaType)
+	adds := make([]mutate.Addendum, 0, len(layers))
+	for _, spec := range layers {
+		adds = append(adds, mutate.Addendum{
+			Layer:       static.NewLayer([]byte(spec.content), layerMediaType),
+			MediaType:   layerMediaType,
+			Annotations: map[string]string{TitleAnnotation: spec.title},
+		})
+	}
+	image, err := mutate.Append(image, adds...)
+	if err != nil {
+		t.Fatalf("build image: %v", err)
+	}
+	return image
 }
 
 // A failed lookup must not be memoised, or --retry-count would be useless.
@@ -393,6 +482,70 @@ func TestValidatePushTarget(t *testing.T) {
 	}
 	if err := ValidatePushTarget(Path{Repository: "models", Reference: "v1", File: "a.txt"}); err == nil {
 		t.Fatal("expected a file target to be rejected")
+	}
+}
+
+func TestValidateUploadNames(t *testing.T) {
+	reader := func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("x")), nil }
+	if err := ValidateUploadNames([]UploadFile{{Name: "a.txt", Open: reader}}); err != nil {
+		t.Fatalf("expected a plain name to be valid: %v", err)
+	}
+	if err := ValidateUploadNames([]UploadFile{{Name: `a\b.txt`, Open: reader}}); err == nil {
+		t.Fatal("expected a backslash name to be rejected")
+	}
+	if err := ValidateUploadNames([]UploadFile{
+		{Name: "a.txt", Open: reader},
+		{Name: "a.txt", Open: reader},
+	}); err == nil {
+		t.Fatal("expected duplicate names to be rejected")
+	}
+	if err := ValidateUploadNames([]UploadFile{{Name: "a.txt"}}); err == nil {
+		t.Fatal("expected a missing reader to be rejected")
+	}
+}
+
+// A lost response after a committed manifest PUT must not make the retry
+// report failure for an artifact this process just published.
+func TestPushRetryIsIdempotent(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "models", Reference: "v1"}
+	files := []UploadFile{{Name: "a.txt", Size: 5, Open: func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("alpha")), nil
+	}}}
+
+	if err := Push(t.Context(), p, files, PushOptions{}); err != nil {
+		t.Fatalf("first push failed: %v", err)
+	}
+	// Re-running the identical push is what an outer retry does.
+	if err := Push(t.Context(), p, files, PushOptions{}); err != nil {
+		t.Fatalf("identical retry should succeed, got %v", err)
+	}
+	// A different artifact on the same tag is still a genuine conflict.
+	other := []UploadFile{{Name: "b.txt", Size: 5, Open: func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("bravo")), nil
+	}}}
+	if err := Push(t.Context(), p, other, PushOptions{}); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected a conflicting artifact to be rejected, got %v", err)
+	}
+}
+
+// go-containerregistry silently uses plain HTTP for RFC1918 literals, which
+// would put registry credentials on the wire unencrypted.
+func TestPrivateAddressRequiresOptIn(t *testing.T) {
+	p := Path{Registry: "10.1.2.3:5000", Repository: "models", Reference: "v1"}
+	if _, err := p.reference(); err == nil || !strings.Contains(err.Error(), "plain HTTP") {
+		t.Fatalf("expected a private address to be refused, got %v", err)
+	}
+
+	t.Setenv("BBB_ACR_INSECURE", "10.1.2.3")
+	if _, err := p.reference(); err != nil {
+		t.Fatalf("expected the opt-in to allow the registry, got %v", err)
+	}
+
+	// Loopback stays automatic: it never leaves the machine.
+	local := Path{Registry: "127.0.0.1:5000", Repository: "models", Reference: "v1"}
+	if _, err := local.reference(); err != nil {
+		t.Fatalf("expected loopback to be allowed, got %v", err)
 	}
 }
 
