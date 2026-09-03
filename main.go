@@ -373,7 +373,7 @@ func run(args []string) int {
 					if dnsPin {
 						cacheEnv = "BBB_DNS_PIN"
 					}
-					slog.Info("DNS caching enabled (applies to Azure SDK and Hugging Face traffic)",
+					slog.Info("DNS caching enabled (applies to Azure SDK, Hugging Face, Azure Container Registry and S3 traffic)",
 						"env", cacheEnv,
 						"ttl", ttlStr,
 						"pin", dnsPin,
@@ -385,7 +385,8 @@ func run(args []string) int {
 				http.DefaultTransport = transport
 
 				// Publish the wrapped transport to internal packages that
-				// build their own HTTP clients (Azure SDK, Hugging Face).
+				// build their own HTTP clients (Azure SDK, Hugging Face,
+				// Azure Container Registry, S3).
 				// Without this the custom DialContext only applies to
 				// stdlib callers, leaving BBB_DNS_PIN ineffective for SDK
 				// traffic (token acquisition, data plane, UDC).
