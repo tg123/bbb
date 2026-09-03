@@ -256,7 +256,7 @@ func ListFiles(ctx context.Context, p Path) ([]File, error) {
 		return nil, err
 	}
 	files := make([]File, 0, len(layers))
-	seen := make(map[string]struct{}, len(layers))
+	seen := make(map[string]string, len(layers))
 	for _, layer := range layers {
 		name := layer.Annotations[TitleAnnotation]
 		if name == "" {
@@ -266,11 +266,19 @@ func ListFiles(ctx context.Context, p Path) ([]File, error) {
 		if err != nil {
 			return nil, fmt.Errorf("acr: invalid layer name %q: %w", name, err)
 		}
-		if _, dup := seen[cleaned]; dup {
-			slog.Debug("acr: skipping duplicate layer name", "name", cleaned, "digest", layer.Digest)
-			continue
+		if previous, dup := seen[cleaned]; dup {
+			// One blob listed twice is redundant and safe to collapse. Two
+			// different blobs claiming the same name are not: silently keeping
+			// the first would hide part of the artifact, so surface it.
+			if previous == layer.Digest {
+				slog.Debug("acr: skipping duplicate layer", "name", cleaned, "digest", layer.Digest)
+				continue
+			}
+			return nil, fmt.Errorf(
+				"acr: conflicting layers named %q (%s and %s); address the artifact by digest to read a specific manifest",
+				cleaned, previous, layer.Digest)
 		}
-		seen[cleaned] = struct{}{}
+		seen[cleaned] = layer.Digest
 		files = append(files, File{Name: cleaned, Size: layer.Size, Digest: layer.Digest})
 	}
 	return files, nil
@@ -323,7 +331,45 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	if size <= 0 {
 		size = resp.ContentLength
 	}
+	// OCI supplies an expected digest, so verify what the registry (or any
+	// proxy in front of it) actually streamed instead of trusting it.
+	if algorithm, _, ok := strings.Cut(f.Digest, ":"); ok && algorithm == "sha256" {
+		return &verifyReadCloser{
+			ReadCloser: resp.Body,
+			hasher:     sha256.New(),
+			expected:   f.Digest,
+			size:       size,
+		}, nil
+	}
 	return downloadReadCloser{ReadCloser: resp.Body, size: size}, nil
+}
+
+// verifyReadCloser checks a streamed blob against the digest advertised by the
+// manifest, failing the final Read when the content does not match so a corrupt
+// or hostile registry cannot silently yield wrong artifact contents.
+type verifyReadCloser struct {
+	io.ReadCloser
+	hasher   hash.Hash
+	expected string
+	size     int64
+}
+
+func (v *verifyReadCloser) Read(p []byte) (int, error) {
+	n, err := v.ReadCloser.Read(p)
+	if n > 0 {
+		_, _ = v.hasher.Write(p[:n])
+	}
+	if errors.Is(err, io.EOF) {
+		if got := "sha256:" + hex.EncodeToString(v.hasher.Sum(nil)); got != v.expected {
+			return n, fmt.Errorf("acr: blob digest mismatch: got %s, want %s", got, v.expected)
+		}
+	}
+	return n, err
+}
+
+// Size reports the blob size or -1 if unknown.
+func (v *verifyReadCloser) Size() int64 {
+	return v.size
 }
 
 // UploadFile describes one layer to publish in an OCI artifact. Open must
@@ -589,6 +635,12 @@ func uploadBlob(ctx context.Context, p Path, file UploadFile, mediaType string, 
 	return descriptor{MediaType: mediaType, Digest: digest, Size: uploaded.size}, nil
 }
 
+// resolveLocation resolves a registry-supplied Location header against base.
+//
+// Location is attacker-controlled when a registry is hostile, and callers
+// attach the registry bearer token to whatever comes back, so a cross-origin
+// (or scheme-downgraded) location would hand that credential to another host.
+// Confine the result to the origin the upload started on.
 func resolveLocation(base, location string) (string, error) {
 	baseURL, err := url.Parse(base)
 	if err != nil {
@@ -598,7 +650,13 @@ func resolveLocation(base, location string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return baseURL.ResolveReference(locationURL).String(), nil
+	resolved := baseURL.ResolveReference(locationURL)
+	if !strings.EqualFold(resolved.Scheme, baseURL.Scheme) || !strings.EqualFold(resolved.Host, baseURL.Host) {
+		return "", fmt.Errorf(
+			"acr: refusing upload location %q outside the registry origin %s://%s",
+			location, baseURL.Scheme, baseURL.Host)
+	}
+	return resolved.String(), nil
 }
 
 type downloadReadCloser struct {

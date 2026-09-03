@@ -68,7 +68,11 @@ acr://<registry>/<repository>@<digest>[/<file>]
 acr://<registry>/<repository>              # defaults to the "latest" tag
 ```
 
-A registry name without a dot is expanded to `<name>.azurecr.io`. The "files" of an artifact are its layers; each layer's name comes from the standard `org.opencontainers.image.title` annotation, falling back to its digest (e.g. `sha256-abc...`) when the annotation is missing. Because a file name follows the tag or digest, a file can only be addressed on a path that specifies one. Layer names are validated before use: absolute paths, `..` traversal and backslashes are rejected, so a registry cannot write outside the chosen destination directory.
+A registry name without a dot is expanded to `<name>.azurecr.io`. The "files" of an artifact are its layers; each layer's name comes from the standard `org.opencontainers.image.title` annotation, falling back to its digest (e.g. `sha256-abc...`) when the annotation is missing. Because a file name follows the tag or digest, a file can only be addressed on a path that specifies one.
+
+Layer names are validated lexically before use: absolute paths, `..` traversal and backslashes are rejected, so a name cannot itself point outside the destination directory. Note this is not full extraction containment — as with the other remote backends, files are written through the normal local path, which follows pre-existing symlinks in the destination. Extract untrusted artifacts into a fresh directory.
+
+Layer contents are verified against the digest recorded in the manifest, so a corrupt registry or proxy cannot silently return different bytes.
 
 An `acr://` destination must identify an artifact tag, not an individual file or digest. Copying or syncing one local file or directory uploads each file as an OCI layer and publishes the tag only after every layer succeeds:
 

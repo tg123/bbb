@@ -134,8 +134,8 @@ func TestListFilesAndDownload(t *testing.T) {
 	tokenCache = map[string]string{}
 	tokenCacheMu.Unlock()
 
-	const blobDigest = "sha256:deadbeef"
 	const blobBody = "hello world"
+	blobDigest := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(blobBody)))
 	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/oauth2/token" {
 			if user, pass, ok := r.BasicAuth(); !ok || user != "user" || pass != "pass" {
@@ -455,5 +455,90 @@ func TestRegistryURLOverride(t *testing.T) {
 	t.Setenv("BBB_ACR_ENDPOINT", "http://%s")
 	if got := registryURL("localhost:5000", "/v2/"); got != "http://localhost:5000/v2/" {
 		t.Fatalf("unexpected registry URL: %s", got)
+	}
+}
+
+// A hostile registry must not be able to steer an authorized upload request —
+// and with it the bearer token — to another host.
+func TestResolveLocationRejectsCrossOrigin(t *testing.T) {
+	const base = "https://reg.azurecr.io/v2/models/blobs/uploads/"
+	for _, location := range []string{
+		"https://evil.example.com/upload",
+		"http://reg.azurecr.io/v2/models/blobs/uploads/1",
+		"//evil.example.com/upload",
+	} {
+		if got, err := resolveLocation(base, location); err == nil {
+			t.Errorf("expected %q to be rejected, got %q", location, got)
+		}
+	}
+	got, err := resolveLocation(base, "/v2/models/blobs/uploads/abc?_state=x")
+	if err != nil {
+		t.Fatalf("same-origin location rejected: %v", err)
+	}
+	if got != "https://reg.azurecr.io/v2/models/blobs/uploads/abc?_state=x" {
+		t.Fatalf("unexpected resolved location: %s", got)
+	}
+}
+
+func TestDownloadStreamVerifiesDigest(t *testing.T) {
+	tokenCacheMu.Lock()
+	tokenCache = map[string]string{}
+	tokenCacheMu.Unlock()
+
+	const digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/models/manifests/v1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"layers": []map[string]any{
+					{
+						"digest":      digest,
+						"size":        9,
+						"annotations": map[string]string{TitleAnnotation: "a.txt"},
+					},
+				},
+			})
+		case "/v2/models/blobs/" + url.PathEscape(digest):
+			_, _ = io.WriteString(w, "tampered!")
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	p := Path{Registry: "reg.azurecr.io", Repository: "models", Reference: "v1", File: "a.txt"}
+	rc, err := DownloadStream(t.Context(), p)
+	if err != nil {
+		t.Fatalf("DownloadStream failed: %v", err)
+	}
+	defer func() {
+		_ = rc.Close()
+	}()
+	if _, err := io.ReadAll(rc); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("expected digest mismatch error, got %v", err)
+	}
+}
+
+func TestListFilesRejectsConflictingLayerNames(t *testing.T) {
+	tokenCacheMu.Lock()
+	tokenCache = map[string]string{}
+	tokenCacheMu.Unlock()
+
+	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/models/manifests/v1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"layers": []map[string]any{
+					{"digest": "sha256:aaa", "size": 1, "annotations": map[string]string{TitleAnnotation: "a.txt"}},
+					{"digest": "sha256:bbb", "size": 2, "annotations": map[string]string{TitleAnnotation: "a.txt"}},
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	p := Path{Registry: "reg.azurecr.io", Repository: "models", Reference: "v1"}
+	_, err := ListFiles(t.Context(), p)
+	if err == nil || !strings.Contains(err.Error(), "conflicting layers") {
+		t.Fatalf("expected conflicting layers error, got %v", err)
 	}
 }

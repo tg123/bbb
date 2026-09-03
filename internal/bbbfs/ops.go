@@ -447,8 +447,10 @@ func ExistsAsBlob(ctx context.Context, p string) (bool, error) {
 	return !entry.IsDir, nil
 }
 
-// IsNonRetryableHTTPErr returns true when err is an HTTP 401, 403, or 404
-// from any supported backend, indicating a non-retryable failure.
+// IsNonRetryableHTTPErr reports whether err represents a failure that retrying
+// cannot fix. That covers HTTP 401, 403 and 404 from any supported backend,
+// plus, for ACR, a 409/412 manifest conflict and a destination artifact that
+// already exists, and any backend error exposing NotFound() == true.
 func IsNonRetryableHTTPErr(err error) bool {
 	if errors.Is(err, acr.ErrArtifactExists) {
 		return true
