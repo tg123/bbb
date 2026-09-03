@@ -86,13 +86,15 @@ Use `-f` with `cp` to replace an existing tag. `sync` always replaces the destin
 
 Authentication is resolved in this order:
 
-1. `BBB_ACR_USERNAME` / `BBB_ACR_PASSWORD` (registry credentials or a token, used as HTTP basic auth against the registry token endpoint)
+1. `BBB_ACR_USERNAME` / `BBB_ACR_PASSWORD` (registry credentials or a token)
 2. Entra ID (Azure AD) via `DefaultAzureCredential` — Azure CLI login, service principal, managed identity, workload identity — exchanged for a registry token
-3. Anonymous pull (for registries with anonymous pull enabled)
+3. The Docker keychain (`~/.docker/config.json` and credential helpers), so a prior `docker login` works for any registry, including anonymous pull
 
-Because the Entra step posts a live Azure access token to the registry, it is only attempted for Azure Container Registry hosts (`*.azurecr.io`, `*.azurecr.cn`, `*.azurecr.us`, `*.azurecr.de`) reached over HTTPS. Any other registry — a private `ghcr.io` repository, say — skips straight to anonymous rather than being offered your Azure credential. Add custom-domain ACR hosts to `BBB_ACR_ENTRA_HOSTS` to opt them in.
+Because the Entra step posts a live Azure access token to the registry, it is only attempted for Azure Container Registry hosts (`*.azurecr.io`, `*.azurecr.cn`, `*.azurecr.us`, `*.azurecr.de`). Any other registry — a private `ghcr.io` repository, say — goes straight to the Docker keychain rather than being offered your Azure credential. Add custom-domain ACR hosts to `BBB_ACR_ENTRA_HOSTS` to opt them in.
 
 Writing requires credentials with push access to the target repository.
+
+The registry protocol is handled by [go-containerregistry](https://github.com/google/go-containerregistry), so manifest resolution, blob transfer, digest verification and auth challenges follow the same well-tested implementation used by `crane` and `ko`. Registries on `localhost`, loopback and RFC1918 addresses are contacted over plain HTTP automatically, which is what makes a local `registry:2` container usable without extra configuration.
 
 ## Global Flags
 
@@ -129,7 +131,6 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_ACR_USERNAME` | | Username for `acr://` registry authentication (used with `BBB_ACR_PASSWORD`) |
 | `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
 | `BBB_ACR_ENTRA_HOSTS` | | Comma separated extra registry hosts allowed to receive Entra ID credentials, for ACR behind a custom domain |
-| `BBB_ACR_ENDPOINT` | `https://%s` | Registry endpoint template; `%s` is replaced by the registry from the `acr://` path (useful for local OCI registries) |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
 | `BBB_PARALLEL_DOWNLOAD` | `1` (`true`) | Set to `0` or `false` to disable parallel ranged Azure→local single-file downloads and fall back to a single streaming connection |
