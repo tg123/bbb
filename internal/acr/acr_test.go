@@ -67,6 +67,8 @@ func TestParse(t *testing.T) {
 		{name: "reserved device name", raw: "acr://myreg.azurecr.io/models:v1/NUL", wantErr: true},
 		{name: "reserved device name with extension", raw: "acr://myreg.azurecr.io/models:v1/CON.txt", wantErr: true},
 		{name: "reserved device name in a subdirectory", raw: "acr://myreg.azurecr.io/models:v1/sub/lpt1.bin", wantErr: true},
+		{name: "superscript device name", raw: "acr://myreg.azurecr.io/models:v1/COM\u00b2", wantErr: true},
+		{name: "superscript device name with extension", raw: "acr://myreg.azurecr.io/models:v1/lpt\u00b3.txt", wantErr: true},
 		{name: "trailing dot", raw: "acr://myreg.azurecr.io/models:v1/a.", wantErr: true},
 		{name: "trailing space", raw: "acr://myreg.azurecr.io/models:v1/a.txt ", wantErr: true},
 		{name: "wildcard character", raw: "acr://myreg.azurecr.io/models:v1/a*.txt", wantErr: true},
@@ -846,6 +848,42 @@ func TestArtifactKeyTreatsDefaultPortAsEquivalent(t *testing.T) {
 	if compact.ArtifactKey() != expanded.ArtifactKey() {
 		t.Fatalf("expected one key for equivalent IPv6 spellings, got %q and %q",
 			compact.ArtifactKey(), expanded.ArtifactKey())
+	}
+
+	// Loopback is HTTP whichever way it is spelled, so :443 is not its default
+	// port and must not be collapsed differently between spellings.
+	compact443, err := Parse("acr://[::1]:443/models:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expanded443, err := Parse("acr://[0:0:0:0:0:0:0:1]:443/models:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compact443.ArtifactKey() != expanded443.ArtifactKey() {
+		t.Fatalf("expected one key for loopback :443 spellings, got %q and %q",
+			compact443.ArtifactKey(), expanded443.ArtifactKey())
+	}
+}
+
+// Loopback must be reached over HTTP whichever way it is written, including
+// spellings go-containerregistry does not itself recognise as local.
+func TestLoopbackAlwaysUsesHTTP(t *testing.T) {
+	for _, registry := range []string{
+		"localhost:5000",
+		"127.0.0.1:5000",
+		"[::1]:5000",
+		"[0:0:0:0:0:0:0:1]:5000",
+	} {
+		p := Path{Registry: registry, Repository: "models", Reference: "v1"}
+		ref, err := p.reference()
+		if err != nil {
+			t.Errorf("%s should be allowed: %v", registry, err)
+			continue
+		}
+		if scheme := ref.Context().Scheme(); scheme != "http" {
+			t.Errorf("%s resolved to %s, want http", registry, scheme)
+		}
 	}
 }
 

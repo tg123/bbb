@@ -172,7 +172,7 @@ func registryKey(registry string) string {
 	}
 	if port != "" {
 		scheme := "https"
-		if isInsecureAllowed(registry) {
+		if isInsecureAllowed(registry) || isLoopback(registry) {
 			scheme = "http"
 		} else if parsed, perr := name.NewRegistry(registry, name.WeakValidation); perr == nil {
 			scheme = parsed.Scheme()
@@ -263,12 +263,15 @@ func (p Path) DefaultFilename() string {
 // windowsReservedNames are DOS device names. On Windows these do not name
 // ordinary files: writing to NUL discards the content entirely, and the
 // reservation applies with any extension, so CON.txt is reserved too.
+// Superscript digit forms are reserved as well.
 var windowsReservedNames = map[string]struct{}{
 	"con": {}, "prn": {}, "aux": {}, "nul": {},
 	"com1": {}, "com2": {}, "com3": {}, "com4": {}, "com5": {},
 	"com6": {}, "com7": {}, "com8": {}, "com9": {},
+	"com\u00b9": {}, "com\u00b2": {}, "com\u00b3": {},
 	"lpt1": {}, "lpt2": {}, "lpt3": {}, "lpt4": {}, "lpt5": {},
 	"lpt6": {}, "lpt7": {}, "lpt8": {}, "lpt9": {},
+	"lpt\u00b9": {}, "lpt\u00b2": {}, "lpt\u00b3": {},
 }
 
 // windowsForbidden are characters Windows does not allow in a filename.
@@ -559,10 +562,11 @@ func (p Path) reference() (name.Reference, error) {
 		return nil, err
 	}
 	options := []name.Option{name.WeakValidation}
-	if isInsecureAllowed(p.Registry) {
-		// An allowlisted host must actually be contacted over HTTP. Without
-		// this, go-containerregistry still chooses HTTPS for an ordinary
-		// hostname and the documented opt-in would have no effect.
+	if isInsecureAllowed(p.Registry) || isLoopback(p.Registry) {
+		// Both cases must actually be contacted over HTTP. Without this,
+		// go-containerregistry still chooses HTTPS for an ordinary hostname,
+		// so the documented opt-in would have no effect, and it does not
+		// recognise every loopback spelling as local either.
 		options = append(options, name.Insecure)
 	}
 	repo := p.Registry + "/" + p.Repository
