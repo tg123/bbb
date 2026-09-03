@@ -199,6 +199,36 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 	}
 }
 
+// Reading and republishing one artifact in the same run would move the tag
+// under the reader, since tasks execute concurrently.
+func TestCPRejectsReadAndWriteOfSameArtifact(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	taskfile := filepath.Join(dir, "tasks.txt")
+	content := "acr://myreg.azurecr.io/models:v1 " + filepath.Join(dir, "out") + "\n" +
+		dir + " acr://myreg.azurecr.io/models:v1\n"
+	if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+		},
+	}
+	err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile})
+	if err == nil || !strings.Contains(err.Error(), "read and publish the same acr:// artifact") {
+		t.Fatalf("expected the overlap to be rejected, got %v", err)
+	}
+}
+
 func TestExpandCPTaskKeepsACRArtifactAtomic(t *testing.T) {
 	source := t.TempDir()
 	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("a"), 0o644); err != nil {

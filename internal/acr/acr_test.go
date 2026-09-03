@@ -1012,6 +1012,29 @@ func TestInsecureOptInNormalisesEntries(t *testing.T) {
 	}
 }
 
+// An allowlisted hostname must actually be contacted over HTTP; without
+// name.Insecure go-containerregistry would still choose HTTPS for it.
+func TestInsecureOptInForcesHTTPForHostnames(t *testing.T) {
+	p := Path{Registry: "registry.example.com:5000", Repository: "models", Reference: "v1"}
+
+	ref, err := p.reference()
+	if err != nil {
+		t.Fatalf("an ordinary hostname should be allowed: %v", err)
+	}
+	if scheme := ref.Context().Registry.Scheme(); scheme != "https" {
+		t.Fatalf("expected https without an opt-in, got %s", scheme)
+	}
+
+	t.Setenv("BBB_ACR_INSECURE", "registry.example.com")
+	ref, err = p.reference()
+	if err != nil {
+		t.Fatalf("reference failed: %v", err)
+	}
+	if scheme := ref.Context().Registry.Scheme(); scheme != "http" {
+		t.Fatalf("expected the opt-in to select http, got %s", scheme)
+	}
+}
+
 // A file layer must stream from disk rather than buffer, and report a digest
 // that matches its contents.
 func TestFileLayerDigestAndStream(t *testing.T) {

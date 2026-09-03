@@ -442,6 +442,12 @@ func isLoopback(registry string) bool {
 	return false
 }
 
+// isInsecureAllowed reports whether the operator explicitly allowed plain HTTP
+// for registry via BBB_ACR_INSECURE.
+func isInsecureAllowed(registry string) bool {
+	return slices.Contains(insecureRegistries(), registryHost(registry))
+}
+
 // checkTransportSecurity refuses to contact a registry that
 // go-containerregistry would silently downgrade to plain HTTP.
 //
@@ -455,13 +461,10 @@ func checkTransportSecurity(registry string) error {
 	if err != nil {
 		return err
 	}
-	if parsed.Scheme() == "https" || isLoopback(registry) {
+	if parsed.Scheme() == "https" || isLoopback(registry) || isInsecureAllowed(registry) {
 		return nil
 	}
 	host := registryHost(registry)
-	if slices.Contains(insecureRegistries(), host) {
-		return nil
-	}
 	return fmt.Errorf(
 		"acr: refusing to contact %s over plain HTTP; set BBB_ACR_INSECURE=%s to allow it, or address the registry by a name that resolves over HTTPS",
 		registry, host)
@@ -472,11 +475,18 @@ func (p Path) reference() (name.Reference, error) {
 	if err := checkTransportSecurity(p.Registry); err != nil {
 		return nil, err
 	}
+	options := []name.Option{name.WeakValidation}
+	if isInsecureAllowed(p.Registry) {
+		// An allowlisted host must actually be contacted over HTTP. Without
+		// this, go-containerregistry still chooses HTTPS for an ordinary
+		// hostname and the documented opt-in would have no effect.
+		options = append(options, name.Insecure)
+	}
 	repo := p.Registry + "/" + p.Repository
 	if strings.Contains(p.Reference, ":") {
-		return name.NewDigest(repo+"@"+p.Reference, name.WeakValidation)
+		return name.NewDigest(repo+"@"+p.Reference, options...)
 	}
-	return name.NewTag(repo+":"+p.Reference, name.WeakValidation)
+	return name.NewTag(repo+":"+p.Reference, options...)
 }
 
 func (p Path) remoteOptions(ctx context.Context) []remote.Option {

@@ -1346,14 +1346,35 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return fmt.Errorf("cp: %w", err)
 		}
-		key := destination.Registry + "/" + destination.Repository + "@" + destination.Reference
+		key := acrArtifactKey(destination)
 		if _, duplicate := acrDestinations[key]; duplicate {
 			return fmt.Errorf("cp: multiple sources cannot target the same acr:// artifact")
 		}
 		acrDestinations[key] = struct{}{}
 	}
+	// Tasks run concurrently, so an artifact that is read by one task and
+	// republished by another would have its tag moved mid-transfer, leaving
+	// the reader mixing revisions.
+	for _, task := range tasks {
+		if !bbbfs.IsACR(task.src) {
+			continue
+		}
+		source, err := acr.Parse(task.src)
+		if err != nil {
+			return fmt.Errorf("cp: %w", err)
+		}
+		if _, clash := acrDestinations[acrArtifactKey(source)]; clash {
+			return fmt.Errorf("cp: cannot read and publish the same acr:// artifact in one run: %s", task.src)
+		}
+	}
 
 	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
+}
+
+// acrArtifactKey identifies the artifact a path addresses, ignoring any file
+// within it.
+func acrArtifactKey(p acr.Path) string {
+	return p.Registry + "/" + p.Repository + "@" + p.Reference
 }
 
 // runCPTasks executes a list of task pairs through the unified expansion +
