@@ -58,6 +58,16 @@ func TestParse(t *testing.T) {
 		{name: "backslash escaping file path", raw: `acr://myreg.azurecr.io/models:v1/..\..\outside`, wantErr: true},
 		{name: "backslash in file path", raw: `acr://myreg.azurecr.io/models:v1/sub\file.bin`, wantErr: true},
 		{name: "alternate data stream", raw: "acr://myreg.azurecr.io/models:v1/a.txt::$DATA", wantErr: true},
+		{name: "reserved device name", raw: "acr://myreg.azurecr.io/models:v1/NUL", wantErr: true},
+		{name: "reserved device name with extension", raw: "acr://myreg.azurecr.io/models:v1/CON.txt", wantErr: true},
+		{name: "reserved device name in a subdirectory", raw: "acr://myreg.azurecr.io/models:v1/sub/lpt1.bin", wantErr: true},
+		{name: "trailing dot", raw: "acr://myreg.azurecr.io/models:v1/a.", wantErr: true},
+		{name: "trailing space", raw: "acr://myreg.azurecr.io/models:v1/a.txt ", wantErr: true},
+		{
+			name: "name merely containing a device name is fine",
+			raw:  "acr://myreg.azurecr.io/models:v1/console.log",
+			want: Path{Registry: "myreg.azurecr.io", Repository: "models", Reference: "v1", File: "console.log"},
+		},
 		{
 			name: "registry case is canonicalised",
 			raw:  "acr://MyReg.AzureCR.io/models:v1",
@@ -473,6 +483,51 @@ func TestManifestExists(t *testing.T) {
 	}
 }
 
+// Two files with identical contents share one blob but are still two files;
+// deduplicating by digest would silently drop the second.
+func TestSameContentDifferentNamesRoundTrip(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "models", Reference: "dup"}
+
+	same := func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("identical")), nil }
+	if err := Push(t.Context(), p, []UploadFile{
+		{Name: "a.txt", Size: 9, Open: same},
+		{Name: "b.txt", Size: 9, Open: same},
+	}, PushOptions{Overwrite: true}); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	invalidateLayers(p)
+
+	files, err := ListFiles(t.Context(), p)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		names = append(names, f.Name)
+	}
+	sort.Strings(names)
+	if !slices.Equal(names, []string{"a.txt", "b.txt"}) {
+		t.Fatalf("expected both names to survive, got %v", names)
+	}
+	if files[0].Digest != files[1].Digest {
+		t.Fatalf("expected both files to share one blob, got %s and %s", files[0].Digest, files[1].Digest)
+	}
+	for _, name := range names {
+		child := p
+		child.File = name
+		rc, err := DownloadStream(t.Context(), child)
+		if err != nil {
+			t.Fatalf("DownloadStream(%s) failed: %v", name, err)
+		}
+		got, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil || string(got) != "identical" {
+			t.Fatalf("%s = %q (%v)", name, got, err)
+		}
+	}
+}
+
 func TestValidatePushTarget(t *testing.T) {
 	if err := ValidatePushTarget(Path{Repository: "models", Reference: "v1"}); err != nil {
 		t.Fatalf("expected tag target to be valid: %v", err)
@@ -546,6 +601,24 @@ func TestPrivateAddressRequiresOptIn(t *testing.T) {
 	local := Path{Registry: "127.0.0.1:5000", Repository: "models", Reference: "v1"}
 	if _, err := local.reference(); err != nil {
 		t.Fatalf("expected loopback to be allowed, got %v", err)
+	}
+}
+
+// .local is mDNS, so it resolves to a real host on the LAN even though
+// go-containerregistry downgrades it to plain HTTP like loopback.
+func TestMDNSRequiresOptIn(t *testing.T) {
+	p := Path{Registry: "registry.local:5000", Repository: "models", Reference: "v1"}
+	if _, err := p.reference(); err == nil || !strings.Contains(err.Error(), "plain HTTP") {
+		t.Fatalf("expected an mDNS host to be refused, got %v", err)
+	}
+	t.Setenv("BBB_ACR_INSECURE", "registry.local")
+	if _, err := p.reference(); err != nil {
+		t.Fatalf("expected the opt-in to allow the registry, got %v", err)
+	}
+	// .localhost remains automatic.
+	loopback := Path{Registry: "reg.localhost:5000", Repository: "models", Reference: "v1"}
+	if _, err := loopback.reference(); err != nil {
+		t.Fatalf("expected .localhost to be allowed, got %v", err)
 	}
 }
 

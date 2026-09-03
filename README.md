@@ -70,7 +70,7 @@ acr://<registry>/<repository>              # defaults to the "latest" tag
 
 A registry name without a dot is expanded to `<name>.azurecr.io`. The "files" of an artifact are its layers; each layer's name comes from the standard `org.opencontainers.image.title` annotation, falling back to its digest (e.g. `sha256-abc...`) when the annotation is missing. Because a file name follows the tag or digest, a file can only be addressed on a path that specifies one.
 
-Layer names are validated lexically before use: absolute paths, `..` traversal and backslashes are rejected, so a name cannot itself point outside the destination directory. Note this is not full extraction containment — as with the other remote backends, files are written through the normal local path, which follows pre-existing symlinks in the destination. Extract untrusted artifacts into a fresh directory.
+Layer names are validated lexically before use: absolute paths, `..` traversal, backslashes, colons, Windows reserved device names (`NUL`, `CON.txt`, …) and segments ending in a dot or space are rejected, so a name cannot itself point outside the destination or silently alias another file. Note this is not full extraction containment — as with the other remote backends, files are written through the normal local path, which follows pre-existing symlinks in the destination. Extract untrusted artifacts into a fresh directory.
 
 Layer contents are verified against the digest recorded in the manifest, so a corrupt registry or proxy cannot silently return different bytes.
 
@@ -94,7 +94,7 @@ Because the Entra step posts a live Azure access token to the registry, it is on
 
 Writing requires credentials with push access to the target repository.
 
-The registry protocol is handled by [go-containerregistry](https://github.com/google/go-containerregistry), so manifest resolution, blob transfer, digest verification and auth challenges follow the same well-tested implementation used by `crane` and `ko`. Registries on `localhost` and loopback addresses are contacted over plain HTTP automatically, which is what makes a local `registry:2` container usable without extra configuration. A private (RFC1918) IP literal would also be downgraded to HTTP, so it must be opted in with `BBB_ACR_INSECURE`; address the registry by hostname to use HTTPS instead.
+The registry protocol is handled by [go-containerregistry](https://github.com/google/go-containerregistry), so manifest resolution, blob transfer, digest verification and auth challenges follow the same well-tested implementation used by `crane` and `ko`. Registries on `localhost` and loopback addresses are contacted over plain HTTP automatically, which is what makes a local `registry:2` container usable without extra configuration. A private (RFC1918) IP literal or an mDNS (`*.local`) name would also be downgraded to HTTP, so both must be opted in with `BBB_ACR_INSECURE`; address the registry by a name that resolves over HTTPS instead.
 
 Multi-manifest artifacts are supported: when a reference resolves to an image index, the layers of every child manifest are merged into one file listing.
 
@@ -133,7 +133,7 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_ACR_USERNAME` | | Username for `acr://` registry authentication (used with `BBB_ACR_PASSWORD`) |
 | `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
 | `BBB_ACR_ENTRA_HOSTS` | | Comma separated extra registry hosts allowed to receive Entra ID credentials, for ACR behind a custom domain |
-| `BBB_ACR_INSECURE` | | Comma separated registry hosts that may be contacted over plain HTTP. Required for private (RFC1918) IP literals; loopback is always allowed |
+| `BBB_ACR_INSECURE` | | Comma separated registry hosts that may be contacted over plain HTTP. Required for private (RFC1918) IP literals and mDNS (`*.local`) names; loopback is always allowed |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
 | `BBB_PARALLEL_DOWNLOAD` | `1` (`true`) | Set to `0` or `false` to disable parallel ranged Azure→local single-file downloads and fall back to a single streaming connection |

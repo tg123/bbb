@@ -195,6 +195,36 @@ func (p Path) DefaultFilename() string {
 	return repo
 }
 
+// windowsReservedNames are DOS device names. On Windows these do not name
+// ordinary files: writing to NUL discards the content entirely, and the
+// reservation applies with any extension, so CON.txt is reserved too.
+var windowsReservedNames = map[string]struct{}{
+	"con": {}, "prn": {}, "aux": {}, "nul": {},
+	"com1": {}, "com2": {}, "com3": {}, "com4": {}, "com5": {},
+	"com6": {}, "com7": {}, "com8": {}, "com9": {},
+	"lpt1": {}, "lpt2": {}, "lpt3": {}, "lpt4": {}, "lpt5": {},
+	"lpt6": {}, "lpt7": {}, "lpt8": {}, "lpt9": {},
+}
+
+// checkPortableSegment rejects a path element that does not name a distinct,
+// ordinary file on Windows. Layer titles are registry-controlled, so a name
+// that silently discards content (NUL) or aliases another name (a. and a)
+// would let an extraction report success while losing or overwriting data.
+func checkPortableSegment(segment string) error {
+	// Windows strips trailing dots and spaces, so "a." and "a" are one file.
+	if trimmed := strings.TrimRight(segment, ". "); trimmed != segment {
+		return fmt.Errorf("invalid file path: %q ends with a dot or space", segment)
+	}
+	base := segment
+	if idx := strings.Index(base, "."); idx >= 0 {
+		base = base[:idx]
+	}
+	if _, reserved := windowsReservedNames[strings.ToLower(base)]; reserved {
+		return fmt.Errorf("invalid file path: %q is a reserved device name", segment)
+	}
+	return nil
+}
+
 // cleanFile validates a name used as a path relative to a local destination.
 //
 // Layer titles come from the registry and are untrusted, so reject anything
@@ -223,6 +253,11 @@ func cleanFile(file string) (string, error) {
 	cleaned := path.Clean(file)
 	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 		return "", errors.New("invalid file path")
+	}
+	for _, segment := range strings.Split(cleaned, "/") {
+		if err := checkPortableSegment(segment); err != nil {
+			return "", err
+		}
 	}
 	return cleaned, nil
 }
@@ -273,9 +308,13 @@ func insecureRegistries() []string {
 
 // isLoopback reports whether registry addresses the local machine, where
 // go-containerregistry's automatic plain HTTP carries no network exposure.
+//
+// Deliberately excludes `.local`: that is mDNS, which resolves to a real host
+// on the LAN, so it has to go through the insecure allowlist like any other
+// remote address even though go-containerregistry downgrades it too.
 func isLoopback(registry string) bool {
 	host := registryHost(registry)
-	if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
 		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {
@@ -290,15 +329,25 @@ func isPrivateIP(registry string) bool {
 	return ip != nil && ip.IsPrivate()
 }
 
+// isMDNS reports whether registry is an mDNS name, which
+// go-containerregistry also contacts over plain HTTP.
+func isMDNS(registry string) bool {
+	host := registryHost(registry)
+	return host == "local" || strings.HasSuffix(host, ".local")
+}
+
 // checkTransportSecurity refuses to contact a registry that
 // go-containerregistry would silently downgrade to plain HTTP.
 //
-// go-containerregistry picks HTTP for loopback and for any RFC1918 literal.
-// Loopback is harmless, but a private address is a real network hop, and
-// authOption may hand it Docker keychain credentials, so require the operator
-// to say so explicitly.
+// go-containerregistry picks HTTP for loopback, for any RFC1918 literal and
+// for mDNS names. Loopback is harmless, but the other two are real network
+// hops, and authOption may hand them Docker keychain credentials, so require
+// the operator to say so explicitly.
 func checkTransportSecurity(registry string) error {
-	if !isPrivateIP(registry) || isLoopback(registry) {
+	if isLoopback(registry) {
+		return nil
+	}
+	if !isPrivateIP(registry) && !isMDNS(registry) {
 		return nil
 	}
 	host := registryHost(registry)
@@ -308,7 +357,7 @@ func checkTransportSecurity(registry string) error {
 		}
 	}
 	return fmt.Errorf(
-		"acr: refusing to contact %s over plain HTTP; set BBB_ACR_INSECURE=%s to allow it, or address the registry by hostname to use HTTPS",
+		"acr: refusing to contact %s over plain HTTP; set BBB_ACR_INSECURE=%s to allow it, or address the registry by a name that resolves over HTTPS",
 		registry, host)
 }
 
@@ -464,10 +513,6 @@ func (a *artifact) addImage(image v1.Image) error {
 	}
 	for _, descriptor := range manifest.Layers {
 		digest := descriptor.Digest.String()
-		// The same blob referenced from several manifests is one file.
-		if _, done := a.layers[digest]; done {
-			continue
-		}
 		title := descriptor.Annotations[TitleAnnotation]
 		if title == "" {
 			title = strings.ReplaceAll(digest, ":", "-")
@@ -477,18 +522,28 @@ func (a *artifact) addImage(image v1.Image) error {
 			return fmt.Errorf("acr: invalid layer name %q: %w", title, err)
 		}
 		if previous, dup := a.seen[cleaned]; dup {
+			// The same descriptor listed twice, typically because several
+			// manifests in an index share a layer, is one file.
+			if previous == digest {
+				continue
+			}
 			// Two different blobs claiming one name would hide part of the
 			// artifact if the first silently won, so surface it.
 			return fmt.Errorf(
 				"acr: conflicting layers named %q (%s and %s); address the artifact by digest to read a specific manifest",
 				cleaned, previous, digest)
 		}
-		layer, err := image.LayerByDigest(descriptor.Digest)
-		if err != nil {
-			return asStatusError(err)
+		// Deduplicate by name rather than by digest: two files with identical
+		// contents share a blob but are still two distinct files, and dropping
+		// the second would silently lose it.
+		if _, ok := a.layers[digest]; !ok {
+			layer, err := image.LayerByDigest(descriptor.Digest)
+			if err != nil {
+				return asStatusError(err)
+			}
+			a.layers[digest] = layer
 		}
 		a.seen[cleaned] = digest
-		a.layers[digest] = layer
 		a.files = append(a.files, File{Name: cleaned, Size: descriptor.Size, Digest: digest})
 	}
 	return nil
