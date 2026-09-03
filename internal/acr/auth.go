@@ -156,9 +156,13 @@ func (a *acrAuthenticator) Authorization() (*authn.AuthConfig, error) {
 	}, nil
 }
 
-// tokenExpiry reads the exp claim of a registry access token, falling back to a
-// conservative lifetime when it cannot be parsed. The token is not verified:
-// this only decides when to refresh, never whether to trust anything.
+// tokenExpiry reads the exp claim of a registry access token, so renewal is
+// driven by the token itself. The token is not verified: this only decides when
+// to refresh, never whether to trust anything.
+//
+// The fallback covers tokens whose expiry cannot be read at all. A token that
+// parses but is already expired, or within the refresh margin, deliberately
+// yields a past time so the next Authorization re-exchanges immediately.
 func tokenExpiry(token string) time.Time {
 	const fallback = 30 * time.Minute
 	parts := strings.Split(token, ".")
@@ -175,20 +179,19 @@ func tokenExpiry(token string) time.Time {
 	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp == 0 {
 		return time.Now().Add(fallback)
 	}
-	expiry := time.Unix(claims.Exp, 0).Add(-tokenRefreshMargin)
-	if !expiry.After(time.Now()) {
-		return time.Now().Add(fallback)
-	}
-	return expiry
+	return time.Unix(claims.Exp, 0).Add(-tokenRefreshMargin)
 }
 
-// authCache memoises one ACR authenticator per registry so a multi-file
-// transfer performs the Entra exchange once rather than per request. A nil
-// entry means "fall back to the Docker keychain".
-var (
-	authCacheMu sync.Mutex
-	authCache   = map[string]authn.Authenticator{}
-)
+// authEntry memoises the credentials for one registry. A nil authenticator
+// means "fall back to the Docker keychain".
+type authEntry struct {
+	once sync.Once
+	auth authn.Authenticator
+}
+
+// authCache holds one entry per registry so a multi-file transfer performs the
+// Entra exchange once rather than per request.
+var authCache sync.Map
 
 // authOption resolves credentials for registry, in order:
 //
@@ -196,38 +199,40 @@ var (
 //  2. Entra ID, but only for Azure Container Registry endpoints
 //  3. the Docker keychain (config.json, credential helpers), which also covers
 //     `docker login` against any other OCI registry
+//
+// The first resolution for a registry performs network I/O, so entries are
+// keyed individually: concurrent callers for the same registry wait for one
+// exchange, while a slow login to one registry never blocks another.
 func authOption(ctx context.Context, registry string) remote.Option {
 	if user, pass, ok := basicCredentials(); ok {
 		return remote.WithAuth(&authn.Basic{Username: user, Password: pass})
 	}
 
-	authCacheMu.Lock()
-	defer authCacheMu.Unlock()
-	auth, cached := authCache[registry]
-	if !cached {
-		if isACR(registry) {
-			// Exchange once up front so an unusable credential falls back to
-			// the keychain now rather than failing mid-transfer; the
-			// authenticator renews itself from then on.
-			token, err := exchangeEntraToken(ctx, registry)
-			if err != nil {
-				slog.Debug("acr: Entra ID authentication unavailable, falling back to the Docker keychain",
-					"registry", registry, "error", err)
-			} else {
-				auth = &acrAuthenticator{
-					registry: registry,
-					token:    token,
-					expires:  tokenExpiry(token),
-				}
-			}
-		} else {
+	value, _ := authCache.LoadOrStore(registry, &authEntry{})
+	entry := value.(*authEntry)
+	entry.once.Do(func() {
+		if !isACR(registry) {
 			slog.Debug("acr: not an Azure Container Registry endpoint, using the Docker keychain",
 				"registry", registry)
+			return
 		}
-		authCache[registry] = auth
-	}
-	if auth != nil {
-		return remote.WithAuth(auth)
+		// Exchange once up front so an unusable credential falls back to the
+		// keychain now rather than failing mid-transfer; the authenticator
+		// renews itself from then on.
+		token, err := exchangeToken(ctx, registry)
+		if err != nil {
+			slog.Debug("acr: Entra ID authentication unavailable, falling back to the Docker keychain",
+				"registry", registry, "error", err)
+			return
+		}
+		entry.auth = &acrAuthenticator{
+			registry: registry,
+			token:    token,
+			expires:  tokenExpiry(token),
+		}
+	})
+	if entry.auth != nil {
+		return remote.WithAuth(entry.auth)
 	}
 	return remote.WithAuthFromKeychain(authn.DefaultKeychain)
 }

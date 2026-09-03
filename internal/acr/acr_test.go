@@ -14,6 +14,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -745,16 +746,91 @@ func TestTokenExpiry(t *testing.T) {
 	if !got.Before(exp) || got.Before(exp.Add(-tokenRefreshMargin-time.Minute)) {
 		t.Fatalf("expiry %v is not shortly before %v", got, exp)
 	}
-	// A token that cannot be parsed, or one already expired, still yields a
-	// usable near-term refresh rather than a zero time.
-	for _, token := range []string{
-		"not-a-jwt",
-		encode(`{"exp":1}`),
-		encode("{}"),
-	} {
+
+	// A token that parses but has already expired, or is within the refresh
+	// margin, must be refreshable immediately rather than trusted further.
+	for _, name := range []string{"long expired", "within the margin"} {
+		var claim time.Time
+		if name == "long expired" {
+			claim = time.Now().Add(-time.Hour)
+		} else {
+			claim = time.Now().Add(tokenRefreshMargin / 2)
+		}
+		got := tokenExpiry(encode(fmt.Sprintf(`{"exp":%d}`, claim.Unix())))
+		if got.After(time.Now()) {
+			t.Errorf("%s token: expiry %v should already have passed", name, got)
+		}
+	}
+
+	// Only a token whose expiry cannot be read at all gets a grace period.
+	for _, token := range []string{"not-a-jwt", encode("{}"), "h.!!!.s"} {
 		if fallback := tokenExpiry(token); !fallback.After(time.Now()) {
 			t.Errorf("tokenExpiry(%q) = %v, want a future time", token, fallback)
 		}
+	}
+}
+
+// Resolving credentials for one registry must not block another: the first
+// resolution performs network I/O.
+func TestAuthOptionDoesNotSerialiseAcrossRegistries(t *testing.T) {
+	authCache.Clear()
+	t.Cleanup(func() { authCache.Clear() })
+
+	release := make(chan struct{})
+	var inFlight atomic.Int64
+	original := exchangeToken
+	exchangeToken = func(_ context.Context, registry string) (string, error) {
+		inFlight.Add(1)
+		<-release
+		return "token-" + registry, nil
+	}
+	t.Cleanup(func() { exchangeToken = original })
+
+	go func() { _ = authOption(t.Context(), "slow.azurecr.io") }()
+	// Wait for the slow registry to be mid-exchange.
+	for inFlight.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	// A different registry must resolve while that exchange is still running.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = authOption(t.Context(), "ghcr.io")
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resolving a second registry blocked behind the first")
+	}
+	close(release)
+}
+
+// Concurrent callers for one registry share a single exchange.
+func TestAuthOptionExchangesOncePerRegistry(t *testing.T) {
+	authCache.Clear()
+	t.Cleanup(func() { authCache.Clear() })
+
+	var exchanges atomic.Int64
+	original := exchangeToken
+	exchangeToken = func(context.Context, string) (string, error) {
+		exchanges.Add(1)
+		time.Sleep(10 * time.Millisecond)
+		return "token", nil
+	}
+	t.Cleanup(func() { exchangeToken = original })
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = authOption(t.Context(), "reg.azurecr.io")
+		}()
+	}
+	wg.Wait()
+	if got := exchanges.Load(); got != 1 {
+		t.Fatalf("expected one exchange for concurrent callers, got %d", got)
 	}
 }
 
