@@ -246,11 +246,15 @@ func authOption(ctx context.Context, registry string) remote.Option {
 	return remote.WithAuthFromKeychain(authn.DefaultKeychain)
 }
 
+// tokenCredential is indirected so tests can drive the exchange with a fake
+// credential instead of contacting Entra ID.
+var tokenCredential = getCredential
+
 // exchangeEntraToken trades an Entra ID access token for an ACR refresh token
 // and then for a registry access token, using the Azure SDK rather than a
 // hand-rolled OAuth flow.
 func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
-	credential, err := getCredential()
+	credential, err := tokenCredential()
 	if err != nil {
 		return "", err
 	}

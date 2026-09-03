@@ -26,6 +26,7 @@ import (
 	"os"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -160,34 +161,42 @@ const expectedPathErr = "expected acr://registry/repository[:tag|@digest][/file]
 // authority used for requests, and dropping it would move
 // registry.example:80 from port 80 to 443.
 func registryKey(registry string) string {
-	registry = strings.ToLower(registry)
+	registry = strings.ToLower(strings.TrimSpace(registry))
 	host, port, err := net.SplitHostPort(registry)
 	if err != nil {
 		host, port = strings.TrimPrefix(strings.TrimSuffix(registry, "]"), "["), ""
 	}
+	// A trailing dot is the DNS root label and names the same host.
+	host = strings.TrimSuffix(host, ".")
 	// An IP literal has many spellings; ParseIP().String() picks one, so
 	// [::1] and [0:0:0:0:0:0:0:1] cannot address one registry under two keys.
 	if ip := net.ParseIP(host); ip != nil {
 		host = ip.String()
 	}
+	// Ports are numeric, so :0443 reaches the same place as :443.
 	if port != "" {
-		scheme := "https"
-		if isInsecureAllowed(registry) || isLoopback(registry) {
-			scheme = "http"
-		} else if parsed, perr := name.NewRegistry(registry, name.WeakValidation); perr == nil {
-			scheme = parsed.Scheme()
+		if n, convErr := strconv.Atoi(port); convErr == nil {
+			port = strconv.Itoa(n)
 		}
-		if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
-			port = ""
-		}
+	}
+	bare := host
+	if strings.Contains(host, ":") {
+		bare = "[" + host + "]"
 	}
 	if port == "" {
-		if strings.Contains(host, ":") {
-			return "[" + host + "]"
-		}
-		return host
+		return bare
 	}
-	return net.JoinHostPort(host, port)
+	authority := net.JoinHostPort(host, port)
+	scheme := "https"
+	if isInsecureAllowed(authority) || isLoopback(authority) {
+		scheme = "http"
+	} else if parsed, perr := name.NewRegistry(authority, name.WeakValidation); perr == nil {
+		scheme = parsed.Scheme()
+	}
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		return bare
+	}
+	return authority
 }
 
 // ArtifactKey identifies the artifact a path addresses, ignoring any file

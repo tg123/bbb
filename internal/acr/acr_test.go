@@ -874,6 +874,22 @@ func TestArtifactKeyTreatsDefaultPortAsEquivalent(t *testing.T) {
 		t.Fatalf("expected one key for loopback :443 spellings, got %q and %q",
 			compact443.ArtifactKey(), expanded443.ArtifactKey())
 	}
+
+	// A trailing DNS root dot and a zero-padded port both reach the same
+	// endpoint, so neither may be used to get a second key.
+	for _, spelling := range []string{
+		"acr://myreg.azurecr.io./models:v1",
+		"acr://myreg.azurecr.io:0443/models:v1",
+		"acr://myreg.azurecr.io.:443/models:v1",
+	} {
+		variant, err := Parse(spelling)
+		if err != nil {
+			t.Fatalf("Parse(%q) failed: %v", spelling, err)
+		}
+		if variant.ArtifactKey() != bare.ArtifactKey() {
+			t.Errorf("%s produced key %q, want %q", spelling, variant.ArtifactKey(), bare.ArtifactKey())
+		}
+	}
 }
 
 // Loopback must be reached over HTTP whichever way it is written, including

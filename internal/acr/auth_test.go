@@ -1,0 +1,151 @@
+package acr
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+)
+
+// fakeCredential stands in for DefaultAzureCredential.
+type fakeCredential struct {
+	token  string
+	scopes []string
+}
+
+func (c *fakeCredential) GetToken(_ context.Context, opts policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	c.scopes = append(c.scopes, opts.Scopes...)
+	return azcore.AccessToken{Token: c.token, ExpiresOn: time.Now().Add(time.Hour)}, nil
+}
+
+// recordedRequest captures one intercepted exchange.
+type recordedRequest struct {
+	path string
+	form url.Values
+}
+
+// The Entra flow is the default ACR login, so a wrong service, scope or grant
+// would compile and only fail in production. Drive both exchanges directly.
+func TestExchangeEntraToken(t *testing.T) {
+	const registry = "myreg.azurecr.io"
+
+	credential := &fakeCredential{token: "aad-token"}
+	originalCredential := tokenCredential
+	tokenCredential = func() (azcore.TokenCredential, error) { return credential, nil }
+	t.Cleanup(func() { tokenCredential = originalCredential })
+
+	var requests []recordedRequest
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		form, err := url.ParseQuery(string(body))
+		if err != nil {
+			return nil, err
+		}
+		requests = append(requests, recordedRequest{path: req.URL.Path, form: form})
+
+		payload := map[string]string{}
+		switch req.URL.Path {
+		case "/oauth2/exchange":
+			payload["refresh_token"] = "refresh-token"
+		case "/oauth2/token":
+			payload["access_token"] = "registry-token"
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, Body: http.NoBody, Request: req}, nil
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(string(encoded))),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Request:    req,
+		}, nil
+	})}
+	SetHTTPClient(client)
+	t.Cleanup(func() { SetHTTPClient(nil) })
+
+	token, err := exchangeEntraToken(t.Context(), registry)
+	if err != nil {
+		t.Fatalf("exchangeEntraToken failed: %v", err)
+	}
+	if token != "registry-token" {
+		t.Fatalf("token = %q, want the registry access token", token)
+	}
+
+	if len(credential.scopes) != 1 || credential.scopes[0] != aadScope {
+		t.Fatalf("credential scopes = %v, want [%s]", credential.scopes, aadScope)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("expected both exchanges, got %d requests", len(requests))
+	}
+
+	first := requests[0]
+	if first.path != "/oauth2/exchange" {
+		t.Errorf("first request path = %s, want /oauth2/exchange", first.path)
+	}
+	if got := first.form.Get("grant_type"); got != "access_token" {
+		t.Errorf("first grant_type = %q, want access_token", got)
+	}
+	if got := first.form.Get("service"); got != registry {
+		t.Errorf("first service = %q, want %s", got, registry)
+	}
+	if got := first.form.Get("access_token"); got != "aad-token" {
+		t.Errorf("the Entra token was not forwarded, got %q", got)
+	}
+
+	second := requests[1]
+	if second.path != "/oauth2/token" {
+		t.Errorf("second request path = %s, want /oauth2/token", second.path)
+	}
+	if got := second.form.Get("grant_type"); got != "refresh_token" {
+		t.Errorf("second grant_type = %q, want refresh_token", got)
+	}
+	if got := second.form.Get("refresh_token"); got != "refresh-token" {
+		t.Errorf("the refresh token was not forwarded, got %q", got)
+	}
+	if got := second.form.Get("service"); got != registry {
+		t.Errorf("second service = %q, want %s", got, registry)
+	}
+	if got := second.form.Get("scope"); got != "repository:*:pull,push" {
+		t.Errorf("second scope = %q, want a wildcard pull,push scope", got)
+	}
+}
+
+// A failed exchange must surface rather than yield an empty credential.
+func TestExchangeEntraTokenPropagatesFailure(t *testing.T) {
+	credential := &fakeCredential{token: "aad-token"}
+	originalCredential := tokenCredential
+	tokenCredential = func() (azcore.TokenCredential, error) { return credential, nil }
+	t.Cleanup(func() { tokenCredential = originalCredential })
+
+	var calls atomic.Int64
+	SetHTTPClient(&http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Body:       io.NopCloser(strings.NewReader(`{"errors":[{"code":"UNAUTHORIZED"}]}`)),
+			Request:    req,
+		}, nil
+	})})
+	t.Cleanup(func() { SetHTTPClient(nil) })
+
+	if _, err := exchangeEntraToken(t.Context(), "myreg.azurecr.io"); err == nil {
+		t.Fatal("expected a rejected exchange to fail")
+	}
+	if calls.Load() == 0 {
+		t.Fatal("expected the exchange to be attempted")
+	}
+}
