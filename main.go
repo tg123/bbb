@@ -270,7 +270,7 @@ func run(args []string) int {
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
 		Name:    "bbb",
-		Usage:   "filesystem helper (local + az:// / https://blob / hf:// / acr://)",
+		Usage:   "filesystem helper (local + az:// / https://blob / s3:// / hf:// / acr://)",
 		Version: version(),
 		Flags: []cli.Flag{
 			&cli.StringFlag{

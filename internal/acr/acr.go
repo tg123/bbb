@@ -197,6 +197,21 @@ func (p Path) ArtifactKey() string {
 	return registryKey(p.Registry) + "/" + p.Repository + "@" + p.Reference
 }
 
+// isAzureShortName reports whether a registry host is the Azure shorthand, so
+// "myregistry" means "myregistry.azurecr.io".
+//
+// "localhost" is excluded because it is a real registry host the backend
+// supports, as are address literals, which never take the suffix.
+func isAzureShortName(host string) bool {
+	if host == "" || host == "localhost" {
+		return false
+	}
+	if strings.Contains(host, ".") || strings.HasPrefix(host, "[") {
+		return false
+	}
+	return net.ParseIP(host) == nil
+}
+
 // Parse parses an acr:// path.
 func Parse(raw string) (Path, error) {
 	if !strings.HasPrefix(raw, Scheme) {
@@ -210,11 +225,19 @@ func Parse(raw string) (Path, error) {
 	// Hostnames are case-insensitive, so canonicalising case cannot change the
 	// endpoint. The port is left exactly as written, because it can.
 	registry = strings.ToLower(registry)
-	// A bare name is an Azure shorthand, but "localhost" is a real registry
-	// host that the backend supports over plain HTTP, so it must not be
-	// rewritten to localhost.azurecr.io.
-	if registry != "localhost" && !strings.ContainsAny(registry, ".:") {
-		registry += defaultSuffix
+	// Apply the Azure shorthand to the host alone, so an explicit port or an
+	// IPv6 authority does not suppress it.
+	host, port, splitErr := net.SplitHostPort(registry)
+	if splitErr != nil {
+		host, port = registry, ""
+	}
+	if isAzureShortName(host) {
+		host += defaultSuffix
+	}
+	if port == "" {
+		registry = host
+	} else {
+		registry = net.JoinHostPort(host, port)
 	}
 	p := Path{Registry: registry, Reference: DefaultTag}
 	idx := strings.IndexAny(rest, ":@")

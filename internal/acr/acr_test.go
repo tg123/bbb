@@ -88,6 +88,16 @@ func TestParse(t *testing.T) {
 			want: Path{Registry: "myreg.azurecr.io:443", Repository: "models", Reference: "v1"},
 		},
 		{
+			name: "a short name still expands when a port is given",
+			raw:  "acr://myreg:443/models:v1",
+			want: Path{Registry: "myreg.azurecr.io:443", Repository: "models", Reference: "v1"},
+		},
+		{
+			name: "an address literal never takes the azure suffix",
+			raw:  "acr://127.0.0.1:5000/models:v1",
+			want: Path{Registry: "127.0.0.1:5000", Repository: "models", Reference: "v1"},
+		},
+		{
 			name: "localhost with a port is unchanged",
 			raw:  "acr://localhost:5000/models:v1",
 			want: Path{Registry: "localhost:5000", Repository: "models", Reference: "v1"},
