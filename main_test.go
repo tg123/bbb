@@ -143,6 +143,26 @@ func TestCmdSyncRejectsHFFilePath(t *testing.T) {
 	}
 }
 
+// A dry run must predict the real outcome, so an invalid destination or a
+// missing source has to fail rather than report a successful PUSH.
+func TestSyncACRDryRunValidatesTarget(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := cmdSyncPaths(context.Background(), true, false, true, "", 1, 0,
+		source, "acr://myreg.azurecr.io/models@sha256:abc")
+	if err == nil || !strings.Contains(err.Error(), "must use a tag") {
+		t.Fatalf("expected digest destination to be rejected in dry run, got %v", err)
+	}
+
+	err = cmdSyncPaths(context.Background(), true, false, true, "", 1, 0,
+		filepath.Join(source, "missing"), "acr://myreg.azurecr.io/models:v1")
+	if err == nil {
+		t.Fatal("expected a missing source to be rejected in dry run")
+	}
+}
+
 func TestCmdSyncRejectsDeleteWithACRSource(t *testing.T) {
 	err := cmdSyncPaths(context.Background(), false, true, true, "", 1, 0,
 		"acr://myreg.azurecr.io/models:v1", t.TempDir())

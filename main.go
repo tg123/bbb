@@ -1627,7 +1627,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		if len(srcs) != 1 {
 			return fmt.Errorf("cp: acr:// destination requires exactly one local file or directory")
 		}
-		return pushLocalArtifact(ctx, srcs[0], dst, overwrite, quiet, showCopyBar, concurrency, retryCount, nil, onBytes)
+		return pushLocalArtifact(ctx, srcs[0], dst, overwrite, quiet, showCopyBar, false, concurrency, retryCount, nil, onBytes)
 	}
 	dstObj := bbbfs.IsObjectStore(dst)
 	// Determine if dst is directory (local or remote object store)
@@ -2144,7 +2144,7 @@ func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.A
 func pushLocalArtifact(
 	ctx context.Context,
 	src, dst string,
-	overwrite, quiet, showProgress bool,
+	overwrite, quiet, showProgress, dryRun bool,
 	concurrency, retryCount int,
 	exclude func(string) bool,
 	onBytes func(int64),
@@ -2152,9 +2152,25 @@ func pushLocalArtifact(
 	if bbbfs.IsRemote(src) {
 		return errors.New("acr:// destinations require a local source")
 	}
+	// Validate and collect before honouring dryRun, so a dry run predicts the
+	// real outcome instead of reporting success for a destination or source
+	// that the actual push would reject.
+	target, err := acr.Parse(dst)
+	if err != nil {
+		return err
+	}
+	if err := acr.ValidatePushTarget(target); err != nil {
+		return err
+	}
 	files, total, err := collectLocalArtifactFiles(src, exclude)
 	if err != nil {
 		return err
+	}
+	if dryRun {
+		if !quiet {
+			lockedPrintln("PUSH", src, "->", dst)
+		}
+		return nil
 	}
 	var bar *progressBar
 	if showProgress {
@@ -2831,16 +2847,10 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		if bbbfs.IsRemote(src) {
 			return fmt.Errorf("sync: acr:// destinations require a local source")
 		}
-		if dry {
-			if !quiet {
-				lockedPrintln("PUSH", src, "->", dst)
-			}
-			return nil
-		}
 		// --delete needs no separate phase here: the pushed manifest replaces
 		// the tag and lists exactly the selected source files, so anything
 		// previously in the artifact is already gone.
-		return pushLocalArtifact(ctx, src, dst, true, quiet, !quiet, concurrency, retryCount, excludeMatch, nil)
+		return pushLocalArtifact(ctx, src, dst, true, quiet, !quiet, dry, concurrency, retryCount, excludeMatch, nil)
 	}
 	if del && srcACR {
 		return errors.New("sync: --delete is not supported with an acr:// source")
@@ -3102,11 +3112,12 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				syncProgress.Finish()
 			}
 		}
-		// The delete phase is not implemented for remote combinations yet.
-		// Warn instead of silently ignoring the flag, so a caller expecting a
-		// mirror knows stale destination files were kept.
+		// The delete phase is not implemented for any sync involving a remote
+		// backend, in either direction. Warn instead of silently ignoring the
+		// flag, so a caller expecting a mirror knows stale files were kept.
 		if del && workerErr == nil {
-			lockedFprintf(os.Stderr, "sync: --delete is not implemented for %s; stale files were kept\n", dst)
+			lockedFprintf(os.Stderr,
+				"sync: --delete is not implemented for %s -> %s; stale files at the destination were kept\n", src, dst)
 		}
 		return workerErr
 	}

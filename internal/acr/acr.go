@@ -23,10 +23,12 @@ import (
 	"hash"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -247,10 +249,53 @@ type manifest struct {
 // maxIndexDepth bounds how many nested image indexes are followed.
 const maxIndexDepth = 4
 
+// layerCacheEntry memoises one artifact's resolved layer set.
+type layerCacheEntry struct {
+	once  sync.Once
+	files []File
+	err   error
+}
+
+// layerCache keys resolved layer sets by registry|repository|reference.
+var layerCache sync.Map
+
+func layerCacheKey(p Path) string {
+	return p.Registry + "|" + p.Repository + "|" + p.Reference
+}
+
+// invalidateLayers drops any cached layer set for p, so a tag republished by
+// this process is not later read back from a stale snapshot.
+func invalidateLayers(p Path) {
+	layerCache.Delete(layerCacheKey(p))
+}
+
 // ListFiles returns the files (layers) contained in the artifact referenced by
 // p. For a multi-platform artifact (image index) the layers of every
 // referenced manifest are merged.
+//
+// A reference is resolved at most once per process. Besides collapsing the
+// manifest fetch that each subsequent Stat would otherwise repeat, this pins a
+// whole-artifact copy to a single snapshot: a tag republished mid-transfer
+// cannot leave the destination holding a mix of two revisions.
 func ListFiles(ctx context.Context, p Path) ([]File, error) {
+	key := layerCacheKey(p)
+	value, _ := layerCache.LoadOrStore(key, &layerCacheEntry{})
+	entry := value.(*layerCacheEntry)
+	entry.once.Do(func() {
+		entry.files, entry.err = listFiles(ctx, p)
+		if entry.err != nil {
+			// Never memoise a failure: it would defeat --retry-count and let a
+			// cancelled context poison every later read.
+			layerCache.Delete(key)
+		}
+	})
+	if entry.err != nil {
+		return nil, entry.err
+	}
+	return slices.Clone(entry.files), nil
+}
+
+func listFiles(ctx context.Context, p Path) ([]File, error) {
 	layers, err := fetchLayers(ctx, p, p.Reference, 0)
 	if err != nil {
 		return nil, err
@@ -332,16 +377,19 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 		size = resp.ContentLength
 	}
 	// OCI supplies an expected digest, so verify what the registry (or any
-	// proxy in front of it) actually streamed instead of trusting it.
-	if algorithm, _, ok := strings.Cut(f.Digest, ":"); ok && algorithm == "sha256" {
-		return &verifyReadCloser{
-			ReadCloser: resp.Body,
-			hasher:     sha256.New(),
-			expected:   f.Digest,
-			size:       size,
-		}, nil
+	// proxy in front of it) actually streamed instead of trusting it. An
+	// algorithm we cannot check is refused rather than silently waved through.
+	algorithm, _, ok := strings.Cut(f.Digest, ":")
+	if !ok || algorithm != "sha256" {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("acr: unsupported layer digest %q: only sha256 can be verified", f.Digest)
 	}
-	return downloadReadCloser{ReadCloser: resp.Body, size: size}, nil
+	return &verifyReadCloser{
+		ReadCloser: resp.Body,
+		hasher:     sha256.New(),
+		expected:   f.Digest,
+		size:       size,
+	}, nil
 }
 
 // verifyReadCloser checks a streamed blob against the digest advertised by the
@@ -387,15 +435,29 @@ type PushOptions struct {
 	OnProgress  func(int64)
 }
 
-// Push uploads files as OCI layers and publishes one manifest at p.Reference.
-// Blob uploads may run concurrently, but the manifest is published only after
-// every layer succeeds.
-func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) error {
+// ValidatePushTarget reports whether p names something that can be published
+// to. Exported so callers such as a dry run can reject an impossible
+// destination without performing the push.
+func ValidatePushTarget(p Path) error {
 	if p.File != "" {
 		return errors.New("acr: push destination must be an artifact, not a file")
 	}
 	if strings.Contains(p.Reference, ":") {
 		return errors.New("acr: push destination must use a tag, not a digest")
+	}
+	return nil
+}
+
+// Push uploads files as OCI layers and publishes one manifest at p.Reference.
+// Blob uploads may run concurrently, but the manifest is published only after
+// every layer succeeds.
+//
+// An empty file set publishes an artifact with no layers. That keeps mirror
+// semantics honest: syncing an empty directory, or one whose files are all
+// excluded, must replace the tag rather than leave the previous contents.
+func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) error {
+	if err := ValidatePushTarget(p); err != nil {
+		return err
 	}
 	if !opts.Overwrite {
 		exists, err := ManifestExists(ctx, p)
@@ -405,9 +467,6 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 		if exists {
 			return fmt.Errorf("%w: %s", ErrArtifactExists, p.String())
 		}
-	}
-	if len(files) == 0 {
-		return errors.New("acr: no files to push")
 	}
 
 	names := make(map[string]struct{}, len(files))
@@ -515,6 +574,9 @@ sendFiles:
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("acr manifest push failed: %w", &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status})
 	}
+	// The tag now points somewhere new, so drop any snapshot this process
+	// cached for it.
+	invalidateLayers(p)
 	return nil
 }
 
@@ -657,16 +719,6 @@ func resolveLocation(base, location string) (string, error) {
 			location, baseURL.Scheme, baseURL.Host)
 	}
 	return resolved.String(), nil
-}
-
-type downloadReadCloser struct {
-	io.ReadCloser
-	size int64
-}
-
-// Size reports the blob size or -1 if unknown.
-func (d downloadReadCloser) Size() int64 {
-	return d.size
 }
 
 // fetchLayers returns the layers of the manifest referenced by reference,
@@ -864,6 +916,59 @@ func splitChallengeParams(s string) []string {
 	return parts
 }
 
+// azureRegistrySuffixes are the Azure Container Registry DNS suffixes across
+// the public and sovereign clouds.
+var azureRegistrySuffixes = []string{
+	".azurecr.io",
+	".azurecr.cn",
+	".azurecr.us",
+	".azurecr.de",
+}
+
+// trustedEntraHosts returns extra registry hosts explicitly opted in via
+// BBB_ACR_ENTRA_HOSTS, for ACR deployments behind a custom domain.
+func trustedEntraHosts() []string {
+	raw := strings.TrimSpace(os.Getenv("BBB_ACR_ENTRA_HOSTS"))
+	if raw == "" {
+		return nil
+	}
+	hosts := strings.Split(raw, ",")
+	out := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		if host = strings.ToLower(strings.TrimSpace(host)); host != "" {
+			out = append(out, host)
+		}
+	}
+	return out
+}
+
+// entraAllowed reports whether an Entra token may be exchanged with registry.
+//
+// The exchange posts a live Azure access token to the registry, so it must not
+// be offered to any host that merely answers with a bearer challenge — pulling
+// from a private ghcr.io repository would otherwise hand that host the caller's
+// Azure credential. Restrict it to Azure Container Registry endpoints reached
+// over TLS, plus an explicit opt-in for custom-domain deployments.
+func entraAllowed(registry, exchangeURL string) bool {
+	if u, err := url.Parse(exchangeURL); err != nil || !strings.EqualFold(u.Scheme, "https") {
+		return false
+	}
+	host := registry
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if slices.Contains(trustedEntraHosts(), host) {
+		return true
+	}
+	for _, suffix := range azureRegistrySuffixes {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 func acquireToken(ctx context.Context, registry, scope, challenge string) (string, error) {
 	realm, service, challengeScope := parseChallenge(challenge)
 	if realm == "" {
@@ -887,14 +992,22 @@ func acquireToken(ctx context.Context, registry, scope, challenge string) (strin
 		return token, nil
 	}
 
-	token, err := entraToken(ctx, registry, realm, service, scope)
-	if err != nil {
+	exchangeURL := registryURL(registry, "/oauth2/exchange")
+	if entraAllowed(registry, exchangeURL) {
+		token, err := entraToken(ctx, exchangeURL, realm, service, scope)
+		if err == nil {
+			storeToken(registry, scope, token)
+			return token, nil
+		}
 		slog.Debug("acr: Entra ID authentication unavailable, falling back to anonymous access",
 			"registry", registry, "error", err)
-		token, err = requestToken(ctx, realm, service, scope, nil)
-		if err != nil {
-			return "", err
-		}
+	} else {
+		slog.Debug("acr: not an Azure Container Registry endpoint, skipping Entra ID authentication",
+			"registry", registry)
+	}
+	token, err := requestToken(ctx, realm, service, scope, nil)
+	if err != nil {
+		return "", err
 	}
 	storeToken(registry, scope, token)
 	return token, nil
@@ -911,7 +1024,7 @@ func basicCredentials() (string, string, bool) {
 
 // entraToken exchanges an Entra ID (Azure AD) access token for a registry
 // refresh token and then for a scoped registry access token.
-func entraToken(ctx context.Context, registry, realm, service, scope string) (string, error) {
+func entraToken(ctx context.Context, exchangeURL, realm, service, scope string) (string, error) {
 	cred, err := getCredential()
 	if err != nil {
 		return "", err
@@ -924,7 +1037,7 @@ func entraToken(ctx context.Context, registry, realm, service, scope string) (st
 			slog.Debug("acr: Entra ID token request failed", "audience", audience, "error", err)
 			continue
 		}
-		refreshToken, err := postForm(ctx, registryURL(registry, "/oauth2/exchange"), url.Values{
+		refreshToken, err := postForm(ctx, exchangeURL, url.Values{
 			"grant_type":   {"access_token"},
 			"service":      {service},
 			"access_token": {aadToken.Token},

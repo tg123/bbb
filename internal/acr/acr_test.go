@@ -110,8 +110,18 @@ func TestParseChallenge(t *testing.T) {
 }
 
 // newTestRegistry starts a registry stub and routes all package requests to it.
+// It also resets the package's process-wide caches so tests sharing a
+// registry/repository/reference cannot observe each other's results.
 func newTestRegistry(t *testing.T, handler http.HandlerFunc) {
 	t.Helper()
+	resetCaches := func() {
+		tokenCacheMu.Lock()
+		tokenCache = map[string]string{}
+		tokenCacheMu.Unlock()
+		layerCache.Clear()
+	}
+	resetCaches()
+	t.Cleanup(resetCaches)
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	target, err := url.Parse(server.URL)
@@ -130,10 +140,6 @@ func newTestRegistry(t *testing.T, handler http.HandlerFunc) {
 func TestListFilesAndDownload(t *testing.T) {
 	t.Setenv("BBB_ACR_USERNAME", "user")
 	t.Setenv("BBB_ACR_PASSWORD", "pass")
-	tokenCacheMu.Lock()
-	tokenCache = map[string]string{}
-	tokenCacheMu.Unlock()
-
 	const blobBody = "hello world"
 	blobDigest := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(blobBody)))
 	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
@@ -211,10 +217,6 @@ func TestListFilesAndDownload(t *testing.T) {
 }
 
 func TestListFilesMergesIndexManifests(t *testing.T) {
-	tokenCacheMu.Lock()
-	tokenCache = map[string]string{}
-	tokenCacheMu.Unlock()
-
 	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v2/models/manifests/v1":
@@ -274,10 +276,6 @@ func TestListFilesMergesIndexManifests(t *testing.T) {
 func TestPushPublishesManifestAfterUploadingLayers(t *testing.T) {
 	t.Setenv("BBB_ACR_USERNAME", "user")
 	t.Setenv("BBB_ACR_PASSWORD", "pass")
-	tokenCacheMu.Lock()
-	tokenCache = map[string]string{}
-	tokenCacheMu.Unlock()
-
 	var nextUpload atomic.Int64
 	var progress atomic.Int64
 	var mu sync.Mutex
@@ -378,9 +376,6 @@ func TestPushPublishesManifestAfterUploadingLayers(t *testing.T) {
 }
 
 func TestPushRefusesExistingTagWithoutOverwrite(t *testing.T) {
-	tokenCacheMu.Lock()
-	tokenCache = map[string]string{}
-	tokenCacheMu.Unlock()
 	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead && r.URL.Path == "/v2/models/manifests/v1" {
 			w.WriteHeader(http.StatusOK)
@@ -398,22 +393,9 @@ func TestPushRefusesExistingTagWithoutOverwrite(t *testing.T) {
 	}
 }
 
-func TestPushRejectsEmptyArtifact(t *testing.T) {
-	err := Push(t.Context(), Path{
-		Registry: "reg.azurecr.io", Repository: "models", Reference: "v1",
-	}, nil, PushOptions{Overwrite: true})
-	if err == nil || !strings.Contains(err.Error(), "no files") {
-		t.Fatalf("expected no-files error, got %v", err)
-	}
-}
-
 // A registry controls layer titles, so a malicious title must not be able to
 // escape the destination directory once joined with a local path.
 func TestListFilesRejectsBackslashLayerTitle(t *testing.T) {
-	tokenCacheMu.Lock()
-	tokenCache = map[string]string{}
-	tokenCacheMu.Unlock()
-
 	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v2/models/manifests/v1" {
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -451,6 +433,170 @@ func TestPushRejectsBackslashFileName(t *testing.T) {
 	}
 }
 
+func TestPushPublishesEmptyArtifact(t *testing.T) {
+	var pushed manifest
+	var pushedTag bool
+	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/models/blobs/uploads/":
+			w.Header().Set("Location", "/uploads/config")
+			w.WriteHeader(http.StatusAccepted)
+		case strings.HasPrefix(r.URL.Path, "/uploads/"):
+			w.Header().Set("Location", r.URL.Path)
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPut && r.URL.Path == "/v2/models/manifests/v1":
+			pushedTag = true
+			_ = json.NewDecoder(r.Body).Decode(&pushed)
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	// An empty source must still replace the tag, otherwise a mirroring sync
+	// would silently leave the previous artifact in place.
+	err := Push(t.Context(), Path{
+		Registry: "reg.azurecr.io", Repository: "models", Reference: "v1",
+	}, nil, PushOptions{Overwrite: true})
+	if err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	if !pushedTag {
+		t.Fatal("expected the tag to be republished for an empty artifact")
+	}
+	if len(pushed.Layers) != 0 {
+		t.Fatalf("expected no layers, got %#v", pushed.Layers)
+	}
+}
+
+func TestValidatePushTarget(t *testing.T) {
+	if err := ValidatePushTarget(Path{Repository: "models", Reference: "v1"}); err != nil {
+		t.Fatalf("expected tag target to be valid: %v", err)
+	}
+	if err := ValidatePushTarget(Path{Repository: "models", Reference: "sha256:abc"}); err == nil {
+		t.Fatal("expected a digest target to be rejected")
+	}
+	if err := ValidatePushTarget(Path{Repository: "models", Reference: "v1", File: "a.txt"}); err == nil {
+		t.Fatal("expected a file target to be rejected")
+	}
+}
+
+// An Entra access token is a live Azure credential and must never be offered to
+// a registry that merely answers with a bearer challenge.
+func TestEntraAllowed(t *testing.T) {
+	for _, tc := range []struct {
+		registry string
+		endpoint string
+		want     bool
+	}{
+		{"myreg.azurecr.io", "https://myreg.azurecr.io/oauth2/exchange", true},
+		{"myreg.azurecr.cn", "https://myreg.azurecr.cn/oauth2/exchange", true},
+		{"myreg.azurecr.io:443", "https://myreg.azurecr.io/oauth2/exchange", true},
+		{"ghcr.io", "https://ghcr.io/oauth2/exchange", false},
+		{"evil.example.com", "https://evil.example.com/oauth2/exchange", false},
+		{"notazurecr.io", "https://notazurecr.io/oauth2/exchange", false},
+		// Never over plaintext, even for a real ACR host.
+		{"myreg.azurecr.io", "http://myreg.azurecr.io/oauth2/exchange", false},
+	} {
+		if got := entraAllowed(tc.registry, tc.endpoint); got != tc.want {
+			t.Errorf("entraAllowed(%q, %q) = %v, want %v", tc.registry, tc.endpoint, got, tc.want)
+		}
+	}
+
+	t.Setenv("BBB_ACR_ENTRA_HOSTS", "registry.corp.example")
+	if !entraAllowed("registry.corp.example", "https://registry.corp.example/oauth2/exchange") {
+		t.Error("expected an explicitly trusted host to be allowed")
+	}
+	if entraAllowed("other.corp.example", "https://other.corp.example/oauth2/exchange") {
+		t.Error("opt-in must not extend to unlisted hosts")
+	}
+}
+
+func TestDownloadStreamRejectsUnsupportedDigest(t *testing.T) {
+
+	const digest = "sha512:abc"
+	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/models/manifests/v1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"layers": []map[string]any{
+					{"digest": digest, "size": 3, "annotations": map[string]string{TitleAnnotation: "a.txt"}},
+				},
+			})
+			return
+		}
+		_, _ = io.WriteString(w, "abc")
+	})
+
+	p := Path{Registry: "reg.azurecr.io", Repository: "models", Reference: "v1", File: "a.txt"}
+	if _, err := DownloadStream(t.Context(), p); err == nil || !strings.Contains(err.Error(), "unsupported layer digest") {
+		t.Fatalf("expected unsupported digest error, got %v", err)
+	}
+}
+
+// A whole-artifact copy lists once and then stats every file; the tag must be
+// resolved a single time so the copy sees one consistent snapshot.
+func TestListFilesResolvesReferenceOnce(t *testing.T) {
+
+	var manifestFetches atomic.Int64
+	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/models/manifests/v1" {
+			manifestFetches.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"layers": []map[string]any{
+					{"digest": "sha256:aaa", "size": 1, "annotations": map[string]string{TitleAnnotation: "a.txt"}},
+					{"digest": "sha256:bbb", "size": 2, "annotations": map[string]string{TitleAnnotation: "b.txt"}},
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	p := Path{Registry: "reg.azurecr.io", Repository: "models", Reference: "v1"}
+	for range 3 {
+		if _, err := ListFiles(t.Context(), p); err != nil {
+			t.Fatalf("ListFiles failed: %v", err)
+		}
+	}
+	stat := p
+	stat.File = "a.txt"
+	if _, err := Stat(t.Context(), stat); err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if got := manifestFetches.Load(); got != 1 {
+		t.Fatalf("expected the tag to be resolved once, got %d manifest fetches", got)
+	}
+}
+
+// A failed lookup must not be memoised, or --retry-count would be useless.
+func TestListFilesDoesNotCacheFailure(t *testing.T) {
+
+	var attempts atomic.Int64
+	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"layers": []map[string]any{
+				{"digest": "sha256:aaa", "size": 1, "annotations": map[string]string{TitleAnnotation: "a.txt"}},
+			},
+		})
+	})
+
+	p := Path{Registry: "reg.azurecr.io", Repository: "models", Reference: "v1"}
+	if _, err := ListFiles(t.Context(), p); err == nil {
+		t.Fatal("expected the first lookup to fail")
+	}
+	files, err := ListFiles(t.Context(), p)
+	if err != nil {
+		t.Fatalf("retry after a failed lookup should succeed, got %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "a.txt" {
+		t.Fatalf("unexpected files after retry: %#v", files)
+	}
+}
+
 func TestRegistryURLOverride(t *testing.T) {
 	t.Setenv("BBB_ACR_ENDPOINT", "http://%s")
 	if got := registryURL("localhost:5000", "/v2/"); got != "http://localhost:5000/v2/" {
@@ -481,10 +627,6 @@ func TestResolveLocationRejectsCrossOrigin(t *testing.T) {
 }
 
 func TestDownloadStreamVerifiesDigest(t *testing.T) {
-	tokenCacheMu.Lock()
-	tokenCache = map[string]string{}
-	tokenCacheMu.Unlock()
-
 	const digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -519,10 +661,6 @@ func TestDownloadStreamVerifiesDigest(t *testing.T) {
 }
 
 func TestListFilesRejectsConflictingLayerNames(t *testing.T) {
-	tokenCacheMu.Lock()
-	tokenCache = map[string]string{}
-	tokenCacheMu.Unlock()
-
 	newTestRegistry(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v2/models/manifests/v1" {
 			_ = json.NewEncoder(w).Encode(map[string]any{

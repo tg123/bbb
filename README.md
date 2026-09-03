@@ -90,6 +90,8 @@ Authentication is resolved in this order:
 2. Entra ID (Azure AD) via `DefaultAzureCredential` — Azure CLI login, service principal, managed identity, workload identity — exchanged for a registry token
 3. Anonymous pull (for registries with anonymous pull enabled)
 
+Because the Entra step posts a live Azure access token to the registry, it is only attempted for Azure Container Registry hosts (`*.azurecr.io`, `*.azurecr.cn`, `*.azurecr.us`, `*.azurecr.de`) reached over HTTPS. Any other registry — a private `ghcr.io` repository, say — skips straight to anonymous rather than being offered your Azure credential. Add custom-domain ACR hosts to `BBB_ACR_ENTRA_HOSTS` to opt them in.
+
 Writing requires credentials with push access to the target repository.
 
 ## Global Flags
@@ -126,6 +128,7 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
 | `BBB_ACR_USERNAME` | | Username for `acr://` registry authentication (used with `BBB_ACR_PASSWORD`) |
 | `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
+| `BBB_ACR_ENTRA_HOSTS` | | Comma separated extra registry hosts allowed to receive Entra ID credentials, for ACR behind a custom domain |
 | `BBB_ACR_ENDPOINT` | `https://%s` | Registry endpoint template; `%s` is replaced by the registry from the `acr://` path (useful for local OCI registries) |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
@@ -706,11 +709,13 @@ bbb sync [flags] src dst
 | `--retry-count N` | Number of retries on failure (default: `0`) |
 
 > **`--delete` support:** The delete phase is only implemented for local→local
-> syncs. For remote destinations (`az://`, `s3://`) `bbb` copies the source but
-> keeps stale destination files, and prints a warning saying so. With an
-> `acr://` source, `--delete` is rejected outright. An `acr://` destination
-> needs no delete phase: the push replaces the tag with a manifest listing
-> exactly the selected source files.
+> syncs. Any sync involving a remote backend on either side — including
+> remote→local, such as `az://… -> ./local` — copies the source but keeps stale
+> destination files, and prints a warning saying so. With an `acr://` source,
+> `--delete` is rejected outright. An `acr://` destination needs no delete
+> phase: the push replaces the tag with a manifest listing exactly the selected
+> source files, so an empty or fully excluded source publishes an empty
+> artifact rather than leaving the previous contents in place.
 
 **Examples:**
 
