@@ -185,21 +185,37 @@ func basicCredentials(registry string) (string, string, bool) {
 	return user, pass, true
 }
 
-var (
-	credOnce sync.Once
-	cred     azcore.TokenCredential
-	credErr  error
-)
+// defaultCreds holds one process credential per cloud, keyed by that cloud's
+// identity authority.
+var defaultCreds sync.Map
 
-func getCredential() (azcore.TokenCredential, error) {
-	credOnce.Do(func() {
+type defaultCredential struct {
+	once sync.Once
+	cred azcore.TokenCredential
+	err  error
+}
+
+// getCredential returns the ambient credential — CLI login, service principal,
+// managed identity, workload identity — for a registry's cloud.
+//
+// The cloud belongs to the credential and not only to the scope asked of it: a
+// service principal or workload identity authenticates against an authority,
+// and the public-cloud one issues nothing for .azurecr.cn or .azurecr.us. One
+// credential per cloud also lets a single run address more than one, which a
+// process-wide credential built from whichever registry came first cannot.
+func getCredential(registry string) (azcore.TokenCredential, error) {
+	config := registryCloud(registry)
+	entry, _ := defaultCreds.LoadOrStore(config.ActiveDirectoryAuthorityHost, &defaultCredential{})
+	e := entry.(*defaultCredential)
+	e.once.Do(func() {
 		opts := &azidentity.DefaultAzureCredentialOptions{}
+		opts.Cloud = config
 		if c := sharedClient.Load(); c != nil {
 			opts.Transport = c
 		}
-		cred, credErr = azidentity.NewDefaultAzureCredential(opts)
+		e.cred, e.err = azidentity.NewDefaultAzureCredential(opts)
 	})
-	return cred, credErr
+	return e.cred, e.err
 }
 
 // tenantClaims is the subset of an Entra access token used to tell which
@@ -278,6 +294,11 @@ var (
 	// tenantCredCache holds one credential per tenant, and tenantCredInflight
 	// serialises acquisition so concurrent transfers open a single login
 	// prompt rather than one each.
+	//
+	// The tenant alone is the key: an Entra tenant exists in exactly one
+	// sovereign instance, so a tenant ID already implies its cloud. The
+	// ambient credential is keyed by cloud instead, since it has no tenant to
+	// imply one.
 	tenantCredCache    sync.Map // map[string]azcore.TokenCredential
 	tenantCredInflight sync.Map // map[string]*sync.Mutex
 )
@@ -340,7 +361,7 @@ func credentialForRegistry(ctx context.Context, registry string) (azcore.TokenCr
 		}
 	}
 	if tid == "" {
-		return getCredential()
+		return getCredential(registry)
 	}
 	if cached, ok := tenantCredCache.Load(tid); ok {
 		return cached.(azcore.TokenCredential), nil

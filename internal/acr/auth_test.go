@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 )
 
@@ -178,6 +179,48 @@ func TestARMScopeFollowsTheCloud(t *testing.T) {
 		if got := armScope(registry); got != want {
 			t.Errorf("armScope(%q) = %q, want %q", registry, got, want)
 		}
+	}
+}
+
+// The cloud belongs to the credential, not only to the scope: a token from the
+// public-cloud authority is no use to a sovereign registry, whatever audience
+// was asked for.
+func TestDefaultCredentialFollowsTheCloud(t *testing.T) {
+	for registry, want := range map[string]cloud.Configuration{
+		"myreg.azurecr.io":      cloud.AzurePublic,
+		"myreg.azurecr.cn":      cloud.AzureChina,
+		"myreg.azurecr.us":      cloud.AzureGovernment,
+		"myreg.azurecr.us:443":  cloud.AzureGovernment,
+		"registry.corp.example": cloud.AzurePublic,
+	} {
+		got := registryCloud(registry)
+		if got.ActiveDirectoryAuthorityHost != want.ActiveDirectoryAuthorityHost {
+			t.Errorf("registryCloud(%q) authority = %q, want %q",
+				registry, got.ActiveDirectoryAuthorityHost, want.ActiveDirectoryAuthorityHost)
+		}
+	}
+
+	// One credential per cloud, so a run touching two is not served by
+	// whichever registry it happened to reach first.
+	defaultCreds.Clear()
+	t.Cleanup(defaultCreds.Clear)
+	public, err := getCredential("myreg.azurecr.io")
+	if err != nil {
+		t.Skipf("no ambient Azure credential available: %v", err)
+	}
+	again, err := getCredential("other.azurecr.io")
+	if err != nil {
+		t.Fatalf("second public-cloud call failed: %v", err)
+	}
+	if public != again {
+		t.Error("two registries in one cloud must share a credential")
+	}
+	china, err := getCredential("myreg.azurecr.cn")
+	if err != nil {
+		t.Fatalf("sovereign call failed: %v", err)
+	}
+	if china == public {
+		t.Error("a sovereign registry must not reuse the public-cloud credential")
 	}
 }
 

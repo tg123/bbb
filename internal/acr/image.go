@@ -519,47 +519,95 @@ type hardLink struct {
 // layers below, and one whose target cannot be found is dropped rather than
 // listed as something unreadable.
 //
-// Links are resolved repeatedly until a pass settles nothing new, so a chain
-// resolves whichever order it appears in. A cycle, or a genuinely dangling
-// target, simply stops making progress and is dropped.
+// A link may name another link, so this is a graph walk rather than a sweep: a
+// chain written back to front — each link naming the one after it — would let
+// a pass-per-link resolver settle a single link per pass, and the entry
+// allowance is half a million, so a crafted layer could cost the square of it.
+// Each link is instead visited once, following its target through the links
+// that have not settled yet. A cycle is left unresolved, so it is dropped like
+// any other target that cannot be found.
 func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order *[]string, writtenAt map[string]int, merged map[string]File) {
-	pending := links
-	for len(pending) > 0 {
-		var unresolved []hardLink
-		for _, link := range pending {
-			if !g.resolveLink(link, added, order, writtenAt, merged) {
-				unresolved = append(unresolved, link)
+	if len(links) == 0 {
+		return
+	}
+	// A tar is a log, so the live link at a name is the last to claim it, and
+	// that is the one another link naming it depends on.
+	byName := make(map[string]int, len(links))
+	for i, link := range links {
+		byName[link.name] = i
+	}
+	const (
+		unvisited = iota
+		visiting
+		settled
+	)
+	state := make([]uint8, len(links))
+	// The stack is explicit rather than the call stack: a chain can be as long
+	// as the layer has entries.
+	stack := make([]int, 0, 16)
+	for i := range links {
+		if state[i] != unvisited {
+			continue
+		}
+		state[i] = visiting
+		stack = append(stack[:0], i)
+		for len(stack) > 0 {
+			top := stack[len(stack)-1]
+			target, ok := g.linkTarget(links[top], writtenAt)
+			if !ok {
+				state[top] = settled
+				stack = stack[:len(stack)-1]
+				continue
 			}
+			if _, found := added[target]; !found {
+				if _, found = merged[target]; !found {
+					// The target may be a link that has not been installed
+					// yet, in which case it has to settle first.
+					if next, isLink := byName[target]; isLink && state[next] == unvisited {
+						state[next] = visiting
+						stack = append(stack, next)
+						continue
+					}
+					// Dangling, part of a cycle, or a link that settled
+					// without resolving.
+					state[top] = settled
+					stack = stack[:len(stack)-1]
+					continue
+				}
+			}
+			g.installLink(links[top], target, added, order, writtenAt, merged)
+			state[top] = settled
+			stack = stack[:len(stack)-1]
 		}
-		if len(unresolved) == len(pending) {
-			// Nothing moved, so the rest are cycles or dangling.
-			return
-		}
-		pending = unresolved
 	}
 }
 
-// resolveLink installs one link, reporting whether its target was found.
-func (g *imageGroup) resolveLink(link hardLink, added map[string]File, order *[]string, writtenAt map[string]int, merged map[string]File) bool {
+// linkTarget renders a hard link's target as the name it would carry in the
+// listing, reporting false when the link can install nothing.
+func (g *imageGroup) linkTarget(link hardLink, writtenAt map[string]int) (string, bool) {
 	if at, ok := writtenAt[link.name]; ok && at > link.at {
-		// A later header already decided this path, so the link is spent
-		// rather than unresolved.
-		return true
+		// A later header already decided this path, so the link is spent.
+		return "", false
 	}
 	target := strings.TrimPrefix(link.target, "./")
 	target = strings.TrimSuffix(target, "/")
 	if target == "" || strings.HasPrefix(target, "/") || !isSafeEntryName(target) {
-		return true
+		return "", false
 	}
 	if g.prefix != "" {
 		target = g.prefix + "/" + target
 	}
+	return target, true
+}
+
+// installLink gives a link the content of the entry it names.
+func (g *imageGroup) installLink(link hardLink, target string, added map[string]File, order *[]string, writtenAt map[string]int, merged map[string]File) {
 	source, ok := added[target]
 	if !ok {
 		source, ok = merged[target]
 	}
 	if !ok {
-		return false
+		return
 	}
 	if _, exists := added[link.name]; !exists {
 		*order = append(*order, link.name)
@@ -572,7 +620,6 @@ func (g *imageGroup) resolveLink(link hardLink, added map[string]File, order *[]
 		TarIndex: source.TarIndex,
 	}
 	writtenAt[link.name] = link.at
-	return true
 }
 
 // removeUnderOne deletes every entry beneath a single path.

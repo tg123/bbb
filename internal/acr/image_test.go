@@ -4,10 +4,12 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -1115,6 +1117,50 @@ func TestImageResolvesChainedHardLinks(t *testing.T) {
 	_ = reader.Close()
 	if err != nil || string(content) != body {
 		t.Fatalf("content = %q (%v), want the end of the chain", content, err)
+	}
+}
+
+// A hard-link chain written back to front used to settle one link per sweep,
+// so a layer could make resolution cost the square of the entry allowance.
+// Resolution has to be linear in the number of links.
+func TestImageResolvesLongHardLinkChainLinearly(t *testing.T) {
+	const chain = 50_000
+
+	group := &imageGroup{budget: newImageBudget()}
+	added := map[string]File{"real": {Name: "real", Size: 7, Digest: "sha256:abc", TarPath: "real"}}
+	order := []string{"real"}
+	writtenAt := map[string]int{"real": 0}
+
+	// Each link names the one after it, and the last names the file. Written
+	// in this order, no link can settle until every link below it has.
+	links := make([]hardLink, 0, chain)
+	for i := range chain {
+		target := "real"
+		if i+1 < chain {
+			target = fmt.Sprintf("link%d", i+1)
+		}
+		links = append(links, hardLink{name: fmt.Sprintf("link%d", i), target: target, at: i + 1})
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		group.resolveLinks(links, added, &order, writtenAt, map[string]File{})
+	}()
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("resolving a chain of hard links did not finish; it is no longer linear")
+	}
+
+	if len(added) != chain+1 {
+		t.Fatalf("resolved %d entries, want %d", len(added), chain+1)
+	}
+	for _, name := range []string{"link0", fmt.Sprintf("link%d", chain-1)} {
+		file, ok := added[name]
+		if !ok || file.TarPath != "real" {
+			t.Fatalf("%s = %#v (%v), want the end of the chain", name, file, ok)
+		}
 	}
 }
 
