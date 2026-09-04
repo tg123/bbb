@@ -5,7 +5,8 @@
 //
 //	acr://<registry>/<repository>:<tag>[/<file>]
 //	acr://<registry>/<repository>@<digest>[/<file>]
-//	acr://<registry>/<repository>            (defaults to the "latest" tag)
+//	acr://<registry>                         (lists the registry's repositories)
+//	acr://<registry>/<repository>            (lists the repository's tags)
 //
 // Files inside an artifact are its layers; a layer's name is taken from the
 // standard "org.opencontainers.image.title" annotation.
@@ -50,9 +51,6 @@ const Scheme = "acr://"
 
 // TitleAnnotation is the OCI annotation carrying a layer's file name.
 const TitleAnnotation = "org.opencontainers.image.title"
-
-// DefaultTag is used when a path does not specify a tag or digest.
-const DefaultTag = "latest"
 
 // defaultSuffix is appended to bare registry names (e.g. "myregistry").
 const defaultSuffix = ".azurecr.io"
@@ -507,7 +505,7 @@ func (s *nameSet) addLayer(name, digest string) (bool, error) {
 				name, existing.digest, digest)
 		default:
 			return false, fmt.Errorf(
-				"layers %q and %q differ only in case and collide on a case-insensitive filesystem",
+				"layers %q and %q differ only by case or Unicode normalisation and collide on one filesystem",
 				existing.name, name)
 		}
 	}
@@ -525,7 +523,7 @@ func (s *nameSet) addUpload(name string) error {
 			return fmt.Errorf("duplicate upload file name %q", name)
 		}
 		return fmt.Errorf(
-			"%q and %q differ only in case and collide on a case-insensitive filesystem",
+			"%q and %q differ only by case or Unicode normalisation and collide on one filesystem",
 			existing.name, name)
 	}
 	if err := s.checkCoexists(name); err != nil {
@@ -617,6 +615,9 @@ type File struct {
 	// TarPath, when set, is the entry's path inside the tar layer identified
 	// by Digest. Empty means the layer is the file.
 	TarPath string
+	// TarIndex is which occurrence of TarPath this is, since a tar may carry
+	// the same path more than once and the last one is the live entry.
+	TarIndex int
 }
 
 // insecureRegistries returns the registry hosts explicitly allowed to be

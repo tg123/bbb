@@ -802,7 +802,7 @@ func TestCaseInsensitiveNamesConflict(t *testing.T) {
 	if err := ValidateUploadNames([]UploadFile{
 		{Name: "A.txt", Open: reader},
 		{Name: "a.txt", Open: reader},
-	}); err == nil || !strings.Contains(err.Error(), "differ only in case") {
+	}); err == nil || !strings.Contains(err.Error(), "differ only by case or Unicode normalisation") {
 		t.Fatalf("expected a case collision to be rejected, got %v", err)
 	}
 	// A directory prefix aliases the same way.
@@ -819,7 +819,7 @@ func TestCaseInsensitiveNamesConflict(t *testing.T) {
 	if err := ValidateUploadNames([]UploadFile{
 		{Name: nfc, Open: reader},
 		{Name: nfd, Open: reader},
-	}); err == nil || !strings.Contains(err.Error(), "differ only in case") {
+	}); err == nil || !strings.Contains(err.Error(), "differ only by case or Unicode normalisation") {
 		t.Fatalf("expected Unicode-equivalent names to be rejected, got %v", err)
 	}
 	// The same aliasing applies between a file and a directory prefix.
@@ -846,7 +846,7 @@ func TestCaseInsensitiveNamesConflict(t *testing.T) {
 		{title: "A.txt", content: "upper"},
 		{title: "a.txt", content: "lower"},
 	})
-	if _, err := ListFiles(t.Context(), p); err == nil || !strings.Contains(err.Error(), "differ only in case") {
+	if _, err := ListFiles(t.Context(), p); err == nil || !strings.Contains(err.Error(), "differ only by case or Unicode normalisation") {
 		t.Fatalf("expected the artifact to be rejected, got %v", err)
 	}
 }

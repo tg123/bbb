@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -27,16 +29,18 @@ import (
 )
 
 // armScopes maps an Azure Container Registry suffix to the Resource Manager
-// audience of its cloud. A token for the public-cloud audience is not valid in
-// a sovereign cloud, so the advertised .cn/.us/.de hosts need their own.
+// audience of its cloud, and to the identity authority that issues for it. A
+// token for the public-cloud audience is not valid in a sovereign cloud, and
+// nor is one obtained from the public-cloud authority.
 var armScopes = []struct {
 	suffix string
 	scope  string
+	cloud  cloud.Configuration
 }{
-	{".azurecr.cn", "https://management.chinacloudapi.cn/.default"},
-	{".azurecr.us", "https://management.usgovcloudapi.net/.default"},
-	{".azurecr.de", "https://management.microsoftazure.de/.default"},
-	{".azurecr.io", "https://management.azure.com/.default"},
+	{".azurecr.cn", "https://management.chinacloudapi.cn/.default", cloud.AzureChina},
+	{".azurecr.us", "https://management.usgovcloudapi.net/.default", cloud.AzureGovernment},
+	{".azurecr.de", "https://management.microsoftazure.de/.default", cloud.AzurePublic},
+	{".azurecr.io", "https://management.azure.com/.default", cloud.AzurePublic},
 }
 
 // defaultARMScope is the public-cloud audience, used for custom-domain hosts
@@ -52,6 +56,20 @@ func armScope(registry string) string {
 		}
 	}
 	return defaultARMScope
+}
+
+// registryCloud returns the identity authority that issues tokens for a
+// registry's cloud. Requesting a sovereign audience from the public-cloud
+// authority does not work, so an interactive sign-in has to be pointed at the
+// same cloud the scope belongs to.
+func registryCloud(registry string) cloud.Configuration {
+	host := registryHost(registry)
+	for _, candidate := range armScopes {
+		if strings.HasSuffix(host, candidate.suffix) {
+			return candidate.cloud
+		}
+	}
+	return cloud.AzurePublic
 }
 
 // acrTokenUsername is the sentinel username ACR expects when the password is a
@@ -440,6 +458,7 @@ func azureCLITenants(ctx context.Context) []string {
 	return tenants
 }
 
+// tenantMatches reports whether a token was issued by the expected tenant. An
 // unreadable tid is accepted rather than triggering a needless login: the
 // registry is the real authority, and this is only an early check.
 func tenantMatches(token, tenant string) bool {
@@ -463,6 +482,7 @@ func browserOrDeviceCodeCredential(ctx context.Context, registry, tenant, scope 
 		fmt.Fprintf(os.Stderr, "\n  Registry %q requires an Entra sign-in to tenant %s.\n  Opening a browser...\n", registry, tenant)
 	}
 	browserOpts := &azidentity.InteractiveBrowserCredentialOptions{TenantID: tenant}
+	browserOpts.Cloud = registryCloud(registry)
 	if c := sharedClient.Load(); c != nil {
 		browserOpts.Transport = c
 	}
@@ -487,6 +507,7 @@ func browserOrDeviceCodeCredential(ctx context.Context, registry, tenant, scope 
 			return nil
 		},
 	}
+	deviceOpts.Cloud = registryCloud(registry)
 	if c := sharedClient.Load(); c != nil {
 		deviceOpts.Transport = c
 	}
@@ -722,8 +743,26 @@ func (a *failedAuthenticator) AuthorizationContext(context.Context) (*authn.Auth
 	return nil, a.err
 }
 
-// tokenCredential is indirected so tests can drive the exchange with a fake
-// credential instead of contacting Entra ID.
+// exchangeTransport returns the HTTP client used to post an Entra token to a
+// registry's token endpoint.
+//
+// The request body carries a live Azure access token, so a redirect must not
+// be followed: a 307 or 308 preserves the method and body, and the Go client
+// would replay both to wherever the Location points, including a host inside
+// the caller's network. The registry has no legitimate reason to redirect this
+// call, so any redirect is refused rather than validated.
+func exchangeTransport(registry string) *http.Client {
+	base := http.DefaultClient
+	if c := sharedClient.Load(); c != nil {
+		base = c
+	}
+	client := *base
+	client.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
+		return fmt.Errorf("acr: refusing to follow a redirect from the %s token endpoint to %s", registry, req.URL.Host)
+	}
+	return &client
+}
+
 var tokenCredential = credentialForRegistry
 
 // tenantMismatchRe matches the rejection ACR returns for a token issued by a
@@ -890,9 +929,7 @@ func rememberTenant(ctx context.Context, registry string, credential azcore.Toke
 // known, is passed along because it is how ACR resolves a guest identity.
 func exchangeWithCredential(ctx context.Context, registry string, credential azcore.TokenCredential, tenant string) (string, error) {
 	options := &azcontainerregistry.AuthenticationClientOptions{}
-	if c := sharedClient.Load(); c != nil {
-		options.Transport = c
-	}
+	options.Transport = exchangeTransport(registry)
 	client, err := azcontainerregistry.NewAuthenticationClient("https://"+registry, options)
 	if err != nil {
 		return "", err

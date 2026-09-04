@@ -63,9 +63,10 @@ To use Azure CLI / managed identity based login, mount the host credentials, e.g
 An `acr://` path addresses an OCI artifact in an Azure Container Registry (or any registry implementing the OCI distribution spec):
 
 ```
+acr://<registry>                           # lists the registry's repositories
+acr://<registry>/<repository>              # lists the repository's tags
 acr://<registry>/<repository>:<tag>[/<file>]
 acr://<registry>/<repository>@<digest>[/<file>]
-acr://<registry>/<repository>              # defaults to the "latest" tag
 ```
 
 A registry name without a dot is expanded to `<name>.azurecr.io`, and paths are printed back in that short form. A path names one of three things, each a directory of the next:

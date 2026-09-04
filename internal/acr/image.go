@@ -130,75 +130,133 @@ func (g *imageGroup) expand(ctx context.Context, p Path) ([]File, error) {
 }
 
 func (g *imageGroup) read(ctx context.Context, p Path) ([]File, error) {
-	// Applied in layer order so a later layer replaces what an earlier one
-	// wrote; names is kept alongside to preserve that order in the listing.
+	// merged is the filesystem built up by the layers applied so far, and
+	// names preserves the order entries were first seen in.
 	merged := map[string]File{}
 	var names []string
+	// listed guards the order slice: a name removed by a whiteout and written
+	// again by the same layer is still one entry, and appending on every
+	// reappearance would list it twice.
+	listed := map[string]bool{}
+	// seen counts every name a layer offered, including ones later removed:
+	// bounding only the live map would let a layer add and delete in turn
+	// forever while names grew without limit.
+	seen := 0
 	for _, layer := range g.layers {
-		if err := g.readLayer(ctx, p, layer, merged, &names); err != nil {
+		added, addedNames, whiteouts, count, err := g.readLayer(ctx, p, layer, seen)
+		if err != nil {
 			return nil, err
 		}
+		seen = count
+		// Whiteouts hide what is underneath, so they are applied to the lower
+		// layers only. Applying them to this layer's own entries would let a
+		// tar hide files it legitimately contains, since a whiteout can
+		// appear before the entry it does not refer to.
+		for _, w := range whiteouts {
+			removeTree(merged, w)
+			delete(merged, w)
+		}
+		for _, name := range addedNames {
+			if !listed[name] {
+				listed[name] = true
+				names = append(names, name)
+			}
+			merged[name] = added[name]
+		}
 	}
+
 	entries := make([]File, 0, len(merged))
 	for _, name := range names {
 		if file, ok := merged[name]; ok {
 			entries = append(entries, file)
 		}
 	}
+	// The names come from the registry, so they are held to the same
+	// coexistence rules as layer titles: a pair that differs only by case or
+	// Unicode normalisation, or a file that is also a directory, cannot be
+	// written to one local tree.
+	if err := validateNames(entries); err != nil {
+		return nil, err
+	}
 	return entries, nil
 }
 
-func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, merged map[string]File, names *[]string) error {
+// validateNames rejects a set of names that cannot coexist on a local
+// filesystem, matching what is enforced for a published artifact.
+func validateNames(entries []File) error {
+	set := newNameSet(len(entries))
+	for _, entry := range entries {
+		if _, err := set.addLayer(entry.Name, entry.Digest+entry.TarPath); err != nil {
+			return fmt.Errorf("acr: %w", err)
+		}
+	}
+	return nil
+}
+
+// readLayer indexes one tar layer, returning its entries, the order they
+// appeared in, the paths it whites out, and the running name count.
+func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen int) (map[string]File, []string, []string, int, error) {
 	blob, err := openBlob(ctx, p, layer.digest)
 	if err != nil {
-		return err
+		return nil, nil, nil, seen, err
 	}
 	defer func() { _ = blob.Close() }()
 
 	reader, err := tarReader(blob)
 	if err != nil {
-		return fmt.Errorf("acr: reading layer %s: %w", layer.digest, err)
+		return nil, nil, nil, seen, fmt.Errorf("acr: reading layer %s: %w", layer.digest, err)
 	}
 	archive := tar.NewReader(reader)
+	added := map[string]File{}
+	var order []string
+	var whiteouts []string
+	// occurrences counts headers per path so a duplicated entry can be found
+	// again: a tar is a log, and the last write of a path is the live one.
+	occurrences := map[string]int{}
 	for {
 		header, err := archive.Next()
 		if errors.Is(err, io.EOF) {
-			return nil
+			return added, order, whiteouts, seen, nil
 		}
 		if err != nil {
-			return fmt.Errorf("acr: reading layer %s: %w", layer.digest, err)
+			return nil, nil, nil, seen, fmt.Errorf("acr: reading layer %s: %w", layer.digest, err)
 		}
-		name, whiteout, ok := tarEntryName(header)
+		index := occurrences[header.Name]
+		occurrences[header.Name]++
+
+		name, kind, ok := tarEntryName(header)
 		if !ok {
 			continue
 		}
 		full := name
-		if g.prefix != "" {
+		if g.prefix != "" && name != "" {
 			full = g.prefix + "/" + name
+		} else if g.prefix != "" {
+			full = g.prefix
 		}
-		switch {
-		case whiteout == whiteoutOpaque:
-			removeTree(merged, full)
-		case whiteout != "":
-			delete(merged, full)
-		default:
-			if _, seen := merged[full]; !seen {
-				if len(merged) >= maxTarEntries {
-					return fmt.Errorf("acr: layer %s holds more than %d files", layer.digest, maxTarEntries)
-				}
-				*names = append(*names, full)
-			}
-			merged[full] = File{
-				Name:    full,
-				Size:    header.Size,
-				Digest:  layer.digest,
-				TarPath: header.Name,
-			}
+		if kind != entryFile {
+			whiteouts = append(whiteouts, full)
+			continue
+		}
+		seen++
+		if seen > maxTarEntries {
+			return nil, nil, nil, seen, fmt.Errorf("acr: image holds more than %d files", maxTarEntries)
+		}
+		if _, exists := added[full]; !exists {
+			order = append(order, full)
+		}
+		added[full] = File{
+			Name:     full,
+			Size:     header.Size,
+			Digest:   layer.digest,
+			TarPath:  header.Name,
+			TarIndex: index,
 		}
 	}
 }
 
-// removeTree drops everything under an opaque whiteout directory.
+// removeTree drops everything beneath a whited-out path. A whiteout can name a
+// directory, and its descendants go with it.
 func removeTree(merged map[string]File, dir string) {
 	prefix := dir + "/"
 	for name := range merged {
@@ -206,48 +264,79 @@ func removeTree(merged map[string]File, dir string) {
 			delete(merged, name)
 		}
 	}
+	if dir == "" {
+		// An opaque whiteout at the root hides everything below it.
+		for name := range merged {
+			delete(merged, name)
+		}
+	}
 }
+
+// entryKind distinguishes a file from the two whiteout markers.
+type entryKind int
+
+const (
+	entryFile entryKind = iota
+	entryWhiteout
+	entryOpaque
+)
 
 // tarEntryName validates a tar entry and classifies it.
 //
 // Only regular files become entries: a directory has no contents of its own,
 // and a symlink, hardlink or device cannot be served as a stream of bytes.
-// Entry names come from the registry, so they are validated exactly like a
-// layer title rather than trusted into a path.
-func tarEntryName(header *tar.Header) (name, whiteout string, ok bool) {
-	clean := path.Clean("/" + strings.ReplaceAll(header.Name, `\`, "/"))
-	clean = strings.TrimPrefix(clean, "/")
-	if clean == "" || clean == "." {
-		return "", "", false
+//
+// The name is validated as written rather than repaired. Cleaning first would
+// turn "../escape" into "escape" and "/etc/passwd" into "etc/passwd", quietly
+// admitting a hostile entry under a name that looks ordinary and can alias a
+// legitimate one. A leading "./" is the one exception, because it is how tools
+// routinely write layer paths and means nothing.
+func tarEntryName(header *tar.Header) (name string, kind entryKind, ok bool) {
+	raw := strings.TrimPrefix(header.Name, "./")
+	raw = strings.TrimSuffix(raw, "/")
+	if raw == "" || raw == "." {
+		// The root itself, which only matters as an opaque whiteout's parent.
+		return "", entryFile, false
+	}
+	if strings.Contains(raw, `\`) || strings.HasPrefix(raw, "/") {
+		return "", entryFile, false
 	}
 
-	base := path.Base(clean)
+	base := path.Base(raw)
 	if base == whiteoutOpaque {
-		parent := path.Dir(clean)
-		if parent == "." {
-			return "", "", false
+		parent := strings.TrimSuffix(raw, whiteoutOpaque)
+		parent = strings.TrimSuffix(parent, "/")
+		if parent == "" {
+			// A root opaque whiteout is valid and hides every lower entry.
+			return "", entryOpaque, true
 		}
-		if _, err := cleanFile(parent); err != nil {
-			return "", "", false
+		if !isSafeEntryName(parent) {
+			return "", entryFile, false
 		}
-		return parent, whiteoutOpaque, true
+		return parent, entryOpaque, true
 	}
 	if after, found := strings.CutPrefix(base, whiteoutPrefix); found {
-		removed := path.Join(path.Dir(clean), after)
-		if _, err := cleanFile(removed); err != nil {
-			return "", "", false
+		removed := path.Join(path.Dir(raw), after)
+		if !isSafeEntryName(removed) {
+			return "", entryFile, false
 		}
-		return removed, whiteoutPrefix, true
+		return removed, entryWhiteout, true
 	}
 
 	if header.Typeflag != tar.TypeReg {
-		return "", "", false
+		return "", entryFile, false
 	}
-	cleaned, err := cleanFile(clean)
-	if err != nil {
-		return "", "", false
+	if !isSafeEntryName(raw) {
+		return "", entryFile, false
 	}
-	return cleaned, "", true
+	return raw, entryFile, true
+}
+
+// isSafeEntryName reports whether a name is already canonical and safe, so an
+// entry is accepted as written or not at all.
+func isSafeEntryName(name string) bool {
+	cleaned, err := cleanFile(name)
+	return err == nil && cleaned == name
 }
 
 // tarReader gunzips a layer when it is compressed. The media type is not
@@ -267,9 +356,10 @@ func tarReader(blob io.Reader) (io.Reader, error) {
 
 // openTarEntry streams one file out of a tar layer.
 //
-// A tar is sequential, so the entry is found by scanning headers and the
-// reader is handed back positioned at its contents; the layer before it is
-// skipped rather than buffered, and nothing after it is read.
+// A tar is a log rather than a directory, so a path can appear more than once
+// and the last header is the live one. The occurrence recorded when the layer
+// was indexed is matched here, or a listing would describe one entry while a
+// download served another.
 func openTarEntry(ctx context.Context, p Path, file File) (io.ReadCloser, error) {
 	blob, err := openBlob(ctx, p, file.Digest)
 	if err != nil {
@@ -281,6 +371,7 @@ func openTarEntry(ctx context.Context, p Path, file File) (io.ReadCloser, error)
 		return nil, fmt.Errorf("acr: reading layer %s: %w", file.Digest, err)
 	}
 	archive := tar.NewReader(reader)
+	seen := 0
 	for {
 		header, err := archive.Next()
 		if errors.Is(err, io.EOF) {
@@ -291,21 +382,64 @@ func openTarEntry(ctx context.Context, p Path, file File) (io.ReadCloser, error)
 			_ = blob.Close()
 			return nil, fmt.Errorf("acr: reading layer %s: %w", file.Digest, err)
 		}
-		if header.Name != file.TarPath || header.Typeflag != tar.TypeReg {
+		if header.Name != file.TarPath {
 			continue
 		}
-		return &tarEntryReader{Reader: archive, closer: blob, size: header.Size}, nil
+		if seen != file.TarIndex {
+			seen++
+			continue
+		}
+		if header.Typeflag != tar.TypeReg {
+			_ = blob.Close()
+			return nil, &notFoundError{path: p.String()}
+		}
+		return &tarEntryReader{
+			Reader: io.LimitReader(archive, header.Size),
+			blob:   blob,
+			rest:   reader,
+			size:   header.Size,
+		}, nil
 	}
 }
 
 // tarEntryReader reads one entry and closes the layer beneath it.
+//
+// go-containerregistry verifies a blob against its digest as it is read, and
+// only completes that check at EOF. Stopping at the entry would leave the
+// layer unverified, so the remainder is drained before the read is reported as
+// successful: without it a registry could serve altered bytes for everything
+// after the entry, and for the entry itself on a later read.
 type tarEntryReader struct {
 	io.Reader
-	closer io.Closer
-	size   int64
+	blob io.ReadCloser
+	rest io.Reader
+	size int64
+
+	drained bool
+	err     error
 }
 
-func (r *tarEntryReader) Close() error { return r.closer.Close() }
+func (r *tarEntryReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if errors.Is(err, io.EOF) && !r.drained {
+		r.drained = true
+		if _, drainErr := io.Copy(io.Discard, r.rest); drainErr != nil {
+			// The digest did not match, or the layer was truncated. Either way
+			// the bytes just read cannot be trusted.
+			r.err = fmt.Errorf("acr: layer verification failed: %w", drainErr)
+			return n, r.err
+		}
+	}
+	return n, err
+}
+
+func (r *tarEntryReader) Close() error {
+	closeErr := r.blob.Close()
+	if r.err != nil {
+		return r.err
+	}
+	return closeErr
+}
 
 // Size reports the entry size, so a download can show progress against it
 // rather than against the whole layer.

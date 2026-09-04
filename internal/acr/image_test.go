@@ -221,8 +221,9 @@ func TestImageLayersOverlay(t *testing.T) {
 	}
 }
 
-// Tar entry names come from the registry, so they are validated exactly like a
-// layer title rather than trusted into a path.
+// Tar entry names come from the registry and are validated as written rather
+// than repaired: cleaning first would turn a traversal into an ordinary-looking
+// name that can alias a legitimate entry.
 func TestImageLayerRejectsUnsafeEntries(t *testing.T) {
 	host := newTestRegistry(t)
 	p := Path{Registry: host, Repository: "unsafe", Reference: "latest"}
@@ -230,8 +231,9 @@ func TestImageLayerRejectsUnsafeEntries(t *testing.T) {
 		"linux/amd64": imageWithLayers(t, tarGz(t,
 			[2]string{"../escape", "nope"},
 			[2]string{"/absolute", "nope"},
+			[2]string{`..\windows`, "nope"},
 			[2]string{"dir/", ""},
-			[2]string{"safe.txt", "fine"},
+			[2]string{"./safe.txt", "fine"},
 		)),
 	})
 
@@ -242,18 +244,134 @@ func TestImageLayerRejectsUnsafeEntries(t *testing.T) {
 		t.Fatalf("ListDir failed: %v", err)
 	}
 	names := entryNames(entries)
-	// "../escape" cleans to "escape" and "/absolute" to "absolute"; neither may
-	// keep its traversal, and the directory entry is not a file.
+	// A traversal must be dropped, not admitted under a repaired name: neither
+	// "escape" nor "absolute" may appear.
 	for _, name := range names {
+		switch name {
+		case "escape", "absolute", "windows", "dir/":
+			t.Errorf("unsafe or non-file entry survived as %q", name)
+		}
 		if strings.Contains(name, "..") || strings.HasPrefix(name, "/") {
 			t.Errorf("unsafe entry survived: %q", name)
 		}
-		if name == "dir/" {
-			t.Errorf("a directory entry is not a file: %q", name)
-		}
 	}
+	// A leading "./" is how tools routinely write layer paths and means
+	// nothing, so that entry is kept.
 	if !slicesContains(names, "safe.txt") {
 		t.Errorf("listing = %v, want the safe entry kept", names)
+	}
+}
+
+// A whiteout hides what lower layers put there, including a whole directory,
+// and an opaque whiteout at the root hides everything.
+func TestImageWhiteoutRemovesSubtrees(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "whiteout", Reference: "latest"}
+	base := tarGz(t,
+		[2]string{"dir/keep.txt", "a"},
+		[2]string{"dir/nested/deep.txt", "b"},
+		[2]string{"top.txt", "c"},
+	)
+	// Removing "dir" must take its descendants with it.
+	top := tarGz(t, [2]string{"dir/.wh.nested", ""}, [2]string{"new.txt", "d"})
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t, base, top)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	for _, file := range files {
+		if strings.Contains(file.Name, "nested") {
+			t.Errorf("a whiteout on a directory must remove its contents, kept %q", file.Name)
+		}
+	}
+
+	// A whiteout must not hide a file its own layer provides, whatever order
+	// the entries appear in.
+	q := Path{Registry: host, Repository: "sameLayer", Reference: "latest"}
+	q.Repository = "samelayer"
+	pushIndex(t, q, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"a.txt", "old"}),
+		tarGz(t, [2]string{".wh.a.txt", ""}, [2]string{"a.txt", "new"}),
+	)})
+	q.File = "linux/amd64"
+	kept, err := ListFiles(t.Context(), q)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	if len(kept) != 1 || kept[0].Name != "linux/amd64/a.txt" {
+		t.Fatalf("listing = %#v, want the layer's own file kept", kept)
+	}
+}
+
+// A root opaque whiteout is valid and hides every entry from lower layers.
+func TestImageRootOpaqueWhiteout(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "opaque", Reference: "latest"}
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"old.txt", "gone"}, [2]string{"sub/old.txt", "gone"}),
+		tarGz(t, [2]string{".wh..wh..opq", ""}, [2]string{"new.txt", "kept"}),
+	)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "linux/amd64/new.txt" {
+		t.Fatalf("listing = %#v, want only the upper layer's file", files)
+	}
+}
+
+// A tar is a log, so the same path can appear twice and the last header is the
+// live one. The listing and the download must agree on which that is.
+func TestImageDuplicateTarEntries(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "dupes", Reference: "latest"}
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"app", "first-version"}, [2]string{"app", "second"}),
+	)})
+
+	file := p
+	file.File = "linux/amd64/app"
+	stat, err := Stat(t.Context(), file)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	reader, err := DownloadStream(t.Context(), file)
+	if err != nil {
+		t.Fatalf("DownloadStream failed: %v", err)
+	}
+	content, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if string(content) != "second" {
+		t.Fatalf("content = %q, want the last entry", content)
+	}
+	if stat.Size != int64(len(content)) {
+		t.Fatalf("stat size %d does not describe the served entry (%d bytes)", stat.Size, len(content))
+	}
+}
+
+// Image entries are held to the same coexistence rules as layer titles, so a
+// registry cannot hand back a pair that maps to one local path.
+func TestImageRejectsCollidingNames(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "collide", Reference: "latest"}
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"A.txt", "upper"}, [2]string{"a.txt", "lower"}),
+	)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	if _, err := ListFiles(t.Context(), arch); err == nil ||
+		!strings.Contains(err.Error(), "differ only by case or Unicode normalisation") {
+		t.Fatalf("expected colliding image names to be rejected, got %v", err)
 	}
 }
 
