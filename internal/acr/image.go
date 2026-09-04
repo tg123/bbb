@@ -393,10 +393,11 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 		// The entry count alone does not bound memory: a name is
 		// registry-controlled and PAX or GNU long names can be enormous, so a
 		// few entries could exhaust the budget the count is meant to protect.
-		if len(header.Name) > maxEntryNameBytes {
+		// A link target is retained just as a name is, so it is charged too.
+		if len(header.Name) > maxEntryNameBytes || len(header.Linkname) > maxEntryNameBytes {
 			continue
 		}
-		nameBytes += len(header.Name)
+		nameBytes += len(header.Name) + len(header.Linkname)
 		if err := g.budget.charge(g, budgetUse{entries: seen, names: nameBytes}); err != nil {
 			return nil, nil, nil, seen, nameBytes, err
 		}
