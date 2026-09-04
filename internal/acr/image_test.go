@@ -924,6 +924,101 @@ func TestImageResolvesHardLinks(t *testing.T) {
 	}
 }
 
+// A title beneath a platform directory is an ordinary child: a manifest may
+// carry both an untitled filesystem layer and a titled metadata file.
+func TestImageAllowsTitleUnderPlatformDirectory(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "mixedmanifest", Reference: "latest"}
+
+	image, err := mutate.Append(empty.Image,
+		mutate.Addendum{Layer: tarGz(t, [2]string{"orng", "binary"}), MediaType: types.DockerLayer},
+		mutate.Addendum{
+			Layer:       tarGz(t, [2]string{"ignored", "x"}),
+			MediaType:   types.MediaType("application/octet-stream"),
+			Annotations: map[string]string{TitleAnnotation: "metadata.json"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{
+		Add:        image,
+		Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}},
+	})
+	ref, err := name.NewTag(p.Registry+"/"+p.Repository+":"+p.Reference, name.WeakValidation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.WriteIndex(ref, index); err != nil {
+		t.Fatalf("WriteIndex failed: %v", err)
+	}
+	invalidateLayers(p)
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Name)
+	}
+	if !slicesContains(names, "linux/amd64/metadata.json") || !slicesContains(names, "linux/amd64/orng") {
+		t.Fatalf("listing = %v, want the titled file alongside the expanded layer", names)
+	}
+}
+
+// A tar is a log, so a regular header after a hard link must win: resolving
+// links at the end must not resurrect a path a later header replaced.
+func TestImageHardLinkDoesNotOverrideLaterHeader(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "linkorder", Reference: "latest"}
+
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	archive := tar.NewWriter(gz)
+	write := func(name, content string) {
+		if err := archive.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o644, Size: int64(len(content)), Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := archive.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("real", "target-content")
+	if err := archive.WriteHeader(&tar.Header{
+		Name: "alias", Mode: 0o644, Typeflag: tar.TypeLink, Linkname: "real",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	write("alias", "later-wins")
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pushIndex(t, p, map[string]v1.Image{
+		"linux/amd64": imageWithLayers(t, static.NewLayer(raw.Bytes(), types.DockerLayer)),
+	})
+
+	alias := p
+	alias.File = "linux/amd64/alias"
+	reader, err := DownloadStream(t.Context(), alias)
+	if err != nil {
+		t.Fatalf("DownloadStream failed: %v", err)
+	}
+	content, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil || string(content) != "later-wins" {
+		t.Fatalf("content = %q (%v), want the header written after the link", content, err)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.

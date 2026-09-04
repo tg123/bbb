@@ -824,7 +824,9 @@ type artifact struct {
 	// budget bounds what every group retains together, since an index can
 	// declare any number of platforms.
 	budget *imageBudget
-	mu     sync.Mutex
+	// validated memoises the cross-source name check per group.
+	validated map[*imageGroup]error
+	mu        sync.Mutex
 }
 
 // layerCacheEntry memoises one resolved artifact.
@@ -922,24 +924,31 @@ func fetchArtifact(ctx context.Context, p Path) (*artifact, error) {
 
 // checkPrefixCollisions rejects a titled layer that cannot coexist with a
 // platform directory.
+//
+// Only a title that *is* the directory, or that sits above it, is a conflict.
+// A title beneath one is an ordinary child: a manifest may carry both an
+// untitled filesystem layer and a titled metadata.json, and rejecting that
+// would refuse a perfectly serviceable image.
 func (a *artifact) checkPrefixCollisions() error {
 	if len(a.groups) == 0 {
 		return nil
-	}
-	set := newNameSet(len(a.files) + len(a.groups))
-	for _, file := range a.files {
-		if _, err := set.addLayer(file.Name, file.Digest); err != nil {
-			return fmt.Errorf("acr: %w", err)
-		}
 	}
 	for _, group := range a.groups {
 		if group.prefix == "" {
 			continue
 		}
-		// Adding the directory as if it were a name catches both an identical
-		// title and one that is an ancestor or descendant of it.
-		if _, err := set.addLayer(group.prefix, "platform:"+group.prefix); err != nil {
-			return fmt.Errorf("acr: %w", err)
+		folded := foldKey(group.prefix)
+		for _, file := range a.files {
+			switch {
+			case foldKey(file.Name) == folded:
+				return fmt.Errorf(
+					"acr: layer %q and the %s platform directory claim one name",
+					file.Name, group.prefix)
+			case strings.HasPrefix(folded, foldKey(file.Name)+"/"):
+				return fmt.Errorf(
+					"acr: layer %q is a file and also a directory holding %s",
+					file.Name, group.prefix)
+			}
 		}
 	}
 	return nil
@@ -1101,6 +1110,22 @@ func (a *artifact) materialise(ctx context.Context, p Path, file string) ([]File
 
 // lookup finds a single file, expanding only the layer that could hold it.
 func (a *artifact) lookup(ctx context.Context, p Path, name string) (File, bool, error) {
+	// A titled layer and a group's entries share one namespace when the group
+	// sits at the root, so the two sources are checked against each other
+	// before either is served — otherwise a direct read would hand back a name
+	// that a recursive listing rejects.
+	for _, group := range a.groups {
+		if group.prefix != "" || !group.covers(name) {
+			continue
+		}
+		entries, err := group.expand(ctx, p)
+		if err != nil {
+			return File{}, false, err
+		}
+		if err := a.validateAgainst(group, entries); err != nil {
+			return File{}, false, err
+		}
+	}
 	if file, ok := a.byName[name]; ok {
 		return file, true, nil
 	}
@@ -1118,6 +1143,23 @@ func (a *artifact) lookup(ctx context.Context, p Path, name string) (File, bool,
 		}
 	}
 	return File{}, false, nil
+}
+
+// validateAgainst checks a group's entries against the titled layers once,
+// memoised so a per-file lookup does not repeat it.
+func (a *artifact) validateAgainst(group *imageGroup, entries []File) error {
+	if a.validated == nil {
+		a.validated = map[*imageGroup]error{}
+	}
+	if err, done := a.validated[group]; done {
+		return err
+	}
+	combined := make([]File, 0, len(a.files)+len(entries))
+	combined = append(combined, a.files...)
+	combined = append(combined, entries...)
+	err := validateNames(combined)
+	a.validated[group] = err
+	return err
 }
 
 // unexpandedDirs returns the directories that exist because a tar layer will be

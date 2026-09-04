@@ -363,6 +363,10 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 	var order []string
 	var shadows []shadow
 	var links []hardLink
+	// writtenAt records the header ordinal that last decided each path, so a
+	// hard link resolved afterwards cannot undo a later header.
+	writtenAt := map[string]int{}
+	ordinal := 0
 	// occurrences counts headers per path so a duplicated entry can be found
 	// again: a tar is a log, and the last write of a path is the live one.
 	occurrences := map[string]int{}
@@ -376,7 +380,7 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			if _, drainErr := io.Copy(io.Discard, reader); drainErr != nil {
 				return nil, nil, nil, seen, nameBytes, fmt.Errorf("acr: verifying layer %s: %w", layer.digest, drainErr)
 			}
-			g.resolveLinks(links, added, &order, merged)
+			g.resolveLinks(links, added, &order, writtenAt, merged)
 			return added, order, shadows, seen, nameBytes, nil
 		}
 		if err != nil {
@@ -417,9 +421,11 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 		if kind == entryLink {
 			// Resolved once the layer's own entries are known, since a link
 			// may name one of them.
-			links = append(links, hardLink{name: full, target: header.Linkname})
+			ordinal++
+			links = append(links, hardLink{name: full, target: header.Linkname, at: ordinal})
 			continue
 		}
+		ordinal++
 		if kind != entryFile {
 			// A tar is a log: this also replaces what the same layer wrote
 			// earlier at that path, and for anything but a directory the
@@ -428,12 +434,14 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			if kind != entryDir {
 				removeUnderOne(added, full)
 			}
+			writtenAt[full] = ordinal
 			shadows = append(shadows, shadow{path: full, subtree: kind != entryDir})
 			continue
 		}
 		if _, exists := added[full]; !exists {
 			order = append(order, full)
 		}
+		writtenAt[full] = ordinal
 		added[full] = File{
 			Name:     full,
 			Size:     header.Size,
@@ -448,14 +456,21 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 type hardLink struct {
 	name   string
 	target string
+	// at is the header ordinal, so a link cannot resurrect a path that a later
+	// header replaced: a tar is a log and the last write wins.
+	at int
 }
 
 // resolveLinks turns hard links into entries of their own, taking the target's
 // content. A link resolves against the layer that declared it first, then the
 // layers below, and one whose target cannot be found is dropped rather than
 // listed as something unreadable.
-func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order *[]string, merged map[string]File) {
+func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order *[]string, writtenAt map[string]int, merged map[string]File) {
 	for _, link := range links {
+		if at, ok := writtenAt[link.name]; ok && at > link.at {
+			// A later header already decided this path.
+			continue
+		}
 		target := strings.TrimPrefix(link.target, "./")
 		target = strings.TrimSuffix(target, "/")
 		if target == "" || strings.HasPrefix(target, "/") || !isSafeEntryName(target) {
@@ -481,6 +496,7 @@ func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order
 			TarPath:  source.TarPath,
 			TarIndex: source.TarIndex,
 		}
+		writtenAt[link.name] = link.at
 	}
 }
 

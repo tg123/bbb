@@ -348,14 +348,15 @@ func credentialForRegistry(ctx context.Context, registry string) (azcore.TokenCr
 		return cached.(azcore.TokenCredential), nil
 	}
 
-	inflight, _ := tenantCredInflight.LoadOrStore(tid, &sync.Mutex{})
-	mu := inflight.(*sync.Mutex)
-	mu.Lock()
-	defer mu.Unlock()
+	inflight, _ := tenantCredInflight.LoadOrStore(tid, newGate())
+	if err := inflight.(gate).acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer inflight.(gate).release()
 	if cached, ok := tenantCredCache.Load(tid); ok {
 		return cached.(azcore.TokenCredential), nil
 	}
-	// Waiting for the lock can outlast the caller: a sign-in that was
+	// Waiting for the gate can outlast the caller: a sign-in that was
 	// interrupted must not be restarted by whoever was queued behind it.
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -886,8 +887,10 @@ func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 
 	// Serialised so two registries in the same foreign tenant do not each open
 	// a sign-in: whoever waits here re-checks the cached credentials first.
-	unknownTenantRecovery.Lock()
-	defer unknownTenantRecovery.Unlock()
+	if err := unknownTenantRecovery.acquire(ctx); err != nil {
+		return "", err
+	}
+	defer unknownTenantRecovery.release()
 
 	// The registry will not say which tenant it belongs to, but a sign-in
 	// earlier in this run, or the Azure CLI, may already have one that works.
@@ -923,10 +926,34 @@ func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 	return token, nil
 }
 
+// gate is a mutex a waiter can abandon.
+//
+// Acquisition here can sit behind an interactive sign-in, which lasts as long
+// as the user takes. A plain sync.Mutex would keep a cancelled caller blocked
+// for all of it, so waiters select on their own context instead.
+type gate chan struct{}
+
+func newGate() gate {
+	g := make(gate, 1)
+	g <- struct{}{}
+	return g
+}
+
+func (g gate) acquire(ctx context.Context) error {
+	select {
+	case <-g:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (g gate) release() { g <- struct{}{} }
+
 // unknownTenantRecovery serialises the tenant-unknown path, so two registries
 // in the same foreign tenant do not each open a sign-in. The cached credential
 // the first one obtained is tried before anything is asked of the user.
-var unknownTenantRecovery sync.Mutex
+var unknownTenantRecovery = newGate()
 
 // exchangeViaKnownTenants retries the exchange with tenants already available:
 // those an interactive sign-in established earlier in this run, then those the
