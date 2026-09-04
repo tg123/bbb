@@ -205,6 +205,17 @@ func (g *imageGroup) read(ctx context.Context, p Path) ([]File, error) {
 			clear(merged)
 		}
 		removeUnder(merged, roots)
+		// A tar need not carry an explicit directory header, so an upper
+		// layer's "app/config" can arrive with nothing announcing "app". If a
+		// lower layer had a regular file there it has become a directory, and
+		// leaving it would report a file and a directory at one path. Only the
+		// exact ancestors go: the lower layer's other children and siblings
+		// are still part of the image.
+		for name := range added {
+			for dir := path.Dir(name); dir != "." && dir != "/"; dir = path.Dir(dir) {
+				delete(merged, dir)
+			}
+		}
 
 		for _, name := range addedNames {
 			file, ok := added[name]

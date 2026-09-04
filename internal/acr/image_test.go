@@ -541,6 +541,39 @@ func TestImageRejectsUnusablePlatform(t *testing.T) {
 	}
 }
 
+// A tar need not announce a directory before the files in it, so an upper
+// layer can turn a lower regular file into a directory implicitly. The lower
+// file has to go, while its siblings stay.
+func TestImageImplicitDirectoryReplacesLowerFile(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "implicitdir", Reference: "latest"}
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"app", "was-a-file"}, [2]string{"sibling.txt", "kept"}),
+		// No "app/" header, which is valid.
+		tarGz(t, [2]string{"app/config", "now-a-directory"}),
+	)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Name)
+	}
+	if slicesContains(names, "linux/amd64/app") {
+		t.Errorf("listing = %v, want the lower file replaced by the directory", names)
+	}
+	if !slicesContains(names, "linux/amd64/app/config") {
+		t.Errorf("listing = %v, want the upper file", names)
+	}
+	if !slicesContains(names, "linux/amd64/sibling.txt") {
+		t.Errorf("listing = %v, want unrelated lower entries kept", names)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.
