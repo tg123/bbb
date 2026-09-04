@@ -465,39 +465,61 @@ type hardLink struct {
 // content. A link resolves against the layer that declared it first, then the
 // layers below, and one whose target cannot be found is dropped rather than
 // listed as something unreadable.
+//
+// Links are resolved repeatedly until a pass settles nothing new, so a chain
+// resolves whichever order it appears in. A cycle, or a genuinely dangling
+// target, simply stops making progress and is dropped.
 func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order *[]string, writtenAt map[string]int, merged map[string]File) {
-	for _, link := range links {
-		if at, ok := writtenAt[link.name]; ok && at > link.at {
-			// A later header already decided this path.
-			continue
+	pending := links
+	for len(pending) > 0 {
+		var unresolved []hardLink
+		for _, link := range pending {
+			if !g.resolveLink(link, added, order, writtenAt, merged) {
+				unresolved = append(unresolved, link)
+			}
 		}
-		target := strings.TrimPrefix(link.target, "./")
-		target = strings.TrimSuffix(target, "/")
-		if target == "" || strings.HasPrefix(target, "/") || !isSafeEntryName(target) {
-			continue
+		if len(unresolved) == len(pending) {
+			// Nothing moved, so the rest are cycles or dangling.
+			return
 		}
-		if g.prefix != "" {
-			target = g.prefix + "/" + target
-		}
-		source, ok := added[target]
-		if !ok {
-			source, ok = merged[target]
-		}
-		if !ok {
-			continue
-		}
-		if _, exists := added[link.name]; !exists {
-			*order = append(*order, link.name)
-		}
-		added[link.name] = File{
-			Name:     link.name,
-			Size:     source.Size,
-			Digest:   source.Digest,
-			TarPath:  source.TarPath,
-			TarIndex: source.TarIndex,
-		}
-		writtenAt[link.name] = link.at
+		pending = unresolved
 	}
+}
+
+// resolveLink installs one link, reporting whether its target was found.
+func (g *imageGroup) resolveLink(link hardLink, added map[string]File, order *[]string, writtenAt map[string]int, merged map[string]File) bool {
+	if at, ok := writtenAt[link.name]; ok && at > link.at {
+		// A later header already decided this path, so the link is spent
+		// rather than unresolved.
+		return true
+	}
+	target := strings.TrimPrefix(link.target, "./")
+	target = strings.TrimSuffix(target, "/")
+	if target == "" || strings.HasPrefix(target, "/") || !isSafeEntryName(target) {
+		return true
+	}
+	if g.prefix != "" {
+		target = g.prefix + "/" + target
+	}
+	source, ok := added[target]
+	if !ok {
+		source, ok = merged[target]
+	}
+	if !ok {
+		return false
+	}
+	if _, exists := added[link.name]; !exists {
+		*order = append(*order, link.name)
+	}
+	added[link.name] = File{
+		Name:     link.name,
+		Size:     source.Size,
+		Digest:   source.Digest,
+		TarPath:  source.TarPath,
+		TarIndex: source.TarIndex,
+	}
+	writtenAt[link.name] = link.at
+	return true
 }
 
 // removeUnderOne deletes every entry beneath a single path.

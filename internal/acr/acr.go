@@ -1275,6 +1275,9 @@ func ListDir(ctx context.Context, p Path) ([]Entry, error) {
 		if expandErr != nil {
 			return nil, expandErr
 		}
+		if err := art.validateAgainst(group, entries); err != nil {
+			return nil, err
+		}
 		files = append(files, entries...)
 	}
 	files = append(files, art.files...)

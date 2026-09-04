@@ -1019,6 +1019,82 @@ func TestImageHardLinkDoesNotOverrideLaterHeader(t *testing.T) {
 	}
 }
 
+// A chain of hard links resolves whichever order it appears in, and a cycle
+// stops rather than spinning.
+func TestImageResolvesChainedHardLinks(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "linkchain", Reference: "latest"}
+
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	archive := tar.NewWriter(gz)
+	body := "target-content"
+	if err := archive.WriteHeader(&tar.Header{
+		Name: "real", Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	for _, link := range []*tar.Header{
+		// alias1 names alias2, which is only defined afterwards.
+		{Name: "alias1", Typeflag: tar.TypeLink, Linkname: "alias2"},
+		{Name: "alias2", Typeflag: tar.TypeLink, Linkname: "real"},
+		// A cycle resolves to nothing and must not spin.
+		{Name: "loopA", Typeflag: tar.TypeLink, Linkname: "loopB"},
+		{Name: "loopB", Typeflag: tar.TypeLink, Linkname: "loopA"},
+	} {
+		link.Mode = 0o644
+		if err := archive.WriteHeader(link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pushIndex(t, p, map[string]v1.Image{
+		"linux/amd64": imageWithLayers(t, static.NewLayer(raw.Bytes(), types.DockerLayer)),
+	})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Name)
+	}
+	for _, want := range []string{"linux/amd64/alias1", "linux/amd64/alias2"} {
+		if !slicesContains(names, want) {
+			t.Errorf("listing = %v, want the chain resolved to %s", names, want)
+		}
+	}
+	for _, gone := range []string{"linux/amd64/loopA", "linux/amd64/loopB"} {
+		if slicesContains(names, gone) {
+			t.Errorf("listing = %v, want the cycle dropped", names)
+		}
+	}
+
+	first := p
+	first.File = "linux/amd64/alias1"
+	reader, err := DownloadStream(t.Context(), first)
+	if err != nil {
+		t.Fatalf("DownloadStream failed: %v", err)
+	}
+	content, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil || string(content) != body {
+		t.Fatalf("content = %q (%v), want the end of the chain", content, err)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.
