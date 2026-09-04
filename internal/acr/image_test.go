@@ -1351,6 +1351,57 @@ func TestImageHardLinkTakesTheTargetAtItsOwnPosition(t *testing.T) {
 	}
 }
 
+// A scratch image has no files, but it is still a member of the index: its
+// platform is a directory that exists, and dropping it would leave the
+// platform missing from a listing and unknown to Stat.
+func TestImageKeepsEmptyPlatform(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "scratch", Reference: "latest"}
+	pushIndex(t, p, map[string]v1.Image{
+		"linux/amd64": imageWithLayers(t, tarGz(t, [2]string{"app", "binary"})),
+		"linux/arm64": imageWithLayers(t),
+	})
+
+	entries, err := ListDir(t.Context(), p)
+	if err != nil {
+		t.Fatalf("ListDir failed: %v", err)
+	}
+	names := entryNames(entries)
+	slices.Sort(names)
+	if want := []string{"linux/"}; !slices.Equal(names, want) {
+		t.Fatalf("root listing = %v, want %v", names, want)
+	}
+
+	inner := p
+	inner.File = "linux"
+	entries, err = ListDir(t.Context(), inner)
+	if err != nil {
+		t.Fatalf("ListDir failed: %v", err)
+	}
+	names = entryNames(entries)
+	slices.Sort(names)
+	if want := []string{"amd64/", "arm64/"}; !slices.Equal(names, want) {
+		t.Fatalf("listing = %v, want the empty platform kept: %v", names, want)
+	}
+
+	empty := p
+	empty.File = "linux/arm64"
+	isDir, err := IsDir(t.Context(), empty)
+	if err != nil {
+		t.Fatalf("IsDir failed: %v", err)
+	}
+	if !isDir {
+		t.Error("an empty platform must still be a directory")
+	}
+	inside, err := ListDir(t.Context(), empty)
+	if err != nil {
+		t.Fatalf("ListDir failed: %v", err)
+	}
+	if len(inside) != 0 {
+		t.Fatalf("listing = %v, want nothing inside an empty platform", entryNames(inside))
+	}
+}
+
 // Two groups can produce the same full name — an unprefixed manifest holding
 // linux/amd64/app alongside a linux/amd64 manifest holding app — so every path
 // must agree that the artifact is ambiguous, not just the recursive one.

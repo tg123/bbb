@@ -1067,7 +1067,11 @@ func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 		a.files = append(a.files, file)
 		a.byName[cleaned] = file
 	}
-	if len(group.layers) > 0 {
+	// A container-image manifest reached through an index contributes its
+	// platform directory even with nothing in it: a scratch image has no
+	// files, but it is still a member of the index, and dropping it would
+	// leave the platform missing from a listing and unknown to Stat.
+	if len(group.layers) > 0 || (filesystem && group.prefix != "") {
 		if len(group.layers) > maxImageLayers {
 			// Merging a layer costs a pass over what the ones below it left,
 			// so the work is the layer count times the entry count. Both are
@@ -1650,6 +1654,15 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 		// two publishers could both observe an absent tag. Ask the registry to
 		// make the manifest PUT create-only; go-containerregistry has no option
 		// for this, so the header is added in the transport.
+		//
+		// This is as far as the guarantee goes. A registry is not obliged to
+		// honour If-None-Match, and the distribution API offers no other way
+		// to claim a tag conditionally, so against one that ignores it two
+		// concurrent publishers can both succeed and the later write wins.
+		// The check below then reports whichever of them lost, which turns a
+		// silent overwrite into an error for that publisher but cannot
+		// prevent the overwrite itself. Serialise publication elsewhere if
+		// two writers may race for one tag.
 		options = append(options, remote.WithTransport(&createOnlyTransport{base: p.transport()}))
 	}
 	if err := remote.Write(ref, image, options...); err != nil {
@@ -1671,7 +1684,8 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 	}
 	if !opts.Overwrite {
 		// Registries are not required to honour If-None-Match, so confirm the
-		// tag holds exactly what we published.
+		// tag holds exactly what we published. On one that ignores it this is
+		// what detects a lost race, after the fact rather than instead of it.
 		if err := confirmPublished(ctx, p, image); err != nil {
 			return err
 		}

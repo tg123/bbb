@@ -100,7 +100,7 @@ bbb cp ./weights.bin acr://myregistry/models/weights:v1
 bbb sync ./llama-artifact/ acr://myregistry/models/llama:v1
 ```
 
-Use `-f` with `cp` to replace an existing tag. `sync` always replaces the destination tag; its exclude filter controls which files become layers.
+Use `-f` with `cp` to replace an existing tag. Without it the manifest is written with `If-None-Match: *` and the published digest is checked afterwards, so an existing tag is refused. Note that a registry is not obliged to honour that condition and the distribution API offers no other way to claim a tag conditionally: against one that ignores it, two publishers racing for the same tag can both write, and the after-the-fact check reports an error to whichever lost rather than preventing the overwrite. Serialise publication elsewhere if that can happen. `sync` always replaces the destination tag; its exclude filter controls which files become layers.
 
 Authentication is resolved in this order:
 
