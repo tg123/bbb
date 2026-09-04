@@ -574,6 +574,34 @@ func TestImageImplicitDirectoryReplacesLowerFile(t *testing.T) {
 	}
 }
 
+// The budget bounds the whole artifact, not each manifest: an index is
+// registry-controlled and can declare any number of platforms, so a per-group
+// limit would be no limit at all.
+func TestImageBudgetIsSharedAcrossGroups(t *testing.T) {
+	budget := newImageBudget()
+	first := &imageGroup{prefix: "linux/amd64", budget: budget}
+	second := &imageGroup{prefix: "linux/arm64", budget: budget}
+
+	if err := budget.charge(first, budgetUse{entries: maxTarEntries - 1}); err != nil {
+		t.Fatalf("the first group should fit: %v", err)
+	}
+	if err := budget.charge(second, budgetUse{entries: 2}); err == nil {
+		t.Fatal("a second group must not be granted its own full allowance")
+	}
+	if err := budget.charge(second, budgetUse{names: maxTotalNameBytes + 1}); err == nil {
+		t.Fatal("the name budget must be shared too")
+	}
+
+	// A group re-read after a failure replaces its own contribution rather
+	// than adding to it, or a retry would exhaust the budget by itself.
+	if err := budget.charge(first, budgetUse{entries: 1}); err != nil {
+		t.Fatalf("re-charging one group must replace its earlier use: %v", err)
+	}
+	if err := budget.charge(second, budgetUse{entries: maxTarEntries - 2}); err != nil {
+		t.Fatalf("the released allowance should be available: %v", err)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.

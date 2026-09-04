@@ -821,6 +821,9 @@ type artifact struct {
 	// reaches inside one. Listing a multi-platform image's root is answered
 	// from the index alone rather than by transferring every layer.
 	groups []*imageGroup
+	// budget bounds what every group retains together, since an index can
+	// declare any number of platforms.
+	budget *imageBudget
 	mu     sync.Mutex
 }
 
@@ -883,7 +886,7 @@ func fetchArtifact(ctx context.Context, p Path) (*artifact, error) {
 	if err != nil {
 		return nil, asStatusError(err)
 	}
-	art := &artifact{byName: map[string]File{}, seen: newNameSet(0)}
+	art := &artifact{byName: map[string]File{}, seen: newNameSet(0), budget: newImageBudget()}
 	switch desc.MediaType {
 	case types.OCIImageIndex, types.DockerManifestList:
 		// Descriptor.Image() would resolve an index to the single child
@@ -958,7 +961,7 @@ func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 	if err != nil {
 		return err
 	}
-	group := &imageGroup{prefix: prefix}
+	group := &imageGroup{prefix: prefix, budget: a.budget}
 	for _, descriptor := range manifest.Layers {
 		digest := descriptor.Digest.String()
 		// A filesystem layer holds files rather than being one, so it is

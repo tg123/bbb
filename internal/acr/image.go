@@ -46,6 +46,50 @@ const (
 	maxTotalNameBytes = 64 << 20
 )
 
+// imageBudget bounds what all of an artifact's image groups retain together.
+//
+// A per-group limit is not a limit: an index is registry-controlled and can
+// declare any number of platforms, so N manifests would each be allowed the
+// full allowance. Groups charge against one shared budget instead, and a group
+// re-read after a failure replaces its own contribution rather than adding to
+// it.
+type imageBudget struct {
+	mu   sync.Mutex
+	used map[*imageGroup]budgetUse
+}
+
+type budgetUse struct {
+	entries int
+	names   int
+}
+
+func newImageBudget() *imageBudget {
+	return &imageBudget{used: map[*imageGroup]budgetUse{}}
+}
+
+// charge reports whether group may retain the given totals, counting what
+// every other group has already committed.
+func (b *imageBudget) charge(group *imageGroup, use budgetUse) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	entries, names := use.entries, use.names
+	for other, committed := range b.used {
+		if other == group {
+			continue
+		}
+		entries += committed.entries
+		names += committed.names
+	}
+	if entries > maxTarEntries {
+		return fmt.Errorf("acr: image holds more than %d entries", maxTarEntries)
+	}
+	if names > maxTotalNameBytes {
+		return fmt.Errorf("acr: image entry names exceed %d bytes", maxTotalNameBytes)
+	}
+	b.used[group] = use
+	return nil
+}
+
 // whiteoutPrefix marks a file deleted by a later layer, and whiteoutOpaque
 // marks a directory whose earlier contents are dropped entirely.
 const (
@@ -102,6 +146,8 @@ type layerRef struct {
 type imageGroup struct {
 	prefix string
 	layers []layerRef
+	// budget is shared with every other group of the same artifact.
+	budget *imageBudget
 
 	mu      sync.Mutex
 	done    bool
@@ -299,8 +345,8 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 		// any of them grows. Counting only the files that survive validation
 		// would let a layer of directories or unsafe names exhaust it freely.
 		seen++
-		if seen > maxTarEntries {
-			return nil, nil, nil, seen, nameBytes, fmt.Errorf("acr: image holds more than %d entries", maxTarEntries)
+		if err := g.budget.charge(g, budgetUse{entries: seen, names: nameBytes}); err != nil {
+			return nil, nil, nil, seen, nameBytes, err
 		}
 		// The entry count alone does not bound memory: a name is
 		// registry-controlled and PAX or GNU long names can be enormous, so a
@@ -309,9 +355,8 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			continue
 		}
 		nameBytes += len(header.Name)
-		if nameBytes > maxTotalNameBytes {
-			return nil, nil, nil, seen, nameBytes, fmt.Errorf(
-				"acr: image entry names exceed %d bytes", maxTotalNameBytes)
+		if err := g.budget.charge(g, budgetUse{entries: seen, names: nameBytes}); err != nil {
+			return nil, nil, nil, seen, nameBytes, err
 		}
 		index := occurrences[header.Name]
 		occurrences[header.Name]++
