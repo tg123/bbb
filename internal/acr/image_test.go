@@ -1145,7 +1145,7 @@ func TestImageResolvesLongHardLinkChainLinearly(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		group.resolveLinks(links, added, &order, writtenAt, map[string]int{}, map[string]File{})
+		group.resolveLinks(links, added, &order, writtenAt, map[string]int{}, map[string]File{}, map[string]bool{})
 	}()
 	select {
 	case <-done:
@@ -1274,6 +1274,82 @@ type fakeImage struct {
 }
 
 func (f *fakeImage) Manifest() (*v1.Manifest, error) { return f.manifest, nil }
+
+// A hard link takes the content its target has at the point the link is
+// written: an extractor calls link() there, so a later header at the target
+// replaces that file and leaves the link alone. A link must not reach through
+// a whiteout this layer has already applied, either.
+func TestImageHardLinkTakesTheTargetAtItsOwnPosition(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "linkorder", Reference: "latest"}
+
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	archive := tar.NewWriter(gz)
+	write := func(name, body string) {
+		t.Helper()
+		if err := archive.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := archive.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := func(name, target string) {
+		t.Helper()
+		if err := archive.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o644, Typeflag: tar.TypeLink, Linkname: target,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("target", "first")
+	link("alias", "target")
+	write("target", "second")
+	// The lower layer's "below" is removed before this link names it.
+	link("reach", "below")
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"below", "lower"}),
+		tarGz(t, [2]string{".wh.below", ""}),
+		static.NewLayer(raw.Bytes(), types.DockerLayer),
+	)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Name)
+	}
+	slices.Sort(names)
+	if want := []string{"linux/amd64/alias", "linux/amd64/target"}; !slices.Equal(names, want) {
+		t.Fatalf("listing = %v, want %v — a link must not reach through a whiteout", names, want)
+	}
+
+	alias := p
+	alias.File = "linux/amd64/alias"
+	reader, err := DownloadStream(t.Context(), alias)
+	if err != nil {
+		t.Fatalf("DownloadStream failed: %v", err)
+	}
+	content, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil || string(content) != "first" {
+		t.Fatalf("alias = %q (%v), want the target as it stood when the link was written", content, err)
+	}
+}
 
 // Two groups can produce the same full name — an unprefixed manifest holding
 // linux/amd64/app alongside a linux/amd64 manifest holding app — so every path

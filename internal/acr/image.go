@@ -393,6 +393,9 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 	// occurrences counts headers per path so a duplicated entry can be found
 	// again: a tar is a log, and the last write of a path is the live one.
 	occurrences := map[string]int{}
+	// whitedOut is the paths this layer has removed from the layers below so
+	// far, so a hard link written afterwards cannot reach through one.
+	whitedOut := map[string]bool{}
 	for {
 		header, err := archive.Next()
 		if errors.Is(err, io.EOF) {
@@ -403,7 +406,7 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			if _, drainErr := io.Copy(io.Discard, reader); drainErr != nil {
 				return nil, nil, nil, seen, nameBytes, fmt.Errorf("acr: verifying layer %s: %w", layer.digest, drainErr)
 			}
-			g.resolveLinks(links, added, &order, writtenAt, nonDirAt, merged)
+			g.resolveLinks(links, added, &order, writtenAt, nonDirAt, merged, whitedOut)
 			reconcileLayerTree(added, writtenAt, nonDirAt)
 			for _, name := range replaced {
 				if subtree, still := replacements[name]; still {
@@ -467,9 +470,18 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 				replacements[full] = true
 				continue
 			}
-			// Resolved once the layer's own entries are known, since a link
-			// may name one of them.
-			links = append(links, hardLink{name: full, target: header.Linkname, at: ordinal})
+			link := hardLink{name: full, target: header.Linkname, at: ordinal}
+			// A link takes the content its target has when the link is
+			// written, not what a later header puts there: an extractor calls
+			// link() at this point in the log, so a subsequent header at the
+			// target replaces that file and leaves this one alone. Resolving
+			// here is also what POSIX expects, since a link's target precedes
+			// it. Only a forward reference has to wait for the layer to end.
+			if target, usable := g.linkTarget(link, writtenAt); usable &&
+				g.installLink(link, target, added, &order, writtenAt, nonDirAt, merged, whitedOut) {
+				continue
+			}
+			links = append(links, link)
 			continue
 		}
 		if kind == entryWhiteout || kind == entryOpaque {
@@ -481,6 +493,9 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			// decides a path for this layer, so no ordinal is recorded either:
 			// a hard link declared earlier is still the live entry.
 			shadows = append(shadows, shadow{path: full, subtree: true})
+			// A link written after this one cannot reach through it to the
+			// layers below: by then the extractor has removed that path.
+			whitedOut[full] = true
 			continue
 		}
 		ordinal++
@@ -528,10 +543,8 @@ type hardLink struct {
 	at int
 }
 
-// resolveLinks turns hard links into entries of their own, taking the target's
-// content. A link resolves against the layer that declared it first, then the
-// layers below, and one whose target cannot be found is dropped rather than
-// listed as something unreadable.
+// resolveLinks settles the hard links that could not resolve where they were
+// written, because they name something the layer only defines later.
 //
 // A link may name another link, so this is a graph walk rather than a sweep: a
 // chain written back to front — each link naming the one after it — would let
@@ -540,7 +553,7 @@ type hardLink struct {
 // Each link is instead visited once, following its target through the links
 // that have not settled yet. A cycle is left unresolved, so it is dropped like
 // any other target that cannot be found.
-func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order *[]string, writtenAt, nonDirAt map[string]int, merged map[string]File) {
+func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order *[]string, writtenAt, nonDirAt map[string]int, merged map[string]File, whitedOut map[string]bool) {
 	if len(links) == 0 {
 		return
 	}
@@ -568,13 +581,8 @@ func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order
 		for len(stack) > 0 {
 			top := stack[len(stack)-1]
 			target, ok := g.linkTarget(links[top], writtenAt)
-			if !ok {
-				state[top] = settled
-				stack = stack[:len(stack)-1]
-				continue
-			}
-			if _, found := added[target]; !found {
-				if _, found = merged[target]; !found {
+			if ok {
+				if _, found := added[target]; !found {
 					// The target may be a link that has not been installed
 					// yet, in which case it has to settle first.
 					if next, isLink := byName[target]; isLink && state[next] == unvisited {
@@ -582,14 +590,11 @@ func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order
 						stack = append(stack, next)
 						continue
 					}
-					// Dangling, part of a cycle, or a link that settled
-					// without resolving.
-					state[top] = settled
-					stack = stack[:len(stack)-1]
-					continue
 				}
+				g.installLink(links[top], target, added, order, writtenAt, nonDirAt, merged, whitedOut)
 			}
-			g.installLink(links[top], target, added, order, writtenAt, nonDirAt, merged)
+			// Installed, spent, dangling, or part of a cycle: either way this
+			// link is finished with.
 			state[top] = settled
 			stack = stack[:len(stack)-1]
 		}
@@ -614,14 +619,21 @@ func (g *imageGroup) linkTarget(link hardLink, writtenAt map[string]int) (string
 	return target, true
 }
 
-// installLink gives a link the content of the entry it names.
-func (g *imageGroup) installLink(link hardLink, target string, added map[string]File, order *[]string, writtenAt, nonDirAt map[string]int, merged map[string]File) {
+// installLink gives a link the content of the entry it names, reporting
+// whether the target was there to take.
+func (g *imageGroup) installLink(link hardLink, target string, added map[string]File, order *[]string, writtenAt, nonDirAt map[string]int, merged map[string]File, whitedOut map[string]bool) bool {
 	source, ok := added[target]
 	if !ok {
+		// The target may belong to a lower layer, which an extractor links
+		// against because it links against the merged tree. Not, however, if
+		// this layer has already removed it: by then there is nothing to link.
+		if coveredByWhiteout(whitedOut, target) {
+			return false
+		}
 		source, ok = merged[target]
 	}
 	if !ok {
-		return
+		return false
 	}
 	if _, exists := added[link.name]; !exists {
 		*order = append(*order, link.name)
@@ -637,6 +649,24 @@ func (g *imageGroup) installLink(link hardLink, target string, added map[string]
 	// A link is a file, so it displaces whatever the same layer wrote beneath
 	// its path, exactly as a regular file does.
 	nonDirAt[link.name] = link.at
+	return true
+}
+
+// coveredByWhiteout reports whether a path, or a directory holding it, has
+// been removed from the layers below.
+func coveredByWhiteout(whitedOut map[string]bool, name string) bool {
+	if len(whitedOut) == 0 {
+		return false
+	}
+	if whitedOut[name] {
+		return true
+	}
+	for cut := strings.LastIndexByte(name, '/'); cut > 0; cut = strings.LastIndexByte(name[:cut], '/') {
+		if whitedOut[name[:cut]] {
+			return true
+		}
+	}
+	return false
 }
 
 // reconcileLayerTree applies one layer's file-over-directory replacements to
