@@ -29,6 +29,18 @@ func TestIsAzHTTPS(t *testing.T) {
 	}
 }
 
+func TestRunCPTaskStreamPropagatesCanceledProducer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := runCPTaskStream(ctx, func(func(taskPair) error) error {
+		return ctx.Err()
+	}, false, true, 1, 0, "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runCPTaskStream error = %v, want context.Canceled", err)
+	}
+}
+
 func TestIsAzHTTPEdgeCases(t *testing.T) {
 	if !bbbfs.IsAz("http://MYACCT.blob.core.windows.net:8080/container/blob.txt?sv=2021#frag") {
 		t.Fatalf("expected blob url with port/query/fragment to be az path")
@@ -217,7 +229,7 @@ func TestCmdCPTaskfileStateRecovery(t *testing.T) {
 	}
 }
 
-func TestRunCPTasksFlushesStateBeforeReturningError(t *testing.T) {
+func TestRunCPTaskStreamFlushesStateBeforeReturningError(t *testing.T) {
 	dir := t.TempDir()
 	srcOK := filepath.Join(dir, "ok.txt")
 	srcMissing := filepath.Join(dir, "missing.txt")
@@ -230,9 +242,17 @@ func TestRunCPTasksFlushesStateBeforeReturningError(t *testing.T) {
 		t.Fatalf("mkdir dst: %v", err)
 	}
 
-	err := runCPTasks(context.Background(), []taskPair{
+	tasks := []taskPair{
 		{src: srcOK, dst: dstDir},
 		{src: srcMissing, dst: dstDir},
+	}
+	err := runCPTaskStream(context.Background(), func(emit func(taskPair) error) error {
+		for _, task := range tasks {
+			if err := emit(task); err != nil {
+				return err
+			}
+		}
+		return nil
 	}, true, true, 1, 0, stateFile)
 	if err == nil {
 		t.Fatal("expected copy error")
@@ -247,14 +267,53 @@ func TestRunCPTasksFlushesStateBeforeReturningError(t *testing.T) {
 	}
 }
 
-func TestRunCPTasksReturnsCancellation(t *testing.T) {
+func TestRunCPTaskStreamReturnsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	stateFile := filepath.Join(t.TempDir(), "tasks.state")
-	err := runCPTasks(ctx, []taskPair{{src: "unused", dst: "unused"}}, true, true, 1, 0, stateFile)
+	err := runCPTaskStream(ctx, func(emit func(taskPair) error) error {
+		return emit(taskPair{src: "unused", dst: "unused"})
+	}, true, true, 1, 0, stateFile)
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("runCPTasks error = %v, want context.Canceled", err)
+		t.Fatalf("runCPTaskStream error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRunCPTaskStreamDoesNotWaitForBlockedProducerAfterWorkerError(t *testing.T) {
+	dir := t.TempDir()
+	producerBlocked := make(chan struct{})
+	releaseProducer := make(chan struct{})
+	defer close(releaseProducer)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runCPTaskStream(context.Background(), func(emit func(taskPair) error) error {
+			if err := emit(taskPair{
+				src: filepath.Join(dir, "missing.txt"),
+				dst: filepath.Join(dir, "dst"),
+			}); err != nil {
+				return err
+			}
+			close(producerBlocked)
+			<-releaseProducer
+			return nil
+		}, true, true, 1, 0, "")
+	}()
+
+	select {
+	case <-producerBlocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("producer did not block after emitting the task")
+	}
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected worker error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runCPTaskStream waited for the blocked producer")
 	}
 }
 
