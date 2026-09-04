@@ -3,6 +3,7 @@ package acr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
 // fakeCredential stands in for DefaultAzureCredential.
@@ -222,6 +224,101 @@ func TestDefaultCredentialFollowsTheCloud(t *testing.T) {
 	if china == public {
 		t.Error("a sovereign registry must not reuse the public-cloud credential")
 	}
+}
+
+// Both auth locks are held across network and interactive work, so a caller
+// queued behind one must be able to give up when its own transfer is
+// cancelled — otherwise a browser prompt nobody answers holds it indefinitely.
+func TestAuthWaitsAreContextAware(t *testing.T) {
+	const registry = "waiter.azurecr.io"
+	authCache.Clear()
+	t.Cleanup(authCache.Clear)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	original := exchangeToken
+	exchangeToken = func(ctx context.Context, _ string) (string, error) {
+		close(entered)
+		select {
+		case <-release:
+			return "token", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	t.Cleanup(func() { exchangeToken = original })
+
+	// One caller holds the gate inside the exchange.
+	holder := make(chan struct{})
+	go func() {
+		defer close(holder)
+		authOption(context.Background(), registry)
+	}()
+	<-entered
+
+	// A second caller for the same registry must not be stuck behind it.
+	ctx, cancel := context.WithCancel(context.Background())
+	waited := make(chan remote.Option, 1)
+	go func() { waited <- authOption(ctx, registry) }()
+	select {
+	case <-waited:
+		t.Fatal("the second caller should still be waiting")
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cancelled caller stayed blocked on the auth gate")
+	}
+
+	close(release)
+	<-holder
+}
+
+// A token refresh reaches the network, so a caller queued behind one must be
+// able to abandon the wait, and must not be handed a token it no longer wants.
+func TestAuthorizationContextHonoursCancellation(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	original := exchangeToken
+	exchangeToken = func(ctx context.Context, _ string) (string, error) {
+		close(entered)
+		select {
+		case <-release:
+			return "token", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	t.Cleanup(func() { exchangeToken = original })
+
+	auth := &acrAuthenticator{registry: "waiter.azurecr.io"}
+	holder := make(chan struct{})
+	go func() {
+		defer close(holder)
+		_, _ = auth.AuthorizationContext(context.Background())
+	}()
+	<-entered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waited := make(chan error, 1)
+	go func() {
+		_, err := auth.AuthorizationContext(ctx)
+		waited <- err
+	}()
+	cancel()
+	select {
+	case err := <-waited:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want the caller's own cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cancelled caller stayed blocked on the token refresh")
+	}
+
+	close(release)
+	<-holder
 }
 
 // A failed exchange must surface rather than yield an empty credential.

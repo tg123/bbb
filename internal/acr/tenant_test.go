@@ -656,8 +656,10 @@ func TestAuthOptionRecoversAfterATransientFailure(t *testing.T) {
 		t.Fatal("expected a cached entry")
 	}
 	entry := value.(*authEntry)
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
+	if err := entry.gate.acquire(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer entry.gate.release()
 	if entry.err != nil {
 		t.Errorf("the failure outlived its retry: %v", entry.err)
 	}

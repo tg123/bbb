@@ -462,6 +462,10 @@ func ExistsAsBlob(ctx context.Context, p string) (bool, error) {
 // upload or an overwrite push that a retry would complete. The one conflict
 // that is genuinely final — a create-only manifest write whose tag already
 // holds something else — is reported as ErrArtifactExists instead.
+//
+// A registry 404 is likewise not always final: an upload session the registry
+// has forgotten answers BLOB_UPLOAD_UNKNOWN, and starting the upload again is
+// exactly what recovers it, so the error code decides rather than the status.
 func IsNonRetryableHTTPErr(err error) bool {
 	if errors.Is(err, acr.ErrArtifactExists) {
 		return true
@@ -471,7 +475,7 @@ func IsNonRetryableHTTPErr(err error) bool {
 		return true
 	}
 	var acrErr *acr.HTTPStatusError
-	if errors.As(err, &acrErr) {
+	if errors.As(err, &acrErr) && !acrErr.Recoverable() {
 		switch acrErr.StatusCode {
 		case 401, 403, 404:
 			return true

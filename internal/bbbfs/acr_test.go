@@ -1,10 +1,12 @@
 package bbbfs
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -143,5 +145,32 @@ func TestConflictStatusStaysRetryable(t *testing.T) {
 	}
 	if !IsNonRetryableHTTPErr(acr.ErrArtifactExists) {
 		t.Error("an existing artifact is final without -f")
+	}
+}
+
+// A 404 says the destination is missing, except when it says the registry has
+// forgotten an upload session — which starting the upload again fixes.
+func TestLostUploadSessionStaysRetryable(t *testing.T) {
+	for _, code := range []string{"BLOB_UPLOAD_UNKNOWN", "BLOB_UPLOAD_INVALID"} {
+		err := &acr.HTTPStatusError{StatusCode: 404, Codes: []string{code}}
+		if IsNonRetryableHTTPErr(err) {
+			t.Errorf("a %s upload must be retried, not abandoned", code)
+		}
+		if err.NotFound() {
+			t.Errorf("%s does not mean the destination is missing", code)
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s must not read as a missing file", code)
+		}
+	}
+	// Everything else at 404 stays final.
+	for _, code := range []string{"MANIFEST_UNKNOWN", "NAME_UNKNOWN", "BLOB_UNKNOWN"} {
+		err := &acr.HTTPStatusError{StatusCode: 404, Codes: []string{code}}
+		if !IsNonRetryableHTTPErr(err) {
+			t.Errorf("%d %s cannot be fixed by retrying", 404, code)
+		}
+		if !err.NotFound() {
+			t.Errorf("%s means the destination is missing", code)
+		}
 	}
 }

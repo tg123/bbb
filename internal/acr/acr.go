@@ -97,16 +97,36 @@ func roundTripper() http.RoundTripper {
 type HTTPStatusError struct {
 	StatusCode int
 	Status     string
+	// Codes are the registry's own error codes for the failure. A status on
+	// its own does not say what failed: a 404 is final for a manifest that
+	// does not exist, but not for a blob upload whose session the registry
+	// forgot, which is recovered by starting the upload again.
+	Codes []string
 }
 
 func (e *HTTPStatusError) Error() string {
 	return e.Status
 }
 
+// Recoverable reports whether the registry named a condition a fresh attempt
+// can get past, despite a status that would otherwise be final.
+func (e *HTTPStatusError) Recoverable() bool {
+	for _, code := range e.Codes {
+		switch transport.ErrorCode(code) {
+		case transport.BlobUploadUnknownErrorCode, transport.BlobUploadInvalidErrorCode:
+			// The upload session is gone, not the destination. remote.Write
+			// starts a new one, so this must reach the retry layer.
+			return true
+		}
+	}
+	return false
+}
+
 // NotFound reports whether the registry answered 404, so callers treating a
-// missing artifact as absent rather than as a failure can recognise it.
+// missing artifact as absent rather than as a failure can recognise it. A lost
+// upload session is excluded: nothing is missing, and the write can be redone.
 func (e *HTTPStatusError) NotFound() bool {
-	return e.StatusCode == http.StatusNotFound
+	return e.StatusCode == http.StatusNotFound && !e.Recoverable()
 }
 
 // Is lets a 404 match os.ErrNotExist, so a missing artifact behaves like a
@@ -123,9 +143,14 @@ func asStatusError(err error) error {
 	}
 	var terr *transport.Error
 	if errors.As(err, &terr) {
+		codes := make([]string, 0, len(terr.Errors))
+		for _, diagnostic := range terr.Errors {
+			codes = append(codes, string(diagnostic.Code))
+		}
 		return fmt.Errorf("%w: %w", err, &HTTPStatusError{
 			StatusCode: terr.StatusCode,
 			Status:     http.StatusText(terr.StatusCode),
+			Codes:      codes,
 		})
 	}
 	return err

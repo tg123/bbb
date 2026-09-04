@@ -562,7 +562,9 @@ func browserOrDeviceCodeCredential(ctx context.Context, registry, tenant, scope 
 type acrAuthenticator struct {
 	registry string
 
-	mu      sync.Mutex
+	// gate rather than a mutex, since a refresh reaches the network: a caller
+	// queued behind one must be able to abandon the wait with its own context.
+	gate    lazyGate
 	token   string
 	expires time.Time
 }
@@ -595,8 +597,18 @@ func (a *acrAuthenticator) Authorization() (*authn.AuthConfig, error) {
 }
 
 func (a *acrAuthenticator) AuthorizationContext(ctx context.Context) (*authn.AuthConfig, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	// A gate rather than a mutex: the refresh below reaches the network and
+	// can take up to tokenExchangeTimeout, so a caller queued behind it must
+	// be able to give up when its own transfer is cancelled.
+	if err := a.gate.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer a.gate.release()
+	// Waiting can outlast the caller, so the token another goroutine fetched
+	// is not handed to an operation that has since been abandoned.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if a.token == "" || time.Now().After(a.expires) {
 		ctx, cancel := context.WithTimeout(ctx, tokenExchangeTimeout)
 		defer cancel()
@@ -643,12 +655,14 @@ func tokenExpiry(token string) time.Time {
 // authEntry memoises the credentials for one registry. A nil authenticator on a
 // resolved entry means "fall back to the Docker keychain".
 //
-// The lock is held across the whole attempt, not just the bookkeeping, because
+// The gate is held across the whole attempt, not just the bookkeeping, because
 // the attempt can open an interactive sign-in: a second caller for the same
 // registry must wait for that to finish and reuse the result rather than
-// opening a prompt of its own.
+// opening a prompt of its own. It is a gate rather than a mutex so that wait
+// ends when the second caller's own context does — a browser prompt nobody
+// answers must not hold a cancelled transfer.
 type authEntry struct {
-	mu       sync.Mutex
+	gate     lazyGate
 	resolved bool
 	auth     authn.Authenticator
 	// err records a failure that no retry can fix, so it is reported rather
@@ -677,8 +691,16 @@ func authOption(ctx context.Context, registry string) remote.Option {
 
 	value, _ := authCache.LoadOrStore(registryKey(registry), &authEntry{})
 	entry := value.(*authEntry)
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
+	if err := entry.gate.acquire(ctx); err != nil {
+		return remote.WithAuth(&failedAuthenticator{err: err})
+	}
+	defer entry.gate.release()
+	// Waiting for the gate can outlast the caller: a sign-in that was
+	// interrupted must not have its result handed to an abandoned operation,
+	// and must not be restarted by whoever was queued behind it.
+	if err := ctx.Err(); err != nil {
+		return remote.WithAuth(&failedAuthenticator{err: err})
+	}
 	if !entry.resolved {
 		entry.resolve(ctx, registry)
 	}
@@ -968,6 +990,23 @@ func (g gate) acquire(ctx context.Context) error {
 }
 
 func (g gate) release() { g <- struct{}{} }
+
+// lazyGate is a gate that works from a zero value, so a struct holding one
+// needs no constructor and cannot be built without it by mistake — a nil
+// channel would block its first caller forever.
+type lazyGate struct {
+	once sync.Once
+	g    gate
+}
+
+func (l *lazyGate) acquire(ctx context.Context) error {
+	l.once.Do(func() { l.g = newGate() })
+	return l.g.acquire(ctx)
+}
+
+// release is only ever called after a successful acquire, which is what
+// guarantees the channel exists.
+func (l *lazyGate) release() { l.g.release() }
 
 // unknownTenantRecovery serialises the tenant-unknown path, so two registries
 // in the same foreign tenant do not each open a sign-in. The cached credential
