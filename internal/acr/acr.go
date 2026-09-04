@@ -614,6 +614,26 @@ func cleanFile(file string) (string, error) {
 	return cleaned, nil
 }
 
+// layerTitleName validates a layer's declared file name as written, rather
+// than repairing it.
+//
+// A title is registry-controlled, so accepting path.Clean's rewrite would put
+// the layer's bytes under a name the manifest never declared — "a/./b" read
+// back as "a/b" — which is exactly the substitution tar entry names are
+// already refused for. A single leading "./" is the one exception: it names
+// the same file, and it is the same convention tar entries are trimmed of.
+func layerTitleName(title string) (string, error) {
+	name := strings.TrimPrefix(title, "./")
+	cleaned, err := cleanFile(name)
+	if err != nil {
+		return "", err
+	}
+	if cleaned != name {
+		return "", errors.New("invalid file path: name is not in canonical form")
+	}
+	return cleaned, nil
+}
+
 // ValidateUploadNames checks the names of an artifact's files without
 // contacting the registry, so a dry run rejects exactly what a real push would.
 func ValidateUploadNames(files []UploadFile) error {
@@ -1091,7 +1111,7 @@ func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 		if title == "" {
 			title = strings.ReplaceAll(digest, ":", "-")
 		}
-		cleaned, err := cleanFile(title)
+		cleaned, err := layerTitleName(title)
 		if err != nil {
 			return fmt.Errorf("acr: invalid layer name %q: %w", title, err)
 		}

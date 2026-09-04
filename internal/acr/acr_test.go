@@ -515,6 +515,34 @@ func TestListFilesRejectsBackslashLayerTitle(t *testing.T) {
 	}
 }
 
+// A title that needs cleaning names one file in the manifest and another on
+// disk. Since titles are registry-controlled, the rewrite is refused rather
+// than performed — the same rule tar entry names are held to.
+func TestListFilesRejectsNonCanonicalLayerTitle(t *testing.T) {
+	for _, title := range []string{"a/./b", "a//b", "dir/", "a/b/."} {
+		host := newTestRegistry(t)
+		p := Path{Registry: host, Repository: "models", Reference: "noncanonical"}
+		pushRawArtifact(t, p, []layerSpec{{title: title, content: "x"}})
+
+		if _, err := ListFiles(t.Context(), p); err == nil || !strings.Contains(err.Error(), "invalid layer name") {
+			t.Errorf("title %q: expected an invalid layer name error, got %v", title, err)
+		}
+	}
+
+	// A leading "./" names the same file and is the one tar convention that is
+	// trimmed rather than refused.
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "models", Reference: "dotslash"}
+	pushRawArtifact(t, p, []layerSpec{{title: "./a/b.txt", content: "x"}})
+	files, err := ListFiles(t.Context(), p)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "a/b.txt" {
+		t.Fatalf("listing = %#v, want a/b.txt", files)
+	}
+}
+
 func TestListFilesRejectsConflictingLayerNames(t *testing.T) {
 	host := newTestRegistry(t)
 	p := Path{Registry: host, Repository: "models", Reference: "conflict"}
