@@ -517,6 +517,54 @@ func TestExchangeDoesNotPromptForAConfiguredTenant(t *testing.T) {
 	}
 }
 
+// A transient exchange failure must not be turned into an anonymous request: a
+// private registry answers that with a 401 the retry layer treats as final, so
+// a passing outage would become a permanent failure with the cause replaced.
+func TestAuthOptionSurfacesATransientFailure(t *testing.T) {
+	const registry = "myreg.azurecr.io"
+	var exchanges atomic.Int64
+	original := exchangeToken
+	exchangeToken = func(context.Context, string) (string, error) {
+		exchanges.Add(1)
+		return "", context.DeadlineExceeded
+	}
+	t.Cleanup(func() {
+		exchangeToken = original
+		authCache.Clear()
+	})
+	authCache.Clear()
+
+	option := authOption(t.Context(), registry)
+	if option == nil {
+		t.Fatal("expected an auth option")
+	}
+	// The entry stays unresolved, so the next attempt tries the exchange again
+	// rather than being stuck with the outage.
+	authOption(t.Context(), registry)
+	if got := exchanges.Load(); got != 2 {
+		t.Fatalf("ran %d exchanges, want the transient failure retried", got)
+	}
+}
+
+// Not every failure is transient: with no Azure credential at all there is
+// nothing to retry, and an anonymous pull is a legitimate outcome.
+func TestAuthOptionFallsBackWhenNoCredentialExists(t *testing.T) {
+	const registry = "myreg.azurecr.io"
+	original := exchangeToken
+	exchangeToken = func(context.Context, string) (string, error) {
+		return "", errors.New("DefaultAzureCredential: no credential was available")
+	}
+	t.Cleanup(func() {
+		exchangeToken = original
+		authCache.Clear()
+	})
+	authCache.Clear()
+
+	if option := authOption(t.Context(), registry); option == nil {
+		t.Fatal("expected the keychain fallback rather than a failure")
+	}
+}
+
 // `ls -l` resolves credentials from more than one goroutine at once. Each must
 // wait for the first attempt rather than opening a sign-in of its own, and a
 // rejection must be remembered so a later request does not reopen a prompt the

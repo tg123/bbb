@@ -703,8 +703,37 @@ func (e *authEntry) resolve(ctx context.Context, registry string) {
 		e.err = err
 		return
 	}
+	if isTransient(err) && !keychainCanServe(registry) {
+		// A timeout or a cancelled exchange says nothing about whether the
+		// caller may read this registry. Falling through would send an
+		// anonymous request, and a private registry answers that with a 401
+		// the retry layer treats as final — turning a passing outage into a
+		// permanent failure with the cause replaced. The entry stays
+		// unresolved so the next attempt tries the exchange again.
+		e.err = err
+		return
+	}
 	slog.Debug("acr: Entra ID authentication unavailable, falling back to the Docker keychain",
 		"registry", registry, "error", err)
+}
+
+// isTransient reports whether an exchange failure is worth retrying, as
+// opposed to meaning no Azure credential is available at all — the latter is a
+// legitimate reason to fall back to the keychain and to anonymous pull.
+func isTransient(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var responseErr *azcore.ResponseError
+	if errors.As(err, &responseErr) {
+		// The registry or Entra was unable to answer rather than unwilling.
+		return responseErr.StatusCode >= 500 || responseErr.StatusCode == http.StatusTooManyRequests
+	}
+	return false
 }
 
 // keychainCanServe reports whether a stored registry credential exists, so a
