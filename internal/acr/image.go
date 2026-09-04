@@ -131,12 +131,19 @@ func isTarLayer(mediaType types.MediaType) bool {
 // members of a multi-platform image are distinguishable.
 //
 // An absent platform yields "", putting that manifest's layers at the artifact
-// root. An invalid one is an error rather than the same "": silently rehoming
-// it would merge an unrelated manifest into the root namespace, and a platform
-// is registry-controlled, so it is validated like any other name.
+// root. Anything else is an error rather than the same "": silently rehoming a
+// manifest would merge it into the root namespace, and a platform is
+// registry-controlled, so it is validated like any other name.
 func platformPrefix(platform *v1.Platform) (string, error) {
-	if platform == nil || platform.OS == "" || platform.Architecture == "" {
+	if platform == nil {
 		return "", nil
+	}
+	if platform.OS == "" || platform.Architecture == "" {
+		// Partial metadata is not absent metadata: putting it at the root
+		// would merge this manifest with unrelated content there, which is
+		// exactly the collision the prefix exists to prevent.
+		return "", fmt.Errorf("acr: manifest declares an incomplete platform (os %q, architecture %q)",
+			platform.OS, platform.Architecture)
 	}
 	parts := []string{platform.OS, platform.Architecture}
 	if platform.Variant != "" {

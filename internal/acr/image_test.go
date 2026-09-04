@@ -532,6 +532,13 @@ func TestImageRejectsUnusablePlatform(t *testing.T) {
 	if _, err := platformPrefix(&v1.Platform{OS: "linux", Architecture: "a:b"}); err == nil {
 		t.Error("expected a colon in a platform to be rejected")
 	}
+	// Partial metadata is not absent metadata.
+	if _, err := platformPrefix(&v1.Platform{OS: "linux"}); err == nil {
+		t.Error("expected a platform with no architecture to be rejected")
+	}
+	if _, err := platformPrefix(&v1.Platform{Architecture: "amd64"}); err == nil {
+		t.Error("expected a platform with no OS to be rejected")
+	}
 	// Genuinely absent metadata still means the artifact root.
 	if prefix, err := platformPrefix(nil); err != nil || prefix != "" {
 		t.Errorf("platformPrefix(nil) = %q (%v), want the root", prefix, err)

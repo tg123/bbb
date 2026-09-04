@@ -454,8 +454,14 @@ func ExistsAsBlob(ctx context.Context, p string) (bool, error) {
 
 // IsNonRetryableHTTPErr reports whether err represents a failure that retrying
 // cannot fix. That covers HTTP 401, 403 and 404 from any supported backend,
-// plus, for ACR, a 409/412 manifest conflict and a destination artifact that
-// already exists, and any backend error exposing NotFound() == true.
+// plus, for ACR, a destination artifact that already exists, and any backend
+// error exposing NotFound() == true.
+//
+// A bare 409 or 412 is deliberately absent: HTTPStatusError does not say which
+// request produced it, so treating those as final would also condemn a blob
+// upload or an overwrite push that a retry would complete. The one conflict
+// that is genuinely final — a create-only manifest write whose tag already
+// holds something else — is reported as ErrArtifactExists instead.
 func IsNonRetryableHTTPErr(err error) bool {
 	if errors.Is(err, acr.ErrArtifactExists) {
 		return true
@@ -467,7 +473,7 @@ func IsNonRetryableHTTPErr(err error) bool {
 	var acrErr *acr.HTTPStatusError
 	if errors.As(err, &acrErr) {
 		switch acrErr.StatusCode {
-		case 401, 403, 404, 409, 412:
+		case 401, 403, 404:
 			return true
 		}
 	}

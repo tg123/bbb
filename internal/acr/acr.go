@@ -1531,16 +1531,17 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 	}
 	if err := remote.Write(ref, image, options...); err != nil {
 		var terr *transport.Error
-		if errors.As(err, &terr) &&
+		if !opts.Overwrite && errors.As(err, &terr) &&
 			(terr.StatusCode == http.StatusPreconditionFailed || terr.StatusCode == http.StatusConflict) {
 			// A registry honouring If-None-Match rejected the write because the
 			// tag exists. That may be this process's own earlier attempt whose
 			// response was lost, so let the published digest decide.
 			//
 			// Both statuses are accepted because registries disagree on which
-			// to use, and IsNonRetryableHTTPErr already treats them alike: a
-			// 409 that skipped this check would fail a retry whose work had in
-			// fact succeeded.
+			// to use. This applies only without -f: the create-only transport
+			// is not installed for an overwrite, so a conflict there is a
+			// transient registry error and must stay retryable rather than
+			// being compared against a tag we intended to replace.
 			return confirmPublished(ctx, p, image)
 		}
 		return asStatusError(err)
