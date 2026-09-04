@@ -824,9 +824,11 @@ type artifact struct {
 	// budget bounds what every group retains together, since an index can
 	// declare any number of platforms.
 	budget *imageBudget
-	// validated memoises the cross-source name check per group.
-	validated map[*imageGroup]error
-	mu        sync.Mutex
+	// validatedCount is how many expanded groups validatedErr covers, so the
+	// check is redone only when another group expands.
+	validatedCount int
+	validatedErr   error
+	mu             sync.Mutex
 }
 
 // layerCacheEntry memoises one resolved artifact.
@@ -1100,35 +1102,48 @@ func (a *artifact) materialise(ctx context.Context, p Path, file string) ([]File
 	// each other or against the titled layers: a platform directory and a
 	// layer title can still collide by case, by Unicode normalisation, or as
 	// file versus directory, and two of those would extract to one local path.
-	if len(a.groups) > 0 {
-		if err := validateNames(files); err != nil {
-			return nil, err
-		}
+	if err := a.validateExpanded(); err != nil {
+		return nil, err
 	}
 	return files, nil
 }
 
-// lookup finds a single file, expanding only the layer that could hold it.
-func (a *artifact) lookup(ctx context.Context, p Path, name string) (File, bool, error) {
-	// A titled layer and a group's entries share one namespace when the group
-	// sits at the root, so the two sources are checked against each other
-	// before either is served — otherwise a direct read would hand back a name
-	// that a recursive listing rejects.
+// validateExpanded checks every expanded group against the titled layers and
+// against one another.
+//
+// Two groups can produce the same full name — an unprefixed manifest holding
+// linux/amd64/app and a linux/amd64 manifest holding app — so checking each
+// against a.files alone would let a direct read serve one of them while a
+// recursive listing rejected the pair. The result is memoised until another
+// group expands, so a per-file lookup does not repeat it.
+func (a *artifact) validateExpanded() error {
+	var expanded []*imageGroup
 	for _, group := range a.groups {
-		if group.prefix != "" || !group.covers(name) {
-			continue
-		}
-		entries, err := group.expand(ctx, p)
-		if err != nil {
-			return File{}, false, err
-		}
-		if err := a.validateAgainst(group, entries); err != nil {
-			return File{}, false, err
+		if _, settled := group.settled(); settled {
+			expanded = append(expanded, group)
 		}
 	}
-	if file, ok := a.byName[name]; ok {
-		return file, true, nil
+	if a.validatedCount == len(expanded) {
+		return a.validatedErr
 	}
+	combined := make([]File, 0, len(a.files))
+	combined = append(combined, a.files...)
+	for _, group := range expanded {
+		entries, _ := group.settled()
+		combined = append(combined, entries...)
+	}
+	a.validatedErr = validateNames(combined)
+	a.validatedCount = len(expanded)
+	return a.validatedErr
+}
+
+// lookup finds a single file, expanding only the layers that could hold it.
+func (a *artifact) lookup(ctx context.Context, p Path, name string) (File, bool, error) {
+	// Every group that could answer is expanded before any of them does, so
+	// the combined namespace is known to be consistent before a file is
+	// served. Selecting from the first match alone would let Stat and a
+	// recursive listing disagree about the same artifact.
+	covering := make([]*imageGroup, 0, len(a.groups))
 	for _, group := range a.groups {
 		if !group.covers(name) {
 			continue
@@ -1136,6 +1151,15 @@ func (a *artifact) lookup(ctx context.Context, p Path, name string) (File, bool,
 		if _, err := group.expand(ctx, p); err != nil {
 			return File{}, false, err
 		}
+		covering = append(covering, group)
+	}
+	if err := a.validateExpanded(); err != nil {
+		return File{}, false, err
+	}
+	if file, ok := a.byName[name]; ok {
+		return file, true, nil
+	}
+	for _, group := range covering {
 		// Indexed at expansion, so this stays constant time however many
 		// files the image holds.
 		if file, ok := group.find(name); ok {
@@ -1143,23 +1167,6 @@ func (a *artifact) lookup(ctx context.Context, p Path, name string) (File, bool,
 		}
 	}
 	return File{}, false, nil
-}
-
-// validateAgainst checks a group's entries against the titled layers once,
-// memoised so a per-file lookup does not repeat it.
-func (a *artifact) validateAgainst(group *imageGroup, entries []File) error {
-	if a.validated == nil {
-		a.validated = map[*imageGroup]error{}
-	}
-	if err, done := a.validated[group]; done {
-		return err
-	}
-	combined := make([]File, 0, len(a.files)+len(entries))
-	combined = append(combined, a.files...)
-	combined = append(combined, entries...)
-	err := validateNames(combined)
-	a.validated[group] = err
-	return err
 }
 
 // unexpandedDirs returns the directories that exist because a tar layer will be
@@ -1275,12 +1282,15 @@ func ListDir(ctx context.Context, p Path) ([]Entry, error) {
 		if expandErr != nil {
 			return nil, expandErr
 		}
-		if err := art.validateAgainst(group, entries); err != nil {
-			return nil, err
-		}
 		files = append(files, entries...)
 	}
 	files = append(files, art.files...)
+	// Expanded groups share one namespace with each other and with the titled
+	// layers, so the listing is built only once the whole set is known to be
+	// consistent.
+	if err := art.validateExpanded(); err != nil {
+		return nil, err
+	}
 
 	seen := map[string]Entry{}
 	var order []string

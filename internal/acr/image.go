@@ -236,6 +236,13 @@ func (g *imageGroup) expand(ctx context.Context, p Path) ([]File, error) {
 	return g.entries, nil
 }
 
+// settled returns the group's entries once expansion has completed.
+func (g *imageGroup) settled() ([]File, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.entries, g.done
+}
+
 // find returns an expanded entry by name in constant time. It reports false
 // when the group has not been expanded, so callers expand first.
 func (g *imageGroup) find(name string) (File, bool) {

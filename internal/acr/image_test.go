@@ -1095,6 +1095,43 @@ func TestImageResolvesChainedHardLinks(t *testing.T) {
 	}
 }
 
+// Two groups can produce the same full name — an unprefixed manifest holding
+// linux/amd64/app alongside a linux/amd64 manifest holding app — so every path
+// must agree that the artifact is ambiguous, not just the recursive one.
+func TestImageRejectsOverlappingGroups(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "overlapgroups", Reference: "latest"}
+
+	index := mutate.AppendManifests(empty.Index,
+		// No platform, so its entries land at the artifact root.
+		mutate.IndexAddendum{Add: imageWithLayers(t, tarGz(t, [2]string{"linux/amd64/app", "root"}))},
+		mutate.IndexAddendum{
+			Add:        imageWithLayers(t, tarGz(t, [2]string{"app", "platform"})),
+			Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}},
+		},
+	)
+	ref, err := name.NewTag(p.Registry+"/"+p.Repository+":"+p.Reference, name.WeakValidation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.WriteIndex(ref, index); err != nil {
+		t.Fatalf("WriteIndex failed: %v", err)
+	}
+	invalidateLayers(p)
+
+	target := p
+	target.File = "linux/amd64/app"
+	if _, err := Stat(t.Context(), target); err == nil {
+		t.Error("Stat must not serve one version of an ambiguous path")
+	}
+	if _, err := ListFiles(t.Context(), p); err == nil {
+		t.Error("ListFiles must reject the artifact")
+	}
+	if _, err := ListDir(t.Context(), p); err == nil {
+		t.Error("ListDir must reject it too")
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.
