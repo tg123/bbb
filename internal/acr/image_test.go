@@ -683,6 +683,78 @@ func TestImageBudgetReleasedOnFailure(t *testing.T) {
 	}
 }
 
+// A title is the documented name of a file, so a layer carrying one is that
+// file whatever its media type. Expanding a published tarball would scatter
+// its contents and lose the name it was given.
+func TestImageDoesNotExpandTitledTarLayer(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "titledtar", Reference: "latest"}
+
+	layer := tarGz(t, [2]string{"inside.txt", "content"})
+	image, err := mutate.Append(empty.Image, mutate.Addendum{
+		Layer:       layer,
+		MediaType:   types.DockerLayer,
+		Annotations: map[string]string{TitleAnnotation: "bundle.tar.gz"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := name.NewTag(p.Registry+"/"+p.Repository+":"+p.Reference, name.WeakValidation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.Write(ref, image); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	invalidateLayers(p)
+
+	files, err := ListFiles(t.Context(), p)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "bundle.tar.gz" {
+		t.Fatalf("listing = %#v, want the titled tarball kept whole", files)
+	}
+	if files[0].TarPath != "" {
+		t.Error("a titled layer must be served as itself, not expanded")
+	}
+}
+
+// Go's archive/tar normalises the legacy NUL type flag before a header is
+// returned, so image code never observes tar.TypeRegA. This pins that, since
+// the classification here depends on it.
+func TestLegacyRegularTypeFlagIsNormalised(t *testing.T) {
+	var raw bytes.Buffer
+	writer := tar.NewWriter(&raw)
+	// The legacy flag is a NUL byte, written literally rather than through the
+	// deprecated tar.TypeRegA constant — which staticcheck rejects, and which
+	// production code therefore could not compare against either.
+	if err := writer.WriteHeader(&tar.Header{
+		Name: "legacy", Mode: 0o644, Size: 3, Typeflag: 0, Format: tar.FormatGNU,
+	}); err != nil {
+		t.Skipf("this Go version refuses to write the legacy flag: %v", err)
+	}
+	if _, err := writer.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := tar.NewReader(bytes.NewReader(raw.Bytes()))
+	header, err := reader.Next()
+	if err != nil {
+		t.Fatalf("reading the legacy entry failed: %v", err)
+	}
+	if header.Typeflag != tar.TypeReg {
+		t.Fatalf("typeflag = %q, want TypeReg: archive/tar no longer normalises TypeRegA", header.Typeflag)
+	}
+	name, kind, ok := tarEntryName(header)
+	if !ok || kind != entryFile || name != "legacy" {
+		t.Fatalf("tarEntryName = (%q, %v, %v), want the entry treated as a regular file", name, kind, ok)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.

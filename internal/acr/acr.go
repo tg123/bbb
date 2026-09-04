@@ -964,18 +964,22 @@ func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 	group := &imageGroup{prefix: prefix, budget: a.budget}
 	for _, descriptor := range manifest.Layers {
 		digest := descriptor.Digest.String()
+		title := descriptor.Annotations[TitleAnnotation]
 		// A filesystem layer holds files rather than being one, so it is
 		// recorded for expansion instead of being named here.
 		//
-		// A foreign layer whose descriptor carries URLs is the exception: the
-		// registry need not hold that blob at all, and fetching from a
+		// A title is the documented name of a file, so a layer carrying one is
+		// that file whatever its media type: expanding a published .tar.gz
+		// would scatter its contents and lose the name it was given.
+		//
+		// A foreign layer whose descriptor carries URLs is also left alone:
+		// the registry need not hold that blob at all, and fetching from a
 		// registry-supplied URL is exactly the redirect this package refuses
 		// elsewhere. Those stay opaque, named by digest as before.
-		if isTarLayer(descriptor.MediaType) && len(descriptor.URLs) == 0 {
+		if title == "" && isTarLayer(descriptor.MediaType) && len(descriptor.URLs) == 0 {
 			group.layers = append(group.layers, layerRef{digest: digest, size: descriptor.Size})
 			continue
 		}
-		title := descriptor.Annotations[TitleAnnotation]
 		if title == "" {
 			title = strings.ReplaceAll(digest, ":", "-")
 		}
