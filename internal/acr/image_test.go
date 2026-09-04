@@ -1535,6 +1535,53 @@ func TestImageRejectsPlatformsDifferingByCase(t *testing.T) {
 	}
 }
 
+// A platform directory and a file inside another platform can claim one name.
+// The file is only known once its layer is expanded, and the directory may
+// belong to a platform that never expands at all, so neither check catches it
+// alone.
+func TestImageFileCannotHideAPlatformDirectory(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "hidden", Reference: "latest"}
+
+	index := v1.ImageIndex(empty.Index)
+	// linux/amd64 holds a regular file called "v8".
+	index = mutate.AppendManifests(index, mutate.IndexAddendum{
+		Add:        imageWithLayers(t, tarGz(t, [2]string{"v8", "a file"})),
+		Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}},
+	})
+	// linux/amd64/v8 is a platform, so the same name is a directory. It has no
+	// layers, so nothing about it ever reaches the name checks.
+	index = mutate.AppendManifests(index, mutate.IndexAddendum{
+		Add: empty.Image,
+		Descriptor: v1.Descriptor{
+			Platform: &v1.Platform{OS: "linux", Architecture: "amd64", Variant: "v8"},
+		},
+	})
+	ref, err := name.NewTag(p.Registry+"/"+p.Repository+":"+p.Reference, name.WeakValidation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.WriteIndex(ref, index); err != nil {
+		t.Fatalf("WriteIndex failed: %v", err)
+	}
+	invalidateLayers(p)
+
+	// Listing the directory holding both expands one and leaves the other lazy.
+	dir := p
+	dir.File = "linux/amd64"
+	if _, err := ListDir(t.Context(), dir); err == nil {
+		t.Error("ListDir must not serve a file that hides a platform directory")
+	}
+	if _, err := ListFiles(t.Context(), p); err == nil {
+		t.Error("ListFiles must reject the pair")
+	}
+	file := p
+	file.File = "linux/amd64/v8"
+	if _, err := Stat(t.Context(), file); err == nil {
+		t.Error("Stat must not resolve the ambiguous name either")
+	}
+}
+
 // Two groups can produce the same full name — an unprefixed manifest holding
 // linux/amd64/app alongside a linux/amd64 manifest holding app — so every path
 // must agree that the artifact is ambiguous, not just the recursive one.

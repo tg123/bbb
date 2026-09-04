@@ -995,26 +995,64 @@ func fetchArtifact(ctx context.Context, p Path) (*artifact, error) {
 // untitled filesystem layer and a titled metadata.json, and rejecting that
 // would refuse a perfectly serviceable image.
 func (a *artifact) checkPrefixCollisions() error {
-	if len(a.groups) == 0 {
-		return nil
-	}
-	for _, group := range a.groups {
+	return checkAgainstPrefixDirs(a.files, a.groups)
+}
+
+// prefixDir is a directory that exists because a platform lives at or under
+// it, and the platform that put it there.
+type prefixDir struct {
+	prefix string
+	// exact is true when the directory is the platform itself rather than one
+	// of its parents, which is a different thing to tell the user.
+	exact bool
+}
+
+// platformDirs indexes every platform directory, and each of their parents, by
+// folded name.
+//
+// Folded because a listing extracts to a real filesystem: a file named V8 and
+// a linux/amd64/v8 platform are one path on Windows and macOS. Indexed rather
+// than compared pairwise so checking costs one fold per file, not one per file
+// per platform — an image can hold half a million entries.
+func platformDirs(groups []*imageGroup) map[string]prefixDir {
+	dirs := map[string]prefixDir{}
+	for _, group := range groups {
 		if group.prefix == "" {
 			continue
 		}
-		folded := foldKey(group.prefix)
-		for _, file := range a.files {
-			switch {
-			case foldKey(file.Name) == folded:
-				return fmt.Errorf(
-					"acr: layer %q and the %s platform directory claim one name",
-					file.Name, group.prefix)
-			case strings.HasPrefix(folded, foldKey(file.Name)+"/"):
-				return fmt.Errorf(
-					"acr: layer %q is a file and also a directory holding %s",
-					file.Name, group.prefix)
+		dirs[foldKey(group.prefix)] = prefixDir{prefix: group.prefix, exact: true}
+		for _, ancestor := range ancestors(group.prefix) {
+			if _, taken := dirs[foldKey(ancestor)]; !taken {
+				dirs[foldKey(ancestor)] = prefixDir{prefix: group.prefix}
 			}
 		}
+	}
+	return dirs
+}
+
+// checkAgainstPrefixDirs rejects a file that claims a name a platform
+// directory already holds.
+//
+// Every group is considered, expanded or not: a platform with no layers never
+// reaches the name checks at all, and a lazily expanded one has not reached
+// them yet, so a file colliding with either would otherwise be served while
+// the directory it hides simply vanished from the listing.
+func checkAgainstPrefixDirs(files []File, groups []*imageGroup) error {
+	dirs := platformDirs(groups)
+	if len(dirs) == 0 {
+		return nil
+	}
+	for _, file := range files {
+		dir, clash := dirs[foldKey(file.Name)]
+		if !clash {
+			continue
+		}
+		if dir.exact {
+			return fmt.Errorf("acr: layer %q and the %s platform directory claim one name",
+				file.Name, dir.prefix)
+		}
+		return fmt.Errorf("acr: layer %q is a file and also a directory holding %s",
+			file.Name, dir.prefix)
 	}
 	return nil
 }
@@ -1228,6 +1266,13 @@ func (a *artifact) validateExpanded() error {
 		combined = append(combined, entries...)
 	}
 	a.validatedErr = validateNames(combined)
+	if a.validatedErr == nil {
+		// An expanded group's files have never been checked against the other
+		// platforms' directories. A file named v8 inside linux/amd64, beside a
+		// linux/amd64/v8 platform, would otherwise be served as a file while
+		// the platform it hides disappeared from the listing.
+		a.validatedErr = checkAgainstPrefixDirs(combined, a.groups)
+	}
 	a.validatedCount = len(expanded)
 	return a.validatedErr
 }
