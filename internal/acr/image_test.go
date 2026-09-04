@@ -1145,7 +1145,7 @@ func TestImageResolvesLongHardLinkChainLinearly(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		group.resolveLinks(links, added, &order, writtenAt, map[string]File{})
+		group.resolveLinks(links, added, &order, writtenAt, map[string]int{}, map[string]File{})
 	}()
 	select {
 	case <-done:
@@ -1163,6 +1163,117 @@ func TestImageResolvesLongHardLinkChainLinearly(t *testing.T) {
 		}
 	}
 }
+
+// Within one layer a tar is a log, so a regular file or hard link written
+// after entries beneath the same path replaces them, and an entry written
+// deeper afterwards turns that path back into a directory. Getting this wrong
+// leaves both, and the artifact is rejected as a file that is also a
+// directory.
+func TestImageFileReplacesSameLayerSubtree(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "replace", Reference: "latest"}
+
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	archive := tar.NewWriter(gz)
+	write := func(header *tar.Header, body string) {
+		t.Helper()
+		header.Size = int64(len(body))
+		if err := archive.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := archive.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A regular file lands on top of what this layer put beneath it.
+	write(&tar.Header{Name: "foo/bar", Mode: 0o644, Typeflag: tar.TypeReg}, "gone")
+	write(&tar.Header{Name: "foo", Mode: 0o644, Typeflag: tar.TypeReg}, "file")
+	// A hard link is a file too, so it does the same.
+	write(&tar.Header{Name: "real", Mode: 0o644, Typeflag: tar.TypeReg}, "content")
+	write(&tar.Header{Name: "alias/child", Mode: 0o644, Typeflag: tar.TypeReg}, "gone")
+	if err := archive.WriteHeader(&tar.Header{
+		Name: "alias", Mode: 0o644, Typeflag: tar.TypeLink, Linkname: "real",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The other direction: a file, then something deeper, which makes the
+	// earlier path a directory again.
+	write(&tar.Header{Name: "dir", Mode: 0o644, Typeflag: tar.TypeReg}, "gone")
+	write(&tar.Header{Name: "dir/kept", Mode: 0o644, Typeflag: tar.TypeReg}, "kept")
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pushIndex(t, p, map[string]v1.Image{
+		"linux/amd64": imageWithLayers(t, static.NewLayer(raw.Bytes(), types.DockerLayer)),
+	})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Name)
+	}
+	slices.Sort(names)
+	want := []string{
+		"linux/amd64/alias",
+		"linux/amd64/dir/kept",
+		"linux/amd64/foo",
+		"linux/amd64/real",
+	}
+	if !slices.Equal(names, want) {
+		t.Fatalf("listing = %v, want %v", names, want)
+	}
+}
+
+// Applying a layer costs a pass over what the layers below it left, so the
+// work is the layer count times the entry count. Bounding only the entries
+// leaves that product to the registry.
+func TestImageRejectsTooManyLayers(t *testing.T) {
+	art := &artifact{
+		byName: map[string]File{},
+		seen:   newNameSet(0),
+		budget: newImageBudget(),
+	}
+	manifest := &v1.Manifest{Config: v1.Descriptor{MediaType: types.OCIConfigJSON}}
+	for i := range maxImageLayers + 1 {
+		manifest.Layers = append(manifest.Layers, v1.Descriptor{
+			MediaType: types.OCILayer,
+			Digest:    v1.Hash{Algorithm: "sha256", Hex: fmt.Sprintf("%064x", i)},
+			Size:      1,
+		})
+	}
+	err := art.addImage(&fakeImage{manifest: manifest})
+	if err == nil {
+		t.Fatal("expected an image with more layers than the bound to be rejected")
+	}
+	if !strings.Contains(err.Error(), "filesystem layers") {
+		t.Fatalf("error = %v, want it to name the layer bound", err)
+	}
+
+	// One below the bound is still accepted, so the limit is not off by one.
+	manifest.Layers = manifest.Layers[:maxImageLayers]
+	fresh := &artifact{byName: map[string]File{}, seen: newNameSet(0), budget: newImageBudget()}
+	if err := fresh.addImage(&fakeImage{manifest: manifest}); err != nil {
+		t.Fatalf("an image at the bound must be accepted, got %v", err)
+	}
+}
+
+// fakeImage carries a manifest without a registry behind it.
+type fakeImage struct {
+	v1.Image
+	manifest *v1.Manifest
+}
+
+func (f *fakeImage) Manifest() (*v1.Manifest, error) { return f.manifest, nil }
 
 // Two groups can produce the same full name — an unprefixed manifest holding
 // linux/amd64/app alongside a linux/amd64 manifest holding app — so every path

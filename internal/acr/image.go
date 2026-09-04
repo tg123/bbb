@@ -36,6 +36,13 @@ import (
 // layer cannot exhaust memory through the listing path alone.
 const maxTarEntries = 500_000
 
+// maxImageLayers bounds the filesystem layers of a single manifest. Applying
+// each one costs a pass over the entries below it, so the work is the layer
+// count times the entry count; bounding only the entries leaves that product
+// to the registry. Docker itself stops at 127, so this is well clear of any
+// real image.
+const maxImageLayers = 1024
+
 // maxEntryNameBytes rejects an individual path longer than any filesystem will
 // accept, and maxTotalNameBytes bounds what all the retained names cost
 // together. The entry count does not do this on its own: PAX and GNU long
@@ -377,8 +384,11 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 	var replaced []string
 	var links []hardLink
 	// writtenAt records the header ordinal that last decided each path, so a
-	// hard link resolved afterwards cannot undo a later header.
+	// hard link resolved afterwards cannot undo a later header. nonDirAt is
+	// the subset of those that left something other than a directory, which is
+	// what displaces the entries beneath a path.
 	writtenAt := map[string]int{}
+	nonDirAt := map[string]int{}
 	ordinal := 0
 	// occurrences counts headers per path so a duplicated entry can be found
 	// again: a tar is a log, and the last write of a path is the live one.
@@ -393,7 +403,8 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			if _, drainErr := io.Copy(io.Discard, reader); drainErr != nil {
 				return nil, nil, nil, seen, nameBytes, fmt.Errorf("acr: verifying layer %s: %w", layer.digest, drainErr)
 			}
-			g.resolveLinks(links, added, &order, writtenAt, merged)
+			g.resolveLinks(links, added, &order, writtenAt, nonDirAt, merged)
+			reconcileLayerTree(added, writtenAt, nonDirAt)
 			for _, name := range replaced {
 				if subtree, still := replacements[name]; still {
 					shadows = append(shadows, shadow{path: name, subtree: subtree})
@@ -448,8 +459,8 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			if oversizedTarget {
 				// Nothing can be resolved, but the path is still replaced.
 				delete(added, full)
-				removeUnderOne(added, full)
 				writtenAt[full] = ordinal
+				nonDirAt[full] = ordinal
 				if _, seenBefore := replacements[full]; !seenBefore {
 					replaced = append(replaced, full)
 				}
@@ -474,14 +485,16 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 		}
 		ordinal++
 		if kind != entryFile {
-			// A tar is a log: this also replaces what the same layer wrote
-			// earlier at that path, and for anything but a directory the
-			// entries beneath it go too — a symlink has no children.
+			// A tar is a log, so this replaces what the same layer wrote
+			// earlier at that path. What it does to the entries beneath is
+			// settled once the layer ends, from the ordinals recorded here.
 			delete(added, full)
-			if kind != entryDir {
-				removeUnderOne(added, full)
-			}
 			writtenAt[full] = ordinal
+			if kind == entryDir {
+				delete(nonDirAt, full)
+			} else {
+				nonDirAt[full] = ordinal
+			}
 			if _, seenBefore := replacements[full]; !seenBefore {
 				replaced = append(replaced, full)
 			}
@@ -495,6 +508,7 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 		// subtree it displaces is handled with the other added names.
 		delete(replacements, full)
 		writtenAt[full] = ordinal
+		nonDirAt[full] = ordinal
 		added[full] = File{
 			Name:     full,
 			Size:     header.Size,
@@ -526,7 +540,7 @@ type hardLink struct {
 // Each link is instead visited once, following its target through the links
 // that have not settled yet. A cycle is left unresolved, so it is dropped like
 // any other target that cannot be found.
-func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order *[]string, writtenAt map[string]int, merged map[string]File) {
+func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order *[]string, writtenAt, nonDirAt map[string]int, merged map[string]File) {
 	if len(links) == 0 {
 		return
 	}
@@ -575,7 +589,7 @@ func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order
 					continue
 				}
 			}
-			g.installLink(links[top], target, added, order, writtenAt, merged)
+			g.installLink(links[top], target, added, order, writtenAt, nonDirAt, merged)
 			state[top] = settled
 			stack = stack[:len(stack)-1]
 		}
@@ -601,7 +615,7 @@ func (g *imageGroup) linkTarget(link hardLink, writtenAt map[string]int) (string
 }
 
 // installLink gives a link the content of the entry it names.
-func (g *imageGroup) installLink(link hardLink, target string, added map[string]File, order *[]string, writtenAt map[string]int, merged map[string]File) {
+func (g *imageGroup) installLink(link hardLink, target string, added map[string]File, order *[]string, writtenAt, nonDirAt map[string]int, merged map[string]File) {
 	source, ok := added[target]
 	if !ok {
 		source, ok = merged[target]
@@ -620,14 +634,41 @@ func (g *imageGroup) installLink(link hardLink, target string, added map[string]
 		TarIndex: source.TarIndex,
 	}
 	writtenAt[link.name] = link.at
+	// A link is a file, so it displaces whatever the same layer wrote beneath
+	// its path, exactly as a regular file does.
+	nonDirAt[link.name] = link.at
 }
 
-// removeUnderOne deletes every entry beneath a single path.
-func removeUnderOne(entries map[string]File, dir string) {
-	prefix := dir + "/"
-	for name := range entries {
-		if strings.HasPrefix(name, prefix) {
-			delete(entries, name)
+// reconcileLayerTree applies one layer's file-over-directory replacements to
+// that layer's own entries.
+//
+// A tar is a log: a regular file, symlink or hard link at a path replaces
+// whatever the same layer wrote beneath it, and an entry written deeper
+// afterwards makes that path a directory again. Without this a layer holding
+// "app/config" and then a regular "app" keeps both, and the artifact is
+// rejected as a file that is also a directory instead of honouring the last
+// header.
+//
+// It runs once, from the ordinals already recorded, so each entry costs its
+// own depth. Removing a subtree as each header arrives instead scans the whole
+// layer per header, which a layer of nothing but symlinks makes quadratic.
+func reconcileLayerTree(added map[string]File, writtenAt, nonDirAt map[string]int) {
+	for name := range added {
+		at := writtenAt[name]
+		for cut := strings.LastIndexByte(name, '/'); cut > 0; cut = strings.LastIndexByte(name[:cut], '/') {
+			ancestor := name[:cut]
+			ancestorAt, ok := nonDirAt[ancestor]
+			if !ok {
+				continue
+			}
+			if ancestorAt > at {
+				// A later header put a file where this entry's parent was.
+				delete(added, name)
+				break
+			}
+			// This entry is deeper and later, so its parent is a directory
+			// again and whatever stood there is gone.
+			delete(added, ancestor)
 		}
 	}
 }

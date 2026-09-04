@@ -377,8 +377,13 @@ func (p Path) DefaultFilename() string {
 // ordinary files: writing to NUL discards the content entirely, and the
 // reservation applies with any extension, so CON.txt is reserved too.
 // Superscript digit forms are reserved as well.
+//
+// CONIN$, CONOUT$ and CLOCK$ are reserved by Win32 too. They are unusual in
+// carrying a dollar rather than being extension-stripped, but the name still
+// opens a device instead of a file, which is the same loss.
 var windowsReservedNames = map[string]struct{}{
 	"con": {}, "prn": {}, "aux": {}, "nul": {},
+	"conin$": {}, "conout$": {}, "clock$": {},
 	"com1": {}, "com2": {}, "com3": {}, "com4": {}, "com5": {},
 	"com6": {}, "com7": {}, "com8": {}, "com9": {},
 	"com\u00b9": {}, "com\u00b2": {}, "com\u00b3": {},
@@ -1063,6 +1068,17 @@ func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 		a.byName[cleaned] = file
 	}
 	if len(group.layers) > 0 {
+		if len(group.layers) > maxImageLayers {
+			// Merging a layer costs a pass over what the ones below it left,
+			// so the work is the layer count times the entry count. Both are
+			// registry-controlled, and the entry allowance alone would let a
+			// manifest declare enough near-empty layers to make that product
+			// enormous. A real image has a few dozen: Docker's own ceiling is
+			// 127, and past this bound the transfer would dwarf anything the
+			// merge saved anyway.
+			return fmt.Errorf("acr: image declares %d filesystem layers, more than the %d supported",
+				len(group.layers), maxImageLayers)
+		}
 		// Two index children can land on the same prefix: platform metadata is
 		// optional, and manifests differing only by OS version or features
 		// share an os/arch. Merging them would overlay unrelated filesystems,
