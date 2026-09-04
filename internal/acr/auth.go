@@ -338,12 +338,14 @@ func credentialForRegistry(ctx context.Context, registry string) (azcore.TokenCr
 			// its cached token has lapsed and it cannot refresh unattended.
 			slog.Debug("acr: the Azure CLI cannot serve this tenant, signing in interactively",
 				"registry", registry, "tenant", tid, "error", tokenErr)
+			explainCLIFallback(tid)
 		case !tenantMatches(token.Token, tid):
 			// az can hold a token only for the home tenant and hand that back
 			// regardless of what was asked for; presenting it would fail at
 			// the registry with the same mismatch this exists to avoid.
 			slog.Debug("acr: the Azure CLI returned a token for another tenant, signing in interactively",
 				"registry", registry, "want", tid, "got", tenantIDFromAccessToken(token.Token))
+			explainCLIFallback(tid)
 		default:
 			slog.Debug("acr: using the Azure CLI credential", "registry", registry, "tenant", tid)
 			tenantCredCache.Store(tid, cli)
@@ -359,7 +361,18 @@ func credentialForRegistry(ctx context.Context, registry string) (azcore.TokenCr
 	return credential, nil
 }
 
-// tenantMatches reports whether a token was issued by the expected tenant. An
+// explainCLIFallback says why a sign-in is being opened despite the Azure CLI
+// being available.
+//
+// Without this the prompt looks like the CLI was ignored, when in fact it was
+// asked and could not answer: a profile can be signed in to a tenant and still
+// hold no usable token for it, which is invisible unless it is said out loud.
+func explainCLIFallback(tenant string) {
+	fmt.Fprintf(os.Stderr,
+		"\n  The Azure CLI has no usable token for tenant %s; `az login --tenant %s` would avoid this prompt.\n",
+		tenant, tenant)
+}
+
 // unreadable tid is accepted rather than triggering a needless login: the
 // registry is the real authority, and this is only an early check.
 func tenantMatches(token, tenant string) bool {

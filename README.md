@@ -156,6 +156,12 @@ export BBB_ACR_TENANT=<tenant-id>
 
 With a tenant set, `bbb` mirrors `az://`: it uses your Azure CLI login for that tenant, verifies the token really was issued by it — `az` can hold a token only for your home tenant and return that whatever you asked for — and otherwise signs you in. A browser opens, falling back to a device code when there is no browser to open, as over SSH or inside WSL. Only one sign-in is opened per tenant no matter how many transfers are running, and a tenant discovered by signing in is reused for the rest of the run.
 
+The CLI login is read through `az` itself, so `AZURE_CONFIG_DIR` selects which profile is used. Being signed in to a tenant is not the same as holding a usable token for it — a profile whose session has lapsed reports `Status_InteractionRequired` for every resource — so when the CLI cannot answer, `bbb` says so before opening a prompt:
+
+```
+  The Azure CLI has no usable token for tenant 8b9ebe14-...; `az login --tenant 8b9ebe14-...` would avoid this prompt.
+```
+
 Signing in requires a terminal, so a pipeline never blocks on a prompt it cannot answer; without one the rejection is reported along with the variable to set. `BBB_ACR_NO_LOGIN=1` suppresses the prompt for an interactive shell that should never show one.
 
 The sign-in lasts for the life of the process, so prefer `az login --tenant <tenant-id>` for repeated use: that persists, and `bbb` then takes the CLI path with no prompt at all.
