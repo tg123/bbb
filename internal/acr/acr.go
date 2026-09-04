@@ -810,6 +810,15 @@ func (p Path) blobPuller(ctx context.Context) (*remote.Puller, error) {
 // maxIndexDepth bounds how many nested image indexes are followed.
 const maxIndexDepth = 4
 
+// maxIndexManifests bounds how many child manifests one reference resolves.
+//
+// Depth alone does not bound the work: an index declares any number of
+// children, each of which is a separate registry round trip and a retained
+// group, and a child with no layers costs nothing against the entry budget. A
+// real multi-platform image has a handful, and the largest published ones are
+// well under a hundred even counting attestations.
+const maxIndexManifests = 512
+
 // artifact is one resolved snapshot of an acr:// reference.
 //
 // Only immutable metadata is retained. Layer objects are deliberately not
@@ -833,7 +842,11 @@ type artifact struct {
 	// check is redone only when another group expands.
 	validatedCount int
 	validatedErr   error
-	mu             sync.Mutex
+	// manifests counts every child manifest resolved for this reference,
+	// across nested indexes, so one response cannot amplify into an unbounded
+	// number of registry round trips.
+	manifests int
+	mu        sync.Mutex
 }
 
 // layerCacheEntry memoises one resolved artifact.
@@ -976,6 +989,13 @@ func (a *artifact) addIndex(index v1.ImageIndex, depth int, inherited string) er
 		return err
 	}
 	for _, child := range manifest.Manifests {
+		// Counted before the child is fetched, so a large index costs one
+		// request rather than as many as it asks for. The count spans nested
+		// indexes: bounding each one separately would let depth multiply.
+		a.manifests++
+		if a.manifests > maxIndexManifests {
+			return fmt.Errorf("acr: this reference resolves more than %d manifests", maxIndexManifests)
+		}
 		prefix := inherited
 		if child.Platform != nil {
 			// A multi-platform image repeats the same file names once per

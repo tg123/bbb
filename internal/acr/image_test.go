@@ -1402,6 +1402,57 @@ func TestImageKeepsEmptyPlatform(t *testing.T) {
 	}
 }
 
+// An index declares any number of children, each a separate registry round
+// trip, and one with no layers costs nothing against the entry budget. Depth
+// alone therefore does not bound the work a single reference can ask for.
+func TestImageRejectsTooManyManifests(t *testing.T) {
+	art := &artifact{
+		byName: map[string]File{},
+		seen:   newNameSet(0),
+		budget: newImageBudget(),
+	}
+	manifest := &v1.IndexManifest{}
+	for i := range maxIndexManifests + 1 {
+		manifest.Manifests = append(manifest.Manifests, v1.Descriptor{
+			MediaType: types.OCIManifestSchema1,
+			Digest:    v1.Hash{Algorithm: "sha256", Hex: fmt.Sprintf("%064x", i)},
+			Platform:  &v1.Platform{OS: "linux", Architecture: fmt.Sprintf("arch%d", i)},
+		})
+	}
+	index := &fakeIndex{manifest: manifest}
+	err := art.addIndex(index, 0, "")
+	if err == nil {
+		t.Fatal("expected an index with more children than the bound to be rejected")
+	}
+	if !strings.Contains(err.Error(), "manifests") {
+		t.Fatalf("error = %v, want it to name the manifest bound", err)
+	}
+	// Counted before the fetch, so the children past the bound are never asked
+	// for — that is the point of the limit.
+	if index.fetched > maxIndexManifests {
+		t.Errorf("fetched %d children, want no more than %d", index.fetched, maxIndexManifests)
+	}
+}
+
+// fakeIndex serves an index manifest without a registry behind it.
+//
+// The embedded interface is aliased because v1.ImageIndex has a method called
+// ImageIndex, which an embedded field of that name would collide with.
+type indexBase = v1.ImageIndex
+
+type fakeIndex struct {
+	indexBase
+	manifest *v1.IndexManifest
+	fetched  int
+}
+
+func (f *fakeIndex) Image(v1.Hash) (v1.Image, error) {
+	f.fetched++
+	return &fakeImage{manifest: &v1.Manifest{Config: v1.Descriptor{MediaType: types.OCIConfigJSON}}}, nil
+}
+
+func (f *fakeIndex) IndexManifest() (*v1.IndexManifest, error) { return f.manifest, nil }
+
 // Two groups can produce the same full name — an unprefixed manifest holding
 // linux/amd64/app alongside a linux/amd64 manifest holding app — so every path
 // must agree that the artifact is ambiguous, not just the recursive one.

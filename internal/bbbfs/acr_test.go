@@ -1,10 +1,78 @@
 package bbbfs
 
 import (
+	"io"
+	"log"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/registry"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/random"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/tg123/bbb/internal/acr"
 )
+
+// A scratch image's platform is a real directory with nothing in it. Neither
+// listing path may mistake "no children" for "no such path".
+func TestACRListsAnEmptyPlatform(t *testing.T) {
+	server := httptest.NewServer(registry.New(registry.Logger(log.New(io.Discard, "", 0))))
+	t.Cleanup(server.Close)
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := random.Image(64, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := mutate.AppendManifests(empty.Index,
+		mutate.IndexAddendum{
+			Add:        loaded,
+			Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}},
+		},
+		mutate.IndexAddendum{
+			Add:        empty.Image,
+			Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm64"}},
+		},
+	)
+	ref, err := name.NewTag(parsed.Host+"/scratch:latest", name.WeakValidation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.WriteIndex(ref, index); err != nil {
+		t.Fatalf("WriteIndex failed: %v", err)
+	}
+
+	target := "acr://" + parsed.Host + "/scratch:latest/linux/arm64"
+	entries, err := (acrFS{}).List(t.Context(), target)
+	if err != nil {
+		t.Fatalf("List failed for an empty platform: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("List = %v, want nothing inside an empty platform", entries)
+	}
+	var seen []Entry
+	if err := (acrFS{}).ListRecursive(t.Context(), target, func(e Entry) error {
+		seen = append(seen, e)
+		return nil
+	}); err != nil {
+		t.Fatalf("ListRecursive failed for an empty platform: %v", err)
+	}
+	if len(seen) != 0 {
+		t.Fatalf("ListRecursive = %v, want nothing inside an empty platform", seen)
+	}
+
+	// A path that really is absent must still be reported as missing.
+	if _, err := (acrFS{}).List(t.Context(), "acr://"+parsed.Host+"/scratch:latest/linux/riscv64"); err == nil {
+		t.Fatal("expected a missing platform to be an error")
+	}
+}
 
 func TestACRMatchAndResolve(t *testing.T) {
 	const p = "acr://myreg.azurecr.io/models/llama:v1/weights.bin"

@@ -61,7 +61,9 @@ func (acrFS) UploadArtifact(ctx context.Context, target string, files []Artifact
 //
 // An exact layer name legitimately has no children, so the prefix is checked
 // against the artifact rather than assumed missing: that case still returns an
-// empty list for the caller to resolve through Stat.
+// empty list for the caller to resolve through Stat. A directory that is
+// genuinely empty — a scratch image's platform is one — has no file to stat
+// either, so the directory question is asked before the miss is believed.
 func confirmPrefix(ctx context.Context, ap acr.Path, prefix string) error {
 	if prefix == "" {
 		return nil
@@ -69,6 +71,12 @@ func confirmPrefix(ctx context.Context, ap acr.Path, prefix string) error {
 	probe := ap
 	probe.File = prefix
 	_, err := acr.Stat(ctx, probe)
+	if err == nil {
+		return nil
+	}
+	if isDir, dirErr := acr.IsDir(ctx, probe); dirErr == nil && isDir {
+		return nil
+	}
 	return err
 }
 
