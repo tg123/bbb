@@ -472,6 +472,56 @@ func TestImageRejectsAmbiguousPlatforms(t *testing.T) {
 	}
 }
 
+// A regular file in an upper layer replaces a lower directory, so nothing
+// beneath that path survives — otherwise a file and a directory are reported
+// at one path, which no filesystem can hold.
+func TestImageFileReplacesLowerDirectory(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "shadowdir", Reference: "latest"}
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"app/config", "old"}, [2]string{"keep.txt", "kept"}),
+		tarGz(t, [2]string{"app", "now-a-file"}),
+	)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Name)
+	}
+	if slicesContains(names, "linux/amd64/app/config") {
+		t.Errorf("listing = %v, want the lower directory replaced by the file", names)
+	}
+	if !slicesContains(names, "linux/amd64/app") || !slicesContains(names, "linux/amd64/keep.txt") {
+		t.Errorf("listing = %v, want the file and the untouched entry", names)
+	}
+}
+
+// A bare ".wh." names nothing. Treating it as a whiteout would delete the
+// directory holding it, along with everything beneath.
+func TestImageIgnoresEmptyWhiteout(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "emptywh", Reference: "latest"}
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"dir/keep.txt", "kept"}),
+		tarGz(t, [2]string{"dir/.wh.", ""}),
+	)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "linux/amd64/dir/keep.txt" {
+		t.Fatalf("listing = %#v, want the malformed whiteout ignored", files)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.

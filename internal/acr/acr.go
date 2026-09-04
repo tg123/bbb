@@ -1024,6 +1024,15 @@ func (a *artifact) materialise(ctx context.Context, p Path, file string) ([]File
 		}
 		files = append(files, entries...)
 	}
+	// Each group validates its own names, but nothing has checked them against
+	// each other or against the titled layers: a platform directory and a
+	// layer title can still collide by case, by Unicode normalisation, or as
+	// file versus directory, and two of those would extract to one local path.
+	if len(a.groups) > 0 {
+		if err := validateNames(files); err != nil {
+			return nil, err
+		}
+	}
 	return files, nil
 }
 

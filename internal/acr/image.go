@@ -159,11 +159,21 @@ func (g *imageGroup) read(ctx context.Context, p Path) ([]File, error) {
 			delete(merged, s.path)
 		}
 		for _, name := range addedNames {
+			file, ok := added[name]
+			if !ok {
+				// Replaced later in the same layer by a directory or symlink.
+				continue
+			}
+			// An upper regular file replaces a lower directory, so anything
+			// the lower layers had beneath this path goes with it. Leaving it
+			// would report a file and a directory at one path, which no
+			// filesystem can hold.
+			removeTree(merged, name)
 			if !listed[name] {
 				listed[name] = true
 				names = append(names, name)
 			}
-			merged[name] = added[name]
+			merged[name] = file
 		}
 	}
 
@@ -252,6 +262,9 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			full = g.prefix
 		}
 		if kind != entryFile {
+			// A tar is a log: this also replaces a regular file the same layer
+			// wrote earlier, which is otherwise obsolete but still listed.
+			delete(added, full)
 			shadows = append(shadows, shadow{path: full, subtree: kind != entryDir})
 			continue
 		}
@@ -345,6 +358,11 @@ func tarEntryName(header *tar.Header) (name string, kind entryKind, ok bool) {
 		return parent, entryOpaque, true
 	}
 	if after, found := strings.CutPrefix(base, whiteoutPrefix); found {
+		if after == "" {
+			// A bare ".wh." names nothing. Treating it as a whiteout would
+			// delete the parent directory and everything under it.
+			return "", entryFile, false
+		}
 		removed := path.Join(path.Dir(raw), after)
 		if !isSafeEntryName(removed) {
 			return "", entryFile, false
