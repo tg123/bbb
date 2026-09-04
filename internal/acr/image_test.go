@@ -1203,6 +1203,46 @@ func TestImageOversizedLinkTargetStillShadows(t *testing.T) {
 	}
 }
 
+// A tar is a log, so a directory header after a symlink at the same path
+// leaves a directory — whose children merge rather than being removed.
+func TestImageLaterDirectoryCancelsSubtreeShadow(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "shadowcancel", Reference: "latest"}
+
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	archive := tar.NewWriter(gz)
+	for _, header := range []*tar.Header{
+		{Name: "dir", Mode: 0o777, Typeflag: tar.TypeSymlink, Linkname: "elsewhere"},
+		{Name: "dir/", Mode: 0o755, Typeflag: tar.TypeDir},
+	} {
+		if err := archive.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"dir/keep.txt", "kept"}),
+		static.NewLayer(raw.Bytes(), types.DockerLayer),
+	)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "linux/amd64/dir/keep.txt" {
+		t.Fatalf("listing = %#v, want the lower child kept under the final directory", files)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.

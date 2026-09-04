@@ -159,29 +159,27 @@ func isACR(registry string) bool {
 // basicCredentials returns explicitly configured registry credentials for
 // registry, if they apply to it.
 //
-// One invocation can address several registries, so these must not be offered
-// to every host: that is the same disclosure the Entra gate prevents. They are
-// scoped to the hosts in BBB_ACR_REGISTRY when set, and otherwise to Azure
-// Container Registry endpoints, matching what the variables are named for.
+// One invocation can address several registries, so these are only ever sent
+// to the hosts named in BBB_ACR_REGISTRY. An Azure suffix is not a scope:
+// anyone can own a *.azurecr.io registry, so a taskfile touching two of them
+// would send credentials meant for one to the other — the same disclosure the
+// Entra gate exists to prevent, against a password rather than a token.
 func basicCredentials(registry string) (string, string, bool) {
 	user := os.Getenv("BBB_ACR_USERNAME")
 	pass := os.Getenv("BBB_ACR_PASSWORD")
 	if user == "" || pass == "" {
 		return "", "", false
 	}
-	host := registryHost(registry)
 	// Scoped with the registry's effective transport, so an insecure endpoint
 	// keeps host and host:443 distinct: over HTTP they are different services,
 	// and the password must not follow the collapse.
-	if scoped := authorityList(os.Getenv("BBB_ACR_REGISTRY"), registryKey); len(scoped) > 0 {
-		if !slices.Contains(scoped, registryKey(registry)) {
-			return "", "", false
-		}
-		return user, pass, true
-	}
-	if !hasAzureSuffix(host) {
-		slog.Debug("acr: registry credentials are scoped to Azure Container Registry; set BBB_ACR_REGISTRY to use them elsewhere",
+	scoped := authorityList(os.Getenv("BBB_ACR_REGISTRY"), registryKey)
+	if len(scoped) == 0 {
+		slog.Debug("acr: registry credentials are ignored until BBB_ACR_REGISTRY names the hosts they belong to",
 			"registry", registry)
+		return "", "", false
+	}
+	if !slices.Contains(scoped, registryKey(registry)) {
 		return "", "", false
 	}
 	return user, pass, true

@@ -104,7 +104,7 @@ Use `-f` with `cp` to replace an existing tag. `sync` always replaces the destin
 
 Authentication is resolved in this order:
 
-1. `BBB_ACR_USERNAME` / `BBB_ACR_PASSWORD` (registry credentials or a token). These are scoped: without `BBB_ACR_REGISTRY` they are only sent to Azure Container Registry hosts, so one registry's password is not offered to every other registry an invocation touches. Set `BBB_ACR_REGISTRY` to the host (or hosts) they belong to when using them elsewhere.
+1. `BBB_ACR_USERNAME` / `BBB_ACR_PASSWORD` (registry credentials or a token), together with `BBB_ACR_REGISTRY` naming the host or hosts they belong to. All three are required: one invocation can address several registries, and an Azure suffix is not a scope — anyone can own a `*.azurecr.io` registry, so a taskfile touching two of them would otherwise send credentials meant for one to the other.
 2. Entra ID (Azure AD) via `DefaultAzureCredential` — Azure CLI login, service principal, managed identity, workload identity — exchanged for a registry token
 3. The Docker keychain (`~/.docker/config.json` and credential helpers), so a prior `docker login` works for any registry, including anonymous pull
 
@@ -207,7 +207,7 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
 | `BBB_ACR_USERNAME` | | Username for `acr://` registry authentication (used with `BBB_ACR_PASSWORD`) |
 | `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
-| `BBB_ACR_REGISTRY` | *(ACR hosts)* | Comma separated hosts the `BBB_ACR_USERNAME`/`BBB_ACR_PASSWORD` credentials belong to. Without it they are only sent to `*.azurecr.io` and the other ACR suffixes. Entries match on scheme and port, so `host` over HTTP is not the same endpoint as `host:443` |
+| `BBB_ACR_REGISTRY` | | Comma separated hosts the `BBB_ACR_USERNAME`/`BBB_ACR_PASSWORD` credentials belong to. Required for those credentials to be used at all. Entries match on scheme and port, so `host` over HTTP is not the same endpoint as `host:443` |
 | `BBB_ACR_ENTRA_HOSTS` | | Comma separated extra registry hosts allowed to receive Entra ID credentials, for ACR behind a custom domain. Matched with HTTPS port semantics, since the token exchange always uses HTTPS |
 | `BBB_ACR_TENANT_<REGISTRY>` | | Entra tenant to authenticate a registry against, by host (`BBB_ACR_TENANT_MYREG_AZURECR_IO`) or short name (`BBB_ACR_TENANT_MYREG`). Optional: without it a cross-tenant registry prompts a sign-in and reports the tenant to set |
 | `BBB_ACR_TENANT` | | Entra tenant for every `acr://` registry that has no host-specific setting |

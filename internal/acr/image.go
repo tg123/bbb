@@ -369,6 +369,13 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 	added := map[string]File{}
 	var order []string
 	var shadows []shadow
+	// replacements is the *final* non-whiteout state of each path in this
+	// layer, since a tar is a log: a symlink followed by a directory header
+	// leaves a directory, whose children merge, so the symlink's subtree
+	// removal must not survive. Whiteouts are kept separately because they
+	// remove from the layers below whatever this layer later puts there.
+	replacements := map[string]bool{}
+	var replaced []string
 	var links []hardLink
 	// writtenAt records the header ordinal that last decided each path, so a
 	// hard link resolved afterwards cannot undo a later header.
@@ -388,6 +395,11 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 				return nil, nil, nil, seen, nameBytes, fmt.Errorf("acr: verifying layer %s: %w", layer.digest, drainErr)
 			}
 			g.resolveLinks(links, added, &order, writtenAt, merged)
+			for _, name := range replaced {
+				if subtree, still := replacements[name]; still {
+					shadows = append(shadows, shadow{path: name, subtree: subtree})
+				}
+			}
 			return added, order, shadows, seen, nameBytes, nil
 		}
 		if err != nil {
@@ -439,7 +451,10 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 				delete(added, full)
 				removeUnderOne(added, full)
 				writtenAt[full] = ordinal
-				shadows = append(shadows, shadow{path: full, subtree: true})
+				if _, seenBefore := replacements[full]; !seenBefore {
+					replaced = append(replaced, full)
+				}
+				replacements[full] = true
 				continue
 			}
 			// Resolved once the layer's own entries are known, since a link
@@ -448,6 +463,15 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			continue
 		}
 		ordinal++
+		if kind == entryWhiteout || kind == entryOpaque {
+			delete(added, full)
+			removeUnderOne(added, full)
+			writtenAt[full] = ordinal
+			// A whiteout removes from the layers below whatever this layer
+			// later puts at that path, so it is not superseded.
+			shadows = append(shadows, shadow{path: full, subtree: true})
+			continue
+		}
 		if kind != entryFile {
 			// A tar is a log: this also replaces what the same layer wrote
 			// earlier at that path, and for anything but a directory the
@@ -457,12 +481,18 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 				removeUnderOne(added, full)
 			}
 			writtenAt[full] = ordinal
-			shadows = append(shadows, shadow{path: full, subtree: kind != entryDir})
+			if _, seenBefore := replacements[full]; !seenBefore {
+				replaced = append(replaced, full)
+			}
+			replacements[full] = kind != entryDir
 			continue
 		}
 		if _, exists := added[full]; !exists {
 			order = append(order, full)
 		}
+		// A regular file supersedes any earlier replacement of this path; the
+		// subtree it displaces is handled with the other added names.
+		delete(replacements, full)
 		writtenAt[full] = ordinal
 		added[full] = File{
 			Name:     full,

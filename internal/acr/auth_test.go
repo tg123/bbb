@@ -38,28 +38,28 @@ func TestBasicCredentialsAreHostScoped(t *testing.T) {
 	t.Setenv("BBB_ACR_USERNAME", "user")
 	t.Setenv("BBB_ACR_PASSWORD", "pass")
 
-	// Unscoped credentials reach Azure Container Registry only.
-	if _, _, ok := basicCredentials("myreg.azurecr.io"); !ok {
-		t.Error("expected credentials to apply to an ACR host")
-	}
-	for _, registry := range []string{"ghcr.io", "registry.example.com", "localhost:5000"} {
+	// An Azure suffix is not a scope: anyone can own a *.azurecr.io registry,
+	// so credentials sit unused until the host is named.
+	for _, registry := range []string{"myreg.azurecr.io", "ghcr.io", "registry.example.com", "localhost:5000"} {
 		if _, _, ok := basicCredentials(registry); ok {
-			t.Errorf("credentials must not be offered to %s", registry)
+			t.Errorf("credentials must not be offered to %s without a scope", registry)
 		}
 	}
 
-	// An explicit scope moves them, rather than widening them.
-	t.Setenv("BBB_ACR_REGISTRY", "ghcr.io")
-	if _, _, ok := basicCredentials("ghcr.io"); !ok {
-		t.Error("expected the explicit scope to apply")
+	// A scope names exactly where they go.
+	t.Setenv("BBB_ACR_REGISTRY", "myreg.azurecr.io")
+	if _, _, ok := basicCredentials("myreg.azurecr.io"); !ok {
+		t.Error("expected the scoped registry to receive them")
 	}
-	if _, _, ok := basicCredentials("myreg.azurecr.io"); ok {
-		t.Error("an explicit scope must exclude other hosts, including ACR")
+	for _, registry := range []string{"other.azurecr.io", "ghcr.io"} {
+		if _, _, ok := basicCredentials(registry); ok {
+			t.Errorf("a scope must exclude %s, including another ACR", registry)
+		}
 	}
 
 	// Without a password there is nothing to offer.
 	t.Setenv("BBB_ACR_PASSWORD", "")
-	if _, _, ok := basicCredentials("ghcr.io"); ok {
+	if _, _, ok := basicCredentials("myreg.azurecr.io"); ok {
 		t.Error("expected incomplete credentials to be ignored")
 	}
 }
