@@ -36,6 +36,16 @@ import (
 // layer cannot exhaust memory through the listing path alone.
 const maxTarEntries = 500_000
 
+// maxEntryNameBytes rejects an individual path longer than any filesystem will
+// accept, and maxTotalNameBytes bounds what all the retained names cost
+// together. The entry count does not do this on its own: PAX and GNU long
+// names are registry-controlled and effectively unbounded, so a handful of
+// entries could hold far more than half a million ordinary ones.
+const (
+	maxEntryNameBytes = 4096
+	maxTotalNameBytes = 64 << 20
+)
+
 // whiteoutPrefix marks a file deleted by a later layer, and whiteoutOpaque
 // marks a directory whose earlier contents are dropped entirely.
 const (
@@ -162,33 +172,46 @@ func (g *imageGroup) read(ctx context.Context, p Path) ([]File, error) {
 	// bounding only the live map would let a layer add and delete in turn
 	// forever while names grew without limit.
 	seen := 0
+	nameBytes := 0
 	for _, layer := range g.layers {
-		added, addedNames, shadows, count, err := g.readLayer(ctx, p, layer, seen)
+		added, addedNames, shadows, count, bytes, err := g.readLayer(ctx, p, layer, seen, nameBytes)
 		if err != nil {
 			return nil, err
 		}
-		seen = count
-		// A layer hides what lies beneath it, so shadows are applied to the
-		// lower layers only. Applying them to this layer's own entries would
-		// let a tar hide files it legitimately contains, since a whiteout can
-		// appear before an unrelated entry of the same name.
+		seen, nameBytes = count, bytes
+
+		// Everything an upper layer places at a path displaces what the lower
+		// layers had beneath it: a whiteout, a symlink, and a regular file
+		// over a directory all remove the subtree. Collecting the roots and
+		// making one pass keeps that linear — removing per entry rescans the
+		// whole merged set and is quadratic on two ordinary layers.
+		roots := make(map[string]bool, len(added)+len(shadows))
+		rootOpaque := false
 		for _, s := range shadows {
-			if s.subtree {
-				removeTree(merged, s.path)
-			}
 			delete(merged, s.path)
+			if !s.subtree {
+				continue
+			}
+			if s.path == "" {
+				rootOpaque = true
+			} else {
+				roots[s.path] = true
+			}
 		}
+		for name := range added {
+			roots[name] = true
+		}
+		if rootOpaque {
+			clear(merged)
+		}
+		removeUnder(merged, roots)
+
 		for _, name := range addedNames {
 			file, ok := added[name]
 			if !ok {
 				// Replaced later in the same layer by a directory or symlink.
 				continue
 			}
-			// An upper regular file replaces a lower directory, so anything
-			// the lower layers had beneath this path goes with it. Leaving it
-			// would report a file and a directory at one path, which no
-			// filesystem can hold.
-			removeTree(merged, name)
 			if !listed[name] {
 				listed[name] = true
 				names = append(names, name)
@@ -227,16 +250,16 @@ func validateNames(entries []File) error {
 
 // readLayer indexes one tar layer, returning its entries, the order they
 // appeared in, the paths it whites out, and the running name count.
-func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen int) (map[string]File, []string, []shadow, int, error) {
+func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen, nameBytes int) (map[string]File, []string, []shadow, int, int, error) {
 	blob, err := openBlob(ctx, p, layer.digest)
 	if err != nil {
-		return nil, nil, nil, seen, err
+		return nil, nil, nil, seen, nameBytes, err
 	}
 	defer func() { _ = blob.Close() }()
 
 	reader, err := tarReader(blob)
 	if err != nil {
-		return nil, nil, nil, seen, fmt.Errorf("acr: reading layer %s: %w", layer.digest, err)
+		return nil, nil, nil, seen, nameBytes, fmt.Errorf("acr: reading layer %s: %w", layer.digest, err)
 	}
 	archive := tar.NewReader(reader)
 	added := map[string]File{}
@@ -253,12 +276,12 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			// its reader reaches EOF, so the rest is drained rather than
 			// caching names and sizes taken from an unverified layer.
 			if _, drainErr := io.Copy(io.Discard, reader); drainErr != nil {
-				return nil, nil, nil, seen, fmt.Errorf("acr: verifying layer %s: %w", layer.digest, drainErr)
+				return nil, nil, nil, seen, nameBytes, fmt.Errorf("acr: verifying layer %s: %w", layer.digest, drainErr)
 			}
-			return added, order, shadows, seen, nil
+			return added, order, shadows, seen, nameBytes, nil
 		}
 		if err != nil {
-			return nil, nil, nil, seen, fmt.Errorf("acr: reading layer %s: %w", layer.digest, err)
+			return nil, nil, nil, seen, nameBytes, fmt.Errorf("acr: reading layer %s: %w", layer.digest, err)
 		}
 		// Every header costs memory somewhere — the occurrence map, the
 		// whiteout list, or the entry map — so the bound is applied before
@@ -266,7 +289,18 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 		// would let a layer of directories or unsafe names exhaust it freely.
 		seen++
 		if seen > maxTarEntries {
-			return nil, nil, nil, seen, fmt.Errorf("acr: image holds more than %d entries", maxTarEntries)
+			return nil, nil, nil, seen, nameBytes, fmt.Errorf("acr: image holds more than %d entries", maxTarEntries)
+		}
+		// The entry count alone does not bound memory: a name is
+		// registry-controlled and PAX or GNU long names can be enormous, so a
+		// few entries could exhaust the budget the count is meant to protect.
+		if len(header.Name) > maxEntryNameBytes {
+			continue
+		}
+		nameBytes += len(header.Name)
+		if nameBytes > maxTotalNameBytes {
+			return nil, nil, nil, seen, nameBytes, fmt.Errorf(
+				"acr: image entry names exceed %d bytes", maxTotalNameBytes)
 		}
 		index := occurrences[header.Name]
 		occurrences[header.Name]++
@@ -301,19 +335,21 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 	}
 }
 
-// removeTree drops everything beneath a whited-out path. A whiteout can name a
-// directory, and its descendants go with it.
-func removeTree(merged map[string]File, dir string) {
-	prefix := dir + "/"
-	for name := range merged {
-		if strings.HasPrefix(name, prefix) {
-			delete(merged, name)
-		}
+// removeUnder deletes every entry that lies beneath one of roots.
+//
+// It walks each surviving name's ancestors rather than testing every root
+// against every name, so applying a layer costs the size of the merged set
+// times path depth instead of the product of the two sets.
+func removeUnder(merged map[string]File, roots map[string]bool) {
+	if len(roots) == 0 {
+		return
 	}
-	if dir == "" {
-		// An opaque whiteout at the root hides everything below it.
-		for name := range merged {
-			delete(merged, name)
+	for name := range merged {
+		for dir := path.Dir(name); dir != "." && dir != "/"; dir = path.Dir(dir) {
+			if roots[dir] {
+				delete(merged, name)
+				break
+			}
 		}
 	}
 }

@@ -884,9 +884,15 @@ func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 		return "", tenantMismatchError(registry, presented)
 	}
 
-	// The registry will not say which tenant it belongs to, but the Azure CLI
-	// knows which ones the user is already signed in to. Trying those costs
-	// nothing visible and avoids a prompt whenever one of them is the answer.
+	// Serialised so two registries in the same foreign tenant do not each open
+	// a sign-in: whoever waits here re-checks the cached credentials first.
+	unknownTenantRecovery.Lock()
+	defer unknownTenantRecovery.Unlock()
+
+	// The registry will not say which tenant it belongs to, but a sign-in
+	// earlier in this run, or the Azure CLI, may already have one that works.
+	// Trying those costs nothing visible and avoids a prompt whenever one of
+	// them is the answer.
 	if token, tenant, ok := exchangeViaKnownTenants(ctx, registry, presented); ok {
 		slog.Debug("acr: authenticated with a tenant the Azure CLI already knows",
 			"registry", registry, "tenant", tenant)
@@ -917,16 +923,44 @@ func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 	return token, nil
 }
 
-// exchangeViaKnownTenants retries the exchange with each tenant the Azure CLI
-// is signed in to, skipping the one the registry just rejected.
+// unknownTenantRecovery serialises the tenant-unknown path, so two registries
+// in the same foreign tenant do not each open a sign-in. The cached credential
+// the first one obtained is tried before anything is asked of the user.
+var unknownTenantRecovery sync.Mutex
+
+// exchangeViaKnownTenants retries the exchange with tenants already available:
+// those an interactive sign-in established earlier in this run, then those the
+// Azure CLI is signed in to. The tenant the registry just rejected is skipped.
 //
 // Each attempt is silent: a tenant whose session has lapsed fails immediately
 // rather than prompting, so this only ever converts a sign-in into no sign-in.
 func exchangeViaKnownTenants(ctx context.Context, registry, rejected string) (token, tenant string, ok bool) {
+	// A credential obtained for another registry in the same tenant is the
+	// cheapest answer, and the reason the one-sign-in-per-tenant guarantee
+	// holds across registries rather than only within one.
+	var cached []string
+	tenantCredCache.Range(func(key, _ any) bool {
+		cached = append(cached, key.(string))
+		return true
+	})
+	for _, candidate := range cached {
+		if strings.EqualFold(candidate, rejected) {
+			continue
+		}
+		value, loaded := tenantCredCache.Load(candidate)
+		if !loaded {
+			continue
+		}
+		credential := value.(azcore.TokenCredential)
+		if refresh, err := exchangeWithCredential(ctx, registry, credential, candidate); err == nil {
+			return refresh, candidate, true
+		}
+	}
+
 	tenants := cliTenantList(ctx)
 	attempts := 0
 	for _, candidate := range tenants {
-		if strings.EqualFold(candidate, rejected) {
+		if strings.EqualFold(candidate, rejected) || slices.Contains(cached, candidate) {
 			continue
 		}
 		if attempts >= maxTenantAttempts {
