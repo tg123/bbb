@@ -775,6 +775,85 @@ func TestLegacyRegularTypeFlagIsNormalised(t *testing.T) {
 	}
 }
 
+// A generic artifact may carry an untitled tar payload under its own config
+// type. Its layers are files, not a filesystem, so expanding them would
+// replace what was published with whatever is inside it.
+func TestImageOnlyExpandsContainerImageConfigs(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "genericartifact", Reference: "latest"}
+
+	image, err := mutate.Append(empty.Image, mutate.Addendum{
+		Layer:     tarGz(t, [2]string{"inside.txt", "content"}),
+		MediaType: types.DockerLayer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	image = mutate.ConfigMediaType(image, types.MediaType("application/vnd.example.config.v1+json"))
+	ref, err := name.NewTag(p.Registry+"/"+p.Repository+":"+p.Reference, name.WeakValidation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.Write(ref, image); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	invalidateLayers(p)
+
+	files, err := ListFiles(t.Context(), p)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	if len(files) != 1 || files[0].TarPath != "" {
+		t.Fatalf("listing = %#v, want the untitled layer left opaque under a non-image config", files)
+	}
+	if !strings.HasPrefix(files[0].Name, "sha256-") {
+		t.Errorf("name = %q, want the digest fallback the README documents", files[0].Name)
+	}
+}
+
+// A titled layer and a platform directory share one namespace, so an artifact
+// where a name is both cannot be served — and that must be decided the same
+// way however the path is reached.
+func TestImageRejectsTitleCollidingWithPlatform(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "prefixclash", Reference: "latest"}
+
+	titled, err := mutate.Append(empty.Image, mutate.Addendum{
+		Layer:       tarGz(t, [2]string{"unused", "x"}),
+		MediaType:   types.MediaType("application/octet-stream"),
+		Annotations: map[string]string{TitleAnnotation: "linux"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := mutate.AppendManifests(empty.Index,
+		mutate.IndexAddendum{Add: titled},
+		mutate.IndexAddendum{
+			Add:        imageWithLayers(t, tarGz(t, [2]string{"orng", "binary"})),
+			Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}},
+		},
+	)
+	ref, err := name.NewTag(p.Registry+"/"+p.Repository+":"+p.Reference, name.WeakValidation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.WriteIndex(ref, index); err != nil {
+		t.Fatalf("WriteIndex failed: %v", err)
+	}
+	invalidateLayers(p)
+
+	// Every entry point must agree, including the ones that never expand a
+	// layer.
+	if _, err := ListDir(t.Context(), p); err == nil {
+		t.Error("ListDir must reject a title colliding with a platform directory")
+	}
+	direct := p
+	direct.File = "linux"
+	if _, err := Stat(t.Context(), direct); err == nil {
+		t.Error("Stat must reject it too, rather than serving the titled blob")
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.

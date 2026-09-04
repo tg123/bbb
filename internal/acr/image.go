@@ -109,6 +109,17 @@ const (
 	whiteoutOpaque = ".wh..wh..opq"
 )
 
+// isImageConfig reports whether a manifest's config marks it as a container
+// image, whose layers are a filesystem, rather than a generic artifact whose
+// layers are files.
+func isImageConfig(mediaType types.MediaType) bool {
+	switch mediaType {
+	case types.DockerConfigJSON, types.OCIConfigJSON:
+		return true
+	}
+	return false
+}
+
 // isTarLayer reports whether a layer is a filesystem tarball whose entries can
 // be listed.
 //
@@ -287,8 +298,8 @@ func (g *imageGroup) read(ctx context.Context, p Path) ([]File, error) {
 		// exact ancestors go: the lower layer's other children and siblings
 		// are still part of the image.
 		for name := range added {
-			for dir := path.Dir(name); dir != "." && dir != "/"; dir = path.Dir(dir) {
-				delete(merged, dir)
+			for cut := strings.LastIndexByte(name, '/'); cut > 0; cut = strings.LastIndexByte(name[:cut], '/') {
+				delete(merged, name[:cut])
 			}
 		}
 
@@ -438,14 +449,17 @@ func removeUnderOne(entries map[string]File, dir string) {
 //
 // It walks each surviving name's ancestors rather than testing every root
 // against every name, so applying a layer costs the size of the merged set
-// times path depth instead of the product of the two sets.
+// times path depth instead of the product of the two sets. Ancestors are found
+// by slash position: path.Dir re-cleans and rescans the shrinking prefix each
+// time, which makes a deeply segmented registry-controlled name quadratic in
+// its own length.
 func removeUnder(merged map[string]File, roots map[string]bool) {
 	if len(roots) == 0 {
 		return
 	}
 	for name := range merged {
-		for dir := path.Dir(name); dir != "." && dir != "/"; dir = path.Dir(dir) {
-			if roots[dir] {
+		for cut := strings.LastIndexByte(name, '/'); cut > 0; cut = strings.LastIndexByte(name[:cut], '/') {
+			if roots[name[:cut]] {
 				delete(merged, name)
 				break
 			}

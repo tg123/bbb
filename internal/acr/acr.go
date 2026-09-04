@@ -897,7 +897,7 @@ func fetchArtifact(ctx context.Context, p Path) (*artifact, error) {
 		if err != nil {
 			return nil, asStatusError(err)
 		}
-		if err := art.addIndex(index, 0); err != nil {
+		if err := art.addIndex(index, 0, ""); err != nil {
 			return nil, err
 		}
 	default:
@@ -909,11 +909,49 @@ func fetchArtifact(ctx context.Context, p Path) (*artifact, error) {
 			return nil, err
 		}
 	}
+	// A titled layer and a platform directory share one namespace, so a name
+	// that is one in the manifest and the other in the index cannot both be
+	// served. This is decided from the manifests alone, so every path — a
+	// direct Stat as much as a recursive listing — is held to it without
+	// expanding anything.
+	if err := art.checkPrefixCollisions(); err != nil {
+		return nil, err
+	}
 	return art, nil
 }
 
+// checkPrefixCollisions rejects a titled layer that cannot coexist with a
+// platform directory.
+func (a *artifact) checkPrefixCollisions() error {
+	if len(a.groups) == 0 {
+		return nil
+	}
+	set := newNameSet(len(a.files) + len(a.groups))
+	for _, file := range a.files {
+		if _, err := set.addLayer(file.Name, file.Digest); err != nil {
+			return fmt.Errorf("acr: %w", err)
+		}
+	}
+	for _, group := range a.groups {
+		if group.prefix == "" {
+			continue
+		}
+		// Adding the directory as if it were a name catches both an identical
+		// title and one that is an ancestor or descendant of it.
+		if _, err := set.addLayer(group.prefix, "platform:"+group.prefix); err != nil {
+			return fmt.Errorf("acr: %w", err)
+		}
+	}
+	return nil
+}
+
 // addIndex merges the layers of every manifest an index references.
-func (a *artifact) addIndex(index v1.ImageIndex, depth int) error {
+//
+// inherited is the platform prefix of the descriptor that led here. A nested
+// index need not repeat the platform its parent declared, so carrying it down
+// keeps those manifests under the prefix they were reached by instead of
+// dropping them at the root.
+func (a *artifact) addIndex(index v1.ImageIndex, depth int, inherited string) error {
 	if depth > maxIndexDepth {
 		return errors.New("acr: too many nested image indexes")
 	}
@@ -922,26 +960,30 @@ func (a *artifact) addIndex(index v1.ImageIndex, depth int) error {
 		return err
 	}
 	for _, child := range manifest.Manifests {
+		prefix := inherited
+		if child.Platform != nil {
+			// A multi-platform image repeats the same file names once per
+			// platform, so each manifest's contents are kept apart under its
+			// own os/arch rather than colliding at the root.
+			declared, prefixErr := platformPrefix(child.Platform)
+			if prefixErr != nil {
+				return prefixErr
+			}
+			prefix = declared
+		}
 		switch child.MediaType {
 		case types.OCIImageIndex, types.DockerManifestList:
 			nested, err := index.ImageIndex(child.Digest)
 			if err != nil {
 				return asStatusError(err)
 			}
-			if err := a.addIndex(nested, depth+1); err != nil {
+			if err := a.addIndex(nested, depth+1, prefix); err != nil {
 				return err
 			}
 		default:
 			image, err := index.Image(child.Digest)
 			if err != nil {
 				return asStatusError(err)
-			}
-			// A multi-platform image repeats the same file names once per
-			// platform, so each manifest's contents are kept apart under its
-			// own os/arch rather than colliding at the root.
-			prefix, err := platformPrefix(child.Platform)
-			if err != nil {
-				return err
 			}
 			if err := a.addImageAt(image, prefix); err != nil {
 				return err
@@ -962,6 +1004,11 @@ func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 		return err
 	}
 	group := &imageGroup{prefix: prefix, budget: a.budget}
+	// Only a container image's layers are a filesystem. A generic artifact may
+	// legitimately carry an untitled tar payload under its own config type,
+	// and expanding that would replace the file it published with whatever is
+	// inside it.
+	filesystem := isImageConfig(manifest.Config.MediaType)
 	for _, descriptor := range manifest.Layers {
 		digest := descriptor.Digest.String()
 		title := descriptor.Annotations[TitleAnnotation]
@@ -976,7 +1023,7 @@ func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 		// the registry need not hold that blob at all, and fetching from a
 		// registry-supplied URL is exactly the redirect this package refuses
 		// elsewhere. Those stay opaque, named by digest as before.
-		if title == "" && isTarLayer(descriptor.MediaType) && len(descriptor.URLs) == 0 {
+		if filesystem && title == "" && isTarLayer(descriptor.MediaType) && len(descriptor.URLs) == 0 {
 			group.layers = append(group.layers, layerRef{digest: digest, size: descriptor.Size})
 			continue
 		}
@@ -1207,10 +1254,15 @@ func ListDir(ctx context.Context, p Path) ([]Entry, error) {
 			}
 		}
 	}
-	// A platform that has not been expanded still exists as a directory.
+	// A platform that has not been expanded still exists as a directory. It
+	// cannot displace a named file: checkPrefixCollisions has already refused
+	// an artifact where both claim one name, so this only fills in what is
+	// missing.
 	for _, prefix := range art.unexpandedDirs() {
 		if child, _, ok := immediateChild(p.File, prefix); ok {
-			add(Entry{Name: child, IsDir: true})
+			if _, taken := seen[child]; !taken {
+				add(Entry{Name: child, IsDir: true})
+			}
 		}
 	}
 
