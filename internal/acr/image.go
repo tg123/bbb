@@ -56,6 +56,11 @@ const (
 type imageBudget struct {
 	mu   sync.Mutex
 	used map[*imageGroup]budgetUse
+	// entries and names are the running sums of used, so a charge costs the
+	// same whatever an index declares. Rescanning every group per header would
+	// make an image's own size multiply the number of platforms it has.
+	entries int
+	names   int
 }
 
 type budgetUse struct {
@@ -68,18 +73,14 @@ func newImageBudget() *imageBudget {
 }
 
 // charge reports whether group may retain the given totals, counting what
-// every other group has already committed.
+// every other group has already committed. use is a running total for the
+// group, so this replaces its previous contribution rather than adding to it.
 func (b *imageBudget) charge(group *imageGroup, use budgetUse) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	entries, names := use.entries, use.names
-	for other, committed := range b.used {
-		if other == group {
-			continue
-		}
-		entries += committed.entries
-		names += committed.names
-	}
+	previous := b.used[group]
+	entries := b.entries - previous.entries + use.entries
+	names := b.names - previous.names + use.names
 	if entries > maxTarEntries {
 		return fmt.Errorf("acr: image holds more than %d entries", maxTarEntries)
 	}
@@ -87,6 +88,7 @@ func (b *imageBudget) charge(group *imageGroup, use budgetUse) error {
 		return fmt.Errorf("acr: image entry names exceed %d bytes", maxTotalNameBytes)
 	}
 	b.used[group] = use
+	b.entries, b.names = entries, names
 	return nil
 }
 
@@ -94,6 +96,9 @@ func (b *imageBudget) charge(group *imageGroup, use budgetUse) error {
 func (b *imageBudget) release(group *imageGroup) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	previous := b.used[group]
+	b.entries -= previous.entries
+	b.names -= previous.names
 	delete(b.used, group)
 }
 

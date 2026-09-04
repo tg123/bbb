@@ -600,6 +600,19 @@ func TestImageBudgetIsSharedAcrossGroups(t *testing.T) {
 	if err := budget.charge(second, budgetUse{entries: maxTarEntries - 2}); err != nil {
 		t.Fatalf("the released allowance should be available: %v", err)
 	}
+
+	// The running sums must agree with what the groups actually hold, since
+	// they are what every charge is decided against.
+	budget.mu.Lock()
+	total := 0
+	for _, use := range budget.used {
+		total += use.entries
+	}
+	aggregate := budget.entries
+	budget.mu.Unlock()
+	if aggregate != total {
+		t.Fatalf("aggregate = %d, want %d: the running sum has drifted", aggregate, total)
+	}
 }
 
 // A symlink replaces a path and everything beneath it, including entries the
