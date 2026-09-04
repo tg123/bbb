@@ -554,11 +554,18 @@ func ValidateUploadNames(files []UploadFile) error {
 	return nil
 }
 
-// File describes a single file (layer) inside an artifact.
+// File describes a single file inside an artifact.
+//
+// A plain artifact stores one file per layer, so Digest identifies the blob to
+// read. For a container image the file lives inside a tar layer instead, and
+// TarPath names it within that layer's archive.
 type File struct {
 	Name   string
 	Size   int64
 	Digest string
+	// TarPath, when set, is the entry's path inside the tar layer identified
+	// by Digest. Empty means the layer is the file.
+	TarPath string
 }
 
 // insecureRegistries returns the registry hosts explicitly allowed to be
@@ -758,6 +765,11 @@ type artifact struct {
 	files  []File
 	byName map[string]File
 	seen   *nameSet
+	// groups holds the tar layers of each manifest, expanded only when a path
+	// reaches inside one. Listing a multi-platform image's root is answered
+	// from the index alone rather than by transferring every layer.
+	groups []*imageGroup
+	mu     sync.Mutex
 }
 
 // layerCacheEntry memoises one resolved artifact.
@@ -863,7 +875,10 @@ func (a *artifact) addIndex(index v1.ImageIndex, depth int) error {
 			if err != nil {
 				return asStatusError(err)
 			}
-			if err := a.addImage(image); err != nil {
+			// A multi-platform image repeats the same file names once per
+			// platform, so each manifest's contents are kept apart under its
+			// own os/arch rather than colliding at the root.
+			if err := a.addImageAt(image, platformPrefix(child.Platform)); err != nil {
 				return err
 			}
 		}
@@ -873,12 +888,23 @@ func (a *artifact) addIndex(index v1.ImageIndex, depth int) error {
 
 // addImage merges one manifest's layers into the artifact.
 func (a *artifact) addImage(image v1.Image) error {
+	return a.addImageAt(image, "")
+}
+
+func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 	manifest, err := image.Manifest()
 	if err != nil {
 		return err
 	}
+	group := &imageGroup{prefix: prefix}
 	for _, descriptor := range manifest.Layers {
 		digest := descriptor.Digest.String()
+		// A filesystem layer holds files rather than being one, so it is
+		// recorded for expansion instead of being named here.
+		if isTarLayer(descriptor.MediaType) {
+			group.layers = append(group.layers, layerRef{digest: digest, size: descriptor.Size})
+			continue
+		}
 		title := descriptor.Annotations[TitleAnnotation]
 		if title == "" {
 			title = strings.ReplaceAll(digest, ":", "-")
@@ -886,6 +912,9 @@ func (a *artifact) addImage(image v1.Image) error {
 		cleaned, err := cleanFile(title)
 		if err != nil {
 			return fmt.Errorf("acr: invalid layer name %q: %w", title, err)
+		}
+		if prefix != "" {
+			cleaned = prefix + "/" + cleaned
 		}
 		dup, err := a.seen.addLayer(cleaned, digest)
 		if err != nil {
@@ -901,16 +930,180 @@ func (a *artifact) addImage(image v1.Image) error {
 		a.files = append(a.files, file)
 		a.byName[cleaned] = file
 	}
+	if len(group.layers) > 0 {
+		a.groups = append(a.groups, group)
+	}
 	return nil
 }
 
-// ListFiles returns the files (layers) contained in the artifact referenced by p.
+// materialise expands the tar layers needed to answer a question about file,
+// and returns every file known once they have been.
+//
+// Expanding transfers a layer, so a group is only read when the requested path
+// reaches into it, or it reaches into the requested directory.
+func (a *artifact) materialise(ctx context.Context, p Path, file string) ([]File, error) {
+	files := a.files
+	for _, group := range a.groups {
+		if !group.covers(file) {
+			continue
+		}
+		entries, err := group.expand(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, entries...)
+	}
+	return files, nil
+}
+
+// lookup finds a single file, expanding only the layer that could hold it.
+func (a *artifact) lookup(ctx context.Context, p Path, name string) (File, bool, error) {
+	if file, ok := a.byName[name]; ok {
+		return file, true, nil
+	}
+	for _, group := range a.groups {
+		if !group.covers(name) {
+			continue
+		}
+		entries, err := group.expand(ctx, p)
+		if err != nil {
+			return File{}, false, err
+		}
+		for _, entry := range entries {
+			if entry.Name == name {
+				return entry, true, nil
+			}
+		}
+	}
+	return File{}, false, nil
+}
+
+// unexpandedDirs returns the directories that exist because a tar layer will be
+// expanded under them, so a listing can show them without transferring
+// anything.
+func (a *artifact) unexpandedDirs() []string {
+	dirs := make([]string, 0, len(a.groups))
+	for _, group := range a.groups {
+		if group.prefix != "" {
+			dirs = append(dirs, group.prefix)
+		}
+	}
+	return dirs
+}
+
+// ListFiles returns the files contained in the artifact referenced by p,
+// including everything inside p.File when it names a directory.
+//
+// Files inside a container image's tar layers require transferring those
+// layers, so only the ones covering p.File are expanded: listing a single
+// platform of a multi-platform image reads that platform alone.
 func ListFiles(ctx context.Context, p Path) ([]File, error) {
 	art, err := resolve(ctx, p)
 	if err != nil {
 		return nil, err
 	}
-	return slices.Clone(art.files), nil
+	art.mu.Lock()
+	defer art.mu.Unlock()
+	files, err := art.materialise(ctx, p, p.File)
+	if err != nil {
+		return nil, err
+	}
+	return slices.Clone(files), nil
+}
+
+// ListDir returns the immediate children of p.File without expanding layers it
+// does not have to.
+//
+// The root of a multi-platform image is answered from the index alone, so
+// listing it costs one manifest fetch rather than a copy of every layer.
+func ListDir(ctx context.Context, p Path) ([]Entry, error) {
+	art, err := resolve(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	art.mu.Lock()
+	defer art.mu.Unlock()
+
+	// Only groups reaching into p.File are expanded; one sitting below it
+	// contributes just the directory that leads to it.
+	var files []File
+	for _, group := range art.groups {
+		if group.prefix != "" && strings.HasPrefix(group.prefix+"/", childPrefix(p.File)) &&
+			group.prefix != p.File {
+			continue
+		}
+		if !group.covers(p.File) {
+			continue
+		}
+		entries, expandErr := group.expand(ctx, p)
+		if expandErr != nil {
+			return nil, expandErr
+		}
+		files = append(files, entries...)
+	}
+	files = append(files, art.files...)
+
+	seen := map[string]Entry{}
+	var order []string
+	add := func(entry Entry) {
+		if _, ok := seen[entry.Name]; !ok {
+			order = append(order, entry.Name)
+		}
+		seen[entry.Name] = entry
+	}
+	for _, file := range files {
+		if child, dir, ok := immediateChild(p.File, file.Name); ok {
+			if dir {
+				add(Entry{Name: child, IsDir: true})
+			} else {
+				add(Entry{Name: child, Size: file.Size})
+			}
+		}
+	}
+	// A platform that has not been expanded still exists as a directory.
+	for _, prefix := range art.unexpandedDirs() {
+		if child, _, ok := immediateChild(p.File, prefix); ok {
+			add(Entry{Name: child, IsDir: true})
+		}
+	}
+
+	out := make([]Entry, 0, len(order))
+	for _, name := range order {
+		out = append(out, seen[name])
+	}
+	return out, nil
+}
+
+// Entry is one child in a directory listing.
+type Entry struct {
+	Name  string
+	Size  int64
+	IsDir bool
+}
+
+// childPrefix renders dir as the prefix its children share.
+func childPrefix(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	return dir + "/"
+}
+
+// immediateChild reports name's first path segment below dir, and whether that
+// segment is a directory rather than the file itself.
+func immediateChild(dir, name string) (child string, isDir bool, ok bool) {
+	prefix := childPrefix(dir)
+	if !strings.HasPrefix(name, prefix) {
+		return "", false, false
+	}
+	rest := name[len(prefix):]
+	if rest == "" {
+		return "", false, false
+	}
+	if head, _, found := strings.Cut(rest, "/"); found {
+		return head, true, true
+	}
+	return rest, false, true
 }
 
 // Stat returns metadata for the file referenced by p.File.
@@ -922,20 +1115,26 @@ func Stat(ctx context.Context, p Path) (File, error) {
 	if err != nil {
 		return File{}, err
 	}
-	if file, ok := art.byName[p.File]; ok {
-		return file, nil
+	art.mu.Lock()
+	defer art.mu.Unlock()
+	file, ok, err := art.lookup(ctx, p, p.File)
+	if err != nil {
+		return File{}, err
 	}
-	return File{}, &notFoundError{path: p.String()}
+	if !ok {
+		return File{}, &notFoundError{path: p.String()}
+	}
+	return file, nil
 }
 
 // IsDir reports whether p.File addresses a directory within the artifact:
-// either the artifact root, or one of the virtual directories List synthesises
-// from layer names.
+// either the artifact root, one of the virtual directories synthesised from
+// file names, or a platform of a multi-platform image.
 //
-// A name that matches a layer exactly is decided by an O(1) map lookup, and
-// only an unmatched name falls back to scanning for children. Downloading an
-// N-file artifact stats every layer through here, so a linear scan per file
-// would make the whole transfer quadratic.
+// A name that matches a file exactly is decided by an O(1) map lookup, and only
+// an unmatched name falls back to scanning. Downloading an N-file artifact
+// stats every file through here, so a linear scan per file would make the whole
+// transfer quadratic.
 func IsDir(ctx context.Context, p Path) (bool, error) {
 	if p.File == "" {
 		return true, nil
@@ -944,11 +1143,27 @@ func IsDir(ctx context.Context, p Path) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	art.mu.Lock()
+	defer art.mu.Unlock()
 	if _, ok := art.byName[p.File]; ok {
 		return false, nil
 	}
+	// A platform directory is known from the index, so this answers without
+	// expanding the layers underneath it.
 	prefix := p.File + "/"
-	for _, f := range art.files {
+	for _, dir := range art.unexpandedDirs() {
+		if dir == p.File || strings.HasPrefix(dir, prefix) {
+			return true, nil
+		}
+	}
+	files, err := art.materialise(ctx, p, p.File)
+	if err != nil {
+		return false, err
+	}
+	for _, f := range files {
+		if f.Name == p.File {
+			return false, nil
+		}
 		if strings.HasPrefix(f.Name, prefix) {
 			return true, nil
 		}
@@ -980,18 +1195,35 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	var target File
-	if file, ok := art.byName[p.File]; ok {
-		target = file
+	art.mu.Lock()
+	target, ok, err := art.lookup(ctx, p, p.File)
+	art.mu.Unlock()
+	if err != nil {
+		return nil, err
 	}
-	if target.Name == "" {
+	if !ok {
 		return nil, &notFoundError{path: p.String()}
 	}
-	// Fetch the blob with the caller's context rather than the one that
-	// resolved the manifest. The digest pins the content, so this still reads
-	// exactly the snapshot that was listed, and a shared puller keeps the
-	// authentication rather than repeating it per layer.
-	digestRef, err := p.blobReference(target.Digest)
+	// A file inside a container image is one entry of a tar layer rather than
+	// the layer itself.
+	if target.TarPath != "" {
+		return openTarEntry(ctx, p, target)
+	}
+	body, err := openBlob(ctx, p, target.Digest)
+	if err != nil {
+		return nil, err
+	}
+	return downloadReadCloser{ReadCloser: body, size: target.Size}, nil
+}
+
+// openBlob streams a layer blob by digest.
+//
+// The blob is fetched with the caller's context rather than the one that
+// resolved the manifest. The digest pins the content, so this still reads
+// exactly the snapshot that was listed, and a shared puller keeps the
+// authentication rather than repeating it per layer.
+func openBlob(ctx context.Context, p Path, digest string) (io.ReadCloser, error) {
+	digestRef, err := p.blobReference(digest)
 	if err != nil {
 		return nil, err
 	}
@@ -1014,7 +1246,7 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 		pullerCache.Delete(registryKey(p.Registry))
 		return nil, asStatusError(err)
 	}
-	return downloadReadCloser{ReadCloser: body, size: target.Size}, nil
+	return body, nil
 }
 
 type downloadReadCloser struct {

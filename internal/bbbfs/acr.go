@@ -78,38 +78,32 @@ func (acrFS) List(ctx context.Context, target string) ([]Entry, error) {
 		return nil, err
 	}
 	prefix := ap.File
-	ap.File = ""
-	files, err := acr.ListFiles(ctx, ap)
+	// ListDir answers from the manifest where it can, so listing the root of a
+	// container image costs one fetch rather than a copy of every layer.
+	children, err := acr.ListDir(ctx, ap)
 	if err != nil {
 		return nil, err
 	}
-	sizes := map[string]int64{}
-	names := make([]string, 0, len(files))
-	for _, f := range files {
-		names = append(names, f.Name)
-		sizes[f.Name] = f.Size
-	}
-	entries := listEntriesByPrefix(names, prefix)
-	if len(entries) == 0 {
-		if err := confirmPrefix(ctx, ap, prefix); err != nil {
+	if len(children) == 0 {
+		root := ap
+		root.File = ""
+		if err := confirmPrefix(ctx, root, prefix); err != nil {
 			return nil, err
 		}
 	}
-	out := make([]Entry, 0, len(entries))
-	for _, name := range entries {
-		trimmed := strings.TrimSuffix(name, "/")
-		if trimmed == "" {
-			continue
-		}
-		fullFile := path.Join(prefix, trimmed)
-		isDir := strings.HasSuffix(name, "/")
+	out := make([]Entry, 0, len(children))
+	for _, entry := range children {
 		child := ap
-		child.File = fullFile
+		child.File = path.Join(prefix, entry.Name)
+		name := entry.Name
+		if entry.IsDir {
+			name += "/"
+		}
 		out = append(out, Entry{
 			Name:  name,
 			Path:  child.String(),
-			Size:  sizes[fullFile],
-			IsDir: isDir,
+			Size:  entry.Size,
+			IsDir: entry.IsDir,
 		})
 	}
 	return out, nil
@@ -161,11 +155,14 @@ func (acrFS) ListRecursive(ctx context.Context, target string, emit func(Entry) 
 		return err
 	}
 	prefix := ap.File
-	ap.File = ""
+	// The prefix is kept on the path so only the layers beneath it are
+	// expanded; the names returned are still full artifact paths.
 	files, err := acr.ListFiles(ctx, ap)
 	if err != nil {
 		return err
 	}
+	root := ap
+	root.File = ""
 	sizes := map[string]int64{}
 	names := make([]string, 0, len(files))
 	for _, f := range files {
@@ -174,7 +171,7 @@ func (acrFS) ListRecursive(ctx context.Context, target string, emit func(Entry) 
 	}
 	filtered := filterFilesByPrefix(names, prefix)
 	if len(filtered) == 0 {
-		if err := confirmPrefix(ctx, ap, prefix); err != nil {
+		if err := confirmPrefix(ctx, root, prefix); err != nil {
 			return err
 		}
 	}
@@ -184,7 +181,7 @@ func (acrFS) ListRecursive(ctx context.Context, target string, emit func(Entry) 
 			continue
 		}
 		fullFile := path.Join(prefix, name)
-		child := ap
+		child := root
 		child.File = fullFile
 		if err := emit(Entry{
 			Name:  name,

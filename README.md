@@ -92,6 +92,28 @@ Authentication is resolved in this order:
 
 Because the Entra step posts a live Azure access token to the registry, it is only attempted for Azure Container Registry hosts (`*.azurecr.io`, `*.azurecr.cn`, `*.azurecr.us`, `*.azurecr.de`). Any other registry — a private `ghcr.io` repository, say — goes straight to the Docker keychain rather than being offered your Azure credential. Add custom-domain ACR hosts to `BBB_ACR_ENTRA_HOSTS` to opt them in. The Resource Manager audience follows the registry's cloud, so sovereign endpoints authenticate against their own. The exchange stops at an ACR refresh token, which is presented per request so the registry's challenge names the exact repository scope — the same flow `docker` uses after `az acr login`.
 
+#### Container images
+
+A container image stores its files *inside* its layers rather than as layers, so the naming above describes nothing useful for one: image layers carry no title, leaving only digests. `bbb` bridges that in two ways.
+
+A manifest reached through an index is prefixed with its platform, so the members of a multi-platform image are told apart by `os/arch` instead of by digest. A layer that is a filesystem tarball is presented as a directory of its entries:
+
+```bash
+$ bbb ls acr://myregistry/orng:latest
+acr://myregistry.azurecr.io/orng:latest/darwin
+acr://myregistry.azurecr.io/orng:latest/linux
+acr://myregistry.azurecr.io/orng:latest/windows
+
+$ bbb ls acr://myregistry/orng:latest/linux/amd64
+acr://myregistry.azurecr.io/orng:latest/linux/amd64/orng
+
+$ bbb cp acr://myregistry/orng:latest/linux/amd64/orng ./orng
+```
+
+Listing a layer means transferring it, so it happens only when a path reaches inside one — listing the root of a multi-platform image is answered from the index alone. Within a manifest, layers overlay: a later layer replaces what an earlier one wrote and `.wh.` whiteouts remove it, so the listing reflects the image's final filesystem. Only regular files are listed; directories, symlinks and device nodes are not files that can be streamed. Entry names are validated exactly like layer titles, so a crafted archive cannot escape the destination.
+
+Permissions are not carried across — like every other `bbb` transfer, files are written `0644`, so an extracted binary needs `chmod +x`. Artifacts published by `bbb` are unaffected by any of this: their layers are not tarballs and are never expanded.
+
 #### Registries in another tenant
 
 If the registry is not in your credential's home tenant, ACR rejects the token with `unknown tenantId`. `bbb` then opens a browser so you can sign in with an account that does have access, retries, and reports the tenant it turned out to be:
