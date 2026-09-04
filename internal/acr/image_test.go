@@ -522,6 +522,25 @@ func TestImageIgnoresEmptyWhiteout(t *testing.T) {
 	}
 }
 
+// An unusable platform must be reported, not quietly rehomed: sharing the
+// empty prefix with genuinely absent metadata would merge an unrelated
+// manifest into the artifact root.
+func TestImageRejectsUnusablePlatform(t *testing.T) {
+	if _, err := platformPrefix(&v1.Platform{OS: "../bad", Architecture: "amd64"}); err == nil {
+		t.Error("expected a traversal in a platform to be rejected")
+	}
+	if _, err := platformPrefix(&v1.Platform{OS: "linux", Architecture: "a:b"}); err == nil {
+		t.Error("expected a colon in a platform to be rejected")
+	}
+	// Genuinely absent metadata still means the artifact root.
+	if prefix, err := platformPrefix(nil); err != nil || prefix != "" {
+		t.Errorf("platformPrefix(nil) = %q (%v), want the root", prefix, err)
+	}
+	if prefix, err := platformPrefix(&v1.Platform{OS: "linux", Architecture: "amd64", Variant: "v8"}); err != nil || prefix != "linux/amd64/v8" {
+		t.Errorf("platformPrefix = %q (%v), want linux/amd64/v8", prefix, err)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.

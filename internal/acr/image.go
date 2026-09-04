@@ -56,23 +56,26 @@ func isTarLayer(mediaType types.MediaType) bool {
 }
 
 // platformPrefix names the directory a manifest's contents live under, so the
-// members of a multi-platform image are distinguishable. It returns "" when the
-// index gives no platform, leaving the layers at the artifact root.
-func platformPrefix(platform *v1.Platform) string {
+// members of a multi-platform image are distinguishable.
+//
+// An absent platform yields "", putting that manifest's layers at the artifact
+// root. An invalid one is an error rather than the same "": silently rehoming
+// it would merge an unrelated manifest into the root namespace, and a platform
+// is registry-controlled, so it is validated like any other name.
+func platformPrefix(platform *v1.Platform) (string, error) {
 	if platform == nil || platform.OS == "" || platform.Architecture == "" {
-		return ""
+		return "", nil
 	}
 	parts := []string{platform.OS, platform.Architecture}
 	if platform.Variant != "" {
 		parts = append(parts, platform.Variant)
 	}
 	prefix := strings.Join(parts, "/")
-	// A platform is registry-controlled, so it is validated like any other
-	// name rather than trusted into a path.
-	if cleaned, err := cleanFile(prefix); err == nil {
-		return cleaned
+	cleaned, err := cleanFile(prefix)
+	if err != nil || cleaned != prefix {
+		return "", fmt.Errorf("acr: manifest declares an unusable platform %q", prefix)
 	}
-	return ""
+	return cleaned, nil
 }
 
 // layerRef identifies one tar layer to expand.
@@ -93,6 +96,10 @@ type imageGroup struct {
 	mu      sync.Mutex
 	done    bool
 	entries []File
+	// byName indexes entries once expansion has settled. Downloading an
+	// N-file image looks up every one of them, so a scan per lookup would
+	// make the metadata work quadratic on top of the layer reads.
+	byName map[string]File
 }
 
 // covers reports whether expanding this group is needed to answer a question
@@ -125,8 +132,21 @@ func (g *imageGroup) expand(ctx context.Context, p Path) ([]File, error) {
 		return nil, err
 	}
 	g.entries = entries
+	g.byName = make(map[string]File, len(entries))
+	for _, entry := range entries {
+		g.byName[entry.Name] = entry
+	}
 	g.done = true
 	return g.entries, nil
+}
+
+// find returns an expanded entry by name in constant time. It reports false
+// when the group has not been expanded, so callers expand first.
+func (g *imageGroup) find(name string) (File, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	file, ok := g.byName[name]
+	return file, ok
 }
 
 func (g *imageGroup) read(ctx context.Context, p Path) ([]File, error) {

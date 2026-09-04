@@ -936,7 +936,11 @@ func (a *artifact) addIndex(index v1.ImageIndex, depth int) error {
 			// A multi-platform image repeats the same file names once per
 			// platform, so each manifest's contents are kept apart under its
 			// own os/arch rather than colliding at the root.
-			if err := a.addImageAt(image, platformPrefix(child.Platform)); err != nil {
+			prefix, err := platformPrefix(child.Platform)
+			if err != nil {
+				return err
+			}
+			if err := a.addImageAt(image, prefix); err != nil {
 				return err
 			}
 		}
@@ -1045,14 +1049,13 @@ func (a *artifact) lookup(ctx context.Context, p Path, name string) (File, bool,
 		if !group.covers(name) {
 			continue
 		}
-		entries, err := group.expand(ctx, p)
-		if err != nil {
+		if _, err := group.expand(ctx, p); err != nil {
 			return File{}, false, err
 		}
-		for _, entry := range entries {
-			if entry.Name == name {
-				return entry, true, nil
-			}
+		// Indexed at expansion, so this stays constant time however many
+		// files the image holds.
+		if file, ok := group.find(name); ok {
+			return file, true, nil
 		}
 	}
 	return File{}, false, nil
@@ -1277,7 +1280,11 @@ func IsDir(ctx context.Context, p Path) (bool, error) {
 	}
 	art.mu.Lock()
 	defer art.mu.Unlock()
-	if _, ok := art.byName[p.File]; ok {
+	// An exact name is answered from the index rather than by scanning, since
+	// downloading an N-file image asks about every one of them.
+	if _, ok, err := art.lookup(ctx, p, p.File); err != nil {
+		return false, err
+	} else if ok {
 		return false, nil
 	}
 	// A platform directory is known from the index, so this answers without
@@ -1293,9 +1300,6 @@ func IsDir(ctx context.Context, p Path) (bool, error) {
 		return false, err
 	}
 	for _, f := range files {
-		if f.Name == p.File {
-			return false, nil
-		}
 		if strings.HasPrefix(f.Name, prefix) {
 			return true, nil
 		}
