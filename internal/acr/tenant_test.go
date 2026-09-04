@@ -150,15 +150,20 @@ func (failingCredential) GetToken(context.Context, policy.TokenRequestOptions) (
 
 func stubTenantCredentials(t *testing.T, cli func(string) (azcore.TokenCredential, error), login func(context.Context, string, string, string) (azcore.TokenCredential, error)) {
 	t.Helper()
-	originalCLI, originalLogin := cliCredentialFor, interactiveLogin
+	originalCLI, originalLogin, originalTenants := cliCredentialFor, interactiveLogin, cliTenantList
 	cliCredentialFor, interactiveLogin = cli, login
+	// Default to knowing no tenants, so a test never shells out to a real
+	// Azure CLI; a test that cares overrides this afterwards.
+	cliTenantList = func(context.Context) []string { return nil }
 	t.Cleanup(func() {
-		cliCredentialFor, interactiveLogin = originalCLI, originalLogin
+		cliCredentialFor, interactiveLogin, cliTenantList = originalCLI, originalLogin, originalTenants
 		tenantCredCache.Clear()
 		tenantCredInflight.Clear()
+		explainedTenants.Clear()
 	})
 	tenantCredCache.Clear()
 	tenantCredInflight.Clear()
+	explainedTenants.Clear()
 }
 
 // The Azure CLI can hold a token only for the home tenant and return it
@@ -301,6 +306,80 @@ func TestCanPromptRespectsTheEnvironment(t *testing.T) {
 	// no-terminal decision rather than the opt-out.
 	if canPrompt() && !isCharDevice(os.Stdin) && !isCharDevice(os.Stderr) {
 		t.Error("expected no prompt without a terminal")
+	}
+}
+
+// An interrupted sign-in must not be reopened by whoever was queued behind it,
+// or cancelling once asks again.
+func TestCredentialForRegistryStopsOnCancellation(t *testing.T) {
+	t.Setenv("BBB_ACR_TENANT_MYREG_AZURECR_IO", "8b9ebe14-d942-49e7-ace9-14496d0caff0")
+	stubTenantCredentials(t,
+		func(string) (azcore.TokenCredential, error) { return failingCredential{}, nil },
+		func(context.Context, string, string, string) (azcore.TokenCredential, error) {
+			t.Error("must not sign in once the caller has gone")
+			return nil, errors.New("unexpected")
+		})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := credentialForRegistry(ctx, "myreg.azurecr.io"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("credentialForRegistry = %v, want the cancellation", err)
+	}
+}
+
+// The Azure CLI knows which tenants the user is signed in to, and the registry
+// will not say which one it wants, so those are worth trying before asking.
+func TestExchangeTriesTenantsTheCLIKnows(t *testing.T) {
+	const green = "8b9ebe14-d942-49e7-ace9-14496d0caff0"
+	const corp = "72f988bf-86f1-41af-91ab-2d7cd011db47"
+	greenToken := jwtWithClaims(`{"tid":"` + green + `"}`)
+	accepted := greenToken
+	attempts := 0
+	rejectingExchange(t, &accepted, &attempts)
+
+	original := tokenCredential
+	tokenCredential = func(context.Context, string) (azcore.TokenCredential, error) {
+		return &tenantCredentialStub{tenant: corp}, nil
+	}
+	t.Cleanup(func() { tokenCredential = original })
+
+	stubTenantCredentials(t,
+		func(tenant string) (azcore.TokenCredential, error) {
+			return &tenantCredentialStub{tenant: tenant}, nil
+		},
+		func(context.Context, string, string, string) (azcore.TokenCredential, error) {
+			t.Error("a tenant the CLI already serves must not prompt")
+			return nil, errors.New("unexpected")
+		})
+
+	originalTenants := cliTenantList
+	var asked bool
+	cliTenantList = func(context.Context) []string {
+		asked = true
+		// The rejected tenant is listed too, and must be skipped rather than
+		// retried against the registry that just refused it.
+		return []string{corp, green}
+	}
+	originalPrompt := promptAllowed
+	promptAllowed = func() bool { return true }
+	t.Cleanup(func() {
+		cliTenantList = originalTenants
+		promptAllowed = originalPrompt
+		discoveredTenants.Clear()
+	})
+	token, err := exchangeEntraToken(t.Context(), "myreg.azurecr.io")
+	if err != nil {
+		t.Fatalf("exchange failed: %v", err)
+	}
+	if token != "acr-refresh" {
+		t.Fatalf("token = %q, want the refresh token", token)
+	}
+	if !asked {
+		t.Error("expected the Azure CLI tenants to be consulted")
+	}
+	// The tenant that worked is remembered, so a refresh does not rediscover it.
+	if found, ok := discoveredTenants.Load(registryKey("myreg.azurecr.io")); !ok || found.(string) != green {
+		t.Errorf("discovered tenant = %v, want %s", found, green)
 	}
 }
 

@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -305,6 +307,9 @@ var (
 // Azure CLI for that tenant, confirm the token really is for it, and otherwise
 // sign in interactively.
 func credentialForRegistry(ctx context.Context, registry string) (azcore.TokenCredential, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	tid := registryTenantID(registry)
 	if tid == "" {
 		// A sign-in earlier in this run already established which tenant this
@@ -327,6 +332,11 @@ func credentialForRegistry(ctx context.Context, registry string) (azcore.TokenCr
 	defer mu.Unlock()
 	if cached, ok := tenantCredCache.Load(tid); ok {
 		return cached.(azcore.TokenCredential), nil
+	}
+	// Waiting for the lock can outlast the caller: a sign-in that was
+	// interrupted must not be restarted by whoever was queued behind it.
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	scope := armScope(registry)
@@ -367,10 +377,67 @@ func credentialForRegistry(ctx context.Context, registry string) (azcore.TokenCr
 // Without this the prompt looks like the CLI was ignored, when in fact it was
 // asked and could not answer: a profile can be signed in to a tenant and still
 // hold no usable token for it, which is invisible unless it is said out loud.
+// explainedTenants ensures the fallback is explained once per tenant, not once
+// per caller: `ls` resolves credentials from more than one place, and repeating
+// the same paragraph reads like something went wrong twice.
+var explainedTenants sync.Map
+
 func explainCLIFallback(tenant string) {
+	if _, seen := explainedTenants.LoadOrStore(tenant, struct{}{}); seen {
+		return
+	}
 	fmt.Fprintf(os.Stderr,
 		"\n  The Azure CLI has no usable token for tenant %s; `az login --tenant %s` would avoid this prompt.\n",
 		tenant, tenant)
+}
+
+// cliTenantList is indirected so tests do not depend on the Azure CLI.
+var cliTenantList = azureCLITenants
+
+// cliListTimeout bounds the tenant lookup, which is a convenience rather than
+// something worth stalling a transfer for.
+const cliListTimeout = 15 * time.Second
+
+// maxTenantAttempts caps how many tenants are tried before falling back to
+// asking, so a user signed in to many tenants is not made to wait through all
+// of them.
+const maxTenantAttempts = 8
+
+// azureCLITenants returns the tenants the Azure CLI has accounts for.
+//
+// An ACR endpoint never says which tenant it belongs to, so when the default
+// credential is rejected the next best source is the set of tenants the user
+// has already signed in to. Asking az rather than Resource Manager matters: a
+// tenant reached with a separate account is absent from ARM's /tenants for the
+// current one, which is exactly the case that fails.
+//
+// AZURE_CONFIG_DIR is honoured because az reads it, so this follows whichever
+// profile the caller selected.
+func azureCLITenants(ctx context.Context) []string {
+	ctx, cancel := context.WithTimeout(ctx, cliListTimeout)
+	defer cancel()
+
+	args := []string{"account", "list", "--all", "--query", "[].tenantId", "-o", "tsv"}
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		// az ships as a batch file on Windows, which is not directly
+		// executable.
+		cmd = exec.CommandContext(ctx, "cmd.exe", append([]string{"/c", "az"}, args...)...)
+	} else {
+		cmd = exec.CommandContext(ctx, "az", args...)
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		slog.Debug("acr: could not list Azure CLI tenants", "error", err)
+		return nil
+	}
+	var tenants []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if tenant := strings.TrimSpace(line); tenant != "" && !slices.Contains(tenants, tenant) {
+			tenants = append(tenants, tenant)
+		}
+	}
+	return tenants
 }
 
 // unreadable tid is accepted rather than triggering a needless login: the
@@ -729,8 +796,23 @@ func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 	if configured != "" {
 		return "", tenantMismatchError(registry, presented)
 	}
+
+	// The registry will not say which tenant it belongs to, but the Azure CLI
+	// knows which ones the user is already signed in to. Trying those costs
+	// nothing visible and avoids a prompt whenever one of them is the answer.
+	if token, tenant, ok := exchangeViaKnownTenants(ctx, registry, presented); ok {
+		slog.Debug("acr: authenticated with a tenant the Azure CLI already knows",
+			"registry", registry, "tenant", tenant)
+		discoveredTenants.Store(registryKey(registry), tenant)
+		return token, nil
+	}
+
 	if !promptAllowed() {
 		return "", tenantMismatchError(registry, presented)
+	}
+	// An interrupted sign-in must not be reopened by the next caller.
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 
 	signedIn, err := interactiveLogin(ctx, registry, "", armScope(registry))
@@ -746,6 +828,44 @@ func exchangeEntraToken(ctx context.Context, registry string) (string, error) {
 	}
 	rememberTenant(ctx, registry, signedIn)
 	return token, nil
+}
+
+// exchangeViaKnownTenants retries the exchange with each tenant the Azure CLI
+// is signed in to, skipping the one the registry just rejected.
+//
+// Each attempt is silent: a tenant whose session has lapsed fails immediately
+// rather than prompting, so this only ever converts a sign-in into no sign-in.
+func exchangeViaKnownTenants(ctx context.Context, registry, rejected string) (token, tenant string, ok bool) {
+	tenants := cliTenantList(ctx)
+	attempts := 0
+	for _, candidate := range tenants {
+		if strings.EqualFold(candidate, rejected) {
+			continue
+		}
+		if attempts >= maxTenantAttempts {
+			break
+		}
+		attempts++
+
+		credential, err := cliCredentialFor(candidate)
+		if err != nil {
+			continue
+		}
+		aad, err := credential.GetToken(ctx, policyTokenRequest(armScope(registry)))
+		if err != nil || !tenantMatches(aad.Token, candidate) {
+			// A lapsed session reports that it needs interaction, and az can
+			// return a home-tenant token whatever was asked for; neither is
+			// worth presenting to the registry.
+			continue
+		}
+		refresh, err := exchangeWithCredential(ctx, registry, credential, candidate)
+		if err != nil {
+			continue
+		}
+		tenantCredCache.Store(candidate, credential)
+		return refresh, candidate, true
+	}
+	return "", "", false
 }
 
 // rememberTenant caches a credential obtained interactively under the tenant
