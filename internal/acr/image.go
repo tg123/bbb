@@ -396,6 +396,9 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 	// whitedOut is the paths this layer has removed from the layers below so
 	// far, so a hard link written afterwards cannot reach through one.
 	whitedOut := map[string]bool{}
+	// claimed is the paths a hard link has taken but not filled, so another
+	// link naming one of them does not fall through to the layers below.
+	claimed := map[string]bool{}
 	for {
 		header, err := archive.Next()
 		if errors.Is(err, io.EOF) {
@@ -406,7 +409,7 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			if _, drainErr := io.Copy(io.Discard, reader); drainErr != nil {
 				return nil, nil, nil, seen, nameBytes, fmt.Errorf("acr: verifying layer %s: %w", layer.digest, drainErr)
 			}
-			g.resolveLinks(links, added, &order, writtenAt, nonDirAt, merged, whitedOut)
+			g.resolveLinks(links, added, &order, writtenAt, nonDirAt, merged, whitedOut, claimed)
 			reconcileLayerTree(added, writtenAt, nonDirAt)
 			for _, name := range replaced {
 				if subtree, still := replacements[name]; still {
@@ -459,15 +462,18 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 		}
 		if kind == entryLink {
 			ordinal++
+			// A link header is the last word on its path whether or not it
+			// can be resolved, so what stood there — in this layer or below —
+			// is replaced before the target is even looked for. An oversized
+			// target leaves nothing to resolve; anything else is attempted.
+			delete(added, full)
+			writtenAt[full] = ordinal
+			nonDirAt[full] = ordinal
+			if _, seenBefore := replacements[full]; !seenBefore {
+				replaced = append(replaced, full)
+			}
+			replacements[full] = true
 			if oversizedTarget {
-				// Nothing can be resolved, but the path is still replaced.
-				delete(added, full)
-				writtenAt[full] = ordinal
-				nonDirAt[full] = ordinal
-				if _, seenBefore := replacements[full]; !seenBefore {
-					replaced = append(replaced, full)
-				}
-				replacements[full] = true
 				continue
 			}
 			link := hardLink{name: full, target: header.Linkname, at: ordinal}
@@ -478,9 +484,12 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			// here is also what POSIX expects, since a link's target precedes
 			// it. Only a forward reference has to wait for the layer to end.
 			if target, usable := g.linkTarget(link, writtenAt); usable &&
-				g.installLink(link, target, added, &order, writtenAt, nonDirAt, merged, whitedOut) {
+				g.installLink(link, target, added, &order, writtenAt, nonDirAt, merged, whitedOut, claimed) {
 				continue
 			}
+			// Still claimed, and now empty: another link naming this path must
+			// not resolve against what the layers below had there.
+			claimed[full] = true
 			links = append(links, link)
 			continue
 		}
@@ -553,7 +562,7 @@ type hardLink struct {
 // Each link is instead visited once, following its target through the links
 // that have not settled yet. A cycle is left unresolved, so it is dropped like
 // any other target that cannot be found.
-func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order *[]string, writtenAt, nonDirAt map[string]int, merged map[string]File, whitedOut map[string]bool) {
+func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order *[]string, writtenAt, nonDirAt map[string]int, merged map[string]File, whitedOut, claimed map[string]bool) {
 	if len(links) == 0 {
 		return
 	}
@@ -591,7 +600,7 @@ func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order
 						continue
 					}
 				}
-				g.installLink(links[top], target, added, order, writtenAt, nonDirAt, merged, whitedOut)
+				g.installLink(links[top], target, added, order, writtenAt, nonDirAt, merged, whitedOut, claimed)
 			}
 			// Installed, spent, dangling, or part of a cycle: either way this
 			// link is finished with.
@@ -621,13 +630,15 @@ func (g *imageGroup) linkTarget(link hardLink, writtenAt map[string]int) (string
 
 // installLink gives a link the content of the entry it names, reporting
 // whether the target was there to take.
-func (g *imageGroup) installLink(link hardLink, target string, added map[string]File, order *[]string, writtenAt, nonDirAt map[string]int, merged map[string]File, whitedOut map[string]bool) bool {
+func (g *imageGroup) installLink(link hardLink, target string, added map[string]File, order *[]string, writtenAt, nonDirAt map[string]int, merged map[string]File, whitedOut, claimed map[string]bool) bool {
 	source, ok := added[target]
 	if !ok {
 		// The target may belong to a lower layer, which an extractor links
 		// against because it links against the merged tree. Not, however, if
-		// this layer has already removed it: by then there is nothing to link.
-		if coveredByWhiteout(whitedOut, target) {
+		// this layer has already removed it, or if a link of its own has
+		// taken that path without filling it: either way there is nothing
+		// left at the target to link to.
+		if claimed[target] || coveredByWhiteout(whitedOut, target) {
 			return false
 		}
 		source, ok = merged[target]
@@ -649,6 +660,8 @@ func (g *imageGroup) installLink(link hardLink, target string, added map[string]
 	// A link is a file, so it displaces whatever the same layer wrote beneath
 	// its path, exactly as a regular file does.
 	nonDirAt[link.name] = link.at
+	// The path now holds something, so a link naming it can resolve.
+	delete(claimed, link.name)
 	return true
 }
 

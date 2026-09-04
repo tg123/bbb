@@ -1145,7 +1145,7 @@ func TestImageResolvesLongHardLinkChainLinearly(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		group.resolveLinks(links, added, &order, writtenAt, map[string]int{}, map[string]File{}, map[string]bool{})
+		group.resolveLinks(links, added, &order, writtenAt, map[string]int{}, map[string]File{}, map[string]bool{}, map[string]bool{})
 	}()
 	select {
 	case <-done:
@@ -1452,6 +1452,88 @@ func (f *fakeIndex) Image(v1.Hash) (v1.Image, error) {
 }
 
 func (f *fakeIndex) IndexManifest() (*v1.IndexManifest, error) { return f.manifest, nil }
+
+// A hard-link header claims its path whether or not the target is there, so
+// what stood there before must go, and another link naming that path must not
+// reach past it to the layers below.
+func TestImageDanglingHardLinkStillClaimsItsPath(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "danglinglink", Reference: "latest"}
+
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	archive := tar.NewWriter(gz)
+	if err := archive.WriteHeader(&tar.Header{
+		Name: "kept", Mode: 0o644, Size: 4, Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive.Write([]byte("here")); err != nil {
+		t.Fatal(err)
+	}
+	for _, header := range []*tar.Header{
+		// "shadowed" exists in the lower layer; this dangling link replaces it.
+		{Name: "shadowed", Typeflag: tar.TypeLink, Linkname: "missing"},
+		// "first" is claimed by a link that cannot resolve, so "second" must
+		// not reach past it to the copy of "first" in the layer below.
+		{Name: "first", Typeflag: tar.TypeLink, Linkname: "nowhere"},
+		{Name: "second", Typeflag: tar.TypeLink, Linkname: "first"},
+	} {
+		header.Mode = 0o644
+		if err := archive.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"shadowed", "lower"}, [2]string{"first", "lower"}, [2]string{"second", "lower"}),
+		static.NewLayer(raw.Bytes(), types.DockerLayer),
+	)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Name)
+	}
+	slices.Sort(names)
+	if want := []string{"linux/amd64/kept"}; !slices.Equal(names, want) {
+		t.Fatalf("listing = %v, want %v — a claimed path must not fall back to the layer below", names, want)
+	}
+}
+
+// An index declaring two platforms that differ only by case offers two virtual
+// directories that are one path on Windows and macOS. Nothing later catches
+// it: a platform with no layers never reaches the name checks.
+func TestImageRejectsPlatformsDifferingByCase(t *testing.T) {
+	art := &artifact{
+		byName: map[string]File{},
+		seen:   newNameSet(0),
+		budget: newImageBudget(),
+	}
+	manifest := &v1.Manifest{Config: v1.Descriptor{MediaType: types.OCIConfigJSON}}
+	image := &fakeImage{manifest: manifest}
+	if err := art.addImageAt(image, "linux/amd64"); err != nil {
+		t.Fatalf("the first platform must be accepted: %v", err)
+	}
+	err := art.addImageAt(image, "LINUX/amd64")
+	if err == nil {
+		t.Fatal("expected platforms differing only by case to be rejected")
+	}
+	if !strings.Contains(err.Error(), "case-insensitive") {
+		t.Fatalf("error = %v, want it to explain the aliasing", err)
+	}
+}
 
 // Two groups can produce the same full name — an unprefixed manifest holding
 // linux/amd64/app alongside a linux/amd64 manifest holding app — so every path

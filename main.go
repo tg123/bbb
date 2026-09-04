@@ -2970,14 +2970,12 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		return fmt.Errorf("sync: hf:// only supported as source")
 	}
 	srcACR := bbbfs.IsACR(src)
-	if srcACR {
-		dirLike, err := bbbfs.IsDirLike(ctx, src)
-		if err != nil {
-			return fmt.Errorf("sync: %w", err)
-		}
-		if !dirLike {
-			return errors.New("sync: acr:// path must target an artifact, not individual files")
-		}
+	if srcACR && !bbbfs.IsDirLikeFromPath(src) {
+		// Answered from the path rather than the registry. Asking whether a
+		// path inside an artifact is a directory expands the layer holding
+		// it, so a source sync cannot accept anyway would transfer gigabytes
+		// before saying so.
+		return errors.New("sync: acr:// path must target an artifact, not individual files")
 	}
 	srcHF := bbbfs.IsHF(src)
 	if srcHF && !bbbfs.IsAz(dst) {

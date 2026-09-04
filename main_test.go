@@ -176,6 +176,18 @@ func TestCmdSyncRejectsDeleteWithACRSource(t *testing.T) {
 	}
 }
 
+// A path inside an artifact is rejected from the path alone. Asking the
+// registry whether it is a directory expands the layer holding it, so a source
+// sync cannot accept anyway would transfer gigabytes before saying so — and
+// the host here does not exist, which is what proves nothing was contacted.
+func TestCmdSyncRejectsACRFilePathWithoutContactingTheRegistry(t *testing.T) {
+	err := cmdSyncPaths(context.Background(), true, false, true, "", 1, 0,
+		"acr://nonexistent-registry.invalid/models:v1/linux/amd64", t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "must target an artifact") {
+		t.Fatalf("expected a path inside an artifact to be rejected, got %v", err)
+	}
+}
+
 func TestCPDirectoryCopiesTree(t *testing.T) {
 	dir := t.TempDir()
 	srcDir := filepath.Join(dir, "src")

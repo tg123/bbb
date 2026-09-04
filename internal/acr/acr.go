@@ -1108,12 +1108,22 @@ func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 		// share an os/arch. Merging them would overlay unrelated filesystems,
 		// with the listing describing one and the download serving another, so
 		// the ambiguity is reported rather than silently resolved by order.
+		//
+		// Compared folded, as file names are: an index declaring both
+		// linux/amd64 and LINUX/amd64 would otherwise offer two directories
+		// that are one path on Windows and macOS. Nothing later catches that
+		// — an empty platform never reaches the name checks at all.
 		for _, existing := range a.groups {
-			if existing.prefix == group.prefix {
-				if group.prefix == "" {
+			if foldKey(existing.prefix) == foldKey(group.prefix) {
+				switch {
+				case group.prefix == "":
 					return errors.New("acr: this image has several manifests without platforms, which cannot be told apart")
+				case existing.prefix != group.prefix:
+					return fmt.Errorf("acr: this image declares both %s and %s, which are one directory on a case-insensitive filesystem",
+						existing.prefix, group.prefix)
+				default:
+					return fmt.Errorf("acr: this image has several manifests for %s, which cannot be told apart", group.prefix)
 				}
-				return fmt.Errorf("acr: this image has several manifests for %s, which cannot be told apart", group.prefix)
 			}
 		}
 		a.groups = append(a.groups, group)
