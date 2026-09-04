@@ -854,6 +854,76 @@ func TestImageRejectsTitleCollidingWithPlatform(t *testing.T) {
 	}
 }
 
+// A hard link is a second name for a file the archive already carries, so it
+// is a regular file in the image and must be listed and readable.
+func TestImageResolvesHardLinks(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "hardlink", Reference: "latest"}
+
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	archive := tar.NewWriter(gz)
+	body := "shared-content"
+	if err := archive.WriteHeader(&tar.Header{
+		Name: "bin/real", Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	for _, link := range []*tar.Header{
+		{Name: "bin/alias", Mode: 0o755, Typeflag: tar.TypeLink, Linkname: "bin/real"},
+		// A link whose target is not in the image is dropped rather than
+		// listed as something unreadable.
+		{Name: "bin/dangling", Mode: 0o755, Typeflag: tar.TypeLink, Linkname: "bin/missing"},
+	} {
+		if err := archive.WriteHeader(link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pushIndex(t, p, map[string]v1.Image{
+		"linux/amd64": imageWithLayers(t, static.NewLayer(raw.Bytes(), types.DockerLayer)),
+	})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Name)
+	}
+	if !slicesContains(names, "linux/amd64/bin/alias") {
+		t.Errorf("listing = %v, want the hard link listed", names)
+	}
+	if slicesContains(names, "linux/amd64/bin/dangling") {
+		t.Errorf("listing = %v, want a dangling link dropped", names)
+	}
+
+	// The link serves the target's bytes.
+	alias := p
+	alias.File = "linux/amd64/bin/alias"
+	reader, err := DownloadStream(t.Context(), alias)
+	if err != nil {
+		t.Fatalf("DownloadStream failed: %v", err)
+	}
+	content, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil || string(content) != body {
+		t.Fatalf("content = %q (%v), want the target's content", content, err)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.

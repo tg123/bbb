@@ -260,7 +260,7 @@ func (g *imageGroup) read(ctx context.Context, p Path) ([]File, error) {
 	seen := 0
 	nameBytes := 0
 	for _, layer := range g.layers {
-		added, addedNames, shadows, count, bytes, err := g.readLayer(ctx, p, layer, seen, nameBytes)
+		added, addedNames, shadows, count, bytes, err := g.readLayer(ctx, p, layer, seen, nameBytes, merged)
 		if err != nil {
 			return nil, err
 		}
@@ -347,7 +347,7 @@ func validateNames(entries []File) error {
 
 // readLayer indexes one tar layer, returning its entries, the order they
 // appeared in, the paths it whites out, and the running name count.
-func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen, nameBytes int) (map[string]File, []string, []shadow, int, int, error) {
+func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen, nameBytes int, merged map[string]File) (map[string]File, []string, []shadow, int, int, error) {
 	blob, err := openBlob(ctx, p, layer.digest)
 	if err != nil {
 		return nil, nil, nil, seen, nameBytes, err
@@ -362,6 +362,7 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 	added := map[string]File{}
 	var order []string
 	var shadows []shadow
+	var links []hardLink
 	// occurrences counts headers per path so a duplicated entry can be found
 	// again: a tar is a log, and the last write of a path is the live one.
 	occurrences := map[string]int{}
@@ -375,6 +376,7 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			if _, drainErr := io.Copy(io.Discard, reader); drainErr != nil {
 				return nil, nil, nil, seen, nameBytes, fmt.Errorf("acr: verifying layer %s: %w", layer.digest, drainErr)
 			}
+			g.resolveLinks(links, added, &order, merged)
 			return added, order, shadows, seen, nameBytes, nil
 		}
 		if err != nil {
@@ -411,6 +413,12 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 		} else if g.prefix != "" {
 			full = g.prefix
 		}
+		if kind == entryLink {
+			// Resolved once the layer's own entries are known, since a link
+			// may name one of them.
+			links = append(links, hardLink{name: full, target: header.Linkname})
+			continue
+		}
 		if kind != entryFile {
 			// A tar is a log: this also replaces what the same layer wrote
 			// earlier at that path, and for anything but a directory the
@@ -431,6 +439,46 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			Digest:   layer.digest,
 			TarPath:  header.Name,
 			TarIndex: index,
+		}
+	}
+}
+
+// hardLink is a second name for a file the archive already carries.
+type hardLink struct {
+	name   string
+	target string
+}
+
+// resolveLinks turns hard links into entries of their own, taking the target's
+// content. A link resolves against the layer that declared it first, then the
+// layers below, and one whose target cannot be found is dropped rather than
+// listed as something unreadable.
+func (g *imageGroup) resolveLinks(links []hardLink, added map[string]File, order *[]string, merged map[string]File) {
+	for _, link := range links {
+		target := strings.TrimPrefix(link.target, "./")
+		target = strings.TrimSuffix(target, "/")
+		if target == "" || strings.HasPrefix(target, "/") || !isSafeEntryName(target) {
+			continue
+		}
+		if g.prefix != "" {
+			target = g.prefix + "/" + target
+		}
+		source, ok := added[target]
+		if !ok {
+			source, ok = merged[target]
+		}
+		if !ok {
+			continue
+		}
+		if _, exists := added[link.name]; !exists {
+			*order = append(*order, link.name)
+		}
+		added[link.name] = File{
+			Name:     link.name,
+			Size:     source.Size,
+			Digest:   source.Digest,
+			TarPath:  source.TarPath,
+			TarIndex: source.TarIndex,
 		}
 	}
 }
@@ -473,6 +521,9 @@ type entryKind int
 
 const (
 	entryFile entryKind = iota
+	// entryLink is a hard link: a second name for a file already in the
+	// archive, so it is a regular file in the resulting image.
+	entryLink
 	// entryDir is a directory: it replaces a lower file at the same path, but
 	// its contents merge rather than being hidden.
 	entryDir
@@ -544,6 +595,14 @@ func tarEntryName(header *tar.Header) (name string, kind entryKind, ok bool) {
 			return "", entryFile, false
 		}
 		return raw, entryDir, true
+	}
+	if header.Typeflag == tar.TypeLink {
+		// A hard link is another name for a file already in the archive, so it
+		// is a regular file in the image rather than something to drop.
+		if !isSafeEntryName(raw) {
+			return "", entryFile, false
+		}
+		return raw, entryLink, true
 	}
 	if header.Typeflag != tar.TypeReg {
 		// Not streamable, but still a replacement: OCI applies it over
