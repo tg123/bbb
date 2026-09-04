@@ -32,6 +32,10 @@ import (
 // audience of its cloud, and to the identity authority that issues for it. A
 // token for the public-cloud audience is not valid in a sovereign cloud, and
 // nor is one obtained from the public-cloud authority.
+//
+// Azure Germany is absent because it was decommissioned: pairing its audience
+// with the only authority the SDK still offers would produce a sign-in that
+// cannot issue for it, which is worse than not claiming support.
 var armScopes = []struct {
 	suffix string
 	scope  string
@@ -39,7 +43,6 @@ var armScopes = []struct {
 }{
 	{".azurecr.cn", "https://management.chinacloudapi.cn/.default", cloud.AzureChina},
 	{".azurecr.us", "https://management.usgovcloudapi.net/.default", cloud.AzureGovernment},
-	{".azurecr.de", "https://management.microsoftazure.de/.default", cloud.AzurePublic},
 	{".azurecr.io", "https://management.azure.com/.default", cloud.AzurePublic},
 }
 
@@ -77,12 +80,13 @@ func registryCloud(registry string) cloud.Configuration {
 const acrTokenUsername = "00000000-0000-0000-0000-000000000000"
 
 // azureRegistrySuffixes are the Azure Container Registry DNS suffixes across
-// the public and sovereign clouds.
+// the public and sovereign clouds. Azure Germany is omitted: it was
+// decommissioned, and its authority is no longer one the SDK can sign in
+// against.
 var azureRegistrySuffixes = []string{
 	".azurecr.io",
 	".azurecr.cn",
 	".azurecr.us",
-	".azurecr.de",
 }
 
 // registryHost strips any port and IPv6 brackets from a registry authority.
@@ -381,6 +385,13 @@ func credentialForRegistry(ctx context.Context, registry string) (azcore.TokenCr
 		}
 	}
 
+	if !promptAllowed() {
+		// The same gate the tenant-mismatch path uses: a sign-in nobody can
+		// answer would hang a pipeline until the credential timed out.
+		return nil, fmt.Errorf(
+			"acr: the Azure CLI has no usable token for tenant %s and signing in is unavailable; run: az login --tenant %s",
+			tid, tid)
+	}
 	credential, err := interactiveLogin(ctx, registry, tid, scope)
 	if err != nil {
 		return nil, err
@@ -668,6 +679,10 @@ func authOption(ctx context.Context, registry string) remote.Option {
 // attempt tries again: a timeout or network blip must not disable Entra for
 // the rest of the run, long after it recovered.
 func (e *authEntry) resolve(ctx context.Context, registry string) {
+	// A previous transient failure must not outlive the attempt that retries
+	// it: authOption reports e.err ahead of e.auth, so leaving it set would
+	// keep serving the outage even once a token had been obtained.
+	e.err = nil
 	if !isACR(registry) {
 		slog.Debug("acr: not an Azure Container Registry endpoint, using the Docker keychain",
 			"registry", registry)
@@ -715,6 +730,10 @@ func (e *authEntry) resolve(ctx context.Context, registry string) {
 	}
 	slog.Debug("acr: Entra ID authentication unavailable, falling back to the Docker keychain",
 		"registry", registry, "error", err)
+	// Definitive: there is no Azure credential to be had, so the keychain is
+	// the answer for the rest of the run rather than something to rediscover
+	// on every operation.
+	e.resolved = true
 }
 
 // isTransient reports whether an exchange failure is worth retrying, as

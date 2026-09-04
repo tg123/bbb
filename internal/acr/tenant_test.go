@@ -604,15 +604,16 @@ func TestAuthOptionSerialisesTheSignIn(t *testing.T) {
 	}
 }
 
-// A transient failure must not disable Entra for the rest of the run, so it is
-// deliberately not remembered.
-func TestAuthOptionRetriesATransientFailure(t *testing.T) {
+// A definitive failure is resolved once: with no Azure credential available
+// the keychain is the answer for the rest of the run, not something to
+// rediscover on every operation.
+func TestAuthOptionResolvesADefinitiveFailureOnce(t *testing.T) {
 	const registry = "myreg.azurecr.io"
 	var exchanges atomic.Int64
 	original := exchangeToken
 	exchangeToken = func(context.Context, string) (string, error) {
 		exchanges.Add(1)
-		return "", errors.New("dial tcp: i/o timeout")
+		return "", errors.New("DefaultAzureCredential: no credential was available")
 	}
 	t.Cleanup(func() {
 		exchangeToken = original
@@ -623,7 +624,44 @@ func TestAuthOptionRetriesATransientFailure(t *testing.T) {
 	authOption(t.Context(), registry)
 	authOption(t.Context(), registry)
 
-	if got := exchanges.Load(); got != 2 {
-		t.Fatalf("ran %d exchanges, want a retry after a transient failure", got)
+	if got := exchanges.Load(); got != 1 {
+		t.Fatalf("ran %d exchanges, want the fallback resolved once", got)
+	}
+}
+
+// Authentication has to be able to recover: an error kept from a failed
+// attempt would outlive the retry that succeeded, since it is reported ahead
+// of the credential.
+func TestAuthOptionRecoversAfterATransientFailure(t *testing.T) {
+	const registry = "myreg.azurecr.io"
+	var attempts atomic.Int64
+	original := exchangeToken
+	exchangeToken = func(context.Context, string) (string, error) {
+		if attempts.Add(1) == 1 {
+			return "", context.DeadlineExceeded
+		}
+		return "recovered", nil
+	}
+	t.Cleanup(func() {
+		exchangeToken = original
+		authCache.Clear()
+	})
+	authCache.Clear()
+
+	authOption(t.Context(), registry)
+	authOption(t.Context(), registry)
+
+	value, ok := authCache.Load(registryKey(registry))
+	if !ok {
+		t.Fatal("expected a cached entry")
+	}
+	entry := value.(*authEntry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.err != nil {
+		t.Errorf("the failure outlived its retry: %v", entry.err)
+	}
+	if entry.auth == nil {
+		t.Error("expected the recovered credential to be used")
 	}
 }

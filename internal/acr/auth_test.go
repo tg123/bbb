@@ -172,7 +172,6 @@ func TestARMScopeFollowsTheCloud(t *testing.T) {
 		"myreg.azurecr.io":      "https://management.azure.com/.default",
 		"myreg.azurecr.cn":      "https://management.chinacloudapi.cn/.default",
 		"myreg.azurecr.us":      "https://management.usgovcloudapi.net/.default",
-		"myreg.azurecr.de":      "https://management.microsoftazure.de/.default",
 		"myreg.azurecr.io:443":  "https://management.azure.com/.default",
 		"registry.corp.example": defaultARMScope,
 	} {

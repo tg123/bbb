@@ -108,7 +108,7 @@ Authentication is resolved in this order:
 2. Entra ID (Azure AD) via `DefaultAzureCredential` — Azure CLI login, service principal, managed identity, workload identity — exchanged for a registry token
 3. The Docker keychain (`~/.docker/config.json` and credential helpers), so a prior `docker login` works for any registry, including anonymous pull
 
-Because the Entra step posts a live Azure access token to the registry, it is only attempted for Azure Container Registry hosts (`*.azurecr.io`, `*.azurecr.cn`, `*.azurecr.us`, `*.azurecr.de`). Any other registry — a private `ghcr.io` repository, say — goes straight to the Docker keychain rather than being offered your Azure credential. Add custom-domain ACR hosts to `BBB_ACR_ENTRA_HOSTS` to opt them in. The Resource Manager audience follows the registry's cloud, so sovereign endpoints authenticate against their own. The exchange stops at an ACR refresh token, which is presented per request so the registry's challenge names the exact repository scope — the same flow `docker` uses after `az acr login`.
+Because the Entra step posts a live Azure access token to the registry, it is only attempted for Azure Container Registry hosts (`*.azurecr.io`, `*.azurecr.cn`, `*.azurecr.us`). Any other registry — a private `ghcr.io` repository, say — goes straight to the Docker keychain rather than being offered your Azure credential. Add custom-domain ACR hosts to `BBB_ACR_ENTRA_HOSTS` to opt them in. The Resource Manager audience and the sign-in authority both follow the registry's cloud, so sovereign endpoints authenticate against their own. The exchange stops at an ACR refresh token, which is presented per request so the registry's challenge names the exact repository scope — the same flow `docker` uses after `az acr login`.
 
 #### Container images
 
@@ -118,12 +118,12 @@ A manifest reached through an index is prefixed with its platform, so the member
 
 ```bash
 $ bbb ls acr://myregistry/orng:latest
-acr://myregistry.azurecr.io/orng:latest/darwin
-acr://myregistry.azurecr.io/orng:latest/linux
-acr://myregistry.azurecr.io/orng:latest/windows
+acr://myregistry/orng:latest/darwin
+acr://myregistry/orng:latest/linux
+acr://myregistry/orng:latest/windows
 
 $ bbb ls acr://myregistry/orng:latest/linux/amd64
-acr://myregistry.azurecr.io/orng:latest/linux/amd64/orng
+acr://myregistry/orng:latest/linux/amd64/orng
 
 $ bbb cp acr://myregistry/orng:latest/linux/amd64/orng ./orng
 ```

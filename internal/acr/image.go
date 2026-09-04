@@ -143,18 +143,20 @@ func (g *imageGroup) read(ctx context.Context, p Path) ([]File, error) {
 	// forever while names grew without limit.
 	seen := 0
 	for _, layer := range g.layers {
-		added, addedNames, whiteouts, count, err := g.readLayer(ctx, p, layer, seen)
+		added, addedNames, shadows, count, err := g.readLayer(ctx, p, layer, seen)
 		if err != nil {
 			return nil, err
 		}
 		seen = count
-		// Whiteouts hide what is underneath, so they are applied to the lower
-		// layers only. Applying them to this layer's own entries would let a
-		// tar hide files it legitimately contains, since a whiteout can
-		// appear before the entry it does not refer to.
-		for _, w := range whiteouts {
-			removeTree(merged, w)
-			delete(merged, w)
+		// A layer hides what lies beneath it, so shadows are applied to the
+		// lower layers only. Applying them to this layer's own entries would
+		// let a tar hide files it legitimately contains, since a whiteout can
+		// appear before an unrelated entry of the same name.
+		for _, s := range shadows {
+			if s.subtree {
+				removeTree(merged, s.path)
+			}
+			delete(merged, s.path)
 		}
 		for _, name := range addedNames {
 			if !listed[name] {
@@ -195,7 +197,7 @@ func validateNames(entries []File) error {
 
 // readLayer indexes one tar layer, returning its entries, the order they
 // appeared in, the paths it whites out, and the running name count.
-func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen int) (map[string]File, []string, []string, int, error) {
+func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen int) (map[string]File, []string, []shadow, int, error) {
 	blob, err := openBlob(ctx, p, layer.digest)
 	if err != nil {
 		return nil, nil, nil, seen, err
@@ -209,17 +211,32 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 	archive := tar.NewReader(reader)
 	added := map[string]File{}
 	var order []string
-	var whiteouts []string
+	var shadows []shadow
 	// occurrences counts headers per path so a duplicated entry can be found
 	// again: a tar is a log, and the last write of a path is the live one.
 	occurrences := map[string]int{}
 	for {
 		header, err := archive.Next()
 		if errors.Is(err, io.EOF) {
-			return added, order, whiteouts, seen, nil
+			// archive.Next stops at the tar end marker, which can come before
+			// the blob does. go-containerregistry only checks the digest when
+			// its reader reaches EOF, so the rest is drained rather than
+			// caching names and sizes taken from an unverified layer.
+			if _, drainErr := io.Copy(io.Discard, reader); drainErr != nil {
+				return nil, nil, nil, seen, fmt.Errorf("acr: verifying layer %s: %w", layer.digest, drainErr)
+			}
+			return added, order, shadows, seen, nil
 		}
 		if err != nil {
 			return nil, nil, nil, seen, fmt.Errorf("acr: reading layer %s: %w", layer.digest, err)
+		}
+		// Every header costs memory somewhere — the occurrence map, the
+		// whiteout list, or the entry map — so the bound is applied before
+		// any of them grows. Counting only the files that survive validation
+		// would let a layer of directories or unsafe names exhaust it freely.
+		seen++
+		if seen > maxTarEntries {
+			return nil, nil, nil, seen, fmt.Errorf("acr: image holds more than %d entries", maxTarEntries)
 		}
 		index := occurrences[header.Name]
 		occurrences[header.Name]++
@@ -235,12 +252,8 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			full = g.prefix
 		}
 		if kind != entryFile {
-			whiteouts = append(whiteouts, full)
+			shadows = append(shadows, shadow{path: full, subtree: kind != entryDir})
 			continue
-		}
-		seen++
-		if seen > maxTarEntries {
-			return nil, nil, nil, seen, fmt.Errorf("acr: image holds more than %d files", maxTarEntries)
 		}
 		if _, exists := added[full]; !exists {
 			order = append(order, full)
@@ -272,14 +285,30 @@ func removeTree(merged map[string]File, dir string) {
 	}
 }
 
-// entryKind distinguishes a file from the two whiteout markers.
+// entryKind distinguishes a streamable file from the entries that only shadow
+// what lies beneath them.
 type entryKind int
 
 const (
 	entryFile entryKind = iota
+	// entryDir is a directory: it replaces a lower file at the same path, but
+	// its contents merge rather than being hidden.
+	entryDir
+	// entryOther is a symlink, hardlink or device. It cannot be served as
+	// bytes, and it replaces whatever the lower layers had at that path.
+	entryOther
 	entryWhiteout
 	entryOpaque
 )
+
+// shadow is a path a layer hides from the layers below it.
+type shadow struct {
+	path string
+	// subtree is set when everything beneath path goes too. A directory only
+	// displaces a file of the same name; a whiteout or a symlink takes the
+	// whole subtree.
+	subtree bool
+}
 
 // tarEntryName validates a tar entry and classifies it.
 //
@@ -323,8 +352,20 @@ func tarEntryName(header *tar.Header) (name string, kind entryKind, ok bool) {
 		return removed, entryWhiteout, true
 	}
 
+	if header.Typeflag == tar.TypeDir {
+		if !isSafeEntryName(raw) {
+			return "", entryFile, false
+		}
+		return raw, entryDir, true
+	}
 	if header.Typeflag != tar.TypeReg {
-		return "", entryFile, false
+		// Not streamable, but still a replacement: OCI applies it over
+		// whatever the lower layers put at this path, so reporting the file
+		// underneath would describe a filesystem the image does not have.
+		if !isSafeEntryName(raw) {
+			return "", entryFile, false
+		}
+		return raw, entryOther, true
 	}
 	if !isSafeEntryName(raw) {
 		return "", entryFile, false
@@ -372,11 +413,21 @@ func openTarEntry(ctx context.Context, p Path, file File) (io.ReadCloser, error)
 	}
 	archive := tar.NewReader(reader)
 	seen := 0
+	// notFound reports a missing entry only once the layer has been verified:
+	// a registry that altered the blob so the indexed entry disappeared would
+	// otherwise look like an ordinary missing file rather than tampering.
+	notFound := func() (io.ReadCloser, error) {
+		if _, drainErr := io.Copy(io.Discard, reader); drainErr != nil {
+			_ = blob.Close()
+			return nil, fmt.Errorf("acr: verifying layer %s: %w", file.Digest, drainErr)
+		}
+		_ = blob.Close()
+		return nil, &notFoundError{path: p.String()}
+	}
 	for {
 		header, err := archive.Next()
 		if errors.Is(err, io.EOF) {
-			_ = blob.Close()
-			return nil, &notFoundError{path: p.String()}
+			return notFound()
 		}
 		if err != nil {
 			_ = blob.Close()
@@ -390,8 +441,7 @@ func openTarEntry(ctx context.Context, p Path, file File) (io.ReadCloser, error)
 			continue
 		}
 		if header.Typeflag != tar.TypeReg {
-			_ = blob.Close()
-			return nil, &notFoundError{path: p.String()}
+			return notFound()
 		}
 		return &tarEntryReader{
 			Reader: io.LimitReader(archive, header.Size),

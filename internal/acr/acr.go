@@ -989,6 +989,19 @@ func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 		a.byName[cleaned] = file
 	}
 	if len(group.layers) > 0 {
+		// Two index children can land on the same prefix: platform metadata is
+		// optional, and manifests differing only by OS version or features
+		// share an os/arch. Merging them would overlay unrelated filesystems,
+		// with the listing describing one and the download serving another, so
+		// the ambiguity is reported rather than silently resolved by order.
+		for _, existing := range a.groups {
+			if existing.prefix == group.prefix {
+				if group.prefix == "" {
+					return errors.New("acr: this image has several manifests without platforms, which cannot be told apart")
+				}
+				return fmt.Errorf("acr: this image has several manifests for %s, which cannot be told apart", group.prefix)
+			}
+		}
 		a.groups = append(a.groups, group)
 	}
 	return nil
@@ -1493,10 +1506,16 @@ func Push(ctx context.Context, p Path, files []UploadFile, opts PushOptions) err
 	}
 	if err := remote.Write(ref, image, options...); err != nil {
 		var terr *transport.Error
-		if errors.As(err, &terr) && terr.StatusCode == http.StatusPreconditionFailed {
+		if errors.As(err, &terr) &&
+			(terr.StatusCode == http.StatusPreconditionFailed || terr.StatusCode == http.StatusConflict) {
 			// A registry honouring If-None-Match rejected the write because the
 			// tag exists. That may be this process's own earlier attempt whose
 			// response was lost, so let the published digest decide.
+			//
+			// Both statuses are accepted because registries disagree on which
+			// to use, and IsNonRetryableHTTPErr already treats them alike: a
+			// 409 that skipped this check would fail a retry whose work had in
+			// fact succeeded.
 			return confirmPublished(ctx, p, image)
 		}
 		return asStatusError(err)

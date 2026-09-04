@@ -384,6 +384,94 @@ func slicesContains(items []string, want string) bool {
 	return false
 }
 
+// An upper layer's directory, symlink or device replaces whatever the lower
+// layers had at that path. Reporting the file underneath would describe a
+// filesystem the image does not have.
+func TestImageNonRegularEntriesReplaceLowerFiles(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "replace", Reference: "latest"}
+
+	base := tarGz(t,
+		[2]string{"becomes-dir", "file"},
+		[2]string{"becomes-link", "file"},
+		[2]string{"becomes-link/child", "under"},
+		[2]string{"survives.txt", "kept"},
+	)
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	archive := tar.NewWriter(gz)
+	for _, header := range []*tar.Header{
+		{Name: "becomes-dir", Mode: 0o755, Typeflag: tar.TypeDir},
+		{Name: "becomes-link", Mode: 0o777, Typeflag: tar.TypeSymlink, Linkname: "elsewhere"},
+	} {
+		if err := archive.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	top := static.NewLayer(raw.Bytes(), types.DockerLayer)
+
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t, base, top)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Name)
+	}
+	for _, gone := range []string{
+		"linux/amd64/becomes-dir",        // now a directory
+		"linux/amd64/becomes-link",       // now a symlink
+		"linux/amd64/becomes-link/child", // and its subtree went with it
+	} {
+		if slicesContains(names, gone) {
+			t.Errorf("%q was replaced by a non-regular entry and must not be listed", gone)
+		}
+	}
+	if !slicesContains(names, "linux/amd64/survives.txt") {
+		t.Errorf("listing = %v, want the untouched file kept", names)
+	}
+}
+
+// Two manifests can carry the same platform, or none at all. Merging them
+// would overlay unrelated filesystems, so the ambiguity is reported.
+func TestImageRejectsAmbiguousPlatforms(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "ambiguous", Reference: "latest"}
+
+	index := v1.ImageIndex(empty.Index)
+	for _, content := range []string{"first", "second"} {
+		index = mutate.AppendManifests(index, mutate.IndexAddendum{
+			Add: imageWithLayers(t, tarGz(t, [2]string{"app", content})),
+			Descriptor: v1.Descriptor{
+				Platform: &v1.Platform{OS: "linux", Architecture: "amd64"},
+			},
+		})
+	}
+	ref, err := name.NewTag(p.Registry+"/"+p.Repository+":"+p.Reference, name.WeakValidation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.WriteIndex(ref, index); err != nil {
+		t.Fatalf("WriteIndex failed: %v", err)
+	}
+	invalidateLayers(p)
+
+	if _, err := ListDir(t.Context(), p); err == nil ||
+		!strings.Contains(err.Error(), "cannot be told apart") {
+		t.Fatalf("expected duplicate platforms to be rejected, got %v", err)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.
