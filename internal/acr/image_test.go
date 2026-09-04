@@ -1132,6 +1132,77 @@ func TestImageRejectsOverlappingGroups(t *testing.T) {
 	}
 }
 
+// A whiteout path is validated as written. Cleaning it first would let a
+// traversal name a file the entry never legitimately referred to.
+func TestImageRejectsNonCanonicalWhiteout(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "whiteouttraversal", Reference: "latest"}
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"keep", "still-here"}),
+		// Cleaning this yields ".wh.keep" at the root, which would delete
+		// "keep"; as written it is not a canonical path and must be ignored.
+		tarGz(t, [2]string{"tmp/../.wh.keep", ""}),
+	)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "linux/amd64/keep" {
+		t.Fatalf("listing = %#v, want the non-canonical whiteout ignored", files)
+	}
+}
+
+// An oversized link target costs the link its identity, not its overlay
+// effect: the lower file it replaces must still disappear.
+func TestImageOversizedLinkTargetStillShadows(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "hugelink", Reference: "latest"}
+
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	archive := tar.NewWriter(gz)
+	if err := archive.WriteHeader(&tar.Header{
+		Name:     "foo",
+		Mode:     0o644,
+		Typeflag: tar.TypeLink,
+		Linkname: strings.Repeat("a", maxEntryNameBytes+1),
+		Format:   tar.FormatPAX,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pushIndex(t, p, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"foo", "lower"}, [2]string{"other", "kept"}),
+		static.NewLayer(raw.Bytes(), types.DockerLayer),
+	)})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Name)
+	}
+	if slicesContains(names, "linux/amd64/foo") {
+		t.Errorf("listing = %v, want the lower file replaced despite the unusable target", names)
+	}
+	if !slicesContains(names, "linux/amd64/other") {
+		t.Errorf("listing = %v, want unrelated entries kept", names)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.

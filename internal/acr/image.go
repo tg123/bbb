@@ -404,11 +404,18 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 		// The entry count alone does not bound memory: a name is
 		// registry-controlled and PAX or GNU long names can be enormous, so a
 		// few entries could exhaust the budget the count is meant to protect.
-		// A link target is retained just as a name is, so it is charged too.
-		if len(header.Name) > maxEntryNameBytes || len(header.Linkname) > maxEntryNameBytes {
+		if len(header.Name) > maxEntryNameBytes {
 			continue
 		}
-		nameBytes += len(header.Name) + len(header.Linkname)
+		nameBytes += len(header.Name)
+		// Only a hard link's target is retained, and an oversized one costs
+		// the link its identity rather than the whole header: a symlink or
+		// link still replaces what the lower layers had at that path, and
+		// dropping the header outright would leave that file visible.
+		oversizedTarget := header.Typeflag == tar.TypeLink && len(header.Linkname) > maxEntryNameBytes
+		if header.Typeflag == tar.TypeLink && !oversizedTarget {
+			nameBytes += len(header.Linkname)
+		}
 		if err := g.budget.charge(g, budgetUse{entries: seen, names: nameBytes}); err != nil {
 			return nil, nil, nil, seen, nameBytes, err
 		}
@@ -426,9 +433,17 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			full = g.prefix
 		}
 		if kind == entryLink {
+			ordinal++
+			if oversizedTarget {
+				// Nothing can be resolved, but the path is still replaced.
+				delete(added, full)
+				removeUnderOne(added, full)
+				writtenAt[full] = ordinal
+				shadows = append(shadows, shadow{path: full, subtree: true})
+				continue
+			}
 			// Resolved once the layer's own entries are known, since a link
 			// may name one of them.
-			ordinal++
 			links = append(links, hardLink{name: full, target: header.Linkname, at: ordinal})
 			continue
 		}
@@ -609,19 +624,24 @@ func tarEntryName(header *tar.Header) (name string, kind entryKind, ok bool) {
 	if strings.Contains(raw, `\`) || strings.HasPrefix(raw, "/") {
 		return "", entryFile, false
 	}
+	// The whole path is checked before any of it is interpreted. Deriving a
+	// whiteout target first would let path.Join clean a traversal away, so
+	// "tmp/../.wh.keep" would be accepted as a whiteout for "keep" — removing
+	// a file the entry never legitimately named.
+	if !isSafeEntryName(raw) {
+		return "", entryFile, false
+	}
 
 	base := path.Base(raw)
+	// raw is canonical, so this is the parent with its trailing slash, or
+	// empty at the root.
+	parent := raw[:len(raw)-len(base)]
 	if base == whiteoutOpaque {
-		parent := strings.TrimSuffix(raw, whiteoutOpaque)
-		parent = strings.TrimSuffix(parent, "/")
 		if parent == "" {
 			// A root opaque whiteout is valid and hides every lower entry.
 			return "", entryOpaque, true
 		}
-		if !isSafeEntryName(parent) {
-			return "", entryFile, false
-		}
-		return parent, entryOpaque, true
+		return strings.TrimSuffix(parent, "/"), entryOpaque, true
 	}
 	if after, found := strings.CutPrefix(base, whiteoutPrefix); found {
 		if after == "" {
@@ -629,7 +649,7 @@ func tarEntryName(header *tar.Header) (name string, kind entryKind, ok bool) {
 			// delete the parent directory and everything under it.
 			return "", entryFile, false
 		}
-		removed := path.Join(path.Dir(raw), after)
+		removed := parent + after
 		if !isSafeEntryName(removed) {
 			return "", entryFile, false
 		}
@@ -637,30 +657,18 @@ func tarEntryName(header *tar.Header) (name string, kind entryKind, ok bool) {
 	}
 
 	if header.Typeflag == tar.TypeDir {
-		if !isSafeEntryName(raw) {
-			return "", entryFile, false
-		}
 		return raw, entryDir, true
 	}
 	if header.Typeflag == tar.TypeLink {
 		// A hard link is another name for a file already in the archive, so it
 		// is a regular file in the image rather than something to drop.
-		if !isSafeEntryName(raw) {
-			return "", entryFile, false
-		}
 		return raw, entryLink, true
 	}
 	if header.Typeflag != tar.TypeReg {
 		// Not streamable, but still a replacement: OCI applies it over
 		// whatever the lower layers put at this path, so reporting the file
 		// underneath would describe a filesystem the image does not have.
-		if !isSafeEntryName(raw) {
-			return "", entryFile, false
-		}
 		return raw, entryOther, true
-	}
-	if !isSafeEntryName(raw) {
-		return "", entryFile, false
 	}
 	return raw, entryFile, true
 }
