@@ -80,6 +80,9 @@ func (acrFS) List(ctx context.Context, target string) ([]Entry, error) {
 	if ap.IsRegistry() {
 		return listRepositories(ctx, ap)
 	}
+	if ap.IsRepository() {
+		return listTags(ctx, ap)
+	}
 	prefix := ap.File
 	// ListDir answers from the manifest where it can, so listing the root of a
 	// container image costs one fetch rather than a copy of every layer.
@@ -112,6 +115,26 @@ func (acrFS) List(ctx context.Context, target string) ([]Entry, error) {
 	return out, nil
 }
 
+// listTags presents a repository's tags as its children. Each is a directory:
+// a tag names an artifact, whose own children are its files.
+func listTags(ctx context.Context, ap acr.Path) ([]Entry, error) {
+	tags, err := acr.ListTags(ctx, ap)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]Entry, 0, len(tags))
+	for _, tag := range tags {
+		child := ap
+		child.Reference = tag
+		entries = append(entries, Entry{
+			Name:  tag + "/",
+			Path:  child.String(),
+			IsDir: true,
+		})
+	}
+	return entries, nil
+}
+
 // listRepositories presents a registry's repositories as its children. Each is
 // a directory: a repository holds tagged artifacts rather than bytes.
 func listRepositories(ctx context.Context, ap acr.Path) ([]Entry, error) {
@@ -123,9 +146,6 @@ func listRepositories(ctx context.Context, ap acr.Path) ([]Entry, error) {
 	for _, repository := range repositories {
 		child := ap
 		child.Repository = repository
-		// No reference: the listing names repositories, and asserting :latest
-		// would offer a path that need not resolve.
-		child.Reference = ""
 		entries = append(entries, Entry{
 			Name:  repository + "/",
 			Path:  child.String(),
@@ -144,6 +164,17 @@ func (acrFS) Stat(ctx context.Context, target string) (Entry, error) {
 		// A registry exists as a directory of repositories; confirm it answers
 		// rather than trusting the path shape.
 		if _, err := acr.ListRepositories(ctx, ap); err != nil {
+			return Entry{}, err
+		}
+		return Entry{
+			Name:  ap.DefaultFilename(),
+			Path:  ap.String(),
+			IsDir: true,
+		}, nil
+	}
+	if ap.IsRepository() {
+		// Likewise a repository, whose children are its tags.
+		if _, err := acr.ListTags(ctx, ap); err != nil {
 			return Entry{}, err
 		}
 		return Entry{
@@ -198,6 +229,9 @@ func (acrFS) ListRecursive(ctx context.Context, target string, emit func(Entry) 
 		// caller is likely to have intended.
 		return fmt.Errorf("acr: %s is a registry; name a repository to list recursively", target)
 	}
+	if ap.IsRepository() {
+		return fmt.Errorf("acr: %s names a repository; add :tag to address an artifact", target)
+	}
 	prefix := ap.File
 	// The prefix is kept on the path so only the layers beneath it are
 	// expanded; the names returned are still full artifact paths.
@@ -247,6 +281,9 @@ func (acrFS) IsDirLike(ctx context.Context, p string) (bool, error) {
 	if ap.IsRegistry() {
 		return true, nil
 	}
+	if ap.IsRepository() {
+		return true, nil
+	}
 	return acr.IsDir(ctx, ap)
 }
 
@@ -267,7 +304,11 @@ func (acrFS) ChildPath(parent, child string) string {
 	if ap.IsRegistry() {
 		// A registry's children are repositories, not files.
 		ap.Repository = strings.TrimSuffix(child, "/")
-		ap.Reference = acr.DefaultTag
+		return ap.String()
+	}
+	if ap.IsRepository() {
+		// A repository's children are its tags.
+		ap.Reference = strings.TrimSuffix(child, "/")
 		return ap.String()
 	}
 	if ap.File == "" {

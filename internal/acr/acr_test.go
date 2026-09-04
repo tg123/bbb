@@ -47,9 +47,12 @@ func TestParse(t *testing.T) {
 			want: Path{Registry: "myreg.azurecr.io", Repository: "models", Reference: "v1"},
 		},
 		{
-			name: "no reference defaults to latest",
+			// A repository with no tag names the repository, whose children
+			// are its tags; defaulting to :latest would claim a tag that need
+			// not exist.
+			name: "no reference names the repository",
 			raw:  "acr://myreg.azurecr.io/models/llama",
-			want: Path{Registry: "myreg.azurecr.io", Repository: "models/llama", Reference: DefaultTag},
+			want: Path{Registry: "myreg.azurecr.io", Repository: "models/llama"},
 		},
 		{
 			name: "digest reference",
@@ -150,13 +153,35 @@ func TestParse(t *testing.T) {
 	}
 }
 
+// A path reads back the way it was written, so the Azure shorthand Parse
+// applies is undone for display.
 func TestPathString(t *testing.T) {
 	p := Path{Registry: "myreg.azurecr.io", Repository: "models", Reference: "v1", File: "a/b.bin"}
-	if got := p.String(); got != "acr://myreg.azurecr.io/models:v1/a/b.bin" {
+	if got := p.String(); got != "acr://myreg/models:v1/a/b.bin" {
 		t.Fatalf("unexpected path: %s", got)
 	}
+	// Whatever is printed must address the same registry when read back.
+	round, err := Parse(p.String())
+	if err != nil || round.Registry != p.Registry {
+		t.Fatalf("re-parsing %q = %#v (%v), want the same registry", p.String(), round, err)
+	}
+	// A suffix Parse would not have added is left alone, or the path would
+	// name a different registry.
+	for _, registry := range []string{
+		"myreg.azurecr.cn",
+		"myreg.azurecr.us",
+		"sub.myreg.azurecr.io",
+		"localhost.azurecr.io",
+		"localhost:5000",
+	} {
+		q := Path{Registry: registry, Repository: "models", Reference: "v1"}
+		back, parseErr := Parse(q.String())
+		if parseErr != nil || back.Registry != registry {
+			t.Errorf("%s printed as %q re-parsed to %q (%v)", registry, q.String(), back.Registry, parseErr)
+		}
+	}
 	p.Reference = "sha256:abc"
-	if got := p.String(); got != "acr://myreg.azurecr.io/models@sha256:abc/a/b.bin" {
+	if got := p.String(); got != "acr://myreg/models@sha256:abc/a/b.bin" {
 		t.Fatalf("unexpected path: %s", got)
 	}
 	roundTrip, err := Parse(p.String())
@@ -364,6 +389,36 @@ func TestListRepositories(t *testing.T) {
 	}
 }
 
+// A repository alone lists its tags, so a registry listing leads somewhere
+// rather than to a :latest that need not exist.
+func TestListTags(t *testing.T) {
+	host := newTestRegistry(t)
+	for _, tag := range []string{"v2", "v1", "latest"} {
+		p := Path{Registry: host, Repository: "orng", Reference: tag}
+		pushTestArtifact(t, p, map[string]string{"a.txt": "alpha"})
+	}
+
+	repository := Path{Registry: host, Repository: "orng"}
+	got, err := ListTags(t.Context(), repository)
+	if err != nil {
+		t.Fatalf("ListTags failed: %v", err)
+	}
+	want := []string{"latest", "v1", "v2"}
+	if len(got) != len(want) {
+		t.Fatalf("tags = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("tags = %v, want %v", got, want)
+		}
+	}
+
+	registry := Path{Registry: host}
+	if _, err := ListTags(t.Context(), registry); err == nil {
+		t.Error("a registry has no tags of its own")
+	}
+}
+
 // A registry holds repositories rather than an artifact, so the artifact paths
 // must say so instead of failing obscurely.
 func TestRegistryPathIsNotAnArtifact(t *testing.T) {
@@ -376,17 +431,29 @@ func TestRegistryPathIsNotAnArtifact(t *testing.T) {
 		!strings.Contains(err.Error(), "not just a registry") {
 		t.Errorf("ValidatePushTarget on a registry = %v, want a rejection", err)
 	}
-	if got := registry.String(); got != "acr://myreg.azurecr.io" {
+	if got := registry.String(); got != "acr://myreg" {
 		t.Errorf("String() = %q, want the bare registry", got)
 	}
 	// A repository with no reference names the repository itself, which is
 	// what a registry listing reports.
 	repository := Path{Registry: "myreg.azurecr.io", Repository: "models/llama"}
-	if got := repository.String(); got != "acr://myreg.azurecr.io/models/llama" {
+	if got := repository.String(); got != "acr://myreg/models/llama" {
 		t.Errorf("String() = %q, want the bare repository", got)
 	}
-	if round, err := Parse(repository.String()); err != nil || round.Reference != DefaultTag {
-		t.Errorf("re-parsing a listed repository = %#v (%v), want the default tag", round, err)
+	if !repository.IsRepository() {
+		t.Error("a repository without a reference must address the repository")
+	}
+	round, err := Parse(repository.String())
+	if err != nil || round.Reference != "" || round.Repository != "models/llama" {
+		t.Errorf("re-parsing a listed repository = %#v (%v), want the repository", round, err)
+	}
+	if _, err := ListFiles(t.Context(), repository); err == nil ||
+		!strings.Contains(err.Error(), "add :tag") {
+		t.Errorf("ListFiles on a repository = %v, want a tag hint", err)
+	}
+	if err := ValidatePushTarget(repository); err == nil ||
+		!strings.Contains(err.Error(), "must name a tag") {
+		t.Errorf("ValidatePushTarget on a repository = %v, want a tag hint", err)
 	}
 }
 

@@ -20,11 +20,19 @@ func TestACRMatchAndResolve(t *testing.T) {
 
 func TestACRPathHelpers(t *testing.T) {
 	fs := acrFS{}
-	if got := fs.ChildPath("acr://myreg.azurecr.io/models:v1", "sub/file.bin"); got != "acr://myreg.azurecr.io/models:v1/sub/file.bin" {
+	if got := fs.ChildPath("acr://myreg.azurecr.io/models:v1", "sub/file.bin"); got != "acr://myreg/models:v1/sub/file.bin" {
 		t.Fatalf("unexpected child path: %s", got)
 	}
-	if got := fs.ChildPath("acr://myreg.azurecr.io/models:v1/sub", "file.bin"); got != "acr://myreg.azurecr.io/models:v1/sub/file.bin" {
+	if got := fs.ChildPath("acr://myreg.azurecr.io/models:v1/sub", "file.bin"); got != "acr://myreg/models:v1/sub/file.bin" {
 		t.Fatalf("unexpected nested child path: %s", got)
+	}
+	// A registry's children are repositories and a repository's are tags, so
+	// descending builds a reference rather than a file path.
+	if got := fs.ChildPath("acr://myreg.azurecr.io", "models/llama/"); got != "acr://myreg/models/llama" {
+		t.Fatalf("unexpected repository child path: %s", got)
+	}
+	if got := fs.ChildPath("acr://myreg.azurecr.io/models/llama", "v1/"); got != "acr://myreg/models/llama:v1" {
+		t.Fatalf("unexpected tag child path: %s", got)
 	}
 	if got := fs.BaseName("acr://myreg.azurecr.io/models/llama:v1/sub/file.bin"); got != "file.bin" {
 		t.Fatalf("unexpected base name: %s", got)

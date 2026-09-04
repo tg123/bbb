@@ -68,15 +68,22 @@ acr://<registry>/<repository>@<digest>[/<file>]
 acr://<registry>/<repository>              # defaults to the "latest" tag
 ```
 
-A registry name without a dot is expanded to `<name>.azurecr.io`, except `localhost`, which is left alone so a local registry is reachable. A registry on its own lists its repositories, the same shape as `az://` naming an account without a container:
+A registry name without a dot is expanded to `<name>.azurecr.io`, and paths are printed back in that short form. A path names one of three things, each a directory of the next:
 
 ```bash
-$ bbb ls acr://myregistry
-acr://myregistry.azurecr.io/models/llama
-acr://myregistry.azurecr.io/orng
+$ bbb ls acr://myregistry                 # repositories
+acr://myregistry/models/llama
+acr://myregistry/orng
+
+$ bbb ls acr://myregistry/orng            # tags
+acr://myregistry/orng:0.1.2030838
+acr://myregistry/orng:latest
+
+$ bbb ls acr://myregistry/orng:latest     # the artifact's files
+acr://myregistry/orng:latest/weights.bin
 ```
 
-Repository names are reported exactly as the registry holds them, slashes included: `models/llama` is one repository, not a directory containing another. Recursive commands need a repository, since walking a registry would mean resolving every tag of every repository it holds.
+Repository names are reported exactly as the registry holds them, slashes included: `models/llama` is one repository, not a directory containing another. A repository has no implicit `:latest` — a tag that need not exist — so reading or publishing needs one named. Recursive commands likewise need a tag, since walking a repository would mean resolving every tag it holds.
 
 The "files" of an artifact are its layers; each layer's name comes from the standard `org.opencontainers.image.title` annotation, falling back to its digest (e.g. `sha256-abc...`) when the annotation is missing. Because a file name follows the tag or digest, a file can only be addressed on a path that specifies one.
 

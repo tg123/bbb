@@ -142,29 +142,55 @@ type Path struct {
 }
 
 func (p Path) String() string {
+	registry := p.displayRegistry()
 	if p.Repository == "" {
-		return Scheme + p.Registry
+		return Scheme + registry
 	}
 	// A repository with no reference names the repository itself, which is
 	// what a registry listing reports: claiming a tag that may not exist would
 	// hand back a path that does not resolve.
 	if p.Reference == "" {
-		return Scheme + p.Registry + "/" + p.Repository
+		return Scheme + registry + "/" + p.Repository
 	}
 	sep := ":"
 	if strings.Contains(p.Reference, ":") {
 		sep = "@"
 	}
-	s := Scheme + p.Registry + "/" + p.Repository + sep + p.Reference
+	s := Scheme + registry + "/" + p.Repository + sep + p.Reference
 	if p.File != "" {
 		s += "/" + p.File
 	}
 	return s
 }
 
+// displayRegistry undoes the Azure shorthand for display, so a path reads the
+// way it was written.
+//
+// Only the suffix Parse adds is removed, and only when the remainder would
+// expand back to the same host: a sovereign endpoint or a name that is already
+// qualified would otherwise be rewritten into a different registry.
+func (p Path) displayRegistry() string {
+	host, port, err := net.SplitHostPort(p.Registry)
+	if err != nil {
+		host, port = p.Registry, ""
+	}
+	short, found := strings.CutSuffix(host, defaultSuffix)
+	if !found || !isAzureShortName(short) {
+		return p.Registry
+	}
+	if port == "" {
+		return short
+	}
+	return net.JoinHostPort(short, port)
+}
+
 // IsRegistry reports whether p addresses a whole registry rather than an
 // artifact within it.
 func (p Path) IsRegistry() bool { return p.Repository == "" }
+
+// IsRepository reports whether p addresses a repository without naming a tag
+// or digest, so its children are the repository's tags.
+func (p Path) IsRepository() bool { return p.Repository != "" && p.Reference == "" }
 
 const expectedPathErr = "expected acr://registry[/repository[:tag|@digest][/file]]"
 
@@ -293,7 +319,7 @@ func Parse(raw string) (Path, error) {
 	} else {
 		registry = net.JoinHostPort(host, port)
 	}
-	p := Path{Registry: registry, Reference: DefaultTag}
+	p := Path{Registry: registry}
 	// A registry on its own addresses the whole registry, whose children are
 	// its repositories — the same shape as az:// naming an account without a
 	// container.
@@ -302,6 +328,9 @@ func Parse(raw string) (Path, error) {
 	}
 	idx := strings.IndexAny(rest, ":@")
 	if idx < 0 {
+		// A repository with no tag addresses the repository, whose children
+		// are its tags. Defaulting to :latest here would claim a tag that need
+		// not exist, and would leave no way to ask what a repository holds.
 		p.Repository = strings.Trim(rest, "/")
 		if p.Repository == "" {
 			return Path{}, errors.New(expectedPathErr)
@@ -842,6 +871,9 @@ func fetchArtifact(ctx context.Context, p Path) (*artifact, error) {
 	if p.Repository == "" {
 		return nil, errors.New("acr: a registry has no artifact; name a repository")
 	}
+	if p.Reference == "" {
+		return nil, fmt.Errorf("acr: %s names a repository; add :tag to address an artifact", p.String())
+	}
 	ref, err := p.reference()
 	if err != nil {
 		return nil, err
@@ -1014,6 +1046,30 @@ func (a *artifact) unexpandedDirs() []string {
 		}
 	}
 	return dirs
+}
+
+// ListTags returns the tags a repository holds.
+func ListTags(ctx context.Context, p Path) ([]string, error) {
+	if p.Repository == "" {
+		return nil, errors.New("acr: a registry has no tags; name a repository")
+	}
+	if err := checkTransportSecurity(p.Registry); err != nil {
+		return nil, err
+	}
+	options := []name.Option{name.WeakValidation}
+	if isInsecureAllowed(p.Registry) || isLoopback(p.Registry) {
+		options = append(options, name.Insecure)
+	}
+	repository, err := name.NewRepository(p.Registry+"/"+p.Repository, options...)
+	if err != nil {
+		return nil, err
+	}
+	tags, err := remote.List(repository, p.remoteOptions(ctx)...)
+	if err != nil {
+		return nil, asStatusError(err)
+	}
+	slices.Sort(tags)
+	return tags, nil
 }
 
 // ListRepositories returns the repositories a registry holds, from the
@@ -1338,6 +1394,10 @@ type PushOptions struct {
 func ValidatePushTarget(p Path) error {
 	if p.Repository == "" {
 		return errors.New("acr: push destination must name a repository, not just a registry")
+	}
+	if p.Reference == "" {
+		// Publishing replaces a tag, so which one cannot be left implicit.
+		return fmt.Errorf("acr: push destination %s must name a tag, as %s:<tag>", p.String(), p.String())
 	}
 	if p.File != "" {
 		return errors.New("acr: push destination must be an artifact, not a file")
