@@ -77,6 +77,9 @@ func (acrFS) List(ctx context.Context, target string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
+	if ap.IsRegistry() {
+		return listRepositories(ctx, ap)
+	}
 	prefix := ap.File
 	// ListDir answers from the manifest where it can, so listing the root of a
 	// container image costs one fetch rather than a copy of every layer.
@@ -109,10 +112,45 @@ func (acrFS) List(ctx context.Context, target string) ([]Entry, error) {
 	return out, nil
 }
 
+// listRepositories presents a registry's repositories as its children. Each is
+// a directory: a repository holds tagged artifacts rather than bytes.
+func listRepositories(ctx context.Context, ap acr.Path) ([]Entry, error) {
+	repositories, err := acr.ListRepositories(ctx, ap)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]Entry, 0, len(repositories))
+	for _, repository := range repositories {
+		child := ap
+		child.Repository = repository
+		// No reference: the listing names repositories, and asserting :latest
+		// would offer a path that need not resolve.
+		child.Reference = ""
+		entries = append(entries, Entry{
+			Name:  repository + "/",
+			Path:  child.String(),
+			IsDir: true,
+		})
+	}
+	return entries, nil
+}
+
 func (acrFS) Stat(ctx context.Context, target string) (Entry, error) {
 	ap, err := acr.Parse(target)
 	if err != nil {
 		return Entry{}, err
+	}
+	if ap.IsRegistry() {
+		// A registry exists as a directory of repositories; confirm it answers
+		// rather than trusting the path shape.
+		if _, err := acr.ListRepositories(ctx, ap); err != nil {
+			return Entry{}, err
+		}
+		return Entry{
+			Name:  ap.DefaultFilename(),
+			Path:  ap.String(),
+			IsDir: true,
+		}, nil
 	}
 	if ap.File == "" {
 		// Resolve the artifact rather than trusting the path shape, so a
@@ -153,6 +191,12 @@ func (acrFS) ListRecursive(ctx context.Context, target string, emit func(Entry) 
 	ap, err := acr.Parse(target)
 	if err != nil {
 		return err
+	}
+	if ap.IsRegistry() {
+		// Walking a whole registry means resolving every tag of every
+		// repository, which is a different and far larger operation than the
+		// caller is likely to have intended.
+		return fmt.Errorf("acr: %s is a registry; name a repository to list recursively", target)
 	}
 	prefix := ap.File
 	// The prefix is kept on the path so only the layers beneath it are
@@ -200,6 +244,9 @@ func (acrFS) IsDirLike(ctx context.Context, p string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if ap.IsRegistry() {
+		return true, nil
+	}
 	return acr.IsDir(ctx, ap)
 }
 
@@ -217,6 +264,12 @@ func (acrFS) ChildPath(parent, child string) string {
 		return parent + "/" + child
 	}
 	child = filepath.ToSlash(child) // normalize Windows backslash separators
+	if ap.IsRegistry() {
+		// A registry's children are repositories, not files.
+		ap.Repository = strings.TrimSuffix(child, "/")
+		ap.Reference = acr.DefaultTag
+		return ap.String()
+	}
 	if ap.File == "" {
 		ap.File = child
 	} else {

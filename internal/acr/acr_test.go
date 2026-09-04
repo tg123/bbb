@@ -57,7 +57,24 @@ func TestParse(t *testing.T) {
 			want: Path{Registry: "myreg.azurecr.io", Repository: "models", Reference: "sha256:abc", File: "sub/file.txt"},
 		},
 		{name: "wrong scheme", raw: "hf://foo/bar", wantErr: true},
-		{name: "missing repository", raw: "acr://myreg.azurecr.io/", wantErr: true},
+		{
+			// A registry alone addresses the registry, whose children are its
+			// repositories, like az:// naming an account without a container.
+			name: "registry with trailing slash",
+			raw:  "acr://myreg.azurecr.io/",
+			want: Path{Registry: "myreg.azurecr.io"},
+		},
+		{
+			name: "registry without trailing slash",
+			raw:  "acr://myreg.azurecr.io",
+			want: Path{Registry: "myreg.azurecr.io"},
+		},
+		{
+			name: "registry shorthand expands",
+			raw:  "acr://myreg",
+			want: Path{Registry: "myreg.azurecr.io"},
+		},
+		{name: "missing registry", raw: "acr://", wantErr: true},
 		{name: "empty tag", raw: "acr://myreg.azurecr.io/models:", wantErr: true},
 		{name: "digest without algorithm", raw: "acr://myreg.azurecr.io/models@abc", wantErr: true},
 		{name: "escaping file path", raw: "acr://myreg.azurecr.io/models:v1/../../etc/passwd", wantErr: true},
@@ -316,6 +333,60 @@ func TestIsDirDistinguishesFilesFromVirtualDirectories(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("IsDir(%q) = %v, want %v", tc.file, got, tc.want)
 		}
+	}
+}
+
+// A registry alone lists its repositories, the same shape as az:// naming an
+// account without a container.
+func TestListRepositories(t *testing.T) {
+	host := newTestRegistry(t)
+	for _, repository := range []string{"orng", "models/llama", "models/phi"} {
+		p := Path{Registry: host, Repository: repository, Reference: "v1"}
+		pushTestArtifact(t, p, map[string]string{"a.txt": "alpha"})
+	}
+
+	registry := Path{Registry: host}
+	if !registry.IsRegistry() {
+		t.Fatal("a path without a repository must address the registry")
+	}
+	got, err := ListRepositories(t.Context(), registry)
+	if err != nil {
+		t.Fatalf("ListRepositories failed: %v", err)
+	}
+	want := []string{"models/llama", "models/phi", "orng"}
+	if len(got) != len(want) {
+		t.Fatalf("repositories = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("repositories = %v, want %v", got, want)
+		}
+	}
+}
+
+// A registry holds repositories rather than an artifact, so the artifact paths
+// must say so instead of failing obscurely.
+func TestRegistryPathIsNotAnArtifact(t *testing.T) {
+	registry := Path{Registry: "myreg.azurecr.io"}
+	if _, err := ListFiles(t.Context(), registry); err == nil ||
+		!strings.Contains(err.Error(), "name a repository") {
+		t.Errorf("ListFiles on a registry = %v, want a repository hint", err)
+	}
+	if err := ValidatePushTarget(registry); err == nil ||
+		!strings.Contains(err.Error(), "not just a registry") {
+		t.Errorf("ValidatePushTarget on a registry = %v, want a rejection", err)
+	}
+	if got := registry.String(); got != "acr://myreg.azurecr.io" {
+		t.Errorf("String() = %q, want the bare registry", got)
+	}
+	// A repository with no reference names the repository itself, which is
+	// what a registry listing reports.
+	repository := Path{Registry: "myreg.azurecr.io", Repository: "models/llama"}
+	if got := repository.String(); got != "acr://myreg.azurecr.io/models/llama" {
+		t.Errorf("String() = %q, want the bare repository", got)
+	}
+	if round, err := Parse(repository.String()); err != nil || round.Reference != DefaultTag {
+		t.Errorf("re-parsing a listed repository = %#v (%v), want the default tag", round, err)
 	}
 }
 

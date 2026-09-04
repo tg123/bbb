@@ -142,6 +142,15 @@ type Path struct {
 }
 
 func (p Path) String() string {
+	if p.Repository == "" {
+		return Scheme + p.Registry
+	}
+	// A repository with no reference names the repository itself, which is
+	// what a registry listing reports: claiming a tag that may not exist would
+	// hand back a path that does not resolve.
+	if p.Reference == "" {
+		return Scheme + p.Registry + "/" + p.Repository
+	}
 	sep := ":"
 	if strings.Contains(p.Reference, ":") {
 		sep = "@"
@@ -153,7 +162,11 @@ func (p Path) String() string {
 	return s
 }
 
-const expectedPathErr = "expected acr://registry/repository[:tag|@digest][/file]"
+// IsRegistry reports whether p addresses a whole registry rather than an
+// artifact within it.
+func (p Path) IsRegistry() bool { return p.Repository == "" }
+
+const expectedPathErr = "expected acr://registry[/repository[:tag|@digest][/file]]"
 
 // canonicalAuthority normalises a registry authority for comparison. scheme is
 // the transport the endpoint is actually reached over, which decides the
@@ -259,8 +272,8 @@ func Parse(raw string) (Path, error) {
 		return Path{}, errors.New(expectedPathErr)
 	}
 	rest := strings.TrimPrefix(raw, Scheme)
-	registry, rest, ok := strings.Cut(rest, "/")
-	if !ok || registry == "" || rest == "" {
+	registry, rest, _ := strings.Cut(rest, "/")
+	if registry == "" {
 		return Path{}, errors.New(expectedPathErr)
 	}
 	// Hostnames are case-insensitive, so canonicalising case cannot change the
@@ -281,6 +294,12 @@ func Parse(raw string) (Path, error) {
 		registry = net.JoinHostPort(host, port)
 	}
 	p := Path{Registry: registry, Reference: DefaultTag}
+	// A registry on its own addresses the whole registry, whose children are
+	// its repositories — the same shape as az:// naming an account without a
+	// container.
+	if strings.Trim(rest, "/") == "" {
+		return Path{Registry: registry}, nil
+	}
 	idx := strings.IndexAny(rest, ":@")
 	if idx < 0 {
 		p.Repository = strings.Trim(rest, "/")
@@ -316,6 +335,9 @@ func Parse(raw string) (Path, error) {
 func (p Path) DefaultFilename() string {
 	if p.File != "" {
 		return path.Base(p.File)
+	}
+	if p.Repository == "" {
+		return registryHost(p.Registry)
 	}
 	repo := p.Repository
 	if idx := strings.LastIndex(repo, "/"); idx >= 0 {
@@ -817,6 +839,9 @@ func resolve(ctx context.Context, p Path) (*artifact, error) {
 }
 
 func fetchArtifact(ctx context.Context, p Path) (*artifact, error) {
+	if p.Repository == "" {
+		return nil, errors.New("acr: a registry has no artifact; name a repository")
+	}
 	ref, err := p.reference()
 	if err != nil {
 		return nil, err
@@ -989,6 +1014,34 @@ func (a *artifact) unexpandedDirs() []string {
 		}
 	}
 	return dirs
+}
+
+// ListRepositories returns the repositories a registry holds, from the
+// distribution catalog endpoint.
+//
+// The result is what the registry reports, including any slashes: ACR namespaces
+// repositories, so "models/llama" is one repository rather than a directory
+// holding another. Each name can be addressed directly as acr://registry/<name>.
+func ListRepositories(ctx context.Context, p Path) ([]string, error) {
+	if err := checkTransportSecurity(p.Registry); err != nil {
+		return nil, err
+	}
+	options := []name.Option{name.WeakValidation}
+	if isInsecureAllowed(p.Registry) || isLoopback(p.Registry) {
+		options = append(options, name.Insecure)
+	}
+	registry, err := name.NewRegistry(p.Registry, options...)
+	if err != nil {
+		return nil, err
+	}
+	// Catalog paginates internally and can be large, so the caller's context
+	// governs how long that is allowed to take.
+	repositories, err := remote.Catalog(ctx, registry, p.remoteOptions(ctx)...)
+	if err != nil {
+		return nil, asStatusError(err)
+	}
+	slices.Sort(repositories)
+	return repositories, nil
 }
 
 // ListFiles returns the files contained in the artifact referenced by p,
@@ -1283,6 +1336,9 @@ type PushOptions struct {
 // to. Exported so callers such as a dry run can reject an impossible
 // destination without performing the push.
 func ValidatePushTarget(p Path) error {
+	if p.Repository == "" {
+		return errors.New("acr: push destination must name a repository, not just a registry")
+	}
 	if p.File != "" {
 		return errors.New("acr: push destination must be an artifact, not a file")
 	}
