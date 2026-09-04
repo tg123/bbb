@@ -602,6 +602,87 @@ func TestImageBudgetIsSharedAcrossGroups(t *testing.T) {
 	}
 }
 
+// A symlink replaces a path and everything beneath it, including entries the
+// same layer wrote earlier — a symlink has no children.
+func TestImageSymlinkRemovesSameLayerDescendants(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "samelayerlink", Reference: "latest"}
+
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	archive := tar.NewWriter(gz)
+	body := "under"
+	if err := archive.WriteHeader(&tar.Header{
+		Name: "foo/bar", Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.WriteHeader(&tar.Header{
+		Name: "foo", Mode: 0o777, Typeflag: tar.TypeSymlink, Linkname: "elsewhere",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pushIndex(t, p, map[string]v1.Image{
+		"linux/amd64": imageWithLayers(t, static.NewLayer(raw.Bytes(), types.DockerLayer)),
+	})
+
+	arch := p
+	arch.File = "linux/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	for _, file := range files {
+		if strings.HasPrefix(file.Name, "linux/amd64/foo") {
+			t.Errorf("a symlink has no children, but %q is listed", file.Name)
+		}
+	}
+}
+
+// Non-distributable layers are ordinary tars and Windows base images use them,
+// so their files must participate.
+func TestImageExpandsNonDistributableLayers(t *testing.T) {
+	for _, mediaType := range []types.MediaType{
+		types.OCIRestrictedLayer,
+		types.OCIUncompressedRestrictedLayer,
+		types.DockerForeignLayer,
+	} {
+		if !isTarLayer(mediaType) {
+			t.Errorf("%s is a tar layer and must be expanded", mediaType)
+		}
+	}
+	// zstd stays opaque rather than becoming an error.
+	if isTarLayer(types.MediaType("application/vnd.oci.image.layer.v1.tar+zstd")) {
+		t.Error("zstd layers cannot be expanded without a decompressor")
+	}
+}
+
+// An expansion that retained nothing must not keep its charge, or another
+// platform fails against a limit counting entries no longer held.
+func TestImageBudgetReleasedOnFailure(t *testing.T) {
+	budget := newImageBudget()
+	failed := &imageGroup{prefix: "linux/amd64", budget: budget}
+	other := &imageGroup{prefix: "linux/arm64", budget: budget}
+
+	if err := budget.charge(failed, budgetUse{entries: maxTarEntries - 1}); err != nil {
+		t.Fatalf("charge failed: %v", err)
+	}
+	budget.release(failed)
+	if err := budget.charge(other, budgetUse{entries: maxTarEntries - 1}); err != nil {
+		t.Fatalf("the released allowance should be available: %v", err)
+	}
+}
+
 // A published artifact stores one file per layer with a title, which must keep
 // working exactly as before: its layers are not tarballs and must not be
 // expanded.

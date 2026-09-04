@@ -966,7 +966,12 @@ func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 		digest := descriptor.Digest.String()
 		// A filesystem layer holds files rather than being one, so it is
 		// recorded for expansion instead of being named here.
-		if isTarLayer(descriptor.MediaType) {
+		//
+		// A foreign layer whose descriptor carries URLs is the exception: the
+		// registry need not hold that blob at all, and fetching from a
+		// registry-supplied URL is exactly the redirect this package refuses
+		// elsewhere. Those stay opaque, named by digest as before.
+		if isTarLayer(descriptor.MediaType) && len(descriptor.URLs) == 0 {
 			group.layers = append(group.layers, layerRef{digest: digest, size: descriptor.Size})
 			continue
 		}

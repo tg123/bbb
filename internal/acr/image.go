@@ -90,6 +90,13 @@ func (b *imageBudget) charge(group *imageGroup, use budgetUse) error {
 	return nil
 }
 
+// release drops a group's contribution, for an expansion that retained nothing.
+func (b *imageBudget) release(group *imageGroup) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.used, group)
+}
+
 // whiteoutPrefix marks a file deleted by a later layer, and whiteoutOpaque
 // marks a directory whose earlier contents are dropped entirely.
 const (
@@ -98,12 +105,18 @@ const (
 )
 
 // isTarLayer reports whether a layer is a filesystem tarball whose entries can
-// be listed. zstd layers are excluded deliberately: without a decompressor they
-// stay opaque blobs, which is the existing behaviour rather than an error.
+// be listed.
+//
+// Non-distributable layers are included: they are ordinary tars, and Windows
+// base images use them, so treating them as opaque would hide those files.
+// zstd layers are excluded deliberately — without a decompressor they stay
+// opaque blobs, which is the existing behaviour rather than an error.
 func isTarLayer(mediaType types.MediaType) bool {
 	switch mediaType {
 	case types.OCILayer, types.OCIUncompressedLayer,
-		types.DockerLayer, types.DockerUncompressedLayer:
+		types.DockerLayer, types.DockerUncompressedLayer,
+		types.OCIRestrictedLayer, types.OCIUncompressedRestrictedLayer,
+		types.DockerForeignLayer:
 		return true
 	}
 	return false
@@ -185,6 +198,10 @@ func (g *imageGroup) expand(ctx context.Context, p Path) ([]File, error) {
 	}
 	entries, err := g.read(ctx, p)
 	if err != nil {
+		// Nothing is retained, so this group's charge is released: leaving it
+		// committed would make another platform fail against a limit that
+		// counts entries no longer held anywhere.
+		g.budget.release(g)
 		return nil, err
 	}
 	g.entries = entries
@@ -372,9 +389,13 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			full = g.prefix
 		}
 		if kind != entryFile {
-			// A tar is a log: this also replaces a regular file the same layer
-			// wrote earlier, which is otherwise obsolete but still listed.
+			// A tar is a log: this also replaces what the same layer wrote
+			// earlier at that path, and for anything but a directory the
+			// entries beneath it go too — a symlink has no children.
 			delete(added, full)
+			if kind != entryDir {
+				removeUnderOne(added, full)
+			}
 			shadows = append(shadows, shadow{path: full, subtree: kind != entryDir})
 			continue
 		}
@@ -387,6 +408,16 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			Digest:   layer.digest,
 			TarPath:  header.Name,
 			TarIndex: index,
+		}
+	}
+}
+
+// removeUnderOne deletes every entry beneath a single path.
+func removeUnderOne(entries map[string]File, dir string) {
+	prefix := dir + "/"
+	for name := range entries {
+		if strings.HasPrefix(name, prefix) {
+			delete(entries, name)
 		}
 	}
 }
