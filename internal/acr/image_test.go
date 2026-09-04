@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -289,20 +290,26 @@ func TestImageWhiteoutRemovesSubtrees(t *testing.T) {
 	}
 
 	// A whiteout must not hide a file its own layer provides, whatever order
-	// the entries appear in.
-	q := Path{Registry: host, Repository: "sameLayer", Reference: "latest"}
-	q.Repository = "samelayer"
+	// the entries appear in: it removes from the layers below only.
+	q := Path{Registry: host, Repository: "samelayer", Reference: "latest"}
 	pushIndex(t, q, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
-		tarGz(t, [2]string{"a.txt", "old"}),
+		tarGz(t, [2]string{"a.txt", "old"}, [2]string{"b.txt", "old"}),
 		tarGz(t, [2]string{".wh.a.txt", ""}, [2]string{"a.txt", "new"}),
+		tarGz(t, [2]string{"b.txt", "new"}, [2]string{".wh.b.txt", ""}),
 	)})
 	q.File = "linux/amd64"
 	kept, err := ListFiles(t.Context(), q)
 	if err != nil {
 		t.Fatalf("ListFiles failed: %v", err)
 	}
-	if len(kept) != 1 || kept[0].Name != "linux/amd64/a.txt" {
-		t.Fatalf("listing = %#v, want the layer's own file kept", kept)
+	names := make([]string, 0, len(kept))
+	for _, file := range kept {
+		names = append(names, file.Name)
+	}
+	slices.Sort(names)
+	want := []string{"linux/amd64/a.txt", "linux/amd64/b.txt"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("listing = %v, want each layer's own file kept: %v", names, want)
 	}
 }
 
@@ -323,6 +330,22 @@ func TestImageRootOpaqueWhiteout(t *testing.T) {
 	}
 	if len(files) != 1 || files[0].Name != "linux/amd64/new.txt" {
 		t.Fatalf("listing = %#v, want only the upper layer's file", files)
+	}
+
+	// An opaque marker hides the lower layers whichever side of its own
+	// layer's entries it is written on.
+	q := Path{Registry: host, Repository: "opaquelate", Reference: "latest"}
+	pushIndex(t, q, map[string]v1.Image{"linux/amd64": imageWithLayers(t,
+		tarGz(t, [2]string{"sub/old.txt", "gone"}),
+		tarGz(t, [2]string{"sub/new.txt", "kept"}, [2]string{"sub/.wh..wh..opq", ""}),
+	)})
+	q.File = "linux/amd64"
+	late, err := ListFiles(t.Context(), q)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	if len(late) != 1 || late[0].Name != "linux/amd64/sub/new.txt" {
+		t.Fatalf("listing = %#v, want the marker's own layer kept and the lower one hidden", late)
 	}
 }
 

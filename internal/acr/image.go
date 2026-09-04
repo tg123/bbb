@@ -257,9 +257,8 @@ func (g *imageGroup) read(ctx context.Context, p Path) ([]File, error) {
 	// names preserves the order entries were first seen in.
 	merged := map[string]File{}
 	var names []string
-	// listed guards the order slice: a name removed by a whiteout and written
-	// again by the same layer is still one entry, and appending on every
-	// reappearance would list it twice.
+	// listed guards the order slice: a name a layer writes more than once is
+	// still one entry, and appending on every reappearance would list it twice.
 	listed := map[string]bool{}
 	// seen counts every name a layer offered, including ones later removed:
 	// bounding only the live map would let a layer add and delete in turn
@@ -462,16 +461,18 @@ func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen
 			links = append(links, hardLink{name: full, target: header.Linkname, at: ordinal})
 			continue
 		}
-		ordinal++
 		if kind == entryWhiteout || kind == entryOpaque {
-			delete(added, full)
-			removeUnderOne(added, full)
-			writtenAt[full] = ordinal
-			// A whiteout removes from the layers below whatever this layer
-			// later puts at that path, so it is not superseded.
+			// A whiteout removes from the layers below and nothing else. Its
+			// own layer's entries stand whichever side of it they appear on,
+			// so an opaque marker written after the directory it covers still
+			// hides only what was underneath — the spec's "applies to lower
+			// layers" does not depend on position in the tar. Nothing here
+			// decides a path for this layer, so no ordinal is recorded either:
+			// a hard link declared earlier is still the live entry.
 			shadows = append(shadows, shadow{path: full, subtree: true})
 			continue
 		}
+		ordinal++
 		if kind != entryFile {
 			// A tar is a log: this also replaces what the same layer wrote
 			// earlier at that path, and for anything but a directory the
