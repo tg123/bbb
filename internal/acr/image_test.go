@@ -20,9 +20,9 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
-// tarGz builds a gzipped tar layer, the form a container image layer takes.
+// tarGzBytes builds the gzipped tar payload of a layer.
 // Entries are written in order so a later one can shadow an earlier one.
-func tarGz(t *testing.T, entries ...[2]string) v1.Layer {
+func tarGzBytes(t *testing.T, entries ...[2]string) []byte {
 	t.Helper()
 	var raw bytes.Buffer
 	gz := gzip.NewWriter(&raw)
@@ -48,7 +48,13 @@ func tarGz(t *testing.T, entries ...[2]string) v1.Layer {
 	if err := gz.Close(); err != nil {
 		t.Fatal(err)
 	}
-	return static.NewLayer(raw.Bytes(), types.DockerLayer)
+	return raw.Bytes()
+}
+
+// tarGz builds a gzipped tar layer, the form a container image layer takes.
+func tarGz(t *testing.T, entries ...[2]string) v1.Layer {
+	t.Helper()
+	return static.NewLayer(tarGzBytes(t, entries...), types.DockerLayer)
 }
 
 func imageWithLayers(t *testing.T, layers ...v1.Layer) v1.Image {
@@ -64,6 +70,13 @@ func imageWithLayers(t *testing.T, layers ...v1.Layer) v1.Image {
 // for several os/arch pairs takes.
 func pushIndex(t *testing.T, p Path, images map[string]v1.Image) {
 	t.Helper()
+	pushIndexWith(t, p, images)
+}
+
+// pushIndexWith is pushIndex with extra remote options, so a test can publish
+// blobs remote.Write would otherwise skip.
+func pushIndexWith(t *testing.T, p Path, images map[string]v1.Image, options ...remote.Option) {
+	t.Helper()
 	index := v1.ImageIndex(empty.Index)
 	for platform, image := range images {
 		os, arch, _ := strings.Cut(platform, "/")
@@ -78,7 +91,7 @@ func pushIndex(t *testing.T, p Path, images map[string]v1.Image) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := remote.WriteIndex(ref, index); err != nil {
+	if err := remote.WriteIndex(ref, index, options...); err != nil {
 		t.Fatalf("WriteIndex failed: %v", err)
 	}
 	invalidateLayers(p)
@@ -709,6 +722,55 @@ func TestImageExpandsNonDistributableLayers(t *testing.T) {
 	// zstd stays opaque rather than becoming an error.
 	if isTarLayer(types.MediaType("application/vnd.oci.image.layer.v1.tar+zstd")) {
 		t.Error("zstd layers cannot be expanded without a decompressor")
+	}
+}
+
+// A non-distributable layer is an ordinary tar read from the registry by
+// digest, so its files participate like any other layer's. Its descriptor URLs
+// are never followed, so when the registry genuinely does not hold the blob the
+// error has to say so rather than surfacing a bare 404 against a digest.
+func TestImageNonDistributableLayerWithURLs(t *testing.T) {
+	host := newTestRegistry(t)
+	p := Path{Registry: host, Repository: "foreign", Reference: "latest"}
+
+	// The blob is present, and the descriptor still carries URLs.
+	raw := tarGzBytes(t, [2]string{"windows/system32/kernel.dll", "binary"})
+	present, err := mutate.Append(empty.Image, mutate.Addendum{
+		Layer:     static.NewLayer(raw, types.DockerForeignLayer),
+		MediaType: types.DockerForeignLayer,
+		URLs:      []string{"https://mcr.microsoft.com/v2/windows/blobs/sha256:abc"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushIndexWith(t, p, map[string]v1.Image{"windows/amd64": present}, remote.WithNondistributable)
+
+	arch := p
+	arch.File = "windows/amd64"
+	files, err := ListFiles(t.Context(), arch)
+	if err != nil {
+		t.Fatalf("ListFiles failed: %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "windows/amd64/windows/system32/kernel.dll" {
+		t.Fatalf("listing = %#v, want the foreign layer's files expanded", files)
+	}
+
+	// A blob the registry does not hold must explain itself.
+	missing := layerRef{
+		digest: "sha256:" + strings.Repeat("0", 64),
+		urls:   []string{"https://mcr.microsoft.com/v2/windows/blobs/sha256:abc"},
+	}
+	explained := missing.explainMissing(&HTTPStatusError{StatusCode: 404, Status: "Not Found"})
+	for _, want := range []string{"non-distributable", "mcr.microsoft.com", "mirror it into the registry"} {
+		if !strings.Contains(explained.Error(), want) {
+			t.Errorf("error %q does not mention %q", explained, want)
+		}
+	}
+	// An ordinary layer's error is left exactly as it was.
+	plain := layerRef{digest: missing.digest}
+	original := &HTTPStatusError{StatusCode: 404, Status: "Not Found"}
+	if got := plain.explainMissing(original); got != error(original) {
+		t.Errorf("a layer without URLs must keep its own error, got %v", got)
 	}
 }
 

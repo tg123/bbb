@@ -1536,15 +1536,19 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 					}
 					slog.Debug("cp: done", "src", task.src, "dst", task.dst)
 					if stateFile != "" {
-						if err := stateAppender.append(task.key); err != nil {
-							setErr(err)
-							return
-						}
+						// The last file of a task and the task's own checkpoint
+						// go down together: recorded separately, a crash between
+						// them leaves every file done with the task still
+						// pending, and the resumed run then rejects a conflict
+						// for work it would skip entirely.
 						if task.tracker != nil && task.tracker.remaining.Add(-1) == 0 {
-							if err := stateAppender.appendCheckpoint(task.tracker.key); err != nil {
+							if err := stateAppender.appendFinal(task.key, task.tracker.key); err != nil {
 								setErr(err)
 								return
 							}
+						} else if err := stateAppender.append(task.key); err != nil {
+							setErr(err)
+							return
 						}
 					}
 					if taskProgress != nil {

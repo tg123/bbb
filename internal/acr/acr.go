@@ -1138,12 +1138,18 @@ func (a *artifact) addImageAt(image v1.Image, prefix string) error {
 		// that file whatever its media type: expanding a published .tar.gz
 		// would scatter its contents and lose the name it was given.
 		//
-		// A foreign layer whose descriptor carries URLs is also left alone:
-		// the registry need not hold that blob at all, and fetching from a
-		// registry-supplied URL is exactly the redirect this package refuses
-		// elsewhere. Those stay opaque, named by digest as before.
-		if filesystem && title == "" && isTarLayer(descriptor.MediaType) && len(descriptor.URLs) == 0 {
-			group.layers = append(group.layers, layerRef{digest: digest, size: descriptor.Size})
+		// A non-distributable layer is expanded like any other. Its descriptor
+		// carries URLs, but those are never followed — the blob is read from
+		// the registry by digest, exactly as every other layer is. Listing it
+		// as an opaque digest-named file instead would advertise a file that
+		// cannot be read at all, and would hide the Windows base-layer files
+		// isTarLayer exists to expose.
+		if filesystem && title == "" && isTarLayer(descriptor.MediaType) {
+			group.layers = append(group.layers, layerRef{
+				digest: digest,
+				size:   descriptor.Size,
+				urls:   descriptor.URLs,
+			})
 			continue
 		}
 		if title == "" {

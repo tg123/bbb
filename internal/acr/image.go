@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strings"
 	"sync"
@@ -179,6 +180,28 @@ func platformPrefix(platform *v1.Platform) (string, error) {
 type layerRef struct {
 	digest string
 	size   int64
+	// urls is what a non-distributable descriptor says about where the blob
+	// lives. They are never fetched — following a registry-supplied URL is the
+	// redirect this package refuses everywhere — but naming them turns "not
+	// found" into something the user can act on.
+	urls []string
+}
+
+// explainMissing turns a bare "not found" for a non-distributable layer into
+// something actionable.
+//
+// A registry is not obliged to hold a foreign blob: the descriptor names where
+// it really lives, and bbb will not fetch that URL, so the user has to mirror
+// the blob into the registry themselves. A plain 404 against a digest gives
+// them nothing to go on.
+func (l layerRef) explainMissing(err error) error {
+	if len(l.urls) == 0 || !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return fmt.Errorf(
+		"acr: layer %s is non-distributable and this registry does not hold it; "+
+			"the manifest says it lives at %s, which bbb will not fetch — mirror it into the registry first: %w",
+		l.digest, strings.Join(l.urls, ", "), err)
 }
 
 // imageGroup is the tar layers of a single manifest, in order.
@@ -363,7 +386,7 @@ func validateNames(entries []File) error {
 func (g *imageGroup) readLayer(ctx context.Context, p Path, layer layerRef, seen, nameBytes int, merged map[string]File) (map[string]File, []string, []shadow, int, int, error) {
 	blob, err := openBlob(ctx, p, layer.digest)
 	if err != nil {
-		return nil, nil, nil, seen, nameBytes, err
+		return nil, nil, nil, seen, nameBytes, layer.explainMissing(err)
 	}
 	defer func() { _ = blob.Close() }()
 

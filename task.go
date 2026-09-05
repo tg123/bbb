@@ -125,13 +125,27 @@ func newTaskStateAppender(path string) (*taskStateAppender, error) {
 }
 
 func (a *taskStateAppender) append(taskKey string) error {
+	return a.appendLines(taskKey)
+}
+
+// appendLines writes every record in one buffer, so a crash cannot leave a
+// prefix of them behind. That matters for the last file of a task and its
+// checkpoint: recorded separately, a crash between the two leaves every file
+// done with the task still marked pending, and a resumed run then refuses a
+// conflict for work it would skip entirely.
+func (a *taskStateAppender) appendLines(taskKeys ...string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.file == nil {
+	if a.file == nil || len(taskKeys) == 0 {
 		return nil
 	}
 
-	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
+	var record strings.Builder
+	for _, key := range taskKeys {
+		record.WriteString(key)
+		record.WriteByte('\n')
+	}
+	if _, err := a.file.WriteString(record.String()); err != nil {
 		return a.closeOnError(err)
 	}
 	if err := a.file.Sync(); err != nil {
@@ -143,6 +157,12 @@ func (a *taskStateAppender) append(taskKey string) error {
 
 func (a *taskStateAppender) appendCheckpoint(taskKey string) error {
 	return a.append(taskKey)
+}
+
+// appendFinal records the last file of a task together with the task's own
+// checkpoint, as one write, so the two cannot be separated by a crash.
+func (a *taskStateAppender) appendFinal(taskKey, checkpointKey string) error {
+	return a.appendLines(taskKey, checkpointKey)
 }
 
 func (a *taskStateAppender) closeOnError(err error) error {

@@ -216,6 +216,45 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 	}
 }
 
+// The last file of a task and the task's own checkpoint must reach the state
+// file as one write. Recorded separately, a crash between them leaves every
+// file done with the task still pending, and validateACRTasks then rejects a
+// resumed run over a conflict for work it would skip entirely.
+func TestTaskStateFinalRecordIsAtomic(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.txt")
+	appender, err := newTaskStateAppender(stateFile)
+	if err != nil {
+		t.Fatalf("open appender: %v", err)
+	}
+	read := taskPair{src: "acr://myreg.azurecr.io/models:v1", dst: "./out"}
+	fileKey := taskStateKey("acr://myreg.azurecr.io/models:v1/last.bin", read.dst)
+	cpKey := taskCheckpointKey(read.src, read.dst)
+	if err := appender.appendFinal(fileKey, cpKey); err != nil {
+		t.Fatalf("appendFinal: %v", err)
+	}
+	if err := appender.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	state, completed, err := loadTaskState(stateFile)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if _, ok := state[fileKey]; !ok {
+		t.Errorf("the final file record is missing: %v", state)
+	}
+	if _, ok := completed[cpKey]; !ok {
+		t.Errorf("the checkpoint must land with it: %v", completed)
+	}
+
+	// With the checkpoint present, a resumed run sees the reader as complete
+	// and a publisher of the same artifact is no longer a conflict.
+	publish := taskPair{src: "./dir", dst: "acr://myreg.azurecr.io/models:v1"}
+	if err := validateACRTasks([]taskPair{publish, read}, state, completed); err != nil {
+		t.Fatalf("a completed reader must not block a publisher: %v", err)
+	}
+}
+
 // A resumed run must not be blocked by a conflict with a task that already
 // completed and will be skipped.
 func TestValidateACRTasksIgnoresCompletedTasks(t *testing.T) {
