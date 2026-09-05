@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/registry"
+	"github.com/tg123/bbb/internal/acr"
 	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/hf"
 	"github.com/urfave/cli/v3"
@@ -143,6 +148,46 @@ func TestCmdSyncRejectsHFFilePath(t *testing.T) {
 	}
 }
 
+// A dry run must predict the real outcome, so an invalid destination or a
+// missing source has to fail rather than report a successful PUSH.
+func TestSyncACRDryRunValidatesTarget(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := cmdSyncPaths(context.Background(), true, false, true, "", 1, 0,
+		source, "acr://myreg.azurecr.io/models@sha256:abc")
+	if err == nil || !strings.Contains(err.Error(), "must use a tag") {
+		t.Fatalf("expected digest destination to be rejected in dry run, got %v", err)
+	}
+
+	err = cmdSyncPaths(context.Background(), true, false, true, "", 1, 0,
+		filepath.Join(source, "missing"), "acr://myreg.azurecr.io/models:v1")
+	if err == nil {
+		t.Fatal("expected a missing source to be rejected in dry run")
+	}
+}
+
+func TestCmdSyncRejectsDeleteWithACRSource(t *testing.T) {
+	err := cmdSyncPaths(context.Background(), false, true, true, "", 1, 0,
+		"acr://myreg.azurecr.io/models:v1", t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "--delete is not supported") {
+		t.Fatalf("expected --delete rejection for acr source, got %v", err)
+	}
+}
+
+// A path inside an artifact is rejected from the path alone. Asking the
+// registry whether it is a directory expands the layer holding it, so a source
+// sync cannot accept anyway would transfer gigabytes before saying so — and
+// the host here does not exist, which is what proves nothing was contacted.
+func TestCmdSyncRejectsACRFilePathWithoutContactingTheRegistry(t *testing.T) {
+	err := cmdSyncPaths(context.Background(), true, false, true, "", 1, 0,
+		"acr://nonexistent-registry.invalid/models:v1/linux/amd64", t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "must target an artifact") {
+		t.Fatalf("expected a path inside an artifact to be rejected, got %v", err)
+	}
+}
+
 func TestCPDirectoryCopiesTree(t *testing.T) {
 	dir := t.TempDir()
 	srcDir := filepath.Join(dir, "src")
@@ -168,6 +213,377 @@ func TestCPDirectoryCopiesTree(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dstDir, "sub", "file.txt")); err != nil {
 		t.Fatalf("expected copied file: %v", err)
+	}
+}
+
+// The last file of a task and the task's own checkpoint must reach the state
+// file as one write. Recorded separately, a crash between them leaves every
+// file done with the task still pending, and validateACRTasks then rejects a
+// resumed run over a conflict for work it would skip entirely.
+func TestTaskStateFinalRecordIsAtomic(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.txt")
+	appender, err := newTaskStateAppender(stateFile)
+	if err != nil {
+		t.Fatalf("open appender: %v", err)
+	}
+	read := taskPair{src: "acr://myreg.azurecr.io/models:v1", dst: "./out"}
+	fileKey := taskStateKey("acr://myreg.azurecr.io/models:v1/last.bin", read.dst)
+	cpKey := taskCheckpointKey(read.src, read.dst)
+	if err := appender.appendFinal(fileKey, cpKey); err != nil {
+		t.Fatalf("appendFinal: %v", err)
+	}
+	if err := appender.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	state, completed, err := loadTaskState(stateFile)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if _, ok := state[fileKey]; !ok {
+		t.Errorf("the final file record is missing: %v", state)
+	}
+	if _, ok := completed[cpKey]; !ok {
+		t.Errorf("the checkpoint must land with it: %v", completed)
+	}
+
+	// With the checkpoint present, a resumed run sees the reader as complete
+	// and a publisher of the same artifact is no longer a conflict.
+	publish := taskPair{src: "./dir", dst: "acr://myreg.azurecr.io/models:v1"}
+	if err := validateACRTasks([]taskPair{publish, read}, state, completed); err != nil {
+		t.Fatalf("a completed reader must not block a publisher: %v", err)
+	}
+}
+
+// A resumed run must not be blocked by a conflict with a task that already
+// completed and will be skipped.
+func TestValidateACRTasksIgnoresCompletedTasks(t *testing.T) {
+	publish := taskPair{src: "./dir", dst: "acr://myreg.azurecr.io/models:v1"}
+	read := taskPair{src: "acr://myreg.azurecr.io/models:v1", dst: "./out"}
+
+	if err := validateACRTasks([]taskPair{publish, read}, nil, nil); err == nil {
+		t.Fatal("expected the overlap to be rejected when both tasks are pending")
+	}
+	completed := map[string]struct{}{
+		taskCheckpointKey(publish.src, publish.dst): {},
+	}
+	if err := validateACRTasks([]taskPair{publish, read}, nil, completed); err != nil {
+		t.Fatalf("a completed publisher should not block the reader: %v", err)
+	}
+
+	// Duplicate destinations behave the same way.
+	other := taskPair{src: "./other", dst: "acr://myreg.azurecr.io/models:v1"}
+	if err := validateACRTasks([]taskPair{publish, other}, nil, nil); err == nil {
+		t.Fatal("expected duplicate destinations to be rejected")
+	}
+	if err := validateACRTasks([]taskPair{publish, other}, nil, completed); err != nil {
+		t.Fatalf("a completed publisher should not block another: %v", err)
+	}
+}
+
+// Reading and republishing one artifact in the same run would move the tag
+// under the reader, since tasks execute concurrently.
+func TestCPRejectsReadAndWriteOfSameArtifact(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	taskfile := filepath.Join(dir, "tasks.txt")
+	content := "acr://myreg.azurecr.io/models:v1 " + filepath.Join(dir, "out") + "\n" +
+		dir + " acr://myreg.azurecr.io/models:v1\n"
+	if err := os.WriteFile(taskfile, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &cli.Command{
+		Action: cmdCP,
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "taskfile"},
+			&cli.BoolFlag{Name: "f"},
+			&cli.BoolFlag{Name: "q"},
+			&cli.IntFlag{Name: "concurrency", Value: 2},
+			&cli.IntFlag{Name: "retry-count"},
+		},
+	}
+	err := app.Run(context.Background(), []string{"cp", "--taskfile", taskfile})
+	if err == nil || !strings.Contains(err.Error(), "read and publish the same acr:// artifact") {
+		t.Fatalf("expected the overlap to be rejected, got %v", err)
+	}
+}
+
+// An ACR artifact source must expand into one task per file, so a download
+// gets the normal per-file concurrency and state tracking.
+func TestExpandCPTaskExpandsACRSource(t *testing.T) {
+	server := httptest.NewServer(registry.New(registry.Logger(log.New(io.Discard, "", 0))))
+	t.Cleanup(server.Close)
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	artifact := acr.Path{Registry: parsed.Host, Repository: "models", Reference: "v1"}
+	uploads := []acr.UploadFile{
+		{Name: "a.txt", Size: 5, Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("alpha")), nil
+		}},
+		{Name: "sub/b.txt", Size: 5, Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("bravo")), nil
+		}},
+	}
+	if err := acr.Push(context.Background(), artifact, uploads, acr.PushOptions{Overwrite: true}); err != nil {
+		t.Fatalf("push artifact: %v", err)
+	}
+
+	destination := t.TempDir()
+	var expanded []cpTask
+	if err := expandCPTask(context.Background(), taskPair{src: artifact.String(), dst: destination},
+		func(task cpTask) error {
+			expanded = append(expanded, task)
+			return nil
+		}); err != nil {
+		t.Fatalf("expandCPTask failed: %v", err)
+	}
+	if len(expanded) != 2 {
+		t.Fatalf("expected one task per file, got %#v", expanded)
+	}
+	for _, task := range expanded {
+		if !strings.HasPrefix(task.src, "acr://") || task.src == artifact.String() {
+			t.Fatalf("expected a per-file source, got %q", task.src)
+		}
+	}
+
+	// A path naming a single file inside the artifact stays one task.
+	single := artifact
+	single.File = "a.txt"
+	expanded = nil
+	if err := expandCPTask(context.Background(), taskPair{src: single.String(), dst: destination},
+		func(task cpTask) error {
+			expanded = append(expanded, task)
+			return nil
+		}); err != nil {
+		t.Fatalf("expandCPTask failed: %v", err)
+	}
+	if len(expanded) != 1 || expanded[0].src != single.String() {
+		t.Fatalf("expected a single task for a file path, got %#v", expanded)
+	}
+}
+
+func TestExpandCPTaskKeepsACRArtifactAtomic(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var expanded []cpTask
+	err := expandCPTask(t.Context(), taskPair{
+		src: source,
+		dst: "acr://registry.example.com/models:v1",
+	}, func(task cpTask) error {
+		expanded = append(expanded, task)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expandCPTask failed: %v", err)
+	}
+	if len(expanded) != 1 || expanded[0].src != source {
+		t.Fatalf("expected one artifact-level task, got %#v", expanded)
+	}
+}
+
+// A symlink inside an artifact source must not be dereferenced, or a link such
+// as `secrets -> /etc/passwd` would upload data from outside the source tree.
+// Collection only proves a path was a regular file during the walk. Each later
+// open must confirm it is still the same file, or a swap after collection would
+// be read from wherever the new path points.
+func TestArtifactFileOpenDetectsReplacement(t *testing.T) {
+	source := t.TempDir()
+	target := filepath.Join(source, "a.txt")
+	if err := os.WriteFile(target, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, _, cleanup, err := collectLocalArtifactFiles(source, nil)
+	if err != nil {
+		t.Fatalf("collectLocalArtifactFiles failed: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if len(files) != 1 {
+		t.Fatalf("unexpected files: %#v", files)
+	}
+
+	// The same file still opens and reads normally.
+	reader, err := files[0].Open()
+	if err != nil {
+		t.Fatalf("open failed: %v", err)
+	}
+	content, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil || string(content) != "original" {
+		t.Fatalf("content = %q (%v)", content, err)
+	}
+
+	// Replacing the path with something that is no longer the same regular
+	// file must be caught rather than silently uploaded. A directory is used
+	// because it needs no privileges and cannot alias the original, whereas
+	// deleting and recreating a file can reuse the inode on Linux.
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := files[0].Open(); err == nil || !strings.Contains(err.Error(), "changed while it was being uploaded") {
+		t.Fatalf("expected the replacement to be detected, got %v", err)
+	}
+
+	// The threat this guards against is a swap for a symlink pointing outside
+	// the source tree. The root handle refuses to traverse out of the source,
+	// so this fails before the handle comparison is even reached.
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("classified"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, target); err != nil {
+		t.Skipf("symlinks unavailable on this host: %v", err)
+	}
+	reader, err = files[0].Open()
+	if err == nil {
+		_ = reader.Close()
+		t.Fatal("expected the symlink swap to be rejected")
+	}
+}
+
+// A directory component replaced after the walk must not let a later open
+// escape the source tree, which is what the root handle guarantees and a
+// path-based walk cannot.
+func TestArtifactFileOpenRejectsDirectorySwap(t *testing.T) {
+	source := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(source, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "sub", "a.txt"), []byte("inside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "a.txt"), []byte("classified"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, _, cleanup, err := collectLocalArtifactFiles(source, nil)
+	if err != nil {
+		t.Fatalf("collectLocalArtifactFiles failed: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if len(files) != 1 || files[0].Name != "sub/a.txt" {
+		t.Fatalf("unexpected files: %#v", files)
+	}
+
+	// Swap the directory itself for a symlink to somewhere else.
+	if err := os.RemoveAll(filepath.Join(source, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(source, "sub")); err != nil {
+		t.Skipf("symlinks unavailable on this host: %v", err)
+	}
+
+	reader, err := files[0].Open()
+	if err == nil {
+		content, _ := io.ReadAll(reader)
+		_ = reader.Close()
+		t.Fatalf("expected the directory swap to be rejected, read %q", content)
+	}
+}
+
+func TestCollectLocalArtifactFilesRejectsSymlink(t *testing.T) {
+	source := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("classified"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "ok.txt"), []byte("fine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(source, "secrets")); err != nil {
+		t.Skipf("symlinks unavailable on this host: %v", err)
+	}
+
+	_, _, cleanup, err := collectLocalArtifactFiles(source, nil)
+	t.Cleanup(cleanup)
+	if err == nil || !strings.Contains(err.Error(), "unsupported source file type") {
+		t.Fatalf("expected the symlink to be rejected, got %v", err)
+	}
+}
+
+// A retry re-uploads only the blobs the registry is still missing, so an
+// attempt's own byte total is not comparable with the previous attempt's.
+// Progress has to be held per file, or an artifact whose layers advanced on
+// different attempts finishes under-counted.
+func TestArtifactProgressAcrossRetries(t *testing.T) {
+	progress := newArtifactProgress(2)
+
+	// Attempt one uploads a.bin and then fails before b.bin.
+	if delta, total := progress.observe("a.bin", 100); delta != 100 || total != 100 {
+		t.Fatalf("a.bin = (%d, %d), want (100, 100)", delta, total)
+	}
+
+	// Attempt two skips a.bin, whose blob now exists, and uploads b.bin. Its
+	// own total never exceeds the first attempt's, but the bytes are real.
+	delta, total := progress.observe("b.bin", 100)
+	if delta != 100 || total != 200 {
+		t.Fatalf("b.bin = (%d, %d), want (100, 200)", delta, total)
+	}
+
+	// Re-reading a file already counted adds nothing, so a retransmission
+	// cannot push the total past the artifact size.
+	if delta, total := progress.observe("a.bin", 40); delta != 0 || total != 200 {
+		t.Fatalf("a.bin replay = (%d, %d), want (0, 200)", delta, total)
+	}
+	if delta, total := progress.observe("a.bin", 100); delta != 0 || total != 200 {
+		t.Fatalf("a.bin resend = (%d, %d), want (0, 200)", delta, total)
+	}
+
+	// A file that got further than before contributes only the difference.
+	if delta, total := progress.observe("b.bin", 150); delta != 50 || total != 250 {
+		t.Fatalf("b.bin growth = (%d, %d), want (50, 250)", delta, total)
+	}
+}
+
+func TestCollectLocalArtifactFiles(t *testing.T) {
+	source := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(source, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "sub", "b.txt"), []byte("bravo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files, total, cleanup, err := collectLocalArtifactFiles(source, func(name string) bool {
+		return name == "a.txt"
+	})
+	if err != nil {
+		t.Fatalf("collectLocalArtifactFiles failed: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if total != 5 || len(files) != 1 || files[0].Name != "sub/b.txt" {
+		t.Fatalf("unexpected artifact files: total=%d files=%#v", total, files)
+	}
+	reader, err := files[0].Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = reader.Close()
+	}()
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "bravo" {
+		t.Fatalf("unexpected file content: %q", content)
 	}
 }
 
