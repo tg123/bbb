@@ -247,6 +247,7 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 	}
 
 	// Check if source is a single file (not a directory)
+	var sourceErr error
 	if bbbfs.IsHF(task.src) || bbbfs.IsACR(task.src) || bbbfs.IsObjectStore(task.src) {
 		dirLike, err := bbbfs.IsDirLike(ctx, task.src)
 		if err != nil {
@@ -267,6 +268,7 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 						size: entry.Size,
 					})
 				} else {
+					sourceErr = statErr
 					slog.Debug("source not found as blob, trying as directory prefix", "src", task.src, "error", statErr)
 				}
 			} else {
@@ -279,14 +281,7 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 		}
 	}
 
-	for result := range bbbfs.ListRecursive(ctx, task.src) {
-		if result.Err != nil {
-			return result.Err
-		}
-		entry := result.Entry
-		if entry.IsDir {
-			continue
-		}
+	return listCopyEntries(ctx, task.src, task.dst, sourceErr, nil, func(entry bbbfs.Entry) error {
 		dstPath, err := copyDestination(task.src, task.dst, entry.Name)
 		if err != nil {
 			return err
@@ -295,15 +290,12 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 		if bbbfs.IsRemote(task.src) && !bbbfs.IsRemote(task.dst) {
 			localTarget = &localCopyTarget{root: task.dst, name: entry.Name}
 		}
-		if err := emit(cpTask{
+		return emit(cpTask{
 			src:         entry.Path,
 			dst:         dstPath,
 			key:         taskStateKey(entry.Path, task.dst),
 			size:        entry.Size,
 			localTarget: localTarget,
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
+		})
+	})
 }

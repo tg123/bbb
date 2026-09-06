@@ -391,6 +391,14 @@ bbb ls gs://mybucket/
 GCS→GCS copies use the server-side rewrite API — which handles objects of any
 size — and never stream bytes through the client.
 
+Recursive remote-to-local copies and syncs collect and validate the selected
+file names before starting transfers. Nonportable names, case/Unicode aliases,
+and file/directory conflicts are rejected rather than overwriting the same
+local file. This preflight uses memory proportional to the listing size.
+GCS object names remain opaque for GCS destinations; copies to backends that
+normalize paths reject names they cannot preserve, such as `../file` or
+`a//file`, rather than writing outside the requested prefix or renaming them.
+
 ### `BBB_DNS_SERVER`
 
 When set, bbb sends every DNS query to the given DNS server(s) instead of the system resolver configuration (`/etc/resolv.conf`, `systemd-resolved`, ...). This is useful when the host resolver is broken, slow, or returns endpoints you do not want to use.
