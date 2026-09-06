@@ -31,7 +31,11 @@ func parseTaskPairLine(line string, lineNo int) (taskPair, error) {
 	return taskPair{src: parts[0], dst: parts[1]}, nil
 }
 
-func loadTaskPairs(taskfile string) ([]taskPair, error) {
+// streamTaskPairs reads task pairs from taskfile (or stdin when taskfile is
+// `-`) and calls emit for each pair as soon as its line is read, so a taskfile
+// can be consumed as a continuous work stream instead of being buffered until
+// EOF. Returning a non-nil error from emit stops reading.
+func streamTaskPairs(taskfile string, emit func(taskPair) error) error {
 	var (
 		reader io.Reader
 		file   *os.File
@@ -42,7 +46,7 @@ func loadTaskPairs(taskfile string) ([]taskPair, error) {
 	} else {
 		file, err = os.Open(taskfile)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		defer func() {
 			_ = file.Close()
@@ -50,7 +54,6 @@ func loadTaskPairs(taskfile string) ([]taskPair, error) {
 		reader = file
 	}
 
-	var tasks []taskPair
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxTaskfileLineSize)
 	for lineNo := 1; scanner.Scan(); lineNo++ {
@@ -58,13 +61,24 @@ func loadTaskPairs(taskfile string) ([]taskPair, error) {
 		if line == "" {
 			continue
 		}
-		task, err := parseTaskPairLine(line, lineNo)
-		if err != nil {
-			return nil, err
+		task, perr := parseTaskPairLine(line, lineNo)
+		if perr != nil {
+			return perr
 		}
-		tasks = append(tasks, task)
+		if eerr := emit(task); eerr != nil {
+			return eerr
+		}
 	}
-	if err := scanner.Err(); err != nil {
+	return scanner.Err()
+}
+
+// loadTaskPairs reads all task pairs from taskfile into memory.
+func loadTaskPairs(taskfile string) ([]taskPair, error) {
+	var tasks []taskPair
+	if err := streamTaskPairs(taskfile, func(t taskPair) error {
+		tasks = append(tasks, t)
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	return tasks, nil
@@ -125,13 +139,27 @@ func newTaskStateAppender(path string) (*taskStateAppender, error) {
 }
 
 func (a *taskStateAppender) append(taskKey string) error {
+	return a.appendLines(taskKey)
+}
+
+// appendLines writes every record in one buffer, so a crash cannot leave a
+// prefix of them behind. That matters for the last file of a task and its
+// checkpoint: recorded separately, a crash between the two leaves every file
+// done with the task still marked pending, and a resumed run then refuses a
+// conflict for work it would skip entirely.
+func (a *taskStateAppender) appendLines(taskKeys ...string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.file == nil {
+	if a.file == nil || len(taskKeys) == 0 {
 		return nil
 	}
 
-	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
+	var record strings.Builder
+	for _, key := range taskKeys {
+		record.WriteString(key)
+		record.WriteByte('\n')
+	}
+	if _, err := a.file.WriteString(record.String()); err != nil {
 		return a.closeOnError(err)
 	}
 	if err := a.file.Sync(); err != nil {
@@ -143,6 +171,12 @@ func (a *taskStateAppender) append(taskKey string) error {
 
 func (a *taskStateAppender) appendCheckpoint(taskKey string) error {
 	return a.append(taskKey)
+}
+
+// appendFinal records the last file of a task together with the task's own
+// checkpoint, as one write, so the two cannot be separated by a crash.
+func (a *taskStateAppender) appendFinal(taskKey, checkpointKey string) error {
+	return a.appendLines(taskKey, checkpointKey)
 }
 
 func (a *taskStateAppender) closeOnError(err error) error {
@@ -206,8 +240,14 @@ type cpTask struct {
 // emit for each discovered file; for file-like sources it emits a single task.
 // Returning a non-nil error from emit stops expansion early.
 func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) error {
+	// An ACR destination is one atomic OCI artifact. Keep a directory source as
+	// one task so its files become layers under a single published manifest.
+	if bbbfs.IsACR(task.dst) {
+		return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+	}
+
 	// Check if source is a single file (not a directory)
-	if bbbfs.IsHF(task.src) || bbbfs.IsObjectStore(task.src) {
+	if bbbfs.IsHF(task.src) || bbbfs.IsACR(task.src) || bbbfs.IsObjectStore(task.src) {
 		dirLike, err := bbbfs.IsDirLike(ctx, task.src)
 		if err != nil {
 			return err
@@ -215,9 +255,9 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 		if !dirLike {
 			// For object-store sources, verify the object actually exists; if
 			// not, the path may be a virtual directory prefix — fall through to
-			// recursive listing. For HF sources, skip the Stat-based check
-			// to avoid a potentially expensive full-repo listing and emit
-			// a single-file task directly.
+			// recursive listing. Hugging Face and ACR sources skip the
+			// Stat-based check, since an artifact or repo path that is not
+			// directory-like is already known to name a single file.
 			if bbbfs.IsObjectStore(task.src) {
 				if entry, statErr := bbbfs.Resolve(task.src).Stat(ctx, task.src); statErr == nil {
 					return emit(cpTask{
