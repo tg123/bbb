@@ -1053,7 +1053,7 @@ func TestDiscoverTenantIDHTTPError(t *testing.T) {
 }
 
 func TestRegisterAccountRoleStoresUpperCase(t *testing.T) {
-	defer accountRoles.Delete("testacct")
+	defer ClearAccountRole("testacct")
 	RegisterAccountRole("testacct", "src")
 	v, ok := accountRoles.Load("testacct")
 	if !ok || v.(string) != "SRC" {
@@ -1061,8 +1061,42 @@ func TestRegisterAccountRoleStoresUpperCase(t *testing.T) {
 	}
 }
 
+func TestAccountRoleChangesInvalidateCachedClients(t *testing.T) {
+	const account = "rolechangeacct"
+	defer ClearAccountRole(account)
+
+	seedCaches := func() {
+		blobClientCache.Store(account, "stale")
+		udcCacheMu.Lock()
+		udcCache[account] = &udcCacheEntry{}
+		udcCacheMu.Unlock()
+	}
+	assertCaches := func(wantCached bool) {
+		t.Helper()
+		_, blobCached := blobClientCache.Load(account)
+		udcCacheMu.Lock()
+		_, udcCached := udcCache[account]
+		udcCacheMu.Unlock()
+		if blobCached != wantCached || udcCached != wantCached {
+			t.Fatalf("cached blob client = %v, UDC = %v; want both %v", blobCached, udcCached, wantCached)
+		}
+	}
+
+	for _, role := range []string{"SRC", "DST", "SRC"} {
+		seedCaches()
+		RegisterAccountRole(account, role)
+		assertCaches(false)
+	}
+	seedCaches()
+	RegisterAccountRole(account, "src")
+	assertCaches(true)
+
+	ClearAccountRole(account)
+	assertCaches(false)
+}
+
 func TestAccountKeyRolePrefixedTakesPrecedence(t *testing.T) {
-	defer accountRoles.Delete("acctkey1")
+	defer ClearAccountRole("acctkey1")
 	RegisterAccountRole("acctkey1", "SRC")
 	t.Setenv("SRC_BBB_AZBLOB_ACCOUNTKEY", "src-key-123")
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "global-key")
@@ -1072,7 +1106,7 @@ func TestAccountKeyRolePrefixedTakesPrecedence(t *testing.T) {
 }
 
 func TestAccountKeyFallsBackToGlobal(t *testing.T) {
-	defer accountRoles.Delete("acctkey2")
+	defer ClearAccountRole("acctkey2")
 	RegisterAccountRole("acctkey2", "DST")
 	t.Setenv("BBB_AZBLOB_ACCOUNTKEY", "global-key")
 	// No DST_BBB_AZBLOB_ACCOUNTKEY set
