@@ -391,6 +391,14 @@ bbb ls gs://mybucket/
 GCS→GCS copies use the server-side rewrite API — which handles objects of any
 size — and never stream bytes through the client.
 
+GCS tree copies and syncs reject overlapping source and destination prefixes
+in the same bucket before listing or copying objects. This includes equal
+prefixes and either prefix containing the other.
+
+Downloads of gzip-encoded GCS objects use one full read instead of parallel
+ranges, preserving normal decompression without using the stored size to
+limit the decoded output.
+
 Recursive remote-to-local copies and syncs collect and validate the selected
 file names before starting transfers. Nonportable names, case/Unicode aliases,
 and file/directory conflicts are rejected rather than overwriting the same

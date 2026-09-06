@@ -39,7 +39,7 @@ func (gsFS) Write(ctx context.Context, p string, r io.Reader) error {
 }
 
 // DownloadToFile downloads the object at src into localPath using parallel
-// ranged reads.
+// ranged reads, or one full read for gzip-encoded objects.
 func (gsFS) DownloadToFile(ctx context.Context, src, localPath string, concurrency int, onProgress func(int64)) (int64, error) {
 	gp, err := gspkg.Parse(src)
 	if err != nil {

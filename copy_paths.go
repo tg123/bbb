@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/tg123/bbb/internal/acr"
 	"github.com/tg123/bbb/internal/bbbfs"
+	"github.com/tg123/bbb/internal/gs"
 )
 
 func validateLocalCopyNames(root string, names []string) error {
@@ -23,11 +25,29 @@ func validateLocalCopyNames(root string, names []string) error {
 }
 
 // listCopyEntries preflights a remote-to-local expansion before emitting any
-// work, so aliases cannot race to overwrite the same local file. Remote
-// destinations keep streaming and preserve their object-store semantics.
+// work, so aliases cannot race to overwrite the same local file. Disjoint
+// remote destinations keep streaming and preserve their object-store semantics.
 func listCopyEntries(ctx context.Context, src, dst string, sourceErr error, exclude func(string) bool, emit func(bbbfs.Entry) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if bbbfs.IsGS(src) && bbbfs.IsGS(dst) {
+		source, err := gs.Parse(src)
+		if err != nil {
+			return err
+		}
+		destination, err := gs.Parse(dst)
+		if err != nil {
+			return err
+		}
+		// Match listing/Child prefix boundaries without cleaning opaque keys.
+		// Overlapping trees can overwrite unread sources or feed newly copied
+		// objects back into later listing pages.
+		sourcePrefix, destinationPrefix := source.WithDir().Object, destination.WithDir().Object
+		if source.Bucket == destination.Bucket &&
+			(strings.HasPrefix(sourcePrefix, destinationPrefix) || strings.HasPrefix(destinationPrefix, sourcePrefix)) {
+			return fmt.Errorf("overlapping GCS source and destination prefixes: %s -> %s", src, dst)
+		}
+	}
 	preflight := bbbfs.IsRemote(src) && !bbbfs.IsRemote(dst)
 	var entries []bbbfs.Entry
 	var names []string

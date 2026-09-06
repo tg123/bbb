@@ -263,6 +263,23 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+type progressWriter struct {
+	w          io.Writer
+	written    int64
+	onProgress func(int64)
+}
+
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	n, err := pw.w.Write(p)
+	if n > 0 {
+		pw.written += int64(n)
+		if pw.onProgress != nil {
+			pw.onProgress(pw.written)
+		}
+	}
+	return n, err
+}
+
 // upload copies reader into the object, reporting cumulative bytes when
 // onProgress is non-nil.
 func upload(ctx context.Context, gp GSPath, reader io.Reader, onProgress func(int64)) error {
@@ -298,8 +315,8 @@ func UploadFile(ctx context.Context, gp GSPath, file *os.File, _ int, onProgress
 	return upload(ctx, gp, file, onProgress)
 }
 
-// DownloadFile downloads the object into file using parallel ranged reads,
-// returning the number of bytes written.
+// DownloadFile downloads the object into file using parallel ranged reads
+// (a single full read for gzip-encoded objects), returning the bytes written.
 func DownloadFile(ctx context.Context, gp GSPath, file *os.File, concurrency int, onProgress func(int64)) (int64, error) {
 	client, err := getClient(ctx)
 	if err != nil {
@@ -329,6 +346,28 @@ func DownloadFile(ctx context.Context, gp GSPath, file *os.File, concurrency int
 	// Pin the generation so concurrent ranges cannot mix content from two
 	// different versions of the object.
 	obj = obj.Generation(attrs.Generation)
+
+	if strings.EqualFold(attrs.ContentEncoding, "gzip") {
+		// GCS can ignore ranges and return the entire decoded object. Its
+		// stored size does not bound the decoded stream, so read to EOF.
+		r, err := obj.NewReader(ctx)
+		if err != nil {
+			if isNotFound(err) {
+				return 0, notExistError(gp.String())
+			}
+			return 0, err
+		}
+		defer func() { _ = r.Close() }()
+		w := &progressWriter{w: io.NewOffsetWriter(file, 0), onProgress: onProgress}
+		n, err := io.Copy(w, r)
+		if isNotFound(err) {
+			err = notExistError(gp.String())
+		}
+		if err == nil && n == 0 && onProgress != nil {
+			onProgress(0)
+		}
+		return n, err
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
