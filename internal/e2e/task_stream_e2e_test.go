@@ -32,6 +32,7 @@ func startTaskStream(t *testing.T, command, dir string) *taskStreamProcess {
 	cmd.Dir = dir
 	cmd.WaitDelay = time.Second
 	stream := &taskStreamProcess{done: make(chan struct{})}
+	// os/exec serializes writes when stdout and stderr share the same writer.
 	cmd.Stdout = &stream.output
 	cmd.Stderr = &stream.output
 	var err error

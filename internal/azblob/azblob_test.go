@@ -1061,27 +1061,38 @@ func TestRegisterAccountRoleStoresUpperCase(t *testing.T) {
 	}
 }
 
-func TestAccountRoleChangesInvalidateCachedClient(t *testing.T) {
+func TestAccountRoleChangesInvalidateCachedClients(t *testing.T) {
 	const account = "rolechangeacct"
 	defer ClearAccountRole(account)
 
-	blobClientCache.Store(account, "stale")
-	RegisterAccountRole(account, "SRC")
-	if _, ok := blobClientCache.Load(account); ok {
-		t.Fatal("registering a new role should invalidate the cached client")
+	seedCaches := func() {
+		blobClientCache.Store(account, "stale")
+		udcCacheMu.Lock()
+		udcCache[account] = &udcCacheEntry{}
+		udcCacheMu.Unlock()
+	}
+	assertCaches := func(wantCached bool) {
+		t.Helper()
+		_, blobCached := blobClientCache.Load(account)
+		udcCacheMu.Lock()
+		_, udcCached := udcCache[account]
+		udcCacheMu.Unlock()
+		if blobCached != wantCached || udcCached != wantCached {
+			t.Fatalf("cached blob client = %v, UDC = %v; want both %v", blobCached, udcCached, wantCached)
+		}
 	}
 
-	blobClientCache.Store(account, "stale")
-	RegisterAccountRole(account, "DST")
-	if _, ok := blobClientCache.Load(account); ok {
-		t.Fatal("changing roles should invalidate the cached client")
+	for _, role := range []string{"SRC", "DST", "SRC"} {
+		seedCaches()
+		RegisterAccountRole(account, role)
+		assertCaches(false)
 	}
+	seedCaches()
+	RegisterAccountRole(account, "src")
+	assertCaches(true)
 
-	blobClientCache.Store(account, "stale")
 	ClearAccountRole(account)
-	if _, ok := blobClientCache.Load(account); ok {
-		t.Fatal("clearing a role should invalidate the cached client")
-	}
+	assertCaches(false)
 }
 
 func TestAccountKeyRolePrefixedTakesPrecedence(t *testing.T) {
