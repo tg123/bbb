@@ -125,13 +125,30 @@ func newTaskStateAppender(path string) (*taskStateAppender, error) {
 }
 
 func (a *taskStateAppender) append(taskKey string) error {
-	if a.file == nil {
-		return nil
-	}
+	return a.appendLines(taskKey)
+}
+
+// appendLines writes every record in one buffer, so a crash cannot leave a
+// prefix of them behind. That matters for the last file of a task and its
+// checkpoint: recorded separately, a crash between the two leaves every file
+// done with the task still marked pending, and a resumed run then refuses a
+// conflict for work it would skip entirely.
+func (a *taskStateAppender) appendLines(taskKeys ...string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.file == nil || len(taskKeys) == 0 {
+		return nil
+	}
 
-	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
+	var record strings.Builder
+	for _, key := range taskKeys {
+		record.WriteString(key)
+		record.WriteByte('\n')
+	}
+	if _, err := a.file.WriteString(record.String()); err != nil {
+		return a.closeOnError(err)
+	}
+	if err := a.file.Sync(); err != nil {
 		return a.closeOnError(err)
 	}
 
@@ -139,21 +156,13 @@ func (a *taskStateAppender) append(taskKey string) error {
 }
 
 func (a *taskStateAppender) appendCheckpoint(taskKey string) error {
-	if a.file == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	return a.append(taskKey)
+}
 
-	if _, err := a.file.WriteString(taskKey + "\n"); err != nil {
-		return a.closeOnError(err)
-	}
-
-	if err := a.file.Sync(); err != nil {
-		return a.closeOnError(err)
-	}
-
-	return nil
+// appendFinal records the last file of a task together with the task's own
+// checkpoint, as one write, so the two cannot be separated by a crash.
+func (a *taskStateAppender) appendFinal(taskKey, checkpointKey string) error {
+	return a.appendLines(taskKey, checkpointKey)
 }
 
 func (a *taskStateAppender) closeOnError(err error) error {
@@ -174,14 +183,19 @@ func (a *taskStateAppender) close() error {
 	if a.file == nil {
 		return nil
 	}
-	if serr := a.file.Sync(); serr != nil {
-		_ = a.file.Close()
-		a.file = nil
-		return serr
-	}
-	err := a.file.Close()
+	syncErr := a.file.Sync()
+	closeErr := a.file.Close()
 	a.file = nil
-	return err
+	return errors.Join(syncErr, closeErr)
+}
+
+func closeTaskStateAppender(a *taskStateAppender, retErr *error) {
+	if a == nil {
+		return
+	}
+	if err := a.close(); err != nil {
+		*retErr = errors.Join(*retErr, fmt.Errorf("flush state file: %w", err))
+	}
 }
 
 const taskCheckpointPrefix = "TASK\t"
@@ -212,8 +226,14 @@ type cpTask struct {
 // emit for each discovered file; for file-like sources it emits a single task.
 // Returning a non-nil error from emit stops expansion early.
 func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) error {
+	// An ACR destination is one atomic OCI artifact. Keep a directory source as
+	// one task so its files become layers under a single published manifest.
+	if bbbfs.IsACR(task.dst) {
+		return emit(cpTask{src: task.src, dst: task.dst, key: taskStateKey(task.src, task.dst)})
+	}
+
 	// Check if source is a single file (not a directory)
-	if bbbfs.IsHF(task.src) || bbbfs.IsAz(task.src) {
+	if bbbfs.IsHF(task.src) || bbbfs.IsACR(task.src) || bbbfs.IsAz(task.src) {
 		dirLike, err := bbbfs.IsDirLike(ctx, task.src)
 		if err != nil {
 			return err
@@ -221,9 +241,9 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 		if !dirLike {
 			// For Azure sources, verify the blob actually exists; if not,
 			// the path may be a virtual directory prefix — fall through to
-			// recursive listing. For HF sources, skip the Stat-based check
-			// to avoid a potentially expensive full-repo listing and emit
-			// a single-file task directly.
+			// recursive listing. Hugging Face and ACR sources skip the
+			// Stat-based check, since an artifact or repo path that is not
+			// directory-like is already known to name a single file.
 			if bbbfs.IsAz(task.src) {
 				if entry, statErr := bbbfs.Resolve(task.src).Stat(ctx, task.src); statErr == nil {
 					return emit(cpTask{

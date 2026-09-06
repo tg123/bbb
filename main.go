@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -28,6 +30,7 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/tg123/bbb/internal/acr"
 	"github.com/tg123/bbb/internal/azblob"
 	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/fsops"
@@ -261,10 +264,14 @@ func newCachingDialContext(baseDial dialContextFunc, lookup lookupHostFunc, ttl 
 }
 
 func main() {
+	os.Exit(run(os.Args))
+}
+
+func run(args []string) int {
 	// logLevel will be set from global flag after parsing
 	app := &cli.Command{
 		Name:    "bbb",
-		Usage:   "filesystem helper (local + az:// / https://blob / hf://)",
+		Usage:   "filesystem helper (local + az:// / https://blob / s3:// / hf:// / acr://)",
 		Version: version(),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -367,7 +374,7 @@ func main() {
 					if dnsPin {
 						cacheEnv = "BBB_DNS_PIN"
 					}
-					slog.Info("DNS caching enabled (applies to Azure SDK and Hugging Face traffic)",
+					slog.Info("DNS caching enabled (applies to Azure SDK, Hugging Face, Azure Container Registry and S3 traffic)",
 						"env", cacheEnv,
 						"ttl", ttlStr,
 						"pin", dnsPin,
@@ -379,7 +386,8 @@ func main() {
 				http.DefaultTransport = transport
 
 				// Publish the wrapped transport to internal packages that
-				// build their own HTTP clients (Azure SDK, Hugging Face).
+				// build their own HTTP clients (Azure SDK, Hugging Face,
+				// Azure Container Registry, S3).
 				// Without this the custom DialContext only applies to
 				// stdlib callers, leaving BBB_DNS_PIN ineffective for SDK
 				// traffic (token acquisition, data plane, UDC).
@@ -390,6 +398,7 @@ func main() {
 				// early enough.
 				azblob.SetHTTPTransport(transport)
 				hf.SetHTTPClient(&http.Client{Transport: transport})
+				acr.SetHTTPClient(&http.Client{Transport: transport})
 				s3pkg.SetHTTPClient(&http.Client{Transport: transport})
 				gspkg.SetHTTPClient(&http.Client{Transport: transport})
 			}
@@ -643,11 +652,19 @@ func main() {
 		},
 	}
 
-	if err := app.Run(context.Background(), os.Args); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop() // Restore default handling so a second Ctrl+C forces termination.
+	}()
+
+	if err := app.Run(ctx, args); err != nil {
 		slog.Error("App error", "err", err)
-		os.Exit(1)
+		return 1
 	}
 	// Remove any stray cli.Before assignment
+	return 0
 }
 
 func cmdLS(ctx context.Context, c *cli.Command) error {
@@ -1280,13 +1297,17 @@ func runOpPoolWithRetryProgress[T any](ctx context.Context, concurrency int, ret
 	progress := newProgressBar(total, label, quiet, false)
 	err := runOpPoolWithRetry(ctx, concurrency, retryCount, producer, func(op T) error {
 		err := worker(op)
-		if progress != nil {
+		if progress != nil && err == nil {
 			progress.Increment()
 		}
 		return err
 	})
 	if progress != nil {
-		progress.Finish()
+		if err != nil {
+			progress.Abort()
+		} else {
+			progress.Finish()
+		}
 	}
 	return err
 }
@@ -1303,7 +1324,11 @@ func runOpPoolWithRetryProgressBytes[T any](ctx context.Context, concurrency int
 		return err
 	})
 	if progress != nil {
-		progress.Finish()
+		if err != nil {
+			progress.Abort()
+		} else {
+			progress.Finish()
+		}
 	}
 	return err
 }
@@ -1349,11 +1374,66 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
 }
 
+// validateACRTasks rejects task combinations that cannot run concurrently
+// against one artifact. Tasks already recorded as complete are excluded,
+// because a resumed run does not execute them.
+//
+// Completion is read from both maps: an atomic ACR publish records its file
+// state before its task checkpoint, so a run interrupted between the two
+// writes is skipped during expansion while only the file record exists.
+func validateACRTasks(tasks []taskPair, state, completed map[string]struct{}) error {
+	pending := make([]taskPair, 0, len(tasks))
+	for _, task := range tasks {
+		if _, done := completed[taskCheckpointKey(task.src, task.dst)]; done {
+			continue
+		}
+		if _, done := state[taskStateKey(task.src, task.dst)]; done {
+			continue
+		}
+		pending = append(pending, task)
+	}
+
+	destinations := make(map[string]struct{})
+	for _, task := range pending {
+		if !bbbfs.IsACR(task.dst) {
+			continue
+		}
+		if bbbfs.IsRemote(task.src) {
+			return fmt.Errorf("cp: acr:// destinations require a local source")
+		}
+		destination, err := acr.Parse(task.dst)
+		if err != nil {
+			return fmt.Errorf("cp: %w", err)
+		}
+		key := destination.ArtifactKey()
+		if _, duplicate := destinations[key]; duplicate {
+			return fmt.Errorf("cp: multiple sources cannot target the same acr:// artifact")
+		}
+		destinations[key] = struct{}{}
+	}
+	// Tasks run concurrently, so an artifact that is read by one task and
+	// republished by another would have its tag moved mid-transfer, leaving
+	// the reader mixing revisions.
+	for _, task := range pending {
+		if !bbbfs.IsACR(task.src) {
+			continue
+		}
+		source, err := acr.Parse(task.src)
+		if err != nil {
+			return fmt.Errorf("cp: %w", err)
+		}
+		if _, clash := destinations[source.ArtifactKey()]; clash {
+			return fmt.Errorf("cp: cannot read and publish the same acr:// artifact in one run: %s", task.src)
+		}
+	}
+	return nil
+}
+
 // runCPTasks executes a list of task pairs through the unified expansion +
 // parallel copy pipeline. Both taskfile mode and positional-arg mode convert
 // their inputs to []taskPair and call this function, ensuring a single code
 // path for state tracking, progress bars, and concurrency control.
-func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, concurrency, retryCount int, stateFile string) error {
+func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, concurrency, retryCount int, stateFile string) (retErr error) {
 	// Register account roles for multi-tenant env var support (SRC_AZURE_* / DST_AZURE_*).
 	{
 		var srcPaths, dstPaths []string
@@ -1379,6 +1459,11 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	if err != nil {
 		return err
 	}
+	// Validate after the checkpoints load, so a resumed run is not blocked by
+	// a conflict with a task that has already completed and will be skipped.
+	if err := validateACRTasks(tasks, state, taskCheckpoints); err != nil {
+		return err
+	}
 	// Streaming progress bar: total starts at 0 and grows as files are
 	// discovered during expansion. The bar stays invisible until the
 	// first file is found, then updates on every change.
@@ -1388,7 +1473,11 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	}
 	defer func() {
 		if taskProgress != nil {
-			taskProgress.Finish()
+			if retErr != nil {
+				taskProgress.Abort()
+			} else {
+				taskProgress.Finish()
+			}
 		}
 	}()
 	seen := make(map[string]struct{}, len(state)+len(tasks))
@@ -1399,6 +1488,7 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	if err != nil {
 		return err
 	}
+	defer closeTaskStateAppender(stateAppender, &retErr)
 
 	workers := concurrency
 	if workers < 1 {
@@ -1438,7 +1528,6 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	var firstErr error
 	var firstErrMu sync.Mutex
 	var totalPending atomic.Int64
-	var queued atomic.Bool
 
 	setErr := func(err error) {
 		firstErrMu.Lock()
@@ -1466,21 +1555,35 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 					if taskProgress != nil {
 						bytesCb = taskProgress.AddBytes
 					}
-					if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, innerConcurrency, retryCount, []string{task.src}, task.dst, task.size, showCopyBars, bytesCb); err != nil {
+					taskConcurrency := innerConcurrency
+					if bbbfs.IsACR(task.dst) && len(tasks) == 1 {
+						// A lone acr:// destination is one atomic artifact
+						// push, so the file-level workers this budget was
+						// split for stay idle and it can have the whole
+						// budget. With several tasks the split still applies,
+						// or concurrent pushes would together exceed
+						// --concurrency.
+						taskConcurrency = concurrency
+					}
+					if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, taskConcurrency, retryCount, []string{task.src}, task.dst, task.size, showCopyBars, bytesCb); err != nil {
 						setErr(err)
 						return
 					}
 					slog.Debug("cp: done", "src", task.src, "dst", task.dst)
 					if stateFile != "" {
-						if err := stateAppender.append(task.key); err != nil {
-							setErr(err)
-							return
-						}
+						// The last file of a task and the task's own checkpoint
+						// go down together: recorded separately, a crash between
+						// them leaves every file done with the task still
+						// pending, and the resumed run then rejects a conflict
+						// for work it would skip entirely.
 						if task.tracker != nil && task.tracker.remaining.Add(-1) == 0 {
-							if err := stateAppender.appendCheckpoint(task.tracker.key); err != nil {
+							if err := stateAppender.appendFinal(task.key, task.tracker.key); err != nil {
 								setErr(err)
 								return
 							}
+						} else if err := stateAppender.append(task.key); err != nil {
+							setErr(err)
+							return
 						}
 					}
 					if taskProgress != nil {
@@ -1554,7 +1657,6 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 							return workerCtx.Err()
 						case taskCh <- expandedTask:
 							slog.Debug("cp: queued", "src", expandedTask.src, "dst", expandedTask.dst)
-							queued.Store(true)
 							if taskProgress != nil {
 								taskProgress.SetTotal(totalPending.Add(1))
 							}
@@ -1603,26 +1705,21 @@ enqueueLoop:
 	}
 	close(taskCh)
 	wg.Wait()
-	if !queued.Load() && firstErr == nil {
-		if err := stateAppender.close(); err != nil {
-			return err
-		}
-		return nil
-	}
-
 	if firstErr != nil {
-		_ = stateAppender.close()
 		return firstErr
 	}
-	if err := stateAppender.close(); err != nil {
-		return err
-	}
-	return nil
+	return ctx.Err()
 }
 
 func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCount int, srcs []string, dst string, srcSize int64, showCopyBar bool, onBytes func(int64)) error {
 	if bbbfs.IsHF(dst) {
 		return fmt.Errorf("cp: hf:// only supported as source")
+	}
+	if bbbfs.IsACR(dst) {
+		if len(srcs) != 1 {
+			return fmt.Errorf("cp: acr:// destination requires exactly one local file or directory")
+		}
+		return pushLocalArtifact(ctx, srcs[0], dst, overwrite, quiet, showCopyBar, false, concurrency, retryCount, nil, onBytes)
 	}
 	dstObj := bbbfs.IsObjectStore(dst)
 	// Determine if dst is directory (local or remote object store)
@@ -1645,7 +1742,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		src := src
 		srcObj := bbbfs.IsObjectStore(src)
 		base := bbbfs.BaseName(src)
-		if bbbfs.IsHF(src) || srcObj {
+		if bbbfs.IsHF(src) || bbbfs.IsACR(src) || srcObj {
 			dirLike, err := bbbfs.IsDirLike(ctx, src)
 			if err != nil {
 				return err
@@ -1785,7 +1882,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				copyBar.render(copied)
 			}); err != nil {
 				if copyBar != nil {
-					copyBar.Finish()
+					copyBar.Abort()
 				}
 				// When S2S is forced, do not fall back to client-side
 				// streaming. Return the error so the operation is retried
@@ -1824,7 +1921,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				reader, readErr := bbbfs.Resolve(op.src).Read(ctx, op.src)
 				if readErr != nil {
 					if copyBar != nil {
-						copyBar.Finish()
+						copyBar.Abort()
 					}
 					return 0, fmt.Errorf("cp: client-side fallback read: %w", readErr)
 				}
@@ -1855,11 +1952,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 					})
 					return bbbfs.Resolve(op.dst).Write(uploadCtx, op.dst, pr)
 				})
+				if writeErr != nil {
+					if copyBar != nil {
+						copyBar.Abort()
+					}
+					return 0, fmt.Errorf("cp: client-side fallback write: %w", writeErr)
+				}
 				if copyBar != nil {
 					copyBar.Finish()
-				}
-				if writeErr != nil {
-					return 0, fmt.Errorf("cp: client-side fallback write: %w", writeErr)
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s (client-side)\n", op.src, op.dst)
@@ -1919,11 +2019,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 						copyBar.render(copied)
 					}
 				})
+				if err != nil {
+					if copyBar != nil {
+						copyBar.Abort()
+					}
+					return 0, err
+				}
 				if copyBar != nil {
 					copyBar.Finish()
-				}
-				if err != nil {
-					return 0, err
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
@@ -1968,11 +2071,14 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 						copyBar.render(copied)
 					}
 				})
+				if err != nil {
+					if copyBar != nil {
+						copyBar.Abort()
+					}
+					return 0, err
+				}
 				if copyBar != nil {
 					copyBar.Finish()
-				}
-				if err != nil {
-					return 0, err
 				}
 				if !quiet {
 					lockedPrintf("Copied %s -> %s\n", op.src, op.dst)
@@ -1995,7 +2101,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			reader, err := bbbfs.Resolve(op.src).Read(ctx, op.src)
 			if err != nil {
 				if copyBar != nil {
-					copyBar.Finish()
+					copyBar.Abort()
 				}
 				return 0, err
 			}
@@ -2036,7 +2142,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				return bbbfs.Resolve(op.dst).Write(writeCtx, op.dst, pr)
 			}); err != nil {
 				if copyBar != nil {
-					copyBar.Finish()
+					copyBar.Abort()
 				}
 				return 0, err
 			}
@@ -2063,6 +2169,255 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		return size, nil
 	}); err != nil {
 		return fmt.Errorf("cp: file operations: %w", err)
+	}
+	return nil
+}
+
+// openVerifiedRegularFile opens path and confirms it is still the same regular
+// file that was accepted earlier.
+//
+// Layers are opened after collection, and more than once (digest, then upload),
+// so checking only at collection time leaves a window: a path swapped for a
+// symlink in between would be followed by os.Open and read from outside the
+// source tree. Comparing the opened handle closes that window.
+func openVerifiedRegularFile(path string, expected os.FileInfo) (io.ReadCloser, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return verifyOpenedFile(file, path, expected)
+}
+
+// openVerifiedRootFile opens name beneath root, which cannot escape it even if
+// a directory component is replaced with a symlink.
+func openVerifiedRootFile(root *os.Root, name string, expected os.FileInfo) (io.ReadCloser, error) {
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return verifyOpenedFile(file, name, expected)
+}
+
+func verifyOpenedFile(file *os.File, name string, expected os.FileInfo) (io.ReadCloser, error) {
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || !os.SameFile(info, expected) {
+		_ = file.Close()
+		return nil, fmt.Errorf("source file changed while it was being uploaded: %s", name)
+	}
+	return file, nil
+}
+
+// collectLocalArtifactFiles gathers the files to publish as one artifact.
+//
+// The returned cleanup must be called once the files are no longer needed: a
+// directory source is walked through an os.Root whose directory handle also
+// backs every later open.
+func collectLocalArtifactFiles(src string, exclude func(string) bool) ([]bbbfs.ArtifactFile, int64, func(), error) {
+	noCleanup := func() {}
+	info, err := os.Stat(src)
+	if err != nil {
+		return nil, 0, noCleanup, err
+	}
+	if !info.IsDir() {
+		if !info.Mode().IsRegular() {
+			return nil, 0, noCleanup, fmt.Errorf("unsupported source file type: %s", src)
+		}
+		name := filepath.Base(src)
+		if exclude != nil && exclude(name) {
+			return nil, 0, noCleanup, nil
+		}
+		return []bbbfs.ArtifactFile{{
+			Name: name,
+			Size: info.Size(),
+			Open: func() (io.ReadCloser, error) {
+				return openVerifiedRegularFile(src, info)
+			},
+		}}, info.Size(), noCleanup, nil
+	}
+
+	// Walk and open through a root handle, so neither the traversal nor a
+	// later open can leave the source tree even if a subdirectory is swapped
+	// for a symlink while the walk is in progress. filepath.WalkDir re-reads
+	// each directory by path and cannot make that guarantee.
+	root, err := os.OpenRoot(src)
+	if err != nil {
+		return nil, 0, noCleanup, err
+	}
+	cleanup := func() { _ = root.Close() }
+	// OpenRoot resolves src again, so confirm the handle refers to the very
+	// directory that was stat-ed above. Otherwise a source replaced by a
+	// symlink in between would anchor the root to its target and every later
+	// check inside that root would happily succeed.
+	rootInfo, err := root.Stat(".")
+	if err != nil {
+		cleanup()
+		return nil, 0, noCleanup, err
+	}
+	if !os.SameFile(rootInfo, info) {
+		cleanup()
+		return nil, 0, noCleanup, fmt.Errorf("source directory changed while it was being read: %s", src)
+	}
+
+	var files []bbbfs.ArtifactFile
+	var total int64
+	err = fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if exclude != nil && exclude(name) {
+			return nil
+		}
+		// entry.Info() does not follow a symlink, so one is reported as an
+		// irregular file rather than as whatever it points at.
+		fileInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !fileInfo.Mode().IsRegular() {
+			return fmt.Errorf("unsupported source file type: %s", filepath.Join(src, filepath.FromSlash(name)))
+		}
+		pathToOpen := name
+		expected := fileInfo
+		files = append(files, bbbfs.ArtifactFile{
+			Name: name,
+			Size: fileInfo.Size(),
+			Open: func() (io.ReadCloser, error) {
+				return openVerifiedRootFile(root, pathToOpen, expected)
+			},
+		})
+		total += fileInfo.Size()
+		return nil
+	})
+	if err != nil {
+		cleanup()
+		return nil, 0, noCleanup, err
+	}
+	return files, total, cleanup, nil
+}
+
+// artifactProgress turns per-file cumulative upload counts into a
+// monotonically increasing artifact total.
+//
+// The counts a backend reports restart at zero whenever a file is re-read, and
+// a retry re-uploads only the blobs the registry is still missing, so an
+// attempt's own total is not comparable with the previous attempt's. Holding a
+// high-water mark per file instead means bytes moved by a later attempt are
+// still counted even when that attempt transfers less overall — otherwise an
+// artifact whose layers advanced on different attempts finishes under-counted.
+type artifactProgress struct {
+	mu        sync.Mutex
+	highWater map[string]int64
+	total     int64
+}
+
+func newArtifactProgress(files int) *artifactProgress {
+	return &artifactProgress{highWater: make(map[string]int64, files)}
+}
+
+// observe records name's cumulative byte count and returns how far the
+// artifact total advanced, together with the new total. A delta of zero means
+// these bytes were already counted.
+func (p *artifactProgress) observe(name string, uploaded int64) (delta, total int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if uploaded > p.highWater[name] {
+		delta = uploaded - p.highWater[name]
+		p.highWater[name] = uploaded
+		p.total += delta
+	}
+	return delta, p.total
+}
+
+func pushLocalArtifact(
+	ctx context.Context,
+	src, dst string,
+	overwrite, quiet, showProgress, dryRun bool,
+	concurrency, retryCount int,
+	exclude func(string) bool,
+	onBytes func(int64),
+) error {
+	if bbbfs.IsRemote(src) {
+		return errors.New("acr:// destinations require a local source")
+	}
+	// Validate and collect before honouring dryRun, so a dry run predicts the
+	// real outcome instead of reporting success for a destination or source
+	// that the actual push would reject.
+	target, err := acr.Parse(dst)
+	if err != nil {
+		return err
+	}
+	if err := acr.ValidatePushTarget(target); err != nil {
+		return err
+	}
+	files, total, cleanup, err := collectLocalArtifactFiles(src, exclude)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	// Validate the collected names too, so a dry run rejects everything the
+	// real push would rather than only the destination.
+	uploads := make([]acr.UploadFile, len(files))
+	for i, file := range files {
+		uploads[i] = acr.UploadFile{Name: file.Name, Size: file.Size, Open: file.Open}
+	}
+	if err := acr.ValidateUploadNames(uploads); err != nil {
+		return err
+	}
+	if dryRun {
+		if !quiet {
+			lockedPrintln("PUSH", src, "->", dst)
+		}
+		return nil
+	}
+	var bar *progressBar
+	if showProgress {
+		bar = newStreamingProgressBar(filepath.Base(src), quiet, true)
+		if bar != nil {
+			bar.byteSized = true
+			if total > 0 {
+				bar.SetTotal(total)
+			}
+		}
+	}
+	// runOpPool clamps a non-positive limit to one; do the same here, or a
+	// zero would fall through to go-containerregistry's default of four jobs
+	// and exceed what --concurrency asked for.
+	uploadConcurrency := max(1, concurrency)
+	progress := newArtifactProgress(len(files))
+	err = retryOp(ctx, retryCount, func() error {
+		return bbbfs.UploadArtifact(ctx, dst, files, uploadConcurrency, overwrite, func(name string, uploaded int64) {
+			delta, done := progress.observe(name, uploaded)
+			if delta == 0 {
+				return
+			}
+			if onBytes != nil {
+				onBytes(delta)
+			}
+			if bar != nil {
+				atomicMax(&bar.bytesDone, done)
+				atomicMax(&bar.done, done)
+				bar.render(done)
+			}
+		})
+	})
+	if err != nil {
+		if bar != nil {
+			bar.Abort()
+		}
+		return err
+	}
+	if bar != nil {
+		bar.Finish()
+	}
+	if !quiet {
+		lockedPrintf("Pushed %s -> %s\n", src, dst)
 	}
 	return nil
 }
@@ -2099,9 +2454,13 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					}
 					return sendOp(ctx, pending, ssOp{name: entry.Name})
 				})
-			}, func(work ssOp) error {
+			}, func(work ssOp) (retErr error) {
 				if copyTreeProgress != nil {
-					defer copyTreeProgress.Increment()
+					defer func() {
+						if retErr == nil {
+							copyTreeProgress.Increment()
+						}
+					}()
 				}
 				srcChild := bbbfs.ChildPath(src, work.name)
 				dstChild := bbbfs.ChildPath(dst, work.name)
@@ -2127,7 +2486,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 					copyBar.render(copied)
 				}); err != nil {
 					if copyBar != nil {
-						copyBar.Finish()
+						copyBar.Abort()
 					}
 					lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 					return err
@@ -2141,7 +2500,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				return nil
 			})
 			if copyTreeProgress != nil {
-				copyTreeProgress.Finish()
+				if poolErr != nil {
+					copyTreeProgress.Abort()
+				} else {
+					copyTreeProgress.Finish()
+				}
 			}
 			return poolErr
 		}
@@ -2231,7 +2594,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			reader, err := bbbfs.Resolve(srcPath).Read(ctx, srcPath)
 			if err != nil {
 				if copyBar != nil {
-					copyBar.Finish()
+					copyBar.Abort()
 				}
 				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 				return err
@@ -2256,7 +2619,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 				return bbbfs.Resolve(dstPath).Write(writeCtx, dstPath, pr)
 			}); err != nil {
 				if copyBar != nil {
-					copyBar.Finish()
+					copyBar.Abort()
 				}
 				lockedFprintf(os.Stderr, "%s: %s: %v\n", errPrefix, work.name, err)
 				return err
@@ -2562,7 +2925,7 @@ func filterExclude(files []string, excludeMatch func(string) bool) []string {
 	return out
 }
 
-func cmdSync(ctx context.Context, c *cli.Command) error {
+func cmdSync(ctx context.Context, c *cli.Command) (retErr error) {
 	slog.Debug("cmdSync called", "args", c.Args().Slice())
 	dry := c.Bool("dry-run")
 	del := c.Bool("delete")
@@ -2598,6 +2961,7 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			if err != nil {
 				return err
 			}
+			defer closeTaskStateAppender(stateAppender, &retErr)
 		}
 		for _, task := range tasks {
 			cpKey := taskCheckpointKey(task.src, task.dst)
@@ -2608,20 +2972,12 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 				continue
 			}
 			if err := cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, task.src, task.dst); err != nil {
-				if stateAppender != nil {
-					_ = stateAppender.close()
-				}
 				return err
 			}
 			if stateAppender != nil {
 				if err := stateAppender.appendCheckpoint(cpKey); err != nil {
 					return err
 				}
-			}
-		}
-		if stateAppender != nil {
-			if err := stateAppender.close(); err != nil {
-				return err
 			}
 		}
 		return nil
@@ -2650,10 +3006,11 @@ func cmdSync(ctx context.Context, c *cli.Command) error {
 			if err != nil {
 				return err
 			}
+			defer closeTaskStateAppender(stateAppender, &retErr)
 			if err := stateAppender.append(key); err != nil {
 				return err
 			}
-			return stateAppender.close()
+			return nil
 		}
 		return nil
 	}
@@ -2666,6 +3023,14 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 
 	if bbbfs.IsHF(dst) {
 		return fmt.Errorf("sync: hf:// only supported as source")
+	}
+	srcACR := bbbfs.IsACR(src)
+	if srcACR && !bbbfs.IsDirLikeFromPath(src) {
+		// Answered from the path rather than the registry. Asking whether a
+		// path inside an artifact is a directory expands the layer holding
+		// it, so a source sync cannot accept anyway would transfer gigabytes
+		// before saying so.
+		return errors.New("sync: acr:// path must target an artifact, not individual files")
 	}
 	srcHF := bbbfs.IsHF(src)
 	if srcHF && !bbbfs.IsAz(dst) {
@@ -2693,7 +3058,19 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 	} else {
 		excludeMatch = func(string) bool { return false }
 	}
-	if bbbfs.IsObjectStore(src) || bbbfs.IsObjectStore(dst) || srcHF {
+	if bbbfs.IsACR(dst) {
+		if bbbfs.IsRemote(src) {
+			return fmt.Errorf("sync: acr:// destinations require a local source")
+		}
+		// --delete needs no separate phase here: the pushed manifest replaces
+		// the tag and lists exactly the selected source files, so anything
+		// previously in the artifact is already gone.
+		return pushLocalArtifact(ctx, src, dst, true, quiet, !quiet, dry, concurrency, retryCount, excludeMatch, nil)
+	}
+	if del && srcACR {
+		return errors.New("sync: --delete is not supported with an acr:// source")
+	}
+	if bbbfs.IsObjectStore(src) || bbbfs.IsObjectStore(dst) || srcHF || srcACR {
 		srcObj, dstObj := bbbfs.IsObjectStore(src), bbbfs.IsObjectStore(dst)
 		// dstAz gates the HF→Az server-side copy fast path below; the HF
 		// source guard above already requires an az:// destination.
@@ -2744,9 +3121,9 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 					return sendOp(ctx, pending, item{rel: entry.Name, size: entry.Size})
 				})
 			}
-			// HF and local→remote: collect first, then feed
+			// HF, ACR and local→remote: collect first, then feed
 			var files []item
-			if srcHF {
+			if srcHF || srcACR {
 				list, err := syncRemoteFiles(ctx, src, excludeMatch)
 				if err != nil {
 					return err
@@ -2783,9 +3160,13 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			}
 			return nil
 		}
-		workerErr := runOpPoolWithRetry(ctx, syncWorkers, retryCount, producer, func(f item) error {
+		workerErr := runOpPoolWithRetry(ctx, syncWorkers, retryCount, producer, func(f item) (retErr error) {
 			if syncProgress != nil {
-				defer syncProgress.Increment()
+				defer func() {
+					if retErr == nil {
+						syncProgress.Increment()
+					}
+				}()
 			}
 			sPath := f.rel
 			srcChild := bbbfs.ChildPath(src, sPath)
@@ -2814,7 +3195,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 					copyBar.render(copied)
 				}); err != nil {
 					if copyBar != nil {
-						copyBar.Finish()
+						copyBar.Abort()
 					}
 					lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 					return fmt.Errorf("sync: %s: %w", sPath, err)
@@ -2940,9 +3321,19 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			return nil
 		})
 		if syncProgress != nil {
-			syncProgress.Finish()
+			if workerErr != nil {
+				syncProgress.Abort()
+			} else {
+				syncProgress.Finish()
+			}
 		}
-		// delete phase not implemented for cloud combos yet
+		// The delete phase is not implemented for any sync involving a remote
+		// backend, in either direction. Warn instead of silently ignoring the
+		// flag, so a caller expecting a mirror knows stale files were kept.
+		if del && workerErr == nil {
+			lockedFprintf(os.Stderr,
+				"sync: --delete is not implemented for %s -> %s; stale files at the destination were kept\n", src, dst)
+		}
 		return workerErr
 	}
 	// collect source files

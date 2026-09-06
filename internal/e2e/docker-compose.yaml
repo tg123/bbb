@@ -23,6 +23,12 @@ services:
     depends_on:
       - azurite
 
+  registry:
+    image: registry:2.8.3
+    network_mode: service:azurite
+    depends_on:
+      - azurite
+
   bbb:
     network_mode: service:azurite
     build:
@@ -42,6 +48,7 @@ services:
       - azurite
       - minio
       - fake-gcs-server
+      - registry
     volumes:
       - ../..:/src
     working_dir: /src/internal/e2e

@@ -35,6 +35,9 @@ type ListResult struct {
 // HFScheme is the scheme prefix for Hugging Face paths.
 const HFScheme = "hf://"
 
+// ACRScheme is the scheme prefix for Azure Container Registry paths.
+const ACRScheme = "acr://"
+
 // ErrWriteUnsupported indicates that a backend does not support writes.
 var ErrWriteUnsupported = errors.New("bbbfs: write not supported")
 
@@ -45,12 +48,14 @@ var (
 	s3Provider      = s3FS{}
 	gsProvider      = gsFS{}
 	hfProvider      = hfFS{}
+	acrProvider     = acrFS{}
 	localFSProvider = localFS{}
 )
 
 func init() {
 	// Register order defines resolution priority; localFS is the fallback.
 	Register(hfProvider)
+	Register(acrProvider)
 	Register(azProvider)
 	Register(s3Provider)
 	Register(gsProvider)
