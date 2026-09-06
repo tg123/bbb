@@ -424,7 +424,8 @@ Example `tasks.txt`:
 ./data/vocab.txt   az://myaccount/mycontainer/models/vocab.txt
 ```
 
-Use `--taskfile` to pass the file to `cp` or `sync`. Use `-` to read from stdin:
+Use `--taskfile` to pass the file to `cp` or `sync`. Use `-` to read from stdin.
+Pairs are consumed as a continuous stream, so a long-running producer piped into `--taskfile -` is processed incrementally instead of waiting for EOF. The exception is `cp` pairs with an `acr://` source or destination: these are buffered until EOF so cross-task artifact conflicts can be rejected before any ACR task starts. Other pairs in the same stream still start as they arrive.
 
 ```bash
 # Copy all pairs listed in the taskfile

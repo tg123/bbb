@@ -515,8 +515,16 @@ func PreAuthenticate(ctx context.Context, accounts ...string) error {
 // with the matching role will use those credentials instead of AzureCLI or
 // interactive browser login. This makes authentication machine-friendly for
 // CI/CD and multi-tenant environments.
+// Changing the role invalidates cached blob clients and delegation credentials.
 func RegisterAccountRole(account, role string) {
-	accountRoles.Store(account, strings.ToUpper(role))
+	role = strings.ToUpper(role)
+	udcCacheMu.Lock()
+	defer udcCacheMu.Unlock()
+	if current, ok := accountRoles.Load(account); ok && current.(string) == role {
+		return
+	}
+	accountRoles.Store(account, role)
+	invalidateAccountClientsLocked(account)
 }
 
 // AccountRole returns the role ("SRC" or "DST") registered for the given
@@ -529,10 +537,25 @@ func AccountRole(account string) (string, bool) {
 	return v.(string), true
 }
 
-// ClearAccountRole removes the role registration for the given account.
-// This is used in tests to reset state between subtests.
+// ClearAccountRole removes the role registration and invalidates cached blob
+// clients and delegation credentials created while that registration was active.
 func ClearAccountRole(account string) {
-	accountRoles.Delete(account)
+	udcCacheMu.Lock()
+	defer udcCacheMu.Unlock()
+	if _, loaded := accountRoles.LoadAndDelete(account); loaded {
+		invalidateAccountClientsLocked(account)
+	}
+}
+
+// invalidateAccountClientsLocked requires udcCacheMu to be held.
+func invalidateAccountClientsLocked(account string) {
+	blobClientCache.Delete(account)
+	delete(udcCache, account)
+	if ch, ok := udcInflight[account]; ok {
+		// Wake waiters and prevent the old refresh from repopulating the cache.
+		delete(udcInflight, account)
+		close(ch)
+	}
 }
 
 // roleEnvVars lists all Azure identity environment variables that are
@@ -2269,10 +2292,13 @@ var (
 
 // getUDC returns a cached User Delegation Credential for the account,
 // refreshing it when necessary. Thread-safe. Concurrent refresh requests
-// for the same account are deduped: the first goroutine performs the
-// network call while others wait for it to finish.
+// for the same account and role registration are deduped: the first goroutine
+// performs the network call while others wait for it to finish.
 func getUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, time.Time{}, time.Time{}, err
+		}
 		udcCacheMu.Lock()
 		entry, ok := udcCache[account]
 		if ok && time.Now().UTC().Before(entry.refreshAt) {
@@ -2298,6 +2324,21 @@ func getUDC(ctx context.Context, account string) (*service.UserDelegationCredent
 		udc, svcClient, start, expiry, err := refreshUDC(ctx, account)
 
 		udcCacheMu.Lock()
+		if udcInflight[account] != ch {
+			// The role changed during the refresh. Discard the old credentials
+			// (or error) and retry with the current role.
+			udcCacheMu.Unlock()
+			continue
+		}
+		if err == nil {
+			udcCache[account] = &udcCacheEntry{
+				udc:       udc,
+				svcClient: svcClient,
+				start:     start,
+				expiry:    expiry,
+				refreshAt: start.Add(expiry.Sub(start) / 2),
+			}
+		}
 		delete(udcInflight, account)
 		close(ch)
 		udcCacheMu.Unlock()
@@ -2306,8 +2347,8 @@ func getUDC(ctx context.Context, account string) (*service.UserDelegationCredent
 	}
 }
 
-// refreshUDC performs the actual UDC refresh (network call). Called at most
-// once per account at a time, guarded by udcInflight.
+// refreshUDC performs the actual UDC refresh (network call). getUDC publishes
+// the result only if the account's role registration has not changed.
 func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
 	cred, err := getCredentialForAccount(ctx, account)
 	if err != nil {
@@ -2329,21 +2370,6 @@ func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCre
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("get user delegation credential: %w", err)
 	}
-
-	// Refresh at 50% of the key's validity window so we never use an
-	// about-to-expire key. Use the same time base (now) for consistency.
-	refreshAt := now.Add(copySASDuration() / 2)
-
-	newEntry := &udcCacheEntry{
-		udc:       udc,
-		svcClient: svcClient,
-		start:     now,
-		expiry:    expiry,
-		refreshAt: refreshAt,
-	}
-	udcCacheMu.Lock()
-	udcCache[account] = newEntry
-	udcCacheMu.Unlock()
 
 	return udc, svcClient, now, expiry, nil
 }

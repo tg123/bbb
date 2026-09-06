@@ -1314,15 +1314,15 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		stateFile = c.Root().String("state")
 	}
 
-	var tasks []taskPair
+	var producer func(func(taskPair) error) error
 	if taskfile != "" {
 		if c.Args().Len() != 0 {
 			return fmt.Errorf("cp: cannot use positional args with --taskfile")
 		}
-		var err error
-		tasks, err = loadTaskPairs(taskfile)
-		if err != nil {
-			return err
+		// Stream task pairs so copies start as soon as the first line is
+		// available instead of waiting for EOF on the taskfile/stdin.
+		producer = func(emit func(taskPair) error) error {
+			return streamTaskPairs(taskfile, emit)
 		}
 	} else {
 		// Convert positional args into task pairs so both modes share the
@@ -1330,13 +1330,22 @@ func cmdCP(ctx context.Context, c *cli.Command) error {
 		if c.Args().Len() < 2 {
 			return fmt.Errorf("cp: need srcs dst")
 		}
+		var tasks []taskPair
 		dst := c.Args().Get(c.Args().Len() - 1)
 		for i := 0; i < c.Args().Len()-1; i++ {
 			tasks = append(tasks, taskPair{src: c.Args().Get(i), dst: dst})
 		}
+		producer = func(emit func(taskPair) error) error {
+			for _, t := range tasks {
+				if err := emit(t); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 	}
 
-	return runCPTasks(ctx, tasks, overwrite, quiet, concurrency, retryCount, stateFile)
+	return runCPTaskStream(ctx, producer, overwrite, quiet, concurrency, retryCount, stateFile)
 }
 
 // validateACRTasks rejects task combinations that cannot run concurrently
@@ -1394,39 +1403,64 @@ func validateACRTasks(tasks []taskPair, state, completed map[string]struct{}) er
 	return nil
 }
 
-// runCPTasks executes a list of task pairs through the unified expansion +
-// parallel copy pipeline. Both taskfile mode and positional-arg mode convert
-// their inputs to []taskPair and call this function, ensuring a single code
-// path for state tracking, progress bars, and concurrency control.
-func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, concurrency, retryCount int, stateFile string) (retErr error) {
-	// Register account roles for multi-tenant env var support (SRC_AZURE_* / DST_AZURE_*).
-	{
-		var srcPaths, dstPaths []string
-		for _, t := range tasks {
-			srcPaths = append(srcPaths, t.src)
-			dstPaths = append(dstPaths, t.dst)
+// azRoleRegistrar incrementally registers Azure account roles and
+// pre-authenticates accounts as new task pairs are streamed in, so a taskfile
+// can be consumed as a continuous work stream.
+type azRoleRegistrar struct {
+	srcPaths []string
+	dstPaths []string
+	srcSeen  map[string]struct{}
+	dstSeen  map[string]struct{}
+}
+
+func newAzRoleRegistrar() *azRoleRegistrar {
+	return &azRoleRegistrar{srcSeen: map[string]struct{}{}, dstSeen: map[string]struct{}{}}
+}
+
+// observe registers roles and pre-authenticates for a newly seen task pair.
+// Only the first path seen per storage account is retained, so memory does
+// not grow with the number of task pairs.
+func (r *azRoleRegistrar) observe(ctx context.Context, task taskPair) error {
+	var newPaths []string
+	add := func(p string, seen map[string]struct{}, paths *[]string) {
+		if !bbbfs.IsAz(p) {
+			return
 		}
-		bbbfs.RegisterAzAccountRoles(srcPaths, dstPaths)
+		account, _, err := bbbfs.AzAccountContainer(p)
+		if err != nil || account == "" {
+			return
+		}
+		if _, ok := seen[account]; ok {
+			return
+		}
+		seen[account] = struct{}{}
+		*paths = append(*paths, p)
+		newPaths = append(newPaths, p)
 	}
-	// Pre-authenticate all Azure accounts before spawning parallel workers.
-	// This ensures interactive login popups happen sequentially, one per tenant.
-	{
-		var paths []string
-		for _, t := range tasks {
-			paths = append(paths, t.src, t.dst)
-		}
-		if err := bbbfs.PreAuthenticateAz(ctx, paths...); err != nil {
-			return err
-		}
+	add(task.src, r.srcSeen, &r.srcPaths)
+	add(task.dst, r.dstSeen, &r.dstPaths)
+	if len(newPaths) == 0 {
+		return nil
 	}
+
+	// Register account roles for multi-tenant env var support
+	// (SRC_AZURE_* / DST_AZURE_*). Recomputed over all accounts seen so far
+	// so accounts appearing in both roles stay untagged.
+	bbbfs.RegisterAzAccountRoles(r.srcPaths, r.dstPaths)
+	// Pre-authenticate Azure accounts before workers use them. This keeps
+	// interactive login popups sequential without re-authenticating accounts
+	// that were handled by earlier task pairs.
+	return bbbfs.PreAuthenticateAz(ctx, newPaths...)
+}
+
+// runCPTaskStream executes task pairs produced by the producer through the
+// unified expansion + parallel copy pipeline. Pairs are consumed as they are
+// produced, so a streaming taskfile (e.g. stdin) starts copying immediately.
+func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) error, overwrite, quiet bool, concurrency, retryCount int, stateFile string) (retErr error) {
+	azRoles := newAzRoleRegistrar()
 
 	state, taskCheckpoints, err := loadTaskState(stateFile)
 	if err != nil {
-		return err
-	}
-	// Validate after the checkpoints load, so a resumed run is not blocked by
-	// a conflict with a task that has already completed and will be skipped.
-	if err := validateACRTasks(tasks, state, taskCheckpoints); err != nil {
 		return err
 	}
 	// Streaming progress bar: total starts at 0 and grows as files are
@@ -1445,7 +1479,7 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 			}
 		}
 	}()
-	seen := make(map[string]struct{}, len(state)+len(tasks))
+	seen := make(map[string]struct{}, len(state))
 	for key := range state {
 		seen[key] = struct{}{}
 	}
@@ -1462,7 +1496,7 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	// Expanders discover files (via listing) and push them to the task channel.
 	// Listing runs as a sequential flat pager, so each expander is lightweight.
 	// Multiple expanders help when there are multiple source→destination pairs;
-	// for a single pair, only 1 expander runs (capped below by len(tasks)).
+	// for a single pair, the extra expanders simply stay idle.
 	expanders := max(1, workers/4)
 	cpWorkers := max(1, workers-expanders)
 	// Distribute the concurrency budget between file-level and block-level
@@ -1493,6 +1527,7 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	var firstErr error
 	var firstErrMu sync.Mutex
 	var totalPending atomic.Int64
+	var fullConcurrencyACR atomic.Bool
 
 	setErr := func(err error) {
 		firstErrMu.Lock()
@@ -1521,7 +1556,7 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 						bytesCb = taskProgress.AddBytes
 					}
 					taskConcurrency := innerConcurrency
-					if bbbfs.IsACR(task.dst) && len(tasks) == 1 {
+					if bbbfs.IsACR(task.dst) && fullConcurrencyACR.Load() {
 						// A lone acr:// destination is one atomic artifact
 						// push, so the file-level workers this budget was
 						// split for stay idle and it can have the whole
@@ -1560,9 +1595,6 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 	}
 
 	// Dedicated expander pool uses goroutines from the concurrency budget.
-	if expanders > len(tasks) {
-		expanders = len(tasks)
-	}
 	pairCh := make(chan taskPair, expanders*2)
 	var seenMu sync.Mutex
 	var expandWG sync.WaitGroup
@@ -1653,15 +1685,67 @@ func runCPTasks(ctx context.Context, tasks []taskPair, overwrite, quiet bool, co
 			}
 		}()
 	}
-enqueueLoop:
-	for _, task := range tasks {
-		select {
-		case <-workerCtx.Done():
-			break enqueueLoop
-		case pairCh <- task:
+	// Consume task pairs as they are produced so copies start immediately
+	// instead of waiting for the whole taskfile to be read. Production runs in
+	// its own goroutine so a blocked stdin/FIFO read cannot prevent worker
+	// failures or cancellation from shutting down the pipeline. ACR tasks are
+	// held until EOF because their cross-task artifact conflicts must be
+	// validated before any of them starts.
+	produceDone := make(chan error, 1)
+	go func() {
+		var acrTasks []taskPair
+		taskCount := 0
+		emitPair := func(task taskPair) error {
+			select {
+			case <-workerCtx.Done():
+				return workerCtx.Err()
+			case pairCh <- task:
+				return nil
+			}
 		}
+		produceErr := produce(func(task taskPair) error {
+			taskCount++
+			select {
+			case <-workerCtx.Done():
+				return workerCtx.Err()
+			default:
+			}
+			if err := azRoles.observe(workerCtx, task); err != nil {
+				return err
+			}
+			if bbbfs.IsACR(task.src) || bbbfs.IsACR(task.dst) {
+				acrTasks = append(acrTasks, task)
+				return nil
+			}
+			return emitPair(task)
+		})
+		if produceErr == nil {
+			if err := validateACRTasks(acrTasks, state, taskCheckpoints); err != nil {
+				produceErr = err
+			} else {
+				fullConcurrencyACR.Store(taskCount == 1 && len(acrTasks) == 1 && bbbfs.IsACR(acrTasks[0].dst))
+				for _, task := range acrTasks {
+					if err := emitPair(task); err != nil {
+						produceErr = err
+						break
+					}
+				}
+			}
+		}
+		produceDone <- produceErr
+	}()
+	producerFinished := false
+	select {
+	case produceErr := <-produceDone:
+		producerFinished = true
+		if produceErr != nil {
+			setErr(produceErr)
+		}
+	case <-workerCtx.Done():
 	}
-	close(pairCh)
+	if producerFinished {
+		close(pairCh)
+	}
 	expandWG.Wait()
 	// Set the final total now that expansion is complete so the bar
 	// can reach 100% once all workers finish.
@@ -2896,10 +2980,6 @@ func cmdSync(ctx context.Context, c *cli.Command) (retErr error) {
 		if c.Args().Len() != 0 {
 			return fmt.Errorf("sync: cannot use positional args with --taskfile")
 		}
-		tasks, err := loadTaskPairs(taskfile)
-		if err != nil {
-			return err
-		}
 		_, taskCheckpoints, err := loadTaskState(stateFile)
 		if err != nil {
 			return err
@@ -2912,13 +2992,15 @@ func cmdSync(ctx context.Context, c *cli.Command) (retErr error) {
 			}
 			defer closeTaskStateAppender(stateAppender, &retErr)
 		}
-		for _, task := range tasks {
+		// Stream task pairs so each pair is synced as soon as its line is
+		// read instead of waiting for EOF on the taskfile/stdin.
+		if err := streamTaskPairs(taskfile, func(task taskPair) error {
 			cpKey := taskCheckpointKey(task.src, task.dst)
 			if _, done := taskCheckpoints[cpKey]; done {
 				if !quiet {
 					lockedFprintf(os.Stderr, "sync: skip already completed task %s -> %s\n", task.src, task.dst)
 				}
-				continue
+				return nil
 			}
 			if err := cmdSyncPaths(ctx, dry, del, quiet, exclude, concurrency, retryCount, task.src, task.dst); err != nil {
 				return err
@@ -2928,6 +3010,9 @@ func cmdSync(ctx context.Context, c *cli.Command) (retErr error) {
 					return err
 				}
 			}
+			return nil
+		}); err != nil {
+			return err
 		}
 		return nil
 	}
