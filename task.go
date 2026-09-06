@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -228,11 +227,12 @@ type taskTracker struct {
 }
 
 type cpTask struct {
-	src     string
-	dst     string
-	key     string
-	size    int64        // known size from listing; 0 = unknown
-	tracker *taskTracker // nil when no task-level checkpoint tracking
+	src         string
+	dst         string
+	key         string
+	size        int64        // known size from listing; 0 = unknown
+	tracker     *taskTracker // nil when no task-level checkpoint tracking
+	localTarget *localCopyTarget
 }
 
 // expandCPTask streams file-level copy tasks for a taskfile pair via the emit
@@ -287,12 +287,20 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 		if entry.IsDir {
 			continue
 		}
-		dstPath := bbbfs.ChildPath(task.dst, filepath.ToSlash(entry.Name))
+		dstPath, err := copyDestination(task.src, task.dst, entry.Name)
+		if err != nil {
+			return err
+		}
+		var localTarget *localCopyTarget
+		if bbbfs.IsRemote(task.src) && !bbbfs.IsRemote(task.dst) {
+			localTarget = &localCopyTarget{root: task.dst, name: entry.Name}
+		}
 		if err := emit(cpTask{
-			src:  entry.Path,
-			dst:  dstPath,
-			key:  taskStateKey(entry.Path, task.dst),
-			size: entry.Size,
+			src:         entry.Path,
+			dst:         dstPath,
+			key:         taskStateKey(entry.Path, task.dst),
+			size:        entry.Size,
+			localTarget: localTarget,
 		}); err != nil {
 			return err
 		}

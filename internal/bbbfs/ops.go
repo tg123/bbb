@@ -12,6 +12,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"google.golang.org/api/googleapi"
 
 	"github.com/tg123/bbb/internal/acr"
 	"github.com/tg123/bbb/internal/hf"
@@ -492,6 +493,13 @@ func IsNonRetryableHTTPErr(err error) bool {
 	var azErr *azcore.ResponseError
 	if errors.As(err, &azErr) && (azErr.StatusCode == 401 || azErr.StatusCode == 403 || azErr.StatusCode == 404) {
 		return true
+	}
+	var gsErr *googleapi.Error
+	if errors.As(err, &gsErr) {
+		switch gsErr.Code {
+		case 401, 403, 404:
+			return true
+		}
 	}
 	// S3 (and other AWS SDK) HTTP responses surface status via a smithy
 	// transport error; treat 401/403/404 as non-retryable.

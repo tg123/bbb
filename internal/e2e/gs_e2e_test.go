@@ -1,6 +1,7 @@
 package e2e_test
 
 import (
+	"bytes"
 	"crypto/md5"
 	"fmt"
 	"os"
@@ -13,13 +14,14 @@ import (
 )
 
 const (
-	gsBucket = "gstest"
 	// gsHost is the fake-gcs-server endpoint. The bbb container shares
 	// azurite's network namespace (see docker-compose.yaml), and
 	// fake-gcs-server runs in that same namespace listening on :4443, so it is
 	// reachable on localhost.
 	gsHost = "localhost:4443"
 )
+
+var gsBucket = fmt.Sprintf("gstest-%d", time.Now().UnixNano())
 
 func gsPath(parts ...string) string {
 	p := "gs://" + gsBucket
@@ -42,6 +44,9 @@ func TestGSBasic(t *testing.T) {
 		if _, err := runBBB("gs", "mkbucket", gsPath()); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := runBBB("gs", "mkbucket", gsPath()); err == nil {
+			t.Fatal("creating an existing bucket should return a conflict")
+		}
 	}
 
 	// start from a clean bucket so reruns are deterministic
@@ -63,6 +68,9 @@ func TestGSBasic(t *testing.T) {
 		}
 		if _, err := runBBB("rm", touchPath); err != nil {
 			t.Fatal(err)
+		}
+		if _, err := runBBB("rm", "-f", touchPath); err != nil {
+			t.Fatalf("force removal of missing object: %v", err)
 		}
 	}
 
@@ -342,4 +350,47 @@ func TestGSBasic(t *testing.T) {
 
 	// final cleanup
 	cleanFolder(t, gsPath())
+}
+
+func TestGSParallelDownload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e tests in short mode")
+	}
+	if !waitForEndpointReady(gsHost) {
+		t.Skipf("fake-gcs-server endpoint %s not reachable", gsHost)
+	}
+	t.Setenv("BBB_PARALLEL_DOWNLOAD", "1")
+	bucket := "gs://" + gsBucket + "-parallel"
+	if _, err := runBBB("gs", "mkbucket", bucket); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanFolder(t, bucket) })
+
+	// Cross two 16 MiB chunk boundaries, with distinct data in each range
+	// and a partial final range to catch misplaced or omitted writes.
+	payload := make([]byte, 2*16*1024*1024+123)
+	for i := range payload {
+		payload[i] = byte(i*31 + i/(16*1024*1024))
+	}
+	localDir := t.TempDir()
+	source := filepath.Join(localDir, "source.bin")
+	destination := filepath.Join(localDir, "download.bin")
+	if err := os.WriteFile(source, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	remote := bucket + "/multirange.bin"
+	if _, err := runBBB("cp", source, remote); err != nil {
+		t.Fatalf("upload multi-range object: %v", err)
+	}
+	// The CLI reserves expansion/copy workers, leaving three range workers.
+	if _, err := runBBB("cp", "--concurrency", "6", remote, destination); err != nil {
+		t.Fatalf("download multi-range object: %v", err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("multi-range content mismatch: got %d bytes, want %d", len(got), len(payload))
+	}
 }

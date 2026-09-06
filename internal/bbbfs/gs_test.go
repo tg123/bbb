@@ -1,8 +1,42 @@
 package bbbfs
 
 import (
+	"fmt"
 	"testing"
+
+	"google.golang.org/api/googleapi"
 )
+
+func TestGSChildPathPreservesOpaqueNames(t *testing.T) {
+	for _, name := range []string{`nested\file.txt`, "../file", "/file", "nested//file", "./file", "a #?%.txt"} {
+		t.Run(name, func(t *testing.T) {
+			for _, parent := range []string{"gs://bucket", "gs://bucket/prefix/"} {
+				want := parent + "/" + name
+				if parent == "gs://bucket/prefix/" {
+					want = parent + name
+				}
+				if got := (gsFS{}).ChildPath(parent, name); got != want {
+					t.Errorf("ChildPath(%q, %q) = %q, want %q", parent, name, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestIsNonRetryableHTTPErrGS(t *testing.T) {
+	for _, status := range []int{400, 401, 403, 404, 408, 409, 412, 429, 500, 502, 503} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			want := status == 401 || status == 403 || status == 404
+			var err error = &googleapi.Error{Code: status}
+			for range 3 {
+				if got := IsNonRetryableHTTPErr(err); got != want {
+					t.Errorf("IsNonRetryableHTTPErr(%v) = %v, want %v", err, got, want)
+				}
+				err = fmt.Errorf("wrapped: %w", err)
+			}
+		})
+	}
+}
 
 func TestGSMatch(t *testing.T) {
 	cases := []struct {

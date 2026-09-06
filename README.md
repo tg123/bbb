@@ -89,7 +89,7 @@ Repository names are reported exactly as the registry holds them, slashes includ
 
 The "files" of an artifact are its layers; each layer's name comes from the standard `org.opencontainers.image.title` annotation, falling back to its digest (e.g. `sha256-abc...`) when the annotation is missing. Because a file name follows the tag or digest, a file can only be addressed on a path that specifies one.
 
-Layer names are validated lexically before use: absolute paths, `..` traversal, backslashes, colons, characters Windows forbids (`<>"|?*` and control characters), Windows reserved device names (`NUL`, `CON.txt`, …) and segments ending in a dot or space are rejected. A name that is not already canonical (`a/./b`, `a//b`, `dir/`) is refused rather than repaired — the registry chooses these names, so a rewrite would put the bytes somewhere the manifest never declared; a single leading `./` is trimmed, since it names the same file. A name that is an ancestor of another (`a` alongside `a/b`) is rejected too, since no filesystem can hold a file and a directory at one path, as are names differing only in case (`A.txt` and `a.txt`), which alias on Windows and macOS. Note this is not full extraction containment — as with the other remote backends, files are written through the normal local path, which follows pre-existing symlinks in the destination. Extract untrusted artifacts into a fresh directory.
+Layer names are validated lexically before use: absolute paths, `..` traversal, backslashes, colons, characters Windows forbids (`<>"|?*` and control characters), Windows reserved device names (`NUL`, `CON.txt`, …) and segments ending in a dot or space are rejected. A name that is not already canonical (`a/./b`, `a//b`, `dir/`) is refused rather than repaired — the registry chooses these names, so a rewrite would put the bytes somewhere the manifest never declared; a single leading `./` is trimmed, since it names the same file. A name that is an ancestor of another (`a` alongside `a/b`) is rejected too, since no filesystem can hold a file and a directory at one path, as are names differing only in case (`A.txt` and `a.txt`), which alias on Windows and macOS. Recursive remote-to-local copies and syncs create files relative to the requested destination root and reject symlink traversal outside it. Explicit single-file destination paths still use normal local path semantics, including following pre-existing symlinks. Extract untrusted artifacts into a fresh directory.
 
 Layer contents are verified against the digest recorded in the manifest, so a corrupt registry or proxy cannot silently return different bytes.
 
@@ -950,6 +950,9 @@ bbb s3 mkbucket s3://newbucket
 ```
 bbb gs mkbucket gs://bucket
 ```
+
+Bucket names are globally unique. An existing bucket returns a conflict, even
+when it is readable by the caller; read access does not prove project ownership.
 
 **Example:**
 

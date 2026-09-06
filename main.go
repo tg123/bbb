@@ -1600,7 +1600,11 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 						// --concurrency.
 						taskConcurrency = concurrency
 					}
-					if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, taskConcurrency, retryCount, []string{task.src}, task.dst, task.size, showCopyBars, bytesCb); err != nil {
+					copyCtx := workerCtx
+					if task.localTarget != nil {
+						copyCtx = context.WithValue(copyCtx, localCopyTargetKey{}, task.localTarget)
+					}
+					if err := cmdCPPaths(copyCtx, overwrite, innerQuiet, taskConcurrency, retryCount, []string{task.src}, task.dst, task.size, showCopyBars, bytesCb); err != nil {
 						setErr(err)
 						return
 					}
@@ -1813,12 +1817,13 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		dst string
 	}
 	type cpFileOp struct {
-		src    string
-		dst    string
-		srcObj bool
-		dstObj bool
-		size   int64
-		base   string
+		src         string
+		dst         string
+		srcObj      bool
+		dstObj      bool
+		size        int64
+		base        string
+		localTarget *localCopyTarget
 	}
 	dirOps := make([]cpDirOp, 0, len(srcs))
 	fileOps := make([]cpFileOp, 0, len(srcs))
@@ -1826,6 +1831,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		src := src
 		srcObj := bbbfs.IsObjectStore(src)
 		base := bbbfs.BaseName(src)
+		localTarget, _ := ctx.Value(localCopyTargetKey{}).(*localCopyTarget)
 		if bbbfs.IsHF(src) || bbbfs.IsACR(src) || srcObj {
 			dirLike, err := bbbfs.IsDirLike(ctx, src)
 			if err != nil {
@@ -1840,6 +1846,11 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			// directory prefix. Skip the expensive Stat for HF sources.
 			if srcObj {
 				if _, statErr := bbbfs.Resolve(src).Stat(ctx, src); statErr != nil {
+					if localTarget != nil {
+						// An expanded task names a file, not a new directory
+						// root that could bypass its original destination scope.
+						return statErr
+					}
 					slog.Debug("source not found as object, trying as directory", "src", src, "error", statErr)
 					dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
 					continue
@@ -1851,9 +1862,20 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			continue
 		}
 		var dstPath string
-		if isDstDir {
+		if localTarget != nil {
 			var err error
-			dstPath, err = bbbfs.ResolveDstPath(dst, base, false)
+			dstPath, err = localCopyPath(localTarget.root, localTarget.name)
+			if err != nil {
+				return err
+			}
+		} else if isDstDir {
+			var err error
+			if bbbfs.IsRemote(src) && !bbbfs.IsRemote(dst) {
+				dstPath, err = localCopyPath(dst, base)
+				localTarget = &localCopyTarget{root: dst, name: base}
+			} else {
+				dstPath, err = bbbfs.ResolveDstPath(dst, base, false)
+			}
 			if err != nil {
 				return err
 			}
@@ -1861,12 +1883,13 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			dstPath = dst
 		}
 		fileOps = append(fileOps, cpFileOp{
-			src:    src,
-			dst:    dstPath,
-			srcObj: srcObj,
-			dstObj: dstObj,
-			size:   srcSize,
-			base:   base,
+			src:         src,
+			dst:         dstPath,
+			srcObj:      srcObj,
+			dstObj:      dstObj,
+			size:        srcSize,
+			base:        base,
+			localTarget: localTarget,
 		})
 	}
 	for _, op := range dirOps {
@@ -2123,7 +2146,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			// object store→local single-file: use parallel ranged download for
 			// higher throughput (mirrors azcopy's chunked download). Opt out with
 			// BBB_PARALLEL_DOWNLOAD=0 to fall back to the single-stream path.
-			if op.srcObj && !bbbfs.IsRemote(op.dst) &&
+			// Root-confined destinations must use the handle-based writer below,
+			// not a backend that reopens an unrestricted filesystem path.
+			if op.srcObj && !bbbfs.IsRemote(op.dst) && op.localTarget == nil &&
 				parallelDownloadEnabled() && bbbfs.CanDownloadToFile(op.src) {
 				var copyBar *progressBar
 				if showCopyBar {
@@ -2223,7 +2248,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 						}
 					},
 				})
-				return bbbfs.Resolve(op.dst).Write(writeCtx, op.dst, pr)
+				return writeCopyDestination(writeCtx, op.dst, op.localTarget, pr)
 			}); err != nil {
 				if copyBar != nil {
 					copyBar.Abort()
@@ -2506,6 +2531,84 @@ func pushLocalArtifact(
 	return nil
 }
 
+// copyDestination converts only local listing names to slash-separated remote
+// keys. Remote names are opaque and must not be cleaned or slash-normalized.
+func copyDestination(src, dst, name string) (string, error) {
+	if !bbbfs.IsRemote(src) {
+		name = filepath.ToSlash(name)
+	}
+	if bbbfs.IsRemote(dst) {
+		return bbbfs.ChildPath(dst, name), nil
+	}
+	return localCopyPath(dst, name)
+}
+
+func localCopyPath(root, name string) (string, error) {
+	// Reject parent components even if cleaning would leave the result inside
+	// root. Check both separators so Windows paths cannot masquerade as keys.
+	if !filepath.IsLocal(filepath.FromSlash(name)) ||
+		strings.HasPrefix(name, `\`) ||
+		(len(name) >= 2 && name[1] == ':') {
+		return "", fmt.Errorf("unsafe local destination name %q", name)
+	}
+	for _, part := range strings.FieldsFunc(name, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if part == ".." {
+			return "", fmt.Errorf("unsafe local destination name %q", name)
+		}
+	}
+	if name == "." {
+		return "", fmt.Errorf("unsafe local destination name %q", name)
+	}
+	return filepath.Join(root, filepath.FromSlash(name)), nil
+}
+
+type localCopyTargetKey struct{}
+
+type localCopyTarget struct {
+	root string
+	name string
+}
+
+func writeCopyDestination(ctx context.Context, dst string, target *localCopyTarget, r io.Reader) error {
+	if target == nil {
+		return bbbfs.Resolve(dst).Write(ctx, dst, r)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := localCopyPath(target.root, target.name); err != nil {
+		return err
+	}
+	rootPath := target.root
+	if rootPath == "" {
+		rootPath = "."
+	}
+	if err := os.MkdirAll(rootPath, 0o755); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	name := filepath.FromSlash(target.name)
+	// Root-relative creation prevents existing or concurrently swapped
+	// symlinks in the destination tree from redirecting writes outside it.
+	if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+		return err
+	}
+	f, err := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(f, r)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
 func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPrefix string, concurrency int, retryCount int) error {
 	if bbbfs.IsRemote(src) || bbbfs.IsRemote(dst) {
 		// Remote copy: list source files and copy each
@@ -2659,7 +2762,14 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			return nil
 		}, func(work remoteCopyOp) error {
 			srcPath := bbbfs.ChildPath(src, work.name)
-			dstPath := bbbfs.ChildPath(dst, work.name)
+			dstPath, err := copyDestination(src, dst, work.name)
+			if err != nil {
+				return err
+			}
+			var localTarget *localCopyTarget
+			if bbbfs.IsRemote(src) && !bbbfs.IsRemote(dst) {
+				localTarget = &localCopyTarget{root: dst, name: work.name}
+			}
 			if !overwrite {
 				if exists, _ := bbbfs.ExistsAsBlob(ctx, dstPath); exists {
 					return nil
@@ -2700,7 +2810,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 						copyBar.render(copied)
 					},
 				})
-				return bbbfs.Resolve(dstPath).Write(writeCtx, dstPath, pr)
+				return writeCopyDestination(writeCtx, dstPath, localTarget, pr)
 			}); err != nil {
 				if copyBar != nil {
 					copyBar.Abort()
@@ -2854,7 +2964,8 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 			if err := bbbfs.Delete(ctx, op.path); err != nil {
 				if force {
 					lower := strings.ToLower(err.Error())
-					if strings.Contains(lower, "notfound") ||
+					if errors.Is(err, os.ErrNotExist) ||
+						strings.Contains(lower, "notfound") ||
 						strings.Contains(lower, "parse") ||
 						strings.Contains(lower, "invalid") {
 						return nil
@@ -3255,7 +3366,14 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			}
 			sPath := f.rel
 			srcChild := bbbfs.ChildPath(src, sPath)
-			dstChild := bbbfs.ChildPath(dst, sPath)
+			dstChild, err := copyDestination(src, dst, sPath)
+			if err != nil {
+				return err
+			}
+			var localTarget *localCopyTarget
+			if bbbfs.IsRemote(src) && !bbbfs.IsRemote(dst) {
+				localTarget = &localCopyTarget{root: dst, name: sPath}
+			}
 			if bbbfs.CanCopyServerSide(srcChild, dstChild) {
 				if dry {
 					if !quiet {
@@ -3395,7 +3513,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				writeCtx = bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
 			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return bbbfs.Resolve(dstChild).Write(writeCtx, dstChild, r)
+				return writeCopyDestination(writeCtx, dstChild, localTarget, r)
 			}); err != nil {
 				lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 				return fmt.Errorf("sync: %s: %w", sPath, err)

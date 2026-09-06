@@ -195,6 +195,7 @@ type notExistError string
 
 func (e notExistError) Error() string  { return string(e) + ": not found" }
 func (e notExistError) NotFound() bool { return true }
+func (e notExistError) Unwrap() error  { return os.ErrNotExist }
 
 func isNotFound(err error) bool {
 	if err == nil {
@@ -273,10 +274,12 @@ func upload(ctx context.Context, gp GSPath, reader io.Reader, onProgress func(in
 		var read atomic.Int64
 		reader = &progressReader{r: reader, read: &read, onProgress: onProgress}
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	w := client.Bucket(gp.Bucket).Object(gp.Object).NewWriter(ctx)
 	if _, err := io.Copy(w, reader); err != nil {
-		// Abort the upload session so no partial object is committed.
-		_ = w.Close()
+		// Cancel the writer context instead of finalizing partial content.
+		cancel()
 		return err
 	}
 	return w.Close()
@@ -331,6 +334,7 @@ func DownloadFile(ctx context.Context, gp GSPath, file *os.File, concurrency int
 	defer cancel()
 
 	var written atomic.Int64
+	var progressMu sync.Mutex
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	var firstErrOnce sync.Once
@@ -342,13 +346,28 @@ func DownloadFile(ctx context.Context, gp GSPath, file *os.File, concurrency int
 		})
 	}
 
+schedule:
 	for start := int64(0); start < size; start += downloadChunkSize {
+		if err := ctx.Err(); err != nil {
+			fail(err)
+			break
+		}
 		length := int64(downloadChunkSize)
 		if start+length > size {
 			length = size - start
 		}
+		select {
+		case <-ctx.Done():
+			fail(ctx.Err())
+			break schedule
+		case sem <- struct{}{}:
+		}
+		if err := ctx.Err(); err != nil {
+			<-sem
+			fail(err)
+			break
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(start, length int64) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -368,10 +387,14 @@ func DownloadFile(ctx context.Context, gp GSPath, file *os.File, concurrency int
 						return
 					}
 					off += int64(n)
+					// Assign and deliver totals under the same lock so concurrent
+					// ranges cannot report progress out of order.
+					progressMu.Lock()
 					total := written.Add(int64(n))
 					if onProgress != nil {
 						onProgress(total)
 					}
+					progressMu.Unlock()
 				}
 				if rerr == io.EOF {
 					return
@@ -416,8 +439,8 @@ func Delete(ctx context.Context, gp GSPath) error {
 	return nil
 }
 
-// MkBucket creates a bucket, ignoring an already-exists error for a bucket we
-// can already read.
+// MkBucket creates a bucket. Conflicts are preserved because read access to an
+// existing bucket does not establish ownership in the requested project.
 func MkBucket(ctx context.Context, bucket string) error {
 	client, err := getClient(ctx)
 	if err != nil {
@@ -431,18 +454,7 @@ func MkBucket(ctx context.Context, bucket string) error {
 		// Emulators ignore the project, but the API requires a non-empty value.
 		project = "bbb"
 	}
-	if err := client.Bucket(bucket).Create(ctx, project, nil); err != nil {
-		var ae *googleapi.Error
-		if errors.As(err, &ae) && ae.Code == http.StatusConflict {
-			// The bucket name is taken; treat as idempotent success only when
-			// the bucket is readable by us (i.e. it is our own bucket).
-			if _, aerr := client.Bucket(bucket).Attrs(ctx); aerr == nil {
-				return nil
-			}
-		}
-		return err
-	}
-	return nil
+	return client.Bucket(bucket).Create(ctx, project, nil)
 }
 
 // --- Listing ---
@@ -585,7 +597,8 @@ func CopyServerSide(ctx context.Context, src, dst GSPath, _ int, sizeHint int64,
 	if err != nil {
 		return err
 	}
-	copier := client.Bucket(dst.Bucket).Object(dst.Object).CopierFrom(client.Bucket(src.Bucket).Object(src.Object))
+	source := client.Bucket(src.Bucket).Object(src.Object)
+	copier := client.Bucket(dst.Bucket).Object(dst.Object).CopierFrom(source)
 	total := sizeHint
 	if onProgress != nil {
 		copier.ProgressFunc = func(copied, size uint64) {
@@ -596,7 +609,10 @@ func CopyServerSide(ctx context.Context, src, dst GSPath, _ int, sizeHint int64,
 	attrs, err := copier.Run(ctx)
 	if err != nil {
 		if isNotFound(err) {
-			return notExistError(src.String())
+			// A rewrite 404 can also refer to the destination bucket.
+			if _, sourceErr := source.Attrs(ctx); isNotFound(sourceErr) {
+				return notExistError(src.String())
+			}
 		}
 		return err
 	}

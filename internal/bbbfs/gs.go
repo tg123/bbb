@@ -167,7 +167,7 @@ func (gsFS) ChildPath(parent, child string) string {
 	if err != nil {
 		return parent + "/" + child
 	}
-	return gp.Child(filepath.ToSlash(child)).String()
+	return gp.Child(child).String()
 }
 
 func (gsFS) BaseName(p string) string {
