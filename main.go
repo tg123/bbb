@@ -29,6 +29,7 @@ import (
 	"log/slog"
 
 	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/tg123/bbb/internal/acr"
 	"github.com/tg123/bbb/internal/azblob"
@@ -1545,6 +1546,10 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 		cpWorkers = maxCPWorkers
 	}
 	innerConcurrency := max(1, concurrency/cpWorkers)
+	// GCS writes use one request at a time per object. Let those tasks use
+	// all file slots, while retaining the existing limits for block transfers.
+	legacyFileSlots := semaphore.NewWeighted(int64(cpWorkers))
+	transferSlots := semaphore.NewWeighted(int64(workers))
 	innerQuiet := true
 	showCopyBars := !quiet
 	workerCtx, cancel := context.WithCancel(ctx)
@@ -1573,7 +1578,7 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 		firstErrMu.Unlock()
 	}
 
-	for i := 0; i < cpWorkers; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1591,6 +1596,9 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 						bytesCb = taskProgress.AddBytes
 					}
 					taskConcurrency := innerConcurrency
+					if bbbfs.IsGS(task.dst) {
+						taskConcurrency = 1
+					}
 					if bbbfs.IsACR(task.dst) && fullConcurrencyACR.Load() {
 						// A lone acr:// destination is one atomic artifact
 						// push, so the file-level workers this budget was
@@ -1604,7 +1612,20 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 					if task.localTarget != nil {
 						copyCtx = context.WithValue(copyCtx, localCopyTargetKey{}, task.localTarget)
 					}
-					if err := cmdCPPaths(copyCtx, overwrite, innerQuiet, taskConcurrency, retryCount, []string{task.src}, task.dst, task.size, showCopyBars, bytesCb); err != nil {
+					err := func() error {
+						if !bbbfs.IsGS(task.dst) {
+							if err := legacyFileSlots.Acquire(copyCtx, 1); err != nil {
+								return err
+							}
+							defer legacyFileSlots.Release(1)
+						}
+						if err := transferSlots.Acquire(copyCtx, int64(taskConcurrency)); err != nil {
+							return err
+						}
+						defer transferSlots.Release(int64(taskConcurrency))
+						return cmdCPPaths(copyCtx, overwrite, innerQuiet, taskConcurrency, retryCount, []string{task.src}, task.dst, task.size, showCopyBars, bytesCb)
+					}()
+					if err != nil {
 						setErr(err)
 						return
 					}
@@ -1903,29 +1924,16 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	// cpPoolSize × blockConcurrency ≤ concurrency. Without this, an upload of a
 	// single (large) file would run with block concurrency 1 and stage blocks
 	// serially, which is far slower than parallel block uploads.
-	cpPoolSize := concurrency
-	blockConcurrency := concurrency
-	for _, op := range fileOps {
-		if op.dstObj {
-			if concurrency >= 2 {
-				cpPoolSize = max(2, concurrency/4)
-				if cpPoolSize > concurrency {
-					cpPoolSize = concurrency
-				}
-			} else {
-				cpPoolSize = 1
-			}
-			blockConcurrency = max(1, concurrency/cpPoolSize)
-			break
-		}
-	}
+	cpPoolSize, blockConcurrency := copyConcurrency(dst, concurrency)
 	// For a single file there is only one active worker, so give the full
 	// concurrency budget to block-level parallelism. Otherwise the per-file
 	// pipeline ends up with only blockConcurrency in-flight blocks, which
 	// caps throughput well below what the network can sustain.
 	if len(fileOps) == 1 {
 		cpPoolSize = 1
-		blockConcurrency = concurrency
+		if !bbbfs.IsGS(dst) {
+			blockConcurrency = concurrency
+		}
 	}
 	if err := runOpPoolWithRetryProgressBytes(ctx, cpPoolSize, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
@@ -2544,9 +2552,10 @@ func copyDestination(src, dst, name string) (string, error) {
 }
 
 func localCopyPath(root, name string) (string, error) {
+	localName := filepath.FromSlash(name)
 	// Reject parent components even if cleaning would leave the result inside
 	// root. Check both separators so Windows paths cannot masquerade as keys.
-	if !filepath.IsLocal(filepath.FromSlash(name)) ||
+	if !filepath.IsLocal(localName) ||
 		strings.HasPrefix(name, `\`) ||
 		(len(name) >= 2 && name[1] == ':') {
 		return "", fmt.Errorf("unsafe local destination name %q", name)
@@ -2556,10 +2565,22 @@ func localCopyPath(root, name string) (string, error) {
 			return "", fmt.Errorf("unsafe local destination name %q", name)
 		}
 	}
-	if name == "." {
+	if name == "." || filepath.Clean(localName) != localName || filepath.ToSlash(localName) != name {
 		return "", fmt.Errorf("unsafe local destination name %q", name)
 	}
-	return filepath.Join(root, filepath.FromSlash(name)), nil
+	return filepath.Join(root, localName), nil
+}
+
+func copyConcurrency(dst string, concurrency int) (files, blocks int) {
+	concurrency = max(1, concurrency)
+	if bbbfs.IsGS(dst) {
+		return concurrency, 1
+	}
+	if !bbbfs.IsObjectStore(dst) {
+		return concurrency, concurrency
+	}
+	files = min(concurrency, max(2, concurrency/4))
+	return files, max(1, concurrency/files)
 }
 
 type localCopyTargetKey struct{}
@@ -2622,13 +2643,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			}
 			// Distribute concurrency between file-level and block-level parallelism:
 			// total goroutines = fileWorkers × blockConcurrency ≤ concurrency.
-			fileWorkers := max(2, concurrency/4)
-			if concurrency < 2 {
-				fileWorkers = 1
-			} else if fileWorkers > concurrency {
-				fileWorkers = concurrency
-			}
-			blockConcurrency := max(1, concurrency/fileWorkers)
+			fileWorkers, blockConcurrency := copyConcurrency(dst, concurrency)
 			var totalItems atomic.Int64
 			copyTreeProgress := newStreamingProgressBar(errPrefix, quiet, false)
 			if copyTreeProgress != nil {
@@ -2740,19 +2755,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		// when uploading to Azure: total goroutines = fileWorkers ×
 		// blockConcurrency ≤ concurrency. Without this, each uploaded file would
 		// stage blocks serially (block concurrency 1).
-		fileWorkers := concurrency
-		blockConcurrency := concurrency
-		if dstObj {
-			if concurrency >= 2 {
-				fileWorkers = max(2, concurrency/4)
-				if fileWorkers > concurrency {
-					fileWorkers = concurrency
-				}
-			} else {
-				fileWorkers = 1
-			}
-			blockConcurrency = max(1, concurrency/fileWorkers)
-		}
+		fileWorkers, blockConcurrency := copyConcurrency(dst, concurrency)
 		err := runOpPoolWithRetryProgress(ctx, fileWorkers, retryCount, len(ops), quiet, errPrefix, func(pending chan<- remoteCopyOp) error {
 			for _, op := range ops {
 				if err := sendOp(ctx, pending, op); err != nil {
@@ -3279,20 +3282,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		// for same-provider server-side copies and uploads to object stores:
 		// total goroutines = syncWorkers × blockConcurrency ≤ concurrency.
 		// Without this, uploads would stage blocks serially (block concurrency 1).
-		syncWorkers := concurrency
-		blockConcurrency := concurrency
-		if dstObj {
-			if concurrency < 2 {
-				syncWorkers = 1
-				blockConcurrency = 1
-			} else {
-				syncWorkers = max(2, concurrency/4)
-				if syncWorkers > concurrency {
-					syncWorkers = concurrency
-				}
-				blockConcurrency = max(1, concurrency/syncWorkers)
-			}
-		}
+		syncWorkers, blockConcurrency := copyConcurrency(dst, concurrency)
 		// Build producer: for object-store sources, stream listing into the
 		// worker pool so processing starts while listing continues. For HF and
 		// local→remote paths, collect first (these are either small or have

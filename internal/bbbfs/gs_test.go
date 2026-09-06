@@ -4,8 +4,24 @@ import (
 	"fmt"
 	"testing"
 
+	gspkg "github.com/tg123/bbb/internal/gs"
 	"google.golang.org/api/googleapi"
 )
+
+func TestGSListingChildPath(t *testing.T) {
+	for _, tc := range []struct{ name, want string }{
+		{"/", "gs://bucket/a//"},
+		{"//", "gs://bucket/a///"},
+		{"child/", "gs://bucket/a/child"},
+		{"child//", "gs://bucket/a/child//"},
+		{"file", "gs://bucket/a/file"},
+		{"child//file", "gs://bucket/a/child//file"},
+	} {
+		if got := gsChildPath(gspkg.GSPath{Bucket: "bucket", Object: "a/"}, tc.name); got != tc.want {
+			t.Errorf("gsChildPath(%q) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
 
 func TestGSChildPathPreservesOpaqueNames(t *testing.T) {
 	for _, name := range []string{`nested\file.txt`, "../file", "/file", "nested//file", "./file", "a #?%.txt"} {

@@ -130,7 +130,7 @@ func IsGS(path string) bool {
 }
 
 // IsObjectStore returns true if the path targets a remote object-store backend
-// with virtual-directory semantics, chunked transfer and Stat-based existence
+// with virtual-directory semantics and Stat-based existence
 // checks (Azure Blob Storage, Amazon S3 or Google Cloud Storage).
 func IsObjectStore(path string) bool {
 	return IsAz(path) || IsS3(path) || IsGS(path)

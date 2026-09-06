@@ -142,8 +142,12 @@ func (gsFS) Stat(ctx context.Context, target string) (Entry, error) {
 }
 
 func gsChildPath(gp gspkg.GSPath, name string) string {
-	trimmed := strings.TrimSuffix(name, "/")
-	return gp.Child(trimmed).String()
+	// A trailing empty segment is part of the prefix, not just a directory
+	// marker. Removing it would make listing point back at the parent.
+	if name != "/" && !strings.HasSuffix(name, "//") {
+		name = strings.TrimSuffix(name, "/")
+	}
+	return gp.Child(name).String()
 }
 
 func (gsFS) IsDirLike(_ context.Context, p string) (bool, error) {

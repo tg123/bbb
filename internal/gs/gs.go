@@ -562,7 +562,12 @@ func DeletePrefix(ctx context.Context, gp GSPath) error {
 		})
 	}
 
+deleteObjects:
 	for {
+		if err := ctx.Err(); err != nil {
+			fail(err)
+			break
+		}
 		attrs, err := it.Next()
 		if errors.Is(err, iterator.Done) {
 			break
@@ -572,8 +577,18 @@ func DeletePrefix(ctx context.Context, gp GSPath) error {
 			break
 		}
 		name := attrs.Name
+		select {
+		case <-ctx.Done():
+			fail(ctx.Err())
+			break deleteObjects
+		case sem <- struct{}{}:
+		}
+		if err := ctx.Err(); err != nil {
+			<-sem
+			fail(err)
+			break
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(name string) {
 			defer wg.Done()
 			defer func() { <-sem }()

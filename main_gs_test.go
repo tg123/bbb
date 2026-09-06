@@ -21,11 +21,16 @@ import (
 
 func TestCopyDestinationNames(t *testing.T) {
 	root := t.TempDir()
-	for _, name := range []string{
+	unsafeNames := []string{
 		"", ".", "..", "../escape", "nested/../../escape", "nested/../file",
 		"/absolute", `\absolute`, `..\escape`, `nested\..\escape`,
 		`C:\escape`, "C:escape", `\\server\share\file`,
-	} {
+		"a/./file", "a//file", "./file", "a/file/",
+	}
+	if filepath.Separator == '\\' {
+		unsafeNames = append(unsafeNames, `a\file`, `a\\file`, `a\.\file`, `a/\file`)
+	}
+	for _, name := range unsafeNames {
 		t.Run(name, func(t *testing.T) {
 			if _, err := copyDestination("gs://bucket/source/", root, name); err == nil {
 				t.Errorf("accepted unsafe local name %q", name)
@@ -143,6 +148,23 @@ func (transport *gsIntegrationTransport) RoundTrip(r *http.Request) (*http.Respo
 
 var gsIntegrationClient = &http.Client{Transport: &gsIntegrationTransport{}}
 
+func useGSIntegrationHandler(t *testing.T, handler http.Handler) {
+	t.Helper()
+	transport := gsIntegrationClient.Transport.(*gsIntegrationTransport)
+	transport.mu.Lock()
+	transport.handler = handler
+	transport.mu.Unlock()
+	t.Cleanup(func() {
+		transport.mu.Lock()
+		transport.handler = nil
+		transport.mu.Unlock()
+	})
+	t.Setenv("BBB_GS_ENDPOINT", "http://gcs.test")
+	t.Setenv("STORAGE_EMULATOR_HOST", "")
+	gspkg.SetHTTPClient(gsIntegrationClient)
+	t.Cleanup(func() { gspkg.SetHTTPClient(nil) })
+}
+
 func TestGCSCopySyncAndRemove(t *testing.T) {
 	// Reuse the transport across test runs because the GCS client is
 	// process-cached; replacing its handler also supports go test -count=N.
@@ -173,19 +195,7 @@ func TestGCSCopySyncAndRemove(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(object)
 	})
-	transport := gsIntegrationClient.Transport.(*gsIntegrationTransport)
-	transport.mu.Lock()
-	transport.handler = handler
-	transport.mu.Unlock()
-	t.Cleanup(func() {
-		transport.mu.Lock()
-		transport.handler = nil
-		transport.mu.Unlock()
-	})
-	t.Setenv("BBB_GS_ENDPOINT", "http://gcs.test")
-	t.Setenv("STORAGE_EMULATOR_HOST", "")
-	gspkg.SetHTTPClient(gsIntegrationClient)
-	t.Cleanup(func() { gspkg.SetHTTPClient(nil) })
+	useGSIntegrationHandler(t, handler)
 
 	copies := []struct {
 		name string
@@ -211,7 +221,7 @@ func TestGCSCopySyncAndRemove(t *testing.T) {
 		}, true},
 	}
 	for _, copy := range copies {
-		for _, remoteName := range []string{"nested/file.txt", "../escape", "/absolute", `..\escape`, `C:\escape`} {
+		for _, remoteName := range []string{"nested/file.txt", "../escape", "/absolute", `..\escape`, `C:\escape`, "nested/./file.txt", "nested//file.txt", "./file.txt"} {
 			t.Run(copy.name+"/"+remoteName, func(t *testing.T) {
 				mu.Lock()
 				name, reads = remoteName, 0
