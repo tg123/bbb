@@ -8,12 +8,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/tg123/bbb/internal/bbbfs"
+	"golang.org/x/sync/semaphore"
 )
 
 type taskPair struct {
@@ -228,11 +228,39 @@ type taskTracker struct {
 }
 
 type cpTask struct {
-	src     string
-	dst     string
-	key     string
-	size    int64        // known size from listing; 0 = unknown
-	tracker *taskTracker // nil when no task-level checkpoint tracking
+	src         string
+	dst         string
+	key         string
+	size        int64        // known size from listing; 0 = unknown
+	tracker     *taskTracker // nil when no task-level checkpoint tracking
+	localTarget *localCopyTarget
+}
+
+func expandCPTaskWithBudget(ctx context.Context, task taskPair, slots *semaphore.Weighted, emit func(cpTask) error) error {
+	if err := slots.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	held := true
+	defer func() {
+		if held {
+			slots.Release(1)
+		}
+	}()
+	// Expansion issues sequential listing/metadata requests. Give its slot
+	// back before emitting: the bounded task channel may need a copy worker
+	// to acquire that slot to drain it, including at concurrency=1.
+	return expandCPTask(ctx, task, func(expanded cpTask) error {
+		slots.Release(1)
+		held = false
+		if err := emit(expanded); err != nil {
+			return err
+		}
+		if err := slots.Acquire(ctx, 1); err != nil {
+			return err
+		}
+		held = true
+		return nil
+	})
 }
 
 // expandCPTask streams file-level copy tasks for a taskfile pair via the emit
@@ -247,18 +275,19 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 	}
 
 	// Check if source is a single file (not a directory)
-	if bbbfs.IsHF(task.src) || bbbfs.IsACR(task.src) || bbbfs.IsAz(task.src) {
+	var sourceErr error
+	if bbbfs.IsHF(task.src) || bbbfs.IsACR(task.src) || bbbfs.IsObjectStore(task.src) {
 		dirLike, err := bbbfs.IsDirLike(ctx, task.src)
 		if err != nil {
 			return err
 		}
 		if !dirLike {
-			// For Azure sources, verify the blob actually exists; if not,
+			// For object-store sources, verify the object actually exists; if not,
 			// the path may be a virtual directory prefix — fall through to
 			// recursive listing. Hugging Face and ACR sources skip the
 			// Stat-based check, since an artifact or repo path that is not
 			// directory-like is already known to name a single file.
-			if bbbfs.IsAz(task.src) {
+			if bbbfs.IsObjectStore(task.src) {
 				if entry, statErr := bbbfs.Resolve(task.src).Stat(ctx, task.src); statErr == nil {
 					return emit(cpTask{
 						src:  task.src,
@@ -267,6 +296,7 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 						size: entry.Size,
 					})
 				} else {
+					sourceErr = statErr
 					slog.Debug("source not found as blob, trying as directory prefix", "src", task.src, "error", statErr)
 				}
 			} else {
@@ -279,23 +309,21 @@ func expandCPTask(ctx context.Context, task taskPair, emit func(cpTask) error) e
 		}
 	}
 
-	for result := range bbbfs.ListRecursive(ctx, task.src) {
-		if result.Err != nil {
-			return result.Err
-		}
-		entry := result.Entry
-		if entry.IsDir {
-			continue
-		}
-		dstPath := bbbfs.ChildPath(task.dst, filepath.ToSlash(entry.Name))
-		if err := emit(cpTask{
-			src:  entry.Path,
-			dst:  dstPath,
-			key:  taskStateKey(entry.Path, task.dst),
-			size: entry.Size,
-		}); err != nil {
+	return listCopyEntries(ctx, task.src, task.dst, sourceErr, nil, func(entry bbbfs.Entry) error {
+		dstPath, err := copyDestination(task.src, task.dst, entry.Name)
+		if err != nil {
 			return err
 		}
-	}
-	return nil
+		var localTarget *localCopyTarget
+		if bbbfs.IsRemote(task.src) && !bbbfs.IsRemote(task.dst) {
+			localTarget = &localCopyTarget{root: task.dst, name: entry.Name}
+		}
+		return emit(cpTask{
+			src:         entry.Path,
+			dst:         dstPath,
+			key:         taskStateKey(entry.Path, task.dst),
+			size:        entry.Size,
+			localTarget: localTarget,
+		})
+	})
 }

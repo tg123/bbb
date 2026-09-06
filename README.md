@@ -1,6 +1,6 @@
 # bbb
 
-A Go fork of [boostedblob](https://github.com/hauntsaninja/boostedblob) — a fast, concurrent CLI for working with local files, Azure Blob Storage (`az://`), Amazon S3 (`s3://`), Hugging Face (`hf://`), and Azure Container Registry artifacts (`acr://`).
+A Go fork of [boostedblob](https://github.com/hauntsaninja/boostedblob) — a fast, concurrent CLI for working with local files, Azure Blob Storage (`az://`), Amazon S3 (`s3://`), Google Cloud Storage (`gs://`), Hugging Face (`hf://`), and Azure Container Registry artifacts (`acr://`).
 
 ## Why a fork of boostedblob
 
@@ -55,6 +55,7 @@ To use Azure CLI / managed identity based login, mount the host credentials, e.g
 | *(none)* | Local filesystem | `/tmp/data/`, `./file.txt` |
 | `az://` | Azure Blob Storage | `az://myaccount/mycontainer/path/to/blob` |
 | `s3://` | Amazon S3 (and S3-compatible stores) | `s3://mybucket/path/to/object` |
+| `gs://` | Google Cloud Storage | `gs://mybucket/path/to/object` |
 | `hf://` | Hugging Face Hub | `hf://meta-llama/Llama-2-7b/weights.bin`, `hf://datasets/org/repo/data.csv` |
 | `acr://` | Azure Container Registry (OCI artifacts) | `acr://myregistry.azurecr.io/models/llama:v1`, `acr://myregistry/models/llama:v1/weights.bin` |
 
@@ -88,7 +89,7 @@ Repository names are reported exactly as the registry holds them, slashes includ
 
 The "files" of an artifact are its layers; each layer's name comes from the standard `org.opencontainers.image.title` annotation, falling back to its digest (e.g. `sha256-abc...`) when the annotation is missing. Because a file name follows the tag or digest, a file can only be addressed on a path that specifies one.
 
-Layer names are validated lexically before use: absolute paths, `..` traversal, backslashes, colons, characters Windows forbids (`<>"|?*` and control characters), Windows reserved device names (`NUL`, `CON.txt`, …) and segments ending in a dot or space are rejected. A name that is not already canonical (`a/./b`, `a//b`, `dir/`) is refused rather than repaired — the registry chooses these names, so a rewrite would put the bytes somewhere the manifest never declared; a single leading `./` is trimmed, since it names the same file. A name that is an ancestor of another (`a` alongside `a/b`) is rejected too, since no filesystem can hold a file and a directory at one path, as are names differing only in case (`A.txt` and `a.txt`), which alias on Windows and macOS. Note this is not full extraction containment — as with the other remote backends, files are written through the normal local path, which follows pre-existing symlinks in the destination. Extract untrusted artifacts into a fresh directory.
+Layer names are validated lexically before use: absolute paths, `..` traversal, backslashes, colons, characters Windows forbids (`<>"|?*` and control characters), Windows reserved device names (`NUL`, `CON.txt`, …) and segments ending in a dot or space are rejected. A name that is not already canonical (`a/./b`, `a//b`, `dir/`) is refused rather than repaired — the registry chooses these names, so a rewrite would put the bytes somewhere the manifest never declared; a single leading `./` is trimmed, since it names the same file. A name that is an ancestor of another (`a` alongside `a/b`) is rejected too, since no filesystem can hold a file and a directory at one path, as are names differing only in case (`A.txt` and `a.txt`), which alias on Windows and macOS. Recursive remote-to-local copies and syncs create files relative to the requested destination root and reject symlink traversal outside it. Explicit single-file destination paths still use normal local path semantics, including following pre-existing symlinks. Extract untrusted artifacts into a fresh directory.
 
 Layer contents are verified against the digest recorded in the manifest, so a corrupt registry or proxy cannot silently return different bytes.
 
@@ -358,6 +359,58 @@ Notes:
 * `bbb s3 mkbucket` omits the `LocationConstraint` on R2, which only accepts the
   pseudo-region `auto` for request signing.
 
+### Google Cloud Storage (`gs://`) Authentication and Configuration
+
+GCS paths use Google's Application Default Credentials, so anything `gcloud`
+understands works out of the box: a service account key file pointed at by
+`GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default login`
+credentials, or the metadata server / workload identity on GCE, GKE and Cloud
+Run.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GOOGLE_APPLICATION_CREDENTIALS` | *(unset)* | Path to a service account key file |
+| `BBB_GS_PROJECT` / `GOOGLE_CLOUD_PROJECT` | *(unset)* | Project used when creating buckets (`bbb gs mkbucket`) |
+| `BBB_GS_ENDPOINT` | *(unset)* | Custom endpoint URL, e.g. a [fake-gcs-server](https://github.com/fsouza/fake-gcs-server) emulator. Authentication is disabled when set |
+| `STORAGE_EMULATOR_HOST` | *(unset)* | Google's standard emulator variable, used when `BBB_GS_ENDPOINT` is unset |
+
+Example using the fake-gcs-server emulator:
+
+```bash
+docker run -d -p 4443:4443 fsouza/fake-gcs-server \
+  -scheme http -port 4443 -backend memory \
+  -public-host localhost:4443 -external-url http://localhost:4443
+
+export BBB_GS_ENDPOINT=http://localhost:4443
+
+bbb gs mkbucket gs://mybucket
+bbb cp ./data.bin gs://mybucket/data.bin
+bbb ls gs://mybucket/
+```
+
+GCS→GCS copies use the server-side rewrite API — which handles objects of any
+size — and never stream bytes through the client.
+
+Copy task streams to GCS share the `--concurrency` budget between source
+expansion and transfers. Once expansion finishes, transfers can use the full
+budget.
+
+GCS tree copies and syncs reject overlapping source and destination prefixes
+in the same bucket before listing or copying objects. This includes equal
+prefixes and either prefix containing the other.
+
+Downloads of gzip-encoded GCS objects use one full read instead of parallel
+ranges, preserving normal decompression without using the stored size to
+limit the decoded output.
+
+Recursive remote-to-local copies and syncs collect and validate the selected
+file names before starting transfers. Nonportable names, case/Unicode aliases,
+and file/directory conflicts are rejected rather than overwriting the same
+local file. This preflight uses memory proportional to the listing size.
+GCS object names remain opaque for GCS destinations; copies to backends that
+normalize paths reject names they cannot preserve, such as `../file` or
+`a//file`, rather than writing outside the requested prefix or renaming them.
+
 ### `BBB_DNS_SERVER`
 
 When set, bbb sends every DNS query to the given DNS server(s) instead of the system resolver configuration (`/etc/resolv.conf`, `systemd-resolved`, ...). This is useful when the host resolver is broken, slow, or returns endpoints you do not want to use.
@@ -371,7 +424,7 @@ BBB_DNS_SERVER=10.0.0.53,1.1.1.1:5353 bbb ls az://myaccount/mycontainer/
 
 Servers must be given as IP addresses (an unresolvable name would need a resolver itself), optionally with a port — port `53` is assumed when omitted. IPv6 literals may be written bare (`::1`) or bracketed together with a port (`[2001:db8::1]:5353`). Servers are tried in the order given; the next one is used when a server cannot be reached.
 
-The override applies to **all** DNS lookups in the bbb process (it replaces the process-wide resolver), including Azure SDK data-plane requests, OAuth token calls, Hugging Face and S3 traffic. It composes with `BBB_DNS_CACHE` / `BBB_DNS_PIN`, which cache or pin the results returned by the configured server.
+The override applies to **all** DNS lookups in the bbb process (it replaces the process-wide resolver), including Azure SDK data-plane requests, OAuth token calls, Hugging Face, S3 and Google Cloud Storage traffic. It composes with `BBB_DNS_CACHE` / `BBB_DNS_PIN`, which cache or pin the results returned by the configured server.
 
 **Caveats:**
 
@@ -910,6 +963,22 @@ bbb s3 mkbucket s3://bucket
 ```bash
 # Create a new S3 bucket
 bbb s3 mkbucket s3://newbucket
+```
+
+### `gs mkbucket` — Create a Google Cloud Storage bucket
+
+```
+bbb gs mkbucket gs://bucket
+```
+
+Bucket names are globally unique. An existing bucket returns a conflict, even
+when it is readable by the caller; read access does not prove project ownership.
+
+**Example:**
+
+```bash
+# Create a new GCS bucket (needs BBB_GS_PROJECT or GOOGLE_CLOUD_PROJECT)
+bbb gs mkbucket gs://newbucket
 ```
 
 ## Benchmark

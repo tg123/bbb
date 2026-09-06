@@ -634,6 +634,25 @@ func layerTitleName(title string) (string, error) {
 	return cleaned, nil
 }
 
+// ValidateLocalNames checks that relative file names are portable and can
+// coexist in one local destination tree. It does not contact the registry.
+func ValidateLocalNames(names []string) error {
+	seen := newNameSet(len(names))
+	for _, name := range names {
+		cleaned, err := cleanFile(name)
+		if err != nil {
+			return fmt.Errorf("invalid local file name %q: %w", name, err)
+		}
+		if cleaned != name {
+			return fmt.Errorf("invalid local file name %q: name is not canonical", name)
+		}
+		if err := seen.addUpload(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ValidateUploadNames checks the names of an artifact's files without
 // contacting the registry, so a dry run rejects exactly what a real push would.
 func ValidateUploadNames(files []UploadFile) error {

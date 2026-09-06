@@ -29,11 +29,13 @@ import (
 	"log/slog"
 
 	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/tg123/bbb/internal/acr"
 	"github.com/tg123/bbb/internal/azblob"
 	"github.com/tg123/bbb/internal/bbbfs"
 	"github.com/tg123/bbb/internal/fsops"
+	gspkg "github.com/tg123/bbb/internal/gs"
 	"github.com/tg123/bbb/internal/hf"
 	s3pkg "github.com/tg123/bbb/internal/s3"
 )
@@ -399,6 +401,7 @@ func run(args []string) int {
 				hf.SetHTTPClient(&http.Client{Transport: transport})
 				acr.SetHTTPClient(&http.Client{Transport: transport})
 				s3pkg.SetHTTPClient(&http.Client{Transport: transport})
+				gspkg.SetHTTPClient(&http.Client{Transport: transport})
 			}
 
 			return ctx, nil
@@ -467,6 +470,39 @@ func run(args []string) int {
 								return err
 							}
 							fmt.Printf("Created bucket %s\n", bucket)
+							return nil
+						},
+					},
+				},
+			},
+			{
+				Name:      "gs",
+				Usage:     "Google Cloud Storage related commands",
+				UsageText: "bbb gs <command>",
+				Commands: []*cli.Command{
+					{
+						Name:      "mkbucket",
+						Usage:     "Create a Google Cloud Storage bucket",
+						UsageText: "bbb gs mkbucket gs://bucket",
+						Action: func(ctx context.Context, c *cli.Command) error {
+							if c.Args().Len() != 1 {
+								return fmt.Errorf("mkbucket: need gs://bucket")
+							}
+							target := c.Args().Get(0)
+							if !bbbfs.IsGS(target) {
+								return fmt.Errorf("mkbucket: only gs:// paths supported")
+							}
+							gp, err := gspkg.Parse(target)
+							if err != nil {
+								return fmt.Errorf("mkbucket: %w", err)
+							}
+							if gp.Bucket == "" || gp.Object != "" {
+								return fmt.Errorf("mkbucket: need gs://bucket")
+							}
+							if err := bbbfs.MkDir(ctx, target); err != nil {
+								return err
+							}
+							fmt.Printf("Created bucket %s\n", gp.Bucket)
 							return nil
 						},
 					},
@@ -1510,6 +1546,10 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 		cpWorkers = maxCPWorkers
 	}
 	innerConcurrency := max(1, concurrency/cpWorkers)
+	// GCS writes use one request at a time per object. Let those tasks use
+	// all file slots, while retaining the existing limits for block transfers.
+	legacyFileSlots := semaphore.NewWeighted(int64(cpWorkers))
+	requestSlots := semaphore.NewWeighted(int64(workers))
 	innerQuiet := true
 	showCopyBars := !quiet
 	workerCtx, cancel := context.WithCancel(ctx)
@@ -1538,7 +1578,7 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 		firstErrMu.Unlock()
 	}
 
-	for i := 0; i < cpWorkers; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1556,6 +1596,9 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 						bytesCb = taskProgress.AddBytes
 					}
 					taskConcurrency := innerConcurrency
+					if bbbfs.IsGS(task.dst) {
+						taskConcurrency = 1
+					}
 					if bbbfs.IsACR(task.dst) && fullConcurrencyACR.Load() {
 						// A lone acr:// destination is one atomic artifact
 						// push, so the file-level workers this budget was
@@ -1565,7 +1608,24 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 						// --concurrency.
 						taskConcurrency = concurrency
 					}
-					if err := cmdCPPaths(workerCtx, overwrite, innerQuiet, taskConcurrency, retryCount, []string{task.src}, task.dst, task.size, showCopyBars, bytesCb); err != nil {
+					copyCtx := workerCtx
+					if task.localTarget != nil {
+						copyCtx = context.WithValue(copyCtx, localCopyTargetKey{}, task.localTarget)
+					}
+					err := func() error {
+						if !bbbfs.IsGS(task.dst) {
+							if err := legacyFileSlots.Acquire(copyCtx, 1); err != nil {
+								return err
+							}
+							defer legacyFileSlots.Release(1)
+						}
+						if err := requestSlots.Acquire(copyCtx, int64(taskConcurrency)); err != nil {
+							return err
+						}
+						defer requestSlots.Release(int64(taskConcurrency))
+						return cmdCPPaths(copyCtx, overwrite, innerQuiet, taskConcurrency, retryCount, []string{task.src}, task.dst, task.size, showCopyBars, bytesCb)
+					}()
+					if err != nil {
 						setErr(err)
 						return
 					}
@@ -1594,7 +1654,7 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 		}()
 	}
 
-	// Dedicated expander pool uses goroutines from the concurrency budget.
+	// Expanders share the request budget with transfers, yielding while emitting.
 	pairCh := make(chan taskPair, expanders*2)
 	var seenMu sync.Mutex
 	var expandWG sync.WaitGroup
@@ -1661,8 +1721,7 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 						return nil
 					}
 					if err := retryOp(workerCtx, retryCount, func() error {
-						pendingCount = 0
-						return expandCPTask(workerCtx, task, expandEmit)
+						return expandCPTaskWithBudget(workerCtx, task, requestSlots, expandEmit)
 					}); err != nil {
 						setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
 						return
@@ -1673,8 +1732,9 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 						taskProgress.SetTotal(totalPending.Load())
 					}
 					if tracker != nil {
-						tracker.remaining.Store(pendingCount)
-						if pendingCount == 0 {
+						// Workers can finish while expansion yields its request
+						// slot. Preserve their decrements, including across retries.
+						if tracker.remaining.Add(pendingCount) == 0 {
 							if err := stateAppender.appendCheckpoint(cpKey); err != nil {
 								setErr(err)
 								return
@@ -1774,16 +1834,18 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	// Determine if dst is directory (local or remote object store)
 	isDstDir := bbbfs.IsDirLikeFromPath(dst)
 	type cpDirOp struct {
-		src string
-		dst string
+		src       string
+		dst       string
+		sourceErr error
 	}
 	type cpFileOp struct {
-		src    string
-		dst    string
-		srcObj bool
-		dstObj bool
-		size   int64
-		base   string
+		src         string
+		dst         string
+		srcObj      bool
+		dstObj      bool
+		size        int64
+		base        string
+		localTarget *localCopyTarget
 	}
 	dirOps := make([]cpDirOp, 0, len(srcs))
 	fileOps := make([]cpFileOp, 0, len(srcs))
@@ -1791,6 +1853,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 		src := src
 		srcObj := bbbfs.IsObjectStore(src)
 		base := bbbfs.BaseName(src)
+		localTarget, _ := ctx.Value(localCopyTargetKey{}).(*localCopyTarget)
 		if bbbfs.IsHF(src) || bbbfs.IsACR(src) || srcObj {
 			dirLike, err := bbbfs.IsDirLike(ctx, src)
 			if err != nil {
@@ -1805,8 +1868,13 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			// directory prefix. Skip the expensive Stat for HF sources.
 			if srcObj {
 				if _, statErr := bbbfs.Resolve(src).Stat(ctx, src); statErr != nil {
+					if localTarget != nil {
+						// An expanded task names a file, not a new directory
+						// root that could bypass its original destination scope.
+						return statErr
+					}
 					slog.Debug("source not found as object, trying as directory", "src", src, "error", statErr)
-					dirOps = append(dirOps, cpDirOp{src: src, dst: dst})
+					dirOps = append(dirOps, cpDirOp{src: src, dst: dst, sourceErr: statErr})
 					continue
 				}
 			}
@@ -1816,9 +1884,20 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			continue
 		}
 		var dstPath string
-		if isDstDir {
+		if localTarget != nil {
 			var err error
-			dstPath, err = bbbfs.ResolveDstPath(dst, base, false)
+			dstPath, err = localCopyPath(localTarget.root, localTarget.name)
+			if err != nil {
+				return err
+			}
+		} else if isDstDir {
+			var err error
+			if bbbfs.IsRemote(src) && !bbbfs.IsRemote(dst) {
+				dstPath, err = localCopyPath(dst, base)
+				localTarget = &localCopyTarget{root: dst, name: base}
+			} else {
+				dstPath, err = bbbfs.ResolveDstPath(dst, base, false)
+			}
 			if err != nil {
 				return err
 			}
@@ -1826,16 +1905,26 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			dstPath = dst
 		}
 		fileOps = append(fileOps, cpFileOp{
-			src:    src,
-			dst:    dstPath,
-			srcObj: srcObj,
-			dstObj: dstObj,
-			size:   srcSize,
-			base:   base,
+			src:         src,
+			dst:         dstPath,
+			srcObj:      srcObj,
+			dstObj:      dstObj,
+			size:        srcSize,
+			base:        base,
+			localTarget: localTarget,
 		})
 	}
+	var localNames []string
+	for _, op := range fileOps {
+		if op.localTarget != nil {
+			localNames = append(localNames, op.localTarget.name)
+		}
+	}
+	if err := validateLocalCopyNames(dst, localNames); err != nil {
+		return err
+	}
 	for _, op := range dirOps {
-		err := copyTree(ctx, op.src, op.dst, overwrite, quiet, "cp", concurrency, retryCount)
+		err := copyTreeWithSourceError(ctx, op.src, op.dst, overwrite, quiet, "cp", concurrency, retryCount, op.sourceErr)
 		if err != nil {
 			return fmt.Errorf("cp: %s -> %s: %w", op.src, op.dst, err)
 		}
@@ -1845,29 +1934,16 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 	// cpPoolSize × blockConcurrency ≤ concurrency. Without this, an upload of a
 	// single (large) file would run with block concurrency 1 and stage blocks
 	// serially, which is far slower than parallel block uploads.
-	cpPoolSize := concurrency
-	blockConcurrency := concurrency
-	for _, op := range fileOps {
-		if op.dstObj {
-			if concurrency >= 2 {
-				cpPoolSize = max(2, concurrency/4)
-				if cpPoolSize > concurrency {
-					cpPoolSize = concurrency
-				}
-			} else {
-				cpPoolSize = 1
-			}
-			blockConcurrency = max(1, concurrency/cpPoolSize)
-			break
-		}
-	}
+	cpPoolSize, blockConcurrency := copyConcurrency(dst, concurrency)
 	// For a single file there is only one active worker, so give the full
 	// concurrency budget to block-level parallelism. Otherwise the per-file
 	// pipeline ends up with only blockConcurrency in-flight blocks, which
 	// caps throughput well below what the network can sustain.
 	if len(fileOps) == 1 {
 		cpPoolSize = 1
-		blockConcurrency = concurrency
+		if !bbbfs.IsGS(dst) {
+			blockConcurrency = concurrency
+		}
 	}
 	if err := runOpPoolWithRetryProgressBytes(ctx, cpPoolSize, retryCount, len(fileOps), quiet, "cp", func(pending chan<- cpFileOp) error {
 		for _, op := range fileOps {
@@ -1933,10 +2009,11 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 				if copyBar != nil {
 					copyBar.Abort()
 				}
-				// When S2S is forced, do not fall back to client-side
-				// streaming. Return the error so the operation is retried
+				// GCS rewrites never fall back to client-side streaming.
+				// Honor the existing opt-out for other providers too.
+				// Return the error so the operation is retried
 				// (honouring --retry-count, with BBB_RETRY_JITTER waits).
-				if forceS2SEnabled() {
+				if bbbfs.IsGS(op.src) || forceS2SEnabled() {
 					return 0, fmt.Errorf("cp: server-side copy: %w", err)
 				}
 				// Server-side copy failed — fall back to client-side streaming.
@@ -2088,7 +2165,9 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 			// object store→local single-file: use parallel ranged download for
 			// higher throughput (mirrors azcopy's chunked download). Opt out with
 			// BBB_PARALLEL_DOWNLOAD=0 to fall back to the single-stream path.
-			if op.srcObj && !bbbfs.IsRemote(op.dst) &&
+			// Root-confined destinations must use the handle-based writer below,
+			// not a backend that reopens an unrestricted filesystem path.
+			if op.srcObj && !bbbfs.IsRemote(op.dst) && op.localTarget == nil &&
 				parallelDownloadEnabled() && bbbfs.CanDownloadToFile(op.src) {
 				var copyBar *progressBar
 				if showCopyBar {
@@ -2188,7 +2267,7 @@ func cmdCPPaths(ctx context.Context, overwrite, quiet bool, concurrency, retryCo
 						}
 					},
 				})
-				return bbbfs.Resolve(op.dst).Write(writeCtx, op.dst, pr)
+				return writeCopyDestination(writeCtx, op.dst, op.localTarget, pr)
 			}); err != nil {
 				if copyBar != nil {
 					copyBar.Abort()
@@ -2471,7 +2550,110 @@ func pushLocalArtifact(
 	return nil
 }
 
+// copyDestination converts only local listing names to slash-separated remote
+// keys. Remote names are opaque and must not be cleaned or slash-normalized.
+func copyDestination(src, dst, name string) (string, error) {
+	if !bbbfs.IsRemote(src) {
+		name = filepath.ToSlash(name)
+	}
+	if bbbfs.IsRemote(dst) {
+		// Other backends may clean dot segments or Windows separators in
+		// ChildPath. Refuse to silently rename an opaque remote source key.
+		if bbbfs.IsRemote(src) && !bbbfs.IsGS(dst) &&
+			(name == "" || name == "." || path.Clean(name) != name ||
+				strings.HasPrefix(name, "/") || strings.Contains(name, `\`) ||
+				name == ".." || strings.HasPrefix(name, "../")) {
+			return "", fmt.Errorf("remote destination cannot preserve object name %q", name)
+		}
+		return bbbfs.ChildPath(dst, name), nil
+	}
+	return localCopyPath(dst, name)
+}
+
+func localCopyPath(root, name string) (string, error) {
+	localName := filepath.FromSlash(name)
+	// Reject parent components even if cleaning would leave the result inside
+	// root. Check both separators so Windows paths cannot masquerade as keys.
+	if !filepath.IsLocal(localName) ||
+		strings.HasPrefix(name, `\`) ||
+		(len(name) >= 2 && name[1] == ':') {
+		return "", fmt.Errorf("unsafe local destination name %q", name)
+	}
+	for _, part := range strings.FieldsFunc(name, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if part == ".." {
+			return "", fmt.Errorf("unsafe local destination name %q", name)
+		}
+	}
+	if name == "." || filepath.Clean(localName) != localName || filepath.ToSlash(localName) != name {
+		return "", fmt.Errorf("unsafe local destination name %q", name)
+	}
+	return filepath.Join(root, localName), nil
+}
+
+func copyConcurrency(dst string, concurrency int) (files, blocks int) {
+	concurrency = max(1, concurrency)
+	if bbbfs.IsGS(dst) {
+		return concurrency, 1
+	}
+	if !bbbfs.IsObjectStore(dst) {
+		return concurrency, concurrency
+	}
+	files = min(concurrency, max(2, concurrency/4))
+	return files, max(1, concurrency/files)
+}
+
+type localCopyTargetKey struct{}
+
+type localCopyTarget struct {
+	root string
+	name string
+}
+
+func writeCopyDestination(ctx context.Context, dst string, target *localCopyTarget, r io.Reader) error {
+	if target == nil {
+		return bbbfs.Resolve(dst).Write(ctx, dst, r)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := localCopyPath(target.root, target.name); err != nil {
+		return err
+	}
+	rootPath := target.root
+	if rootPath == "" {
+		rootPath = "."
+	}
+	if err := os.MkdirAll(rootPath, 0o755); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	name := filepath.FromSlash(target.name)
+	// Root-relative creation prevents existing or concurrently swapped
+	// symlinks in the destination tree from redirecting writes outside it.
+	if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+		return err
+	}
+	f, err := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(f, r)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
 func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPrefix string, concurrency int, retryCount int) error {
+	return copyTreeWithSourceError(ctx, src, dst, overwrite, quiet, errPrefix, concurrency, retryCount, nil)
+}
+
+func copyTreeWithSourceError(ctx context.Context, src, dst string, overwrite, quiet bool, errPrefix string, concurrency int, retryCount int, sourceErr error) error {
 	if bbbfs.IsRemote(src) || bbbfs.IsRemote(dst) {
 		// Remote copy: list source files and copy each
 		dstObj := bbbfs.IsObjectStore(dst)
@@ -2484,20 +2666,14 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			}
 			// Distribute concurrency between file-level and block-level parallelism:
 			// total goroutines = fileWorkers × blockConcurrency ≤ concurrency.
-			fileWorkers := max(2, concurrency/4)
-			if concurrency < 2 {
-				fileWorkers = 1
-			} else if fileWorkers > concurrency {
-				fileWorkers = concurrency
-			}
-			blockConcurrency := max(1, concurrency/fileWorkers)
+			fileWorkers, blockConcurrency := copyConcurrency(dst, concurrency)
 			var totalItems atomic.Int64
 			copyTreeProgress := newStreamingProgressBar(errPrefix, quiet, false)
 			if copyTreeProgress != nil {
 				copyTreeProgress.pinBottom = true
 			}
 			poolErr := runOpPoolWithRetry(ctx, fileWorkers, retryCount, func(pending chan<- ssOp) error {
-				return bbbfs.ListRecursiveWithSizeStream(ctx, src, func(entry bbbfs.Entry) error {
+				return listCopyEntries(ctx, src, dst, sourceErr, nil, func(entry bbbfs.Entry) error {
 					if copyTreeProgress != nil {
 						copyTreeProgress.SetTotal(totalItems.Add(1))
 					}
@@ -2564,14 +2740,11 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		var ops []remoteCopyOp
 		var walkIssues bool
 		if bbbfs.IsRemote(src) {
-			for result := range bbbfs.ListRecursive(ctx, src) {
-				if result.Err != nil {
-					return result.Err
-				}
-				if result.Entry.IsDir {
-					continue
-				}
-				ops = append(ops, remoteCopyOp{name: result.Entry.Name})
+			if err := listCopyEntries(ctx, src, dst, sourceErr, nil, func(entry bbbfs.Entry) error {
+				ops = append(ops, remoteCopyOp{name: entry.Name})
+				return nil
+			}); err != nil {
+				return err
 			}
 		} else {
 			walkErr := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
@@ -2602,19 +2775,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 		// when uploading to Azure: total goroutines = fileWorkers ×
 		// blockConcurrency ≤ concurrency. Without this, each uploaded file would
 		// stage blocks serially (block concurrency 1).
-		fileWorkers := concurrency
-		blockConcurrency := concurrency
-		if dstObj {
-			if concurrency >= 2 {
-				fileWorkers = max(2, concurrency/4)
-				if fileWorkers > concurrency {
-					fileWorkers = concurrency
-				}
-			} else {
-				fileWorkers = 1
-			}
-			blockConcurrency = max(1, concurrency/fileWorkers)
-		}
+		fileWorkers, blockConcurrency := copyConcurrency(dst, concurrency)
 		err := runOpPoolWithRetryProgress(ctx, fileWorkers, retryCount, len(ops), quiet, errPrefix, func(pending chan<- remoteCopyOp) error {
 			for _, op := range ops {
 				if err := sendOp(ctx, pending, op); err != nil {
@@ -2624,7 +2785,14 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 			return nil
 		}, func(work remoteCopyOp) error {
 			srcPath := bbbfs.ChildPath(src, work.name)
-			dstPath := bbbfs.ChildPath(dst, work.name)
+			dstPath, err := copyDestination(src, dst, work.name)
+			if err != nil {
+				return err
+			}
+			var localTarget *localCopyTarget
+			if bbbfs.IsRemote(src) && !bbbfs.IsRemote(dst) {
+				localTarget = &localCopyTarget{root: dst, name: work.name}
+			}
 			if !overwrite {
 				if exists, _ := bbbfs.ExistsAsBlob(ctx, dstPath); exists {
 					return nil
@@ -2665,7 +2833,7 @@ func copyTree(ctx context.Context, src, dst string, overwrite, quiet bool, errPr
 						copyBar.render(copied)
 					},
 				})
-				return bbbfs.Resolve(dstPath).Write(writeCtx, dstPath, pr)
+				return writeCopyDestination(writeCtx, dstPath, localTarget, pr)
 			}); err != nil {
 				if copyBar != nil {
 					copyBar.Abort()
@@ -2819,7 +2987,8 @@ func cmdRM(ctx context.Context, c *cli.Command) error {
 			if err := bbbfs.Delete(ctx, op.path); err != nil {
 				if force {
 					lower := strings.ToLower(err.Error())
-					if strings.Contains(lower, "notfound") ||
+					if errors.Is(err, os.ErrNotExist) ||
+						strings.Contains(lower, "notfound") ||
 						strings.Contains(lower, "parse") ||
 						strings.Contains(lower, "invalid") {
 						return nil
@@ -2929,6 +3098,22 @@ func cmdShare(ctx context.Context, c *cli.Command) error {
 		fmt.Println("Direct Object (if public):", direct)
 		return nil
 	}
+	if bbbfs.IsGS(p) {
+		console, direct, err := bbbfs.ParseShareInfo(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "share: %s: %v\n", p, err)
+			return err
+		}
+		if console == direct {
+			// Emulators (e.g. fake-gcs-server) have no separate web console,
+			// so ShareInfo returns the same object URL for both.
+			fmt.Println("Object URL:", direct)
+			return nil
+		}
+		fmt.Println("Google Cloud Console:", console)
+		fmt.Println("Direct Object (if public):", direct)
+		return nil
+	}
 	// For local files, print a file:// link
 	abs, err := filepath.Abs(p)
 	if err != nil {
@@ -2937,14 +3122,6 @@ func cmdShare(ctx context.Context, c *cli.Command) error {
 	}
 	fmt.Println("file://" + abs)
 	return nil
-}
-
-func syncRemoteFiles(ctx context.Context, src string, excludeMatch func(string) bool) ([]string, error) {
-	files, err := bbbfs.ListFilesFlat(ctx, src)
-	if err != nil {
-		return nil, err
-	}
-	return filterExclude(files, excludeMatch), nil
 }
 
 func filterExclude(files []string, excludeMatch func(string) bool) []string {
@@ -3117,24 +3294,9 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		// for same-provider server-side copies and uploads to object stores:
 		// total goroutines = syncWorkers × blockConcurrency ≤ concurrency.
 		// Without this, uploads would stage blocks serially (block concurrency 1).
-		syncWorkers := concurrency
-		blockConcurrency := concurrency
-		if dstObj {
-			if concurrency < 2 {
-				syncWorkers = 1
-				blockConcurrency = 1
-			} else {
-				syncWorkers = max(2, concurrency/4)
-				if syncWorkers > concurrency {
-					syncWorkers = concurrency
-				}
-				blockConcurrency = max(1, concurrency/syncWorkers)
-			}
-		}
-		// Build producer: for object-store sources, stream listing into the
-		// worker pool so processing starts while listing continues. For HF and
-		// local→remote paths, collect first (these are either small or have
-		// different constraints).
+		syncWorkers, blockConcurrency := copyConcurrency(dst, concurrency)
+		// Remote destinations stream listing into the pool; local destinations
+		// validate the complete source name set before starting any writes.
 		var syncProgress *progressBar
 		if !quiet {
 			syncProgress = newStreamingProgressBar("sync", quiet, false)
@@ -3144,45 +3306,32 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 		}
 		var totalItems atomic.Int64
 		producer := func(pending chan<- item) error {
-			if srcObj {
-				return bbbfs.ListRecursiveWithSizeStream(ctx, src, func(entry bbbfs.Entry) error {
-					if entry.Name == "" || excludeMatch(entry.Name) {
-						return nil
-					}
+			if srcObj || srcHF || srcACR {
+				return listCopyEntries(ctx, src, dst, nil, excludeMatch, func(entry bbbfs.Entry) error {
 					if syncProgress != nil {
 						syncProgress.SetTotal(totalItems.Add(1))
 					}
 					return sendOp(ctx, pending, item{rel: entry.Name, size: entry.Size})
 				})
 			}
-			// HF, ACR and local→remote: collect first, then feed
+			// Local sources: collect first, then feed.
 			var files []item
-			if srcHF || srcACR {
-				list, err := syncRemoteFiles(ctx, src, excludeMatch)
+			if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
-				for _, name := range list {
-					files = append(files, item{rel: name})
-				}
-			} else {
-				if err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
-					if err != nil {
-						return err
-					}
-					if d.IsDir() {
-						return nil
-					}
-					rel, _ := filepath.Rel(src, p)
-					if excludeMatch(rel) {
-						return nil
-					}
-					info, _ := d.Info()
-					files = append(files, item{rel: rel, size: info.Size()})
+				if d.IsDir() {
 					return nil
-				}); err != nil {
-					return err
 				}
+				rel, _ := filepath.Rel(src, p)
+				if excludeMatch(rel) {
+					return nil
+				}
+				info, _ := d.Info()
+				files = append(files, item{rel: rel, size: info.Size()})
+				return nil
+			}); err != nil {
+				return err
 			}
 			if syncProgress != nil {
 				syncProgress.SetTotal(totalItems.Add(int64(len(files))))
@@ -3204,7 +3353,14 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 			}
 			sPath := f.rel
 			srcChild := bbbfs.ChildPath(src, sPath)
-			dstChild := bbbfs.ChildPath(dst, sPath)
+			dstChild, err := copyDestination(src, dst, sPath)
+			if err != nil {
+				return err
+			}
+			var localTarget *localCopyTarget
+			if bbbfs.IsRemote(src) && !bbbfs.IsRemote(dst) {
+				localTarget = &localCopyTarget{root: dst, name: sPath}
+			}
 			if bbbfs.CanCopyServerSide(srcChild, dstChild) {
 				if dry {
 					if !quiet {
@@ -3344,7 +3500,7 @@ func cmdSyncPaths(ctx context.Context, dry, del, quiet bool, exclude string, con
 				writeCtx = bbbfs.WithUploadConcurrency(ctx, blockConcurrency)
 			}
 			if err := withReadCloser(reader, func(r io.Reader) error {
-				return bbbfs.Resolve(dstChild).Write(writeCtx, dstChild, r)
+				return writeCopyDestination(writeCtx, dstChild, localTarget, r)
 			}); err != nil {
 				lockedFprintf(os.Stderr, "sync: %s: %v\n", sPath, err)
 				return fmt.Errorf("sync: %s: %w", sPath, err)
