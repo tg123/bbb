@@ -13,6 +13,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
+	"github.com/tg123/bbb/internal/acr"
 	"github.com/tg123/bbb/internal/hf"
 )
 
@@ -112,6 +113,11 @@ func IsHF(path string) bool {
 	return hfProvider.Match(path)
 }
 
+// IsACR returns true if the path targets an Azure Container Registry backend.
+func IsACR(path string) bool {
+	return acrProvider.Match(path)
+}
+
 // IsS3 returns true if the path targets an Amazon S3 (or S3-compatible) backend.
 func IsS3(path string) bool {
 	return s3Provider.Match(path)
@@ -126,7 +132,7 @@ func IsObjectStore(path string) bool {
 
 // IsRemote returns true if the path targets a remote (non-local) backend.
 func IsRemote(path string) bool {
-	return IsAz(path) || IsHF(path) || IsS3(path)
+	return IsAz(path) || IsHF(path) || IsS3(path) || IsACR(path)
 }
 
 // dirChecker is an optional FS extension for checking whether a path is directory-like.
@@ -336,6 +342,32 @@ func UploadReader(ctx context.Context, dst string, r io.Reader, concurrency int,
 	return Resolve(dst).Write(ctx, dst, r)
 }
 
+// ArtifactFile describes one file to publish in an artifact-oriented backend.
+// Open must return a fresh reader for each call.
+type ArtifactFile struct {
+	Name string
+	Size int64
+	Open func() (io.ReadCloser, error)
+}
+
+type artifactUploader interface {
+	UploadArtifact(ctx context.Context, dst string, files []ArtifactFile, concurrency int, overwrite bool, onProgress func(name string, uploaded int64)) error
+}
+
+// UploadArtifact publishes files atomically as one backend artifact.
+//
+// onProgress, when non-nil, receives a file's name and how many of its bytes
+// have been uploaded so far. The value is cumulative per file and may restart
+// at zero when a transfer is retried, so callers must track a high-water mark
+// per name instead of treating each call as a delta.
+func UploadArtifact(ctx context.Context, dst string, files []ArtifactFile, concurrency int, overwrite bool, onProgress func(name string, uploaded int64)) error {
+	uploader, ok := Resolve(dst).(artifactUploader)
+	if !ok {
+		return fmt.Errorf("artifact upload not supported for %s", dst)
+	}
+	return uploader.UploadArtifact(ctx, dst, files, concurrency, overwrite, onProgress)
+}
+
 // streamLister is an optional FS extension for streaming list.
 type streamLister interface {
 	ListStream(ctx context.Context, path string, fn func(Entry) error) error
@@ -420,12 +452,34 @@ func ExistsAsBlob(ctx context.Context, p string) (bool, error) {
 	return !entry.IsDir, nil
 }
 
-// IsNonRetryableHTTPErr returns true when err is an HTTP 401, 403, or 404
-// from any supported backend, indicating a non-retryable failure.
+// IsNonRetryableHTTPErr reports whether err represents a failure that retrying
+// cannot fix. That covers HTTP 401, 403 and 404 from any supported backend,
+// plus, for ACR, a destination artifact that already exists, and any backend
+// error exposing NotFound() == true.
+//
+// A bare 409 or 412 is deliberately absent: HTTPStatusError does not say which
+// request produced it, so treating those as final would also condemn a blob
+// upload or an overwrite push that a retry would complete. The one conflict
+// that is genuinely final — a create-only manifest write whose tag already
+// holds something else — is reported as ErrArtifactExists instead.
+//
+// A registry 404 is likewise not always final: an upload session the registry
+// has forgotten answers BLOB_UPLOAD_UNKNOWN, and starting the upload again is
+// exactly what recovers it, so the error code decides rather than the status.
 func IsNonRetryableHTTPErr(err error) bool {
+	if errors.Is(err, acr.ErrArtifactExists) {
+		return true
+	}
 	var hfErr *hf.HTTPStatusError
 	if errors.As(err, &hfErr) && (hfErr.StatusCode == 401 || hfErr.StatusCode == 403 || hfErr.StatusCode == 404) {
 		return true
+	}
+	var acrErr *acr.HTTPStatusError
+	if errors.As(err, &acrErr) && !acrErr.Recoverable() {
+		switch acrErr.StatusCode {
+		case 401, 403, 404:
+			return true
+		}
 	}
 	var azErr *azcore.ResponseError
 	if errors.As(err, &azErr) && (azErr.StatusCode == 401 || azErr.StatusCode == 403 || azErr.StatusCode == 404) {

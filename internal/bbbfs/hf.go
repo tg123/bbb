@@ -48,12 +48,12 @@ func (hfFS) List(ctx context.Context, target string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	hp.File = normalizeHFPrefix(hp.File)
+	hp.File = normalizePrefix(hp.File)
 	files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 	if err != nil {
 		return nil, err
 	}
-	entries := hfListEntries(files, hp.File)
+	entries := listEntriesByPrefix(files, hp.File)
 	out := make([]Entry, 0, len(entries))
 	for _, name := range entries {
 		trimmed := strings.TrimSuffix(name, "/")
@@ -92,7 +92,7 @@ func (hfFS) Stat(ctx context.Context, target string) (Entry, error) {
 	if err != nil {
 		return Entry{}, err
 	}
-	normalized := normalizeHFPrefix(hp.File)
+	normalized := normalizePrefix(hp.File)
 	found := false
 	for _, f := range files {
 		if f == normalized {
@@ -117,12 +117,12 @@ func (hfFS) ListRecursive(ctx context.Context, target string, emit func(Entry) e
 	if err != nil {
 		return err
 	}
-	hp.File = normalizeHFPrefix(hp.File)
+	hp.File = normalizePrefix(hp.File)
 	files, err := hf.ListFiles(ctx, hf.Path{Repo: hp.Repo})
 	if err != nil {
 		return err
 	}
-	filtered := hfFilterFiles(files, hp.File)
+	filtered := filterFilesByPrefix(files, hp.File)
 	sort.Strings(filtered)
 	for _, file := range filtered {
 		if file == "" {
@@ -189,68 +189,4 @@ func (hfFS) ListFilesFlat(ctx context.Context, p string) ([]string, error) {
 		return nil, fmt.Errorf("hf:// path must target repository root, not individual files")
 	}
 	return hf.ListFiles(ctx, hp)
-}
-
-func normalizeHFPrefix(prefix string) string {
-	for strings.HasPrefix(prefix, "/") {
-		prefix = strings.TrimPrefix(prefix, "/")
-	}
-	if prefix == "" {
-		return ""
-	}
-	prefix = path.Clean(prefix)
-	if prefix == "." {
-		return ""
-	}
-	return prefix
-}
-
-func hfFilterPrefix(prefix string) string {
-	prefix = normalizeHFPrefix(prefix)
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-	return prefix
-}
-
-func hfFilterFiles(files []string, prefix string) []string {
-	prefix = hfFilterPrefix(prefix)
-	out := make([]string, 0, len(files))
-	for _, file := range files {
-		if file == "" {
-			continue
-		}
-		if prefix != "" {
-			if !strings.HasPrefix(file, prefix) {
-				continue
-			}
-			file = strings.TrimPrefix(file, prefix)
-			if file == "" {
-				continue
-			}
-		}
-		out = append(out, file)
-	}
-	return out
-}
-
-func hfListEntries(files []string, prefix string) []string {
-	seen := map[string]struct{}{}
-	for _, file := range hfFilterFiles(files, prefix) {
-		parts := strings.SplitN(file, "/", 2)
-		name := parts[0]
-		if name == "" {
-			continue
-		}
-		if len(parts) > 1 {
-			name += "/"
-		}
-		seen[name] = struct{}{}
-	}
-	entries := make([]string, 0, len(seen))
-	for name := range seen {
-		entries = append(entries, name)
-	}
-	sort.Strings(entries)
-	return entries
 }
