@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 
 	"github.com/tg123/bbb/internal/bbbfs"
+	"golang.org/x/sync/semaphore"
 )
 
 type taskPair struct {
@@ -233,6 +234,33 @@ type cpTask struct {
 	size        int64        // known size from listing; 0 = unknown
 	tracker     *taskTracker // nil when no task-level checkpoint tracking
 	localTarget *localCopyTarget
+}
+
+func expandCPTaskWithBudget(ctx context.Context, task taskPair, slots *semaphore.Weighted, emit func(cpTask) error) error {
+	if err := slots.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	held := true
+	defer func() {
+		if held {
+			slots.Release(1)
+		}
+	}()
+	// Expansion issues sequential listing/metadata requests. Give its slot
+	// back before emitting: the bounded task channel may need a copy worker
+	// to acquire that slot to drain it, including at concurrency=1.
+	return expandCPTask(ctx, task, func(expanded cpTask) error {
+		slots.Release(1)
+		held = false
+		if err := emit(expanded); err != nil {
+			return err
+		}
+		if err := slots.Acquire(ctx, 1); err != nil {
+			return err
+		}
+		held = true
+		return nil
+	})
 }
 
 // expandCPTask streams file-level copy tasks for a taskfile pair via the emit

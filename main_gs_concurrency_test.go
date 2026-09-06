@@ -3,17 +3,21 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/tg123/bbb/internal/bbbfs"
+	"golang.org/x/sync/semaphore"
 )
 
 func TestCopyConcurrency(t *testing.T) {
@@ -126,6 +130,358 @@ func TestGCSUsesFullFileConcurrency(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestGCSTaskStreamSharesExpansionBudget(t *testing.T) {
+	const budget = 8
+	for _, expansion := range []string{"page", "metadata"} {
+		t.Run(expansion, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				var active, peak, transfers atomic.Int64
+				expansionStarted := make(chan struct{})
+				var expansionOnce sync.Once
+				finishExpansion := make(chan struct{})
+				finishTransfers := make(chan struct{})
+				var objects []map[string]string
+				for i := range budget - 1 {
+					objects = append(objects, map[string]string{
+						"bucket": "bucket", "name": fmt.Sprintf("source/file-%d", i), "size": "7", "generation": "1",
+					})
+				}
+				useGSIntegrationHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					n := active.Add(1)
+					defer active.Add(-1)
+					for old := peak.Load(); old < n && !peak.CompareAndSwap(old, n); old = peak.Load() {
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if r.Method == http.MethodGet {
+						isList := strings.HasSuffix(r.URL.Path, "/o")
+						if isList && r.URL.Query().Get("pageToken") == "" {
+							response := map[string]any{"items": objects}
+							if expansion == "page" {
+								response["nextPageToken"] = "next"
+							}
+							_ = json.NewEncoder(w).Encode(response)
+							return
+						}
+						if isList || strings.HasSuffix(r.URL.Path, "/o/probe") {
+							expansionOnce.Do(func() { close(expansionStarted) })
+							select {
+							case <-finishExpansion:
+							case <-r.Context().Done():
+								return
+							}
+							if isList {
+								_, _ = io.WriteString(w, `{"items":[]}`)
+							} else {
+								_ = json.NewEncoder(w).Encode(objects[0])
+							}
+							return
+						}
+						_ = json.NewEncoder(w).Encode(objects[0])
+						return
+					}
+					if r.Body != nil {
+						_, _ = io.Copy(io.Discard, r.Body)
+					}
+					transfers.Add(1)
+					select {
+					case <-finishTransfers:
+					case <-r.Context().Done():
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"done": true, "totalBytesRewritten": "7", "objectSize": "7", "resource": objects[0],
+					})
+				}))
+				errCh := make(chan error, 1)
+				go func() {
+					errCh <- runCPTaskStream(ctx, func(emit func(taskPair) error) error {
+						if err := emit(taskPair{src: "gs://bucket/source/", dst: "gs://bucket/destination/"}); err != nil {
+							return err
+						}
+						if expansion == "metadata" {
+							if err := emit(taskPair{src: "gs://bucket/probe", dst: "gs://bucket/probed"}); err != nil {
+								return err
+							}
+						}
+						<-expansionStarted
+						return emit(taskPair{src: "gs://bucket/extra", dst: "gs://bucket/extra-copy"})
+					}, true, true, budget, 0, "")
+				}()
+				synctest.Wait()
+				if got := transfers.Load(); got != budget-1 {
+					t.Errorf("transfers while expansion is active = %d, want %d", got, budget-1)
+				}
+				if got := peak.Load(); got > budget {
+					t.Errorf("aggregate request peak = %d, exceeds budget %d", got, budget)
+				}
+				close(finishExpansion)
+				synctest.Wait()
+				if got := active.Load(); got != budget {
+					t.Errorf("transfers after expansion finishes = %d, want %d", got, budget)
+				}
+				close(finishTransfers)
+				if err := <-errCh; err != nil {
+					t.Fatal(err)
+				}
+				if got := peak.Load(); got > budget {
+					t.Errorf("aggregate request peak = %d, exceeds budget %d", got, budget)
+				}
+			})
+		})
+	}
+}
+
+func TestGCSTaskStreamSingleSlotBackpressure(t *testing.T) {
+	const count = 4096 + 2
+	for _, outcome := range []string{"complete", "cancel", "failure"} {
+		t.Run(outcome, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				var transfers atomic.Int64
+				finishTransfers := make(chan struct{})
+				var objects []map[string]string
+				for i := range count {
+					objects = append(objects, map[string]string{
+						"bucket": "bucket", "name": fmt.Sprintf("source/file-%d", i), "size": "7", "generation": "1",
+					})
+				}
+				useGSIntegrationHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					if r.Method == http.MethodGet {
+						if strings.HasSuffix(r.URL.Path, "/o") {
+							_ = json.NewEncoder(w).Encode(map[string]any{"items": objects})
+						} else {
+							_ = json.NewEncoder(w).Encode(objects[0])
+						}
+						return
+					}
+					transfers.Add(1)
+					select {
+					case <-finishTransfers:
+					case <-r.Context().Done():
+						return
+					}
+					if outcome == "failure" {
+						w.WriteHeader(http.StatusForbidden)
+						_, _ = io.WriteString(w, `{"error":{"code":403,"message":"transfer failed"}}`)
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"done": true, "totalBytesRewritten": "7", "objectSize": "7", "resource": objects[0],
+					})
+				}))
+				errCh := make(chan error, 1)
+				go func() {
+					errCh <- runCPTaskStream(ctx, func(emit func(taskPair) error) error {
+						return emit(taskPair{src: "gs://bucket/source/", dst: "gs://bucket/destination/"})
+					}, true, true, 1, 0, "")
+				}()
+				synctest.Wait()
+				if got := transfers.Load(); got != 1 {
+					t.Errorf("transfers at backpressure = %d, want 1", got)
+				}
+				if outcome == "cancel" {
+					cancel()
+				} else {
+					close(finishTransfers)
+				}
+				err := <-errCh
+				switch outcome {
+				case "complete":
+					if err != nil || transfers.Load() != count {
+						t.Fatalf("completed %d/%d transfers: %v", transfers.Load(), count, err)
+					}
+				case "cancel":
+					if !errors.Is(err, context.Canceled) {
+						t.Fatalf("error = %v, want cancellation", err)
+					}
+				case "failure":
+					if err == nil || !strings.Contains(err.Error(), "transfer failed") {
+						t.Fatalf("error = %v, want transfer failure", err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestCPExpansionBudgetYieldsToBlockedEmitter(t *testing.T) {
+	for _, outcome := range []string{"complete", "emit-error", "cancel-reacquire"} {
+		t.Run(outcome, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				slots := semaphore.NewWeighted(1)
+				pending := make(chan cpTask, 1)
+				pending <- cpTask{}
+				emitErr := errors.New("emit failed")
+				errCh := make(chan error, 1)
+				go func() {
+					errCh <- expandCPTaskWithBudget(ctx, taskPair{src: "missing", dst: "unused"}, slots, func(task cpTask) error {
+						pending <- task
+						if outcome == "emit-error" {
+							return emitErr
+						}
+						return nil
+					})
+				}()
+				synctest.Wait()
+				if !slots.TryAcquire(1) {
+					t.Fatal("expansion retained the only slot while blocked on a full channel")
+				}
+				<-pending
+				synctest.Wait()
+				if outcome == "cancel-reacquire" {
+					cancel()
+				} else {
+					slots.Release(1)
+				}
+				err := <-errCh
+				switch outcome {
+				case "complete":
+					if err != nil {
+						t.Fatal(err)
+					}
+				case "emit-error":
+					if !errors.Is(err, emitErr) {
+						t.Fatalf("error = %v, want emitter error", err)
+					}
+				case "cancel-reacquire":
+					if !errors.Is(err, context.Canceled) {
+						t.Fatalf("error = %v, want cancellation", err)
+					}
+					slots.Release(1)
+				}
+				if !slots.TryAcquire(1) {
+					t.Fatal("expansion leaked its slot")
+				}
+				slots.Release(1)
+			})
+		})
+	}
+}
+
+func TestGCSTaskStreamMixedTransferWeights(t *testing.T) {
+	const budget = 8
+	local := t.TempDir()
+	src, dst := filepath.Join(local, "source"), filepath.Join(local, "destination")
+	if err := os.WriteFile(src, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	synctest.Test(t, func(t *testing.T) {
+		finishTransfers := make(chan struct{})
+		emitLocal := make(chan struct{})
+		var transfers atomic.Int64
+		useGSIntegrationHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			object := map[string]string{"bucket": "bucket", "name": "source", "size": "7", "generation": "1"}
+			if r.Method == http.MethodGet {
+				_ = json.NewEncoder(w).Encode(object)
+				return
+			}
+			transfers.Add(1)
+			<-finishTransfers
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"done": true, "totalBytesRewritten": "7", "objectSize": "7", "resource": object,
+			})
+		}))
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- runCPTaskStream(t.Context(), func(emit func(taskPair) error) error {
+				for i := range budget {
+					if err := emit(taskPair{src: "gs://bucket/source", dst: fmt.Sprintf("gs://bucket/copy-%d", i)}); err != nil {
+						return err
+					}
+				}
+				<-emitLocal
+				return emit(taskPair{src: src, dst: dst})
+			}, true, true, budget, 0, "")
+		}()
+		synctest.Wait()
+		if got := transfers.Load(); got != budget {
+			t.Errorf("active GCS transfers = %d, want %d", got, budget)
+		}
+		close(emitLocal)
+		synctest.Wait()
+		close(finishTransfers)
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+		if data, err := os.ReadFile(dst); err != nil || string(data) != "payload" {
+			t.Fatalf("weighted non-GCS task did not complete: %q, %v", data, err)
+		}
+	})
+}
+
+func TestGCSTaskStreamCheckpointsCopiesFinishedDuringExpansion(t *testing.T) {
+	for _, retryListing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retry=%t", retryListing), func(t *testing.T) {
+			stateFile := filepath.Join(t.TempDir(), "tasks.state")
+			synctest.Test(t, func(t *testing.T) {
+				finishListing := make(chan struct{})
+				var secondPages, transfers atomic.Int64
+				useGSIntegrationHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					object := map[string]string{"bucket": "bucket", "name": "source/file", "size": "7", "generation": "1"}
+					if r.Method == http.MethodGet {
+						if strings.HasSuffix(r.URL.Path, "/o") {
+							if r.URL.Query().Get("pageToken") == "" {
+								_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{object}, "nextPageToken": "next"})
+							} else {
+								attempt := secondPages.Add(1)
+								<-finishListing
+								if retryListing && attempt == 1 {
+									_, _ = io.WriteString(w, `{`)
+								} else {
+									_, _ = io.WriteString(w, `{"items":[]}`)
+								}
+							}
+						} else {
+							_ = json.NewEncoder(w).Encode(object)
+						}
+						return
+					}
+					transfers.Add(1)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"done": true, "totalBytesRewritten": "7", "objectSize": "7", "resource": object,
+					})
+				}))
+				errCh := make(chan error, 1)
+				pair := taskPair{src: "gs://bucket/source/", dst: "gs://bucket/destination/"}
+				go func() {
+					errCh <- runCPTaskStream(t.Context(), func(emit func(taskPair) error) error {
+						return emit(pair)
+					}, true, true, 2, 1, stateFile)
+				}()
+				synctest.Wait()
+				if got := transfers.Load(); got != 1 {
+					t.Errorf("copies finished before listing = %d, want 1", got)
+				}
+				close(finishListing)
+				if err := <-errCh; err != nil {
+					t.Fatal(err)
+				}
+				state, checkpoints, err := loadTaskState(stateFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, ok := checkpoints[taskCheckpointKey(pair.src, pair.dst)]; !ok {
+					t.Errorf("missing completed task checkpoint: %v", checkpoints)
+				}
+				if len(state) != 1 || transfers.Load() != 1 {
+					t.Errorf("copied or checkpointed files more than once: state=%v, transfers=%d", state, transfers.Load())
+				}
+				if retryListing && secondPages.Load() != 2 {
+					t.Errorf("listing attempts = %d, want 2", secondPages.Load())
+				}
+			})
+		})
 	}
 }
 

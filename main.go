@@ -1549,7 +1549,7 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 	// GCS writes use one request at a time per object. Let those tasks use
 	// all file slots, while retaining the existing limits for block transfers.
 	legacyFileSlots := semaphore.NewWeighted(int64(cpWorkers))
-	transferSlots := semaphore.NewWeighted(int64(workers))
+	requestSlots := semaphore.NewWeighted(int64(workers))
 	innerQuiet := true
 	showCopyBars := !quiet
 	workerCtx, cancel := context.WithCancel(ctx)
@@ -1619,10 +1619,10 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 							}
 							defer legacyFileSlots.Release(1)
 						}
-						if err := transferSlots.Acquire(copyCtx, int64(taskConcurrency)); err != nil {
+						if err := requestSlots.Acquire(copyCtx, int64(taskConcurrency)); err != nil {
 							return err
 						}
-						defer transferSlots.Release(int64(taskConcurrency))
+						defer requestSlots.Release(int64(taskConcurrency))
 						return cmdCPPaths(copyCtx, overwrite, innerQuiet, taskConcurrency, retryCount, []string{task.src}, task.dst, task.size, showCopyBars, bytesCb)
 					}()
 					if err != nil {
@@ -1654,7 +1654,7 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 		}()
 	}
 
-	// Dedicated expander pool uses goroutines from the concurrency budget.
+	// Expanders share the request budget with transfers, yielding while emitting.
 	pairCh := make(chan taskPair, expanders*2)
 	var seenMu sync.Mutex
 	var expandWG sync.WaitGroup
@@ -1721,8 +1721,7 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 						return nil
 					}
 					if err := retryOp(workerCtx, retryCount, func() error {
-						pendingCount = 0
-						return expandCPTask(workerCtx, task, expandEmit)
+						return expandCPTaskWithBudget(workerCtx, task, requestSlots, expandEmit)
 					}); err != nil {
 						setErr(fmt.Errorf("cp: expand task %s -> %s: %w", task.src, task.dst, err))
 						return
@@ -1733,8 +1732,9 @@ func runCPTaskStream(ctx context.Context, produce func(func(taskPair) error) err
 						taskProgress.SetTotal(totalPending.Load())
 					}
 					if tracker != nil {
-						tracker.remaining.Store(pendingCount)
-						if pendingCount == 0 {
+						// Workers can finish while expansion yields its request
+						// slot. Preserve their decrements, including across retries.
+						if tracker.remaining.Add(pendingCount) == 0 {
 							if err := stateAppender.appendCheckpoint(cpKey); err != nil {
 								setErr(err)
 								return

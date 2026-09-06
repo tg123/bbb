@@ -391,6 +391,10 @@ bbb ls gs://mybucket/
 GCS→GCS copies use the server-side rewrite API — which handles objects of any
 size — and never stream bytes through the client.
 
+Copy task streams to GCS share the `--concurrency` budget between source
+expansion and transfers. Once expansion finishes, transfers can use the full
+budget.
+
 GCS tree copies and syncs reject overlapping source and destination prefixes
 in the same bucket before listing or copying objects. This includes equal
 prefixes and either prefix containing the other.
