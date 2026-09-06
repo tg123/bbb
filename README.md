@@ -1,6 +1,6 @@
 # bbb
 
-A Go fork of [boostedblob](https://github.com/hauntsaninja/boostedblob) — a fast, concurrent CLI for working with local files, Azure Blob Storage (`az://`), Amazon S3 (`s3://`), and Hugging Face (`hf://`).
+A Go fork of [boostedblob](https://github.com/hauntsaninja/boostedblob) — a fast, concurrent CLI for working with local files, Azure Blob Storage (`az://`), Amazon S3 (`s3://`), Hugging Face (`hf://`), and Azure Container Registry artifacts (`acr://`).
 
 ## Why a fork of boostedblob
 
@@ -56,6 +56,122 @@ To use Azure CLI / managed identity based login, mount the host credentials, e.g
 | `az://` | Azure Blob Storage | `az://myaccount/mycontainer/path/to/blob` |
 | `s3://` | Amazon S3 (and S3-compatible stores) | `s3://mybucket/path/to/object` |
 | `hf://` | Hugging Face Hub | `hf://meta-llama/Llama-2-7b/weights.bin`, `hf://datasets/org/repo/data.csv` |
+| `acr://` | Azure Container Registry (OCI artifacts) | `acr://myregistry.azurecr.io/models/llama:v1`, `acr://myregistry/models/llama:v1/weights.bin` |
+
+### `acr://` paths
+
+An `acr://` path addresses an OCI artifact in an Azure Container Registry (or any registry implementing the OCI distribution spec):
+
+```
+acr://<registry>                           # lists the registry's repositories
+acr://<registry>/<repository>              # lists the repository's tags
+acr://<registry>/<repository>:<tag>[/<file>]
+acr://<registry>/<repository>@<digest>[/<file>]
+```
+
+A registry name without a dot is expanded to `<name>.azurecr.io`, and paths are printed back in that short form. A path names one of three things, each a directory of the next:
+
+```bash
+$ bbb ls acr://myregistry                 # repositories
+acr://myregistry/models/llama
+acr://myregistry/orng
+
+$ bbb ls acr://myregistry/orng            # tags
+acr://myregistry/orng:0.1.2030838
+acr://myregistry/orng:latest
+
+$ bbb ls acr://myregistry/orng:latest     # the artifact's files
+acr://myregistry/orng:latest/weights.bin
+```
+
+Repository names are reported exactly as the registry holds them, slashes included: `models/llama` is one repository, not a directory containing another. A repository has no implicit `:latest` — a tag that need not exist — so reading or publishing needs one named. Recursive commands likewise need a tag, since walking a repository would mean resolving every tag it holds.
+
+The "files" of an artifact are its layers; each layer's name comes from the standard `org.opencontainers.image.title` annotation, falling back to its digest (e.g. `sha256-abc...`) when the annotation is missing. Because a file name follows the tag or digest, a file can only be addressed on a path that specifies one.
+
+Layer names are validated lexically before use: absolute paths, `..` traversal, backslashes, colons, characters Windows forbids (`<>"|?*` and control characters), Windows reserved device names (`NUL`, `CON.txt`, …) and segments ending in a dot or space are rejected. A name that is not already canonical (`a/./b`, `a//b`, `dir/`) is refused rather than repaired — the registry chooses these names, so a rewrite would put the bytes somewhere the manifest never declared; a single leading `./` is trimmed, since it names the same file. A name that is an ancestor of another (`a` alongside `a/b`) is rejected too, since no filesystem can hold a file and a directory at one path, as are names differing only in case (`A.txt` and `a.txt`), which alias on Windows and macOS. Note this is not full extraction containment — as with the other remote backends, files are written through the normal local path, which follows pre-existing symlinks in the destination. Extract untrusted artifacts into a fresh directory.
+
+Layer contents are verified against the digest recorded in the manifest, so a corrupt registry or proxy cannot silently return different bytes.
+
+An `acr://` destination must identify an artifact tag, not an individual file or digest. Copying or syncing one local file or directory uploads each file as an OCI layer and publishes the tag only after every layer succeeds:
+
+```bash
+bbb cp ./llama-artifact/ acr://myregistry/models/llama:v1
+bbb cp ./weights.bin acr://myregistry/models/weights:v1
+bbb sync ./llama-artifact/ acr://myregistry/models/llama:v1
+```
+
+Use `-f` with `cp` to replace an existing tag. Without it the manifest is written with `If-None-Match: *` and the published digest is checked afterwards, so a tag already holding *different* content is refused; a tag that already holds exactly the artifact being published is reported as success, which is what lets `--retry-count` finish a push whose response was lost. Note that a registry is not obliged to honour that condition and the distribution API offers no other way to claim a tag conditionally: against one that ignores it, two publishers racing for the same tag can both write, and the after-the-fact check reports an error to whichever lost rather than preventing the overwrite. Serialise publication elsewhere if that can happen. `sync` always replaces the destination tag; its exclude filter controls which files become layers.
+
+Authentication is resolved in this order:
+
+1. `BBB_ACR_USERNAME` / `BBB_ACR_PASSWORD` (registry credentials or a token), together with `BBB_ACR_REGISTRY` naming the host or hosts they belong to. All three are required: one invocation can address several registries, and an Azure suffix is not a scope — anyone can own a `*.azurecr.io` registry, so a taskfile touching two of them would otherwise send credentials meant for one to the other.
+2. Entra ID (Azure AD) via `DefaultAzureCredential` — Azure CLI login, service principal, managed identity, workload identity — exchanged for a registry token
+3. The Docker keychain (`~/.docker/config.json` and credential helpers), so a prior `docker login` works for any registry, including anonymous pull
+
+Because the Entra step posts a live Azure access token to the registry, it is only attempted for Azure Container Registry hosts (`*.azurecr.io`, `*.azurecr.cn`, `*.azurecr.us`). Any other registry — a private `ghcr.io` repository, say — goes straight to the Docker keychain rather than being offered your Azure credential. Add custom-domain ACR hosts to `BBB_ACR_ENTRA_HOSTS` to opt them in. The Resource Manager audience and the sign-in authority both follow the registry's cloud, so sovereign endpoints authenticate against their own. The exchange stops at an ACR refresh token, which is presented per request so the registry's challenge names the exact repository scope — the same flow `docker` uses after `az acr login`.
+
+#### Container images
+
+A container image stores its files *inside* its layers rather than as layers, so the naming above describes nothing useful for one: image layers carry no title, leaving only digests. `bbb` bridges that in two ways.
+
+A manifest reached through an index is prefixed with its platform, so the members of a multi-platform image are told apart by `os/arch` instead of by digest. A layer that is a filesystem tarball is presented as a directory of its entries:
+
+```bash
+$ bbb ls acr://myregistry/orng:latest
+acr://myregistry/orng:latest/darwin
+acr://myregistry/orng:latest/linux
+acr://myregistry/orng:latest/windows
+
+$ bbb ls acr://myregistry/orng:latest/linux/amd64
+acr://myregistry/orng:latest/linux/amd64/orng
+
+$ bbb cp acr://myregistry/orng:latest/linux/amd64/orng ./orng
+```
+
+Listing a layer means transferring it, so it happens only when a path reaches inside one — listing the root of a multi-platform image is answered from the index alone. Each file read reopens its layer, so pulling one or two files out of an image costs one layer read each, while copying a whole image directory re-reads the layer per file; extract what you need rather than mirroring an image. Within a manifest, layers overlay: a later layer replaces what an earlier one wrote and `.wh.` whiteouts remove it (including whole subtrees, and everything at the root for `.wh..wh..opq`), so the listing reflects the image's final filesystem. Only regular files are listed; directories, symlinks and device nodes are not files that can be streamed. Entry names are validated as written rather than repaired, so an entry that would need cleaning is refused instead of being admitted under a harmless-looking name, and the merged names are held to the same collision rules as layer titles — an image containing both `A.txt` and `a.txt` is rejected rather than silently collapsed on a case-insensitive destination.
+
+Permissions are not carried across — like every other `bbb` transfer, files are written `0644`, so an extracted binary needs `chmod +x`. Zstd-compressed layers (`application/vnd.oci.image.layer.v1.tar+zstd`) are left as opaque blobs rather than expanded, so an image built with zstd compression lists its layers by digest as before. Non-distributable (foreign) layers, which Windows base images use, are expanded like any other — the blob is read from the registry by digest and the descriptor's URLs are never followed, so if your registry does not hold the blob the error says so and names where the manifest claims it lives; mirror it in first. A manifest declaring more than 1024 filesystem layers is refused, since applying a layer costs a pass over the ones below it; real images are far below that (Docker's own ceiling is 127). Artifacts published by `bbb` are unaffected by any of this: their layers are not tarballs and are never expanded.
+
+#### Registries in another tenant
+
+If the registry is not in your credential's home tenant, ACR rejects the token with `unknown tenantId`. `bbb` then opens a browser so you can sign in with an account that does have access, retries, and reports the tenant it turned out to be:
+
+```
+  Your Azure sign-in is not valid for "myregistry.azurecr.io".
+  Opening a browser — choose an account in the registry's tenant.
+  Signed in to tenant 8b9ebe14-... Set BBB_ACR_TENANT_MYREGISTRY_AZURECR_IO=8b9ebe14-... to skip this prompt.
+```
+
+The prompt comes *after* the rejection because an ACR endpoint never reveals its tenant — every `WWW-Authenticate` challenge carries only `realm`, `service` and `scope`, with no `authorization_uri`, and a registry in another tenant is invisible to Resource Manager until you already hold a token for it. This is the one place `acr://` cannot behave like `az://`, which discovers a storage account's tenant up front and so can prompt before making a request.
+
+Naming the tenant skips the failed attempt entirely:
+
+```bash
+# Per registry (host form, or just the registry short name)
+export BBB_ACR_TENANT_MYREGISTRY_AZURECR_IO=<tenant-id>
+export BBB_ACR_TENANT_MYREGISTRY=<tenant-id>
+
+# Or as a default for every acr:// registry
+export BBB_ACR_TENANT=<tenant-id>
+```
+
+With a tenant set, `bbb` mirrors `az://`: it uses your Azure CLI login for that tenant, verifies the token really was issued by it — `az` can hold a token only for your home tenant and return that whatever you asked for — and otherwise signs you in. A browser opens, falling back to a device code when there is no browser to open, as over SSH or inside WSL. Only one sign-in is opened per tenant no matter how many transfers are running, and a tenant discovered by signing in is reused for the rest of the run.
+
+The CLI login is read through `az` itself, so `AZURE_CONFIG_DIR` selects which profile is used. Being signed in to a tenant is not the same as holding a usable token for it — a profile whose session has lapsed reports `Status_InteractionRequired` for every resource — so when the CLI cannot answer, `bbb` says so before opening a prompt:
+
+```
+  The Azure CLI has no usable token for tenant 8b9ebe14-...; `az login --tenant 8b9ebe14-...` would avoid this prompt.
+```
+
+Signing in requires a terminal, so a pipeline never blocks on a prompt it cannot answer; without one the rejection is reported along with the variable to set. `BBB_ACR_NO_LOGIN=1` suppresses the prompt for an interactive shell that should never show one.
+
+The sign-in lasts for the life of the process, so prefer `az login --tenant <tenant-id>` for repeated use: that persists, and `bbb` then takes the CLI path with no prompt at all.
+
+Writing requires credentials with push access to the target repository.
+
+The registry protocol is handled by [go-containerregistry](https://github.com/google/go-containerregistry), so manifest resolution, blob transfer, digest verification and auth challenges follow the same well-tested implementation used by `crane` and `ko`. Registries on `localhost` and loopback addresses are contacted over plain HTTP automatically, which is what makes a local `registry:2` container usable without extra configuration. A private (RFC1918) IP literal would also be downgraded to HTTP, so it must be opted in with `BBB_ACR_INSECURE`; address the registry by a name that resolves over HTTPS instead.
+
+Multi-manifest artifacts are supported: when a reference resolves to an image index, the layers of every child manifest are merged into one file listing.
 
 ## Global Flags
 
@@ -89,6 +205,14 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_DNS_CACHE` | *(off)* | Set to `1` or `true` to enable process-local DNS caching |
 | `BBB_DNS_PIN` | *(off)* | Set to `1` or `true` to pin DNS to a single IP (implies `BBB_DNS_CACHE=1`) |
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
+| `BBB_ACR_USERNAME` | | Username for `acr://` registry authentication (used with `BBB_ACR_PASSWORD`) |
+| `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
+| `BBB_ACR_REGISTRY` | | Comma separated hosts the `BBB_ACR_USERNAME`/`BBB_ACR_PASSWORD` credentials belong to. Required for those credentials to be used at all. Entries match on scheme and port, so `host` over HTTP is not the same endpoint as `host:443` |
+| `BBB_ACR_ENTRA_HOSTS` | | Comma separated extra registry hosts allowed to receive Entra ID credentials, for ACR behind a custom domain. Matched with HTTPS port semantics, since the token exchange always uses HTTPS |
+| `BBB_ACR_TENANT_<REGISTRY>` | | Entra tenant to authenticate a registry against, by host (`BBB_ACR_TENANT_MYREG_AZURECR_IO`) or short name (`BBB_ACR_TENANT_MYREG`). Optional: without it a cross-tenant registry prompts a sign-in and reports the tenant to set |
+| `BBB_ACR_TENANT` | | Entra tenant for every `acr://` registry that has no host-specific setting |
+| `BBB_ACR_NO_LOGIN` | `false` | Never open an interactive Entra sign-in; report the tenant mismatch instead. Prompts are already suppressed when no terminal is attached |
+| `BBB_ACR_INSECURE` | | Comma separated registry hosts that may be contacted over plain HTTP. Required for private (RFC1918) IP literals, and for any other host go-containerregistry will not use TLS for; loopback is always allowed |
 | `SRC_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for source storage accounts only |
 | `DST_BBB_AZBLOB_ACCOUNTKEY` | | Shared key for destination storage accounts only |
 | `BBB_PARALLEL_DOWNLOAD` | `1` (`true`) | Set to `0` or `false` to disable parallel ranged Azure→local single-file downloads and fall back to a single streaming connection |
@@ -368,6 +492,9 @@ bbb ls -l az://myaccount/mycontainer/
 
 # List Hugging Face repo files with relative paths
 bbb ls -s hf://meta-llama/Llama-2-7b/
+
+# List the files of an OCI artifact in Azure Container Registry
+bbb ls acr://myregistry/models/llama:v1
 ```
 
 ---
@@ -508,7 +635,7 @@ bbb touch az://myaccount/mycontainer/marker.txt
 
 Aliases: `cpr`, `cptree`
 
-Copy one or more source files/directories to a destination. Supports local and Azure Blob paths in any combination. Hugging Face (`hf://`) paths are supported as a **source only** (the `hf://` backend is read-only).
+Copy one or more source files/directories to a destination. Supports local and Azure Blob paths in any combination. Hugging Face (`hf://`) is source-only. Azure Container Registry (`acr://`) can be a source, or a destination when pushing one local file or directory as an OCI artifact.
 
 ```
 bbb cp [flags] src [src ...] dst
@@ -540,6 +667,15 @@ bbb cp az://myaccount/src-container/data/ az://myaccount/dst-container/data/
 
 # Download from Hugging Face (hf:// is source-only)
 bbb cp hf://meta-llama/Llama-2-7b/ ./llama-model/
+
+# Download an OCI artifact from Azure Container Registry
+bbb cp acr://myregistry/models/llama:v1 ./llama-artifact/
+
+# Download a single file from an artifact
+bbb cp acr://myregistry/models/llama:v1/weights.bin ./weights.bin
+
+# Push a local directory as one OCI artifact
+bbb cp ./llama-artifact/ acr://myregistry/models/llama:v1
 
 # Copy multiple sources to one destination
 bbb cp file1.txt file2.txt az://myaccount/mycontainer/uploads/
@@ -649,11 +785,20 @@ bbb sync [flags] src dst
 | `--taskfile FILE` | Batch task file with one `src dst` pair per line; use `-` for stdin |
 | `--state FILE` | State file for crash recovery / resuming interrupted operations |
 | `--dry-run` | Show what would be done without making changes |
-| `--delete` | Delete destination files that don't exist in source |
+| `--delete` | Delete destination files that don't exist in source (local→local only; see note below) |
 | `-x`, `--exclude PATTERN` | Exclude files matching this regex pattern |
 | `-q`, `--quiet` | Suppress output |
 | `--concurrency N` | Number of concurrent transfers (default: CPU cores) |
 | `--retry-count N` | Number of retries on failure (default: `0`) |
+
+> **`--delete` support:** The delete phase is only implemented for local→local
+> syncs. Any sync involving a remote backend on either side — including
+> remote→local, such as `az://… -> ./local` — copies the source but keeps stale
+> destination files, and prints a warning saying so. With an `acr://` source,
+> `--delete` is rejected outright. An `acr://` destination needs no delete
+> phase: the push replaces the tag with a manifest listing exactly the selected
+> source files, so an empty or fully excluded source publishes an empty
+> artifact rather than leaving the previous contents in place.
 
 **Examples:**
 
@@ -664,8 +809,8 @@ bbb sync ./data/ az://myaccount/mycontainer/data/
 # Sync from Azure to local
 bbb sync az://myaccount/mycontainer/data/ ./local-data/
 
-# Mirror (delete extra files at destination)
-bbb sync --delete ./source/ az://myaccount/mycontainer/dest/
+# Mirror (delete extra files at destination; local→local only)
+bbb sync --delete ./source/ ./dest/
 
 # Preview changes without applying
 bbb sync --dry-run ./data/ az://myaccount/mycontainer/data/
