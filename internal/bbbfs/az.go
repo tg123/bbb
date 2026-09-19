@@ -417,7 +417,12 @@ func AzAccountContainer(p string) (account, container string, err error) {
 // used for authentication in multi-tenant environments.
 //
 // If the same account appears in both srcPaths and dstPaths it is not tagged
-// with any role, so the normal (non-role-scoped) credential flow is used.
+// with any role. Identity credential lookup for untagged accounts still uses
+// SRC_AZURE_* overrides and unprefixed AZURE_* defaults.
+//
+// The function is safe to call repeatedly with a growing set of paths (as
+// happens when task pairs are streamed): an account previously tagged with a
+// role has its tag cleared once it is seen in both roles.
 func RegisterAzAccountRoles(srcPaths, dstPaths []string) {
 	srcAccounts := make(map[string]struct{})
 	for _, p := range srcPaths {
@@ -445,12 +450,14 @@ func RegisterAzAccountRoles(srcPaths, dstPaths []string) {
 
 	for acct := range srcAccounts {
 		if _, both := dstAccounts[acct]; both {
-			continue // account is both src and dst — skip role tagging
+			azblob.ClearAccountRole(acct) // account is both src and dst — no role tagging
+			continue
 		}
 		azblob.RegisterAccountRole(acct, "SRC")
 	}
 	for acct := range dstAccounts {
 		if _, both := srcAccounts[acct]; both {
+			azblob.ClearAccountRole(acct)
 			continue
 		}
 		azblob.RegisterAccountRole(acct, "DST")

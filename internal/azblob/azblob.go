@@ -515,8 +515,16 @@ func PreAuthenticate(ctx context.Context, accounts ...string) error {
 // with the matching role will use those credentials instead of AzureCLI or
 // interactive browser login. This makes authentication machine-friendly for
 // CI/CD and multi-tenant environments.
+// Changing the role invalidates cached blob clients and delegation credentials.
 func RegisterAccountRole(account, role string) {
-	accountRoles.Store(account, strings.ToUpper(role))
+	role = strings.ToUpper(role)
+	udcCacheMu.Lock()
+	defer udcCacheMu.Unlock()
+	if current, ok := accountRoles.Load(account); ok && current.(string) == role {
+		return
+	}
+	accountRoles.Store(account, role)
+	invalidateAccountClientsLocked(account)
 }
 
 // AccountRole returns the role ("SRC" or "DST") registered for the given
@@ -529,10 +537,25 @@ func AccountRole(account string) (string, bool) {
 	return v.(string), true
 }
 
-// ClearAccountRole removes the role registration for the given account.
-// This is used in tests to reset state between subtests.
+// ClearAccountRole removes the role registration and invalidates cached blob
+// clients and delegation credentials created while that registration was active.
 func ClearAccountRole(account string) {
-	accountRoles.Delete(account)
+	udcCacheMu.Lock()
+	defer udcCacheMu.Unlock()
+	if _, loaded := accountRoles.LoadAndDelete(account); loaded {
+		invalidateAccountClientsLocked(account)
+	}
+}
+
+// invalidateAccountClientsLocked requires udcCacheMu to be held.
+func invalidateAccountClientsLocked(account string) {
+	blobClientCache.Delete(account)
+	delete(udcCache, account)
+	if ch, ok := udcInflight[account]; ok {
+		// Wake waiters and prevent the old refresh from repopulating the cache.
+		delete(udcInflight, account)
+		close(ch)
+	}
 }
 
 // roleEnvVars lists all Azure identity environment variables that are
@@ -1136,10 +1159,8 @@ func uploadInitialConcurrencyForSize(caller int, size int64) int {
 // BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX). The optional onProgress callback
 // receives the cumulative number of bytes staged.
 //
-// If staging is rejected with InvalidBlobOrBlock — which happens when the
-// destination retains uncommitted blocks of a different block-ID length from a
-// prior aborted upload — the poisoned blob is cleared and the upload is retried
-// once from a clean slate.
+// If staging is rejected because stale uncommitted blocks poison the
+// destination, the blob is cleared and the upload is retried once.
 func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency int, onProgress func(int64)) error {
 	// Guard against non-monotonic progress across the self-heal retry below,
 	// which restarts the byte counter from zero.
@@ -1152,10 +1173,14 @@ func UploadFile(ctx context.Context, ap AzurePath, file *os.File, concurrency in
 		onProgress = monotonicProgress(&last, onProgress)
 	}
 	err := uploadFileOnce(ctx, ap, file, concurrency, onProgress)
-	if err != nil && isInvalidBlobOrBlock(err) {
-		slog.Warn("upload hit InvalidBlobOrBlock; clearing stale uncommitted blocks and retrying", "dst", ap.String())
-		if client, cerr := getAzBlobClient(ctx, ap.Account); cerr == nil {
-			clearUncommittedBlocks(ctx, client, ap)
+	if err != nil && isStaleUncommittedBlockError(err) {
+		slog.Warn("upload hit stale uncommitted blocks; clearing destination and retrying", "dst", ap.String())
+		client, clientErr := getAzBlobClient(ctx, ap.Account)
+		if clientErr != nil {
+			return errors.Join(err, fmt.Errorf("get client to clear stale uncommitted blocks: %w", clientErr))
+		}
+		if clearErr := clearUncommittedBlocks(ctx, client, ap); clearErr != nil {
+			return errors.Join(err, clearErr)
 		}
 		err = uploadFileOnce(ctx, ap, file, concurrency, onProgress)
 	}
@@ -1728,32 +1753,35 @@ func planBlocks(totalSize int64, defaultBlockSize int64, maxBlocks int64) (block
 	return blockSize, ids, nil
 }
 
-// isInvalidBlobOrBlock reports whether err is an Azure "InvalidBlobOrBlock"
-// (HTTP 400) response. This occurs when a block blob has pre-existing
-// uncommitted blocks whose IDs differ in length from the ones being staged —
-// e.g. left behind by a prior aborted upload that used a different block
-// size/ID scheme. Azure requires every block ID for a blob to be the same
-// length, so staging new blocks on such a "poisoned" blob is rejected until the
-// stale uncommitted blocks are cleared.
-func isInvalidBlobOrBlock(err error) bool {
+// isStaleUncommittedBlockError reports errors caused by orphaned blocks from
+// prior interrupted uploads. Those blocks can either use an incompatible ID
+// length or accumulate past Azure's 100,000-uncommitted-block limit.
+func isStaleUncommittedBlockError(err error) bool {
 	var respErr *azcore.ResponseError
-	return errors.As(err, &respErr) && respErr.ErrorCode == string(bloberror.InvalidBlobOrBlock)
+	if !errors.As(err, &respErr) {
+		return false
+	}
+	return respErr.ErrorCode == string(bloberror.InvalidBlobOrBlock) ||
+		respErr.ErrorCode == "BlockCountExceedsLimit"
 }
 
-// clearUncommittedBlocks deletes the destination blob to discard any
-// uncommitted blocks poisoning it, so a subsequent staged upload starts from a
-// clean slate. Best effort: a missing blob (BlobNotFound — nothing to clear) is
-// expected and ignored silently; any other delete error is logged at Warn for
-// diagnosis but not returned, since the caller retries the upload regardless.
-func clearUncommittedBlocks(ctx context.Context, client *azblob.Client, ap AzurePath) {
+// clearUncommittedBlocks commits an empty block list to discard every orphaned
+// block, then best-effort deletes the temporary empty blob. Delete alone is
+// insufficient when no committed blob exists: Azure returns BlobNotFound but
+// retains the uncommitted blocks.
+func clearUncommittedBlocks(ctx context.Context, client *azblob.Client, ap AzurePath) error {
 	bbc := client.ServiceClient().NewContainerClient(ap.Container).NewBlockBlobClient(ap.Blob)
+	if _, err := bbc.CommitBlockList(ctx, nil, nil); err != nil {
+		return fmt.Errorf("clear stale uncommitted blocks for %s: %w", ap.String(), err)
+	}
 	if _, err := bbc.Delete(ctx, nil); err != nil {
 		var respErr *azcore.ResponseError
 		if errors.As(err, &respErr) && respErr.ErrorCode == string(bloberror.BlobNotFound) {
-			return
+			return nil
 		}
-		slog.Warn("clearUncommittedBlocks: delete failed (ignored)", "dst", ap.String(), "err", err)
+		slog.Warn("delete cleared blob failed (ignored)", "dst", ap.String(), "err", err)
 	}
+	return nil
 }
 
 // CopyProgress is called during server-side copy with the number of
@@ -2015,10 +2043,8 @@ func CopyBlobFromURLServerSide(ctx context.Context, dst AzurePath, sourceURL str
 
 // copyBlobBlocks copies a blob using parallel StageBlockFromURL + CommitBlockList.
 //
-// If staging is rejected with InvalidBlobOrBlock — which happens when the
-// destination retains uncommitted blocks of a different block-ID length from a
-// prior aborted upload — the poisoned blob is cleared and the copy is retried
-// once from a clean slate.
+// If staging is rejected because stale uncommitted blocks poison the
+// destination, the blob is cleared and the copy is retried once.
 func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, concurrency int, onProgress CopyProgress) error {
 	// Guard against non-monotonic progress across the self-heal retry below,
 	// which restarts the byte counter from zero.
@@ -2033,9 +2059,11 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 		onProgress = func(copied, _ int64) { emit(copied) }
 	}
 	err := copyBlobBlocksOnce(ctx, client, dst, copySource, sourceAuth, totalSize, concurrency, onProgress)
-	if err != nil && isInvalidBlobOrBlock(err) {
-		slog.Warn("server-side copy hit InvalidBlobOrBlock; clearing stale uncommitted blocks and retrying", "dst", dst.String())
-		clearUncommittedBlocks(ctx, client, dst)
+	if err != nil && isStaleUncommittedBlockError(err) {
+		slog.Warn("server-side copy hit stale uncommitted blocks; clearing destination and retrying", "dst", dst.String())
+		if clearErr := clearUncommittedBlocks(ctx, client, dst); clearErr != nil {
+			return errors.Join(err, clearErr)
+		}
 		err = copyBlobBlocksOnce(ctx, client, dst, copySource, sourceAuth, totalSize, concurrency, onProgress)
 	}
 	return err
@@ -2264,10 +2292,13 @@ var (
 
 // getUDC returns a cached User Delegation Credential for the account,
 // refreshing it when necessary. Thread-safe. Concurrent refresh requests
-// for the same account are deduped: the first goroutine performs the
-// network call while others wait for it to finish.
+// for the same account and role registration are deduped: the first goroutine
+// performs the network call while others wait for it to finish.
 func getUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, time.Time{}, time.Time{}, err
+		}
 		udcCacheMu.Lock()
 		entry, ok := udcCache[account]
 		if ok && time.Now().UTC().Before(entry.refreshAt) {
@@ -2293,6 +2324,21 @@ func getUDC(ctx context.Context, account string) (*service.UserDelegationCredent
 		udc, svcClient, start, expiry, err := refreshUDC(ctx, account)
 
 		udcCacheMu.Lock()
+		if udcInflight[account] != ch {
+			// The role changed during the refresh. Discard the old credentials
+			// (or error) and retry with the current role.
+			udcCacheMu.Unlock()
+			continue
+		}
+		if err == nil {
+			udcCache[account] = &udcCacheEntry{
+				udc:       udc,
+				svcClient: svcClient,
+				start:     start,
+				expiry:    expiry,
+				refreshAt: start.Add(expiry.Sub(start) / 2),
+			}
+		}
 		delete(udcInflight, account)
 		close(ch)
 		udcCacheMu.Unlock()
@@ -2301,8 +2347,8 @@ func getUDC(ctx context.Context, account string) (*service.UserDelegationCredent
 	}
 }
 
-// refreshUDC performs the actual UDC refresh (network call). Called at most
-// once per account at a time, guarded by udcInflight.
+// refreshUDC performs the actual UDC refresh (network call). getUDC publishes
+// the result only if the account's role registration has not changed.
 func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCredential, *service.Client, time.Time, time.Time, error) {
 	cred, err := getCredentialForAccount(ctx, account)
 	if err != nil {
@@ -2324,21 +2370,6 @@ func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCre
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, fmt.Errorf("get user delegation credential: %w", err)
 	}
-
-	// Refresh at 50% of the key's validity window so we never use an
-	// about-to-expire key. Use the same time base (now) for consistency.
-	refreshAt := now.Add(copySASDuration() / 2)
-
-	newEntry := &udcCacheEntry{
-		udc:       udc,
-		svcClient: svcClient,
-		start:     now,
-		expiry:    expiry,
-		refreshAt: refreshAt,
-	}
-	udcCacheMu.Lock()
-	udcCache[account] = newEntry
-	udcCacheMu.Unlock()
 
 	return udc, svcClient, now, expiry, nil
 }

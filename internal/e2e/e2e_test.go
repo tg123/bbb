@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/creack/pty"
 	"github.com/tg123/bbb/internal/hf"
 )
@@ -1235,6 +1238,89 @@ func TestMultiRangeDownload(t *testing.T) {
 	gotSum := md5.Sum(got)
 	if gotSum != wantSum {
 		t.Fatalf("md5 mismatch: want %x got %x", wantSum, gotSum)
+	}
+}
+
+func TestStaleBlockRecoveryPersistsState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e tests in short mode")
+	}
+	if !waitForEndpointReady(azuriteHost) {
+		t.Skipf("azurite endpoint %s not reachable", azuriteHost)
+	}
+
+	_, _ = runBBB("az", "mkcontainer", "az://"+azuriteAccount+"/test")
+
+	accountKey := os.Getenv("BBB_AZBLOB_ACCOUNTKEY")
+	if accountKey == "" {
+		t.Fatal("BBB_AZBLOB_ACCOUNTKEY is required")
+	}
+	credential, err := azblob.NewSharedKeyCredential(azuriteAccount, accountKey)
+	if err != nil {
+		t.Fatalf("create Azurite credential: %v", err)
+	}
+	client, err := azblob.NewClientWithSharedKeyCredential("http://"+azuriteHost, credential, nil)
+	if err != nil {
+		t.Fatalf("create Azurite client: %v", err)
+	}
+
+	blobName := fmt.Sprintf("stale-state-%d.bin", time.Now().UnixNano())
+	remote := fmt.Sprintf("az://%s/test/%s", azuriteAccount, blobName)
+	t.Cleanup(func() {
+		_, _ = runBBB("rm", "-f", remote)
+	})
+
+	blockClient := client.ServiceClient().NewContainerClient("test").NewBlockBlobClient(blobName)
+	poisonID := base64.StdEncoding.EncodeToString([]byte("stale"))
+	if _, err := blockClient.StageBlock(
+		context.Background(),
+		poisonID,
+		streaming.NopCloser(bytes.NewReader([]byte("poison"))),
+		nil,
+	); err != nil {
+		t.Fatalf("stage stale block: %v", err)
+	}
+
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.bin")
+	stateFile := filepath.Join(dir, "copy.state")
+	payload := bytes.Repeat([]byte("state-recovery-"), 128*1024)
+	if err := os.WriteFile(source, payload, 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	t.Setenv("BBB_AZBLOB_UPLOAD_BLOCK_MIB", "1")
+
+	output, err := runBBB("cp", "-f", "--state", stateFile, "--concurrency", "2", source, remote)
+	if err != nil {
+		t.Fatalf("copy over stale blocks failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "stale uncommitted blocks") {
+		t.Fatalf("copy did not exercise stale-block recovery:\n%s", output)
+	}
+
+	remoteSum, err := runBBB("md5sum", remote)
+	if err != nil {
+		t.Fatalf("checksum recovered blob: %v", err)
+	}
+	wantSum := fmt.Sprintf("%x", md5.Sum(payload))
+	if got := parseMD5Output(remoteSum); got != wantSum {
+		t.Fatalf("recovered blob checksum = %s, want %s", got, wantSum)
+	}
+
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("read state file: %v", err)
+	}
+	stateKey := taskStateKey(source, remote)
+	if !slices.Contains(strings.Split(strings.TrimSpace(string(stateData)), "\n"), stateKey) {
+		t.Fatalf("state file missing completed copy %q:\n%s", stateKey, stateData)
+	}
+
+	if err := os.Remove(source); err != nil {
+		t.Fatalf("remove source before resume: %v", err)
+	}
+	if output, err := runBBB("cp", "-f", "--state", stateFile, source, remote); err != nil {
+		t.Fatalf("state resume attempted completed copy: %v\n%s", err, output)
 	}
 }
 
