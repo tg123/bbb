@@ -15,7 +15,7 @@ require (
 	github.com/aws/smithy-go v1.28.1
 	github.com/creack/pty v1.1.24
 	github.com/google/go-containerregistry v0.22.1
-	github.com/urfave/cli/v3 v3.11.0
+	github.com/urfave/cli/v3 v3.12.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.41.0
