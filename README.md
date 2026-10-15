@@ -15,6 +15,39 @@ Download the latest release from the [Releases](https://github.com/tg123/bbb/rel
 go install github.com/tg123/bbb@latest
 ```
 
+### Shell completion
+
+`bbb completion <shell>` prints a completion script for commands and flags. Load it in your shell, or add the corresponding command to your shell's startup file:
+
+```bash
+# Bash (~/.bashrc; requires bash-completion)
+source <(bbb completion bash)
+```
+
+```zsh
+# Zsh (~/.zshrc; after compinit)
+autoload -Uz compinit && compinit
+source <(bbb completion zsh)
+```
+
+```fish
+# Fish (installed once, loaded automatically in new shells)
+mkdir -p ~/.config/fish/completions
+bbb completion fish > ~/.config/fish/completions/bbb.fish
+source ~/.config/fish/completions/bbb.fish
+```
+
+```powershell
+# PowerShell (save as bbb.ps1; the filename determines the command to complete)
+$completionFile = Join-Path (Split-Path $PROFILE) 'bbb.ps1'
+New-Item -ItemType Directory -Force (Split-Path $completionFile) | Out-Null
+bbb completion pwsh | Set-Content $completionFile
+. $completionFile
+# Add the dot-sourcing line with this file's full path to $PROFILE to load it automatically.
+```
+
+Completion does not query remote storage paths.
+
 ## Docker
 
 Images are published to GitHub Container Registry for `linux/amd64` and `linux/arm64`. They are also published to Docker Hub when the repository's Docker Hub credentials are configured:

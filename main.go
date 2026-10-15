@@ -268,12 +268,16 @@ func main() {
 	os.Exit(run(os.Args))
 }
 
-func run(args []string) int {
+func newApp() *cli.Command {
 	// logLevel will be set from global flag after parsing
-	app := &cli.Command{
-		Name:    "bbb",
-		Usage:   "filesystem helper (local + az:// / https://blob / s3:// / hf:// / acr://)",
-		Version: version(),
+	return &cli.Command{
+		Name:                  "bbb",
+		Usage:                 "filesystem helper (local + az:// / https://blob / s3:// / hf:// / acr://)",
+		Version:               version(),
+		EnableShellCompletion: true,
+		ConfigureShellCompletionCommand: func(cmd *cli.Command) {
+			cmd.Hidden = false
+		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "loglevel",
@@ -652,7 +656,10 @@ func run(args []string) int {
 			},
 		},
 	}
+}
 
+func run(args []string) int {
+	app := newApp()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	go func() {
