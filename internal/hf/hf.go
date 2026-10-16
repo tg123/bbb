@@ -31,10 +31,11 @@ func SetHTTPClient(c *http.Client) {
 }
 
 var doRequest = func(req *http.Request) (*http.Response, error) {
-	if c := sharedClient.Load(); c != nil {
-		return c.Do(req)
+	c := sharedClient.Load()
+	if c == nil {
+		c = http.DefaultClient
 	}
-	return http.DefaultClient.Do(req)
+	return hubClient(c).Do(req)
 }
 
 // HTTPStatusError is returned when an HTTP request returns a non-2xx status code.
@@ -134,7 +135,7 @@ func DownloadStream(ctx context.Context, p Path) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	req, err := newRequest(ctx, http.MethodGet, downloadURL)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +180,7 @@ func ResolveDirectURL(ctx context.Context, p Path) (directURL string, size int64
 	// server-side copy (StageBlockFromURL / CopyFromURL) to fail with 403
 	// CannotVerifyCopySource. A rangeless HEAD yields a signed URL that accepts
 	// arbitrary Range requests, which is required for block-based S2S copy.
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, resolveURL, nil)
+	req, err := newRequest(ctx, http.MethodHead, resolveURL)
 	if err != nil {
 		return "", 0, err
 	}
@@ -253,7 +254,7 @@ func ListFiles(ctx context.Context, p Path) ([]string, error) {
 	if strings.HasPrefix(p.Repo, "datasets/") {
 		apiURL = fmt.Sprintf("https://huggingface.co/api/datasets/%s?blobs=true", strings.TrimPrefix(p.Repo, "datasets/"))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	req, err := newRequest(ctx, http.MethodGet, apiURL)
 	if err != nil {
 		return nil, err
 	}
