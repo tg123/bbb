@@ -232,7 +232,7 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `HUGGING_FACE_HUB_TOKEN` | | Legacy fallback for `HF_TOKEN` |
 | `HF_TOKEN_PATH` | `$HF_HOME/token` | Hugging Face saved token file |
 | `HF_HOME` | `~/.cache/huggingface` | Hugging Face home directory; defaults to `$XDG_CACHE_HOME/huggingface` when set |
-| `HF_HUB_DISABLE_IMPLICIT_TOKEN` | `false` | Disable Hugging Face authentication (`1`, `ON`, `YES`, or `TRUE`, case-insensitive) |
+| `HF_HUB_DISABLE_IMPLICIT_TOKEN` | `false` | Disable Hugging Face authentication using Go's `strconv.ParseBool` (`1`, `t`, `T`, `true`, `TRUE`, or `True`). Unset or invalid values leave authentication enabled |
 | `BBB_ACR_USERNAME` | | Username for `acr://` registry authentication (used with `BBB_ACR_PASSWORD`) |
 | `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
 | `BBB_ACR_REGISTRY` | | Comma separated hosts the `BBB_ACR_USERNAME`/`BBB_ACR_PASSWORD` credentials belong to. Required for those credentials to be used at all. Entries match on scheme and port, so `host` over HTTP is not the same endpoint as `host:443` |

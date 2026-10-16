@@ -8,12 +8,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 func authToken() (string, error) {
-	switch strings.ToUpper(os.Getenv("HF_HUB_DISABLE_IMPLICIT_TOKEN")) {
-	case "1", "ON", "YES", "TRUE":
+	if disabled, err := strconv.ParseBool(os.Getenv("HF_HUB_DISABLE_IMPLICIT_TOKEN")); err == nil && disabled {
 		return "", nil
 	}
 	for _, name := range []string{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"} {

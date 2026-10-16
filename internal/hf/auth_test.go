@@ -146,7 +146,7 @@ func TestDisableImplicitToken(t *testing.T) {
 	home := isolateAuthEnv(t)
 	t.Setenv("HF_TOKEN", "env-token")
 	t.Setenv("HF_TOKEN_PATH", home)
-	for _, value := range []string{"1", "ON", "yes", "True"} {
+	for _, value := range []string{"1", "t", "T", "true", "TRUE", "True"} {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", value)
 			token, err := authToken()
@@ -155,7 +155,7 @@ func TestDisableImplicitToken(t *testing.T) {
 			}
 		})
 	}
-	for _, value := range []string{"", "0", "false"} {
+	for _, value := range []string{"", "0", "f", "F", "false", "FALSE", "False", "ON", "YES", "yes", "TrUe", "invalid"} {
 		t.Run("enabled="+value, func(t *testing.T) {
 			t.Setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", value)
 			token, err := authToken()
