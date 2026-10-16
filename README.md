@@ -92,6 +92,30 @@ To use Azure CLI / managed identity based login, mount the host credentials, e.g
 | `hf://` | Hugging Face Hub | `hf://meta-llama/Llama-2-7b/weights.bin`, `hf://datasets/org/repo/data.csv` |
 | `acr://` | Azure Container Registry (OCI artifacts) | `acr://myregistry.azurecr.io/models/llama:v1`, `acr://myregistry/models/llama:v1/weights.bin` |
 
+### Hugging Face authentication
+
+Private and gated `hf://` repositories use a Hugging Face user access token.
+Set `HF_TOKEN`, or run `hf auth login` to save a token before using `bbb`:
+
+```bash
+hf auth login
+bbb cp hf://meta-llama/Llama-2-7b/ ./llama-model/
+```
+
+Credentials are resolved in order: `HF_TOKEN`, the legacy
+`HUGGING_FACE_HUB_TOKEN`, then the token file at `HF_TOKEN_PATH` or
+`$HF_HOME/token`. `HF_HOME` defaults to `$XDG_CACHE_HOME/huggingface`, or
+`~/.cache/huggingface` when `XDG_CACHE_HOME` is unset. A missing or empty token
+allows anonymous access to public repositories, as does an unavailable default
+home directory when no credentials or cache-path overrides are configured.
+Explicit path expansion errors and other token-file read errors are reported.
+`HF_HUB_DISABLE_IMPLICIT_TOKEN=1` disables authentication.
+
+The token is used for repository listings, file downloads, and resolving signed
+download URLs for Azure server-side copies. It is not forwarded to CDN hosts.
+Gated repositories still require your account to have accepted the repository's
+terms and been granted access.
+
 ### `acr://` paths
 
 An `acr://` path addresses an OCI artifact in an Azure Container Registry (or any registry implementing the OCI distribution spec):
@@ -239,6 +263,11 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_DNS_CACHE` | *(off)* | Set to `1` or `true` to enable process-local DNS caching |
 | `BBB_DNS_PIN` | *(off)* | Set to `1` or `true` to pin DNS to a single IP (implies `BBB_DNS_CACHE=1`) |
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
+| `HF_TOKEN` | | Hugging Face user access token; takes precedence over a saved login |
+| `HUGGING_FACE_HUB_TOKEN` | | Legacy fallback for `HF_TOKEN` |
+| `HF_TOKEN_PATH` | `$HF_HOME/token` | Hugging Face saved token file |
+| `HF_HOME` | `~/.cache/huggingface` | Hugging Face home directory; defaults to `$XDG_CACHE_HOME/huggingface` when set |
+| `HF_HUB_DISABLE_IMPLICIT_TOKEN` | `false` | Disable Hugging Face authentication using Go's `strconv.ParseBool` (`1`, `t`, `T`, `true`, `TRUE`, or `True`). Unset or invalid values leave authentication enabled |
 | `BBB_ACR_USERNAME` | | Username for `acr://` registry authentication (used with `BBB_ACR_PASSWORD`) |
 | `BBB_ACR_PASSWORD` | | Password/token for `acr://` registry authentication |
 | `BBB_ACR_REGISTRY` | | Comma separated hosts the `BBB_ACR_USERNAME`/`BBB_ACR_PASSWORD` credentials belong to. Required for those credentials to be used at all. Entries match on scheme and port, so `host` over HTTP is not the same endpoint as `host:443` |
