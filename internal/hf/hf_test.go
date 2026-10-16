@@ -9,6 +9,7 @@ import (
 )
 
 func TestListFilesAPIEndpoint(t *testing.T) {
+	isolateAuthEnv(t)
 	tests := []struct {
 		name    string
 		repo    string
@@ -53,6 +54,7 @@ func TestListFilesAPIEndpoint(t *testing.T) {
 }
 
 func TestResolveDirectURL(t *testing.T) {
+	isolateAuthEnv(t)
 	const cdnURL = "https://cdn-lfs.huggingface.co/repo/model.bin?sig=abc"
 	original := doRequest
 	doRequest = func(req *http.Request) (*http.Response, error) {
@@ -88,6 +90,7 @@ func TestResolveDirectURL(t *testing.T) {
 }
 
 func TestResolveDirectURLXLinkedSize(t *testing.T) {
+	isolateAuthEnv(t)
 	original := doRequest
 	doRequest = func(req *http.Request) (*http.Response, error) {
 		hdr := make(http.Header)
