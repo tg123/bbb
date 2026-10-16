@@ -46,7 +46,7 @@ bbb completion pwsh | Set-Content $completionFile
 # Add the dot-sourcing line with this file's full path to $PROFILE to load it automatically.
 ```
 
-Completion does not query remote storage paths.
+Completion does not query remote storage paths. The Bash callback passes words as literal arguments without evaluating shell syntax, so completion does not execute redirections or command substitutions.
 
 ## Docker
 

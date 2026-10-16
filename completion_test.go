@@ -3,8 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -127,6 +131,160 @@ func TestCompletionDoesNotRunActions(t *testing.T) {
 			content, err := os.ReadFile(file)
 			if err != nil || string(content) != "keep" {
 				t.Fatalf("completion modified file: content=%q, err=%v", content, err)
+			}
+		})
+	}
+}
+
+func TestBashCompletion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires native Bash")
+	}
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
+	}
+	t.Setenv("BASH_ENV", "")
+	t.Setenv("ENV", "")
+	script := runCompletionTest(t, "completion", "bash")
+	for _, init := range []string{"legacy", "modern"} {
+		t.Run(init, func(t *testing.T) {
+			for _, test := range []struct {
+				name        string
+				words       []string
+				cword       int
+				list        bool
+				wantArgs    []string
+				wantMatches []string
+			}{
+				{
+					name:        "command prefix",
+					words:       []string{"bbb", "c"},
+					cword:       1,
+					wantArgs:    []string{"--generate-shell-completion"},
+					wantMatches: []string{"cp", "cat"},
+				},
+				{
+					name:        "flag prefix",
+					words:       []string{"bbb", "cp", "--con"},
+					cword:       2,
+					wantArgs:    []string{"cp", "--con", "--generate-shell-completion"},
+					wantMatches: []string{"--concurrency"},
+				},
+				{
+					name:        "cursor before trailing words",
+					words:       []string{"bbb", "cp", "--con", "ignored"},
+					cword:       2,
+					wantArgs:    []string{"cp", "--con", "--generate-shell-completion"},
+					wantMatches: []string{"--concurrency"},
+				},
+				{
+					name:        "descriptions",
+					words:       []string{"bbb", "c"},
+					cword:       1,
+					list:        true,
+					wantArgs:    []string{"--generate-shell-completion"},
+					wantMatches: []string{"cp   -- Copy files", "cat  -- Print files"},
+				},
+				{
+					name:     "redirection",
+					words:    []string{"bbb", "cat", "input", ">", "protected.txt", ""},
+					cword:    5,
+					wantArgs: []string{"cat", "input", ">", "protected.txt", "--generate-shell-completion"},
+				},
+				{
+					name:     "command substitutions",
+					words:    []string{"bbb", "cat", "$(printf changed > protected.txt)", "`printf changed > protected.txt`", ""},
+					cword:    4,
+					wantArgs: []string{"cat", "$(printf changed > protected.txt)", "`printf changed > protected.txt`", "--generate-shell-completion"},
+				},
+				{
+					name:     "command separator",
+					words:    []string{"bbb", "cat", ";", "printf", "changed", ">", "protected.txt", "#", ""},
+					cword:    8,
+					wantArgs: []string{"cat", ";", "printf", "changed", ">", "protected.txt", "#", "--generate-shell-completion"},
+				},
+				{
+					name: "literal metacharacters",
+					words: []string{"bbb", "cat", "a b", "single'quote", `double"quote`,
+						"$(printf changed > protected.txt)", "`printf changed > protected.txt`",
+						";", "|", "*", "$HOME", `a\b`, ""},
+					cword: 12,
+					wantArgs: []string{"cat", "a b", "single'quote", `double"quote`,
+						"$(printf changed > protected.txt)", "`printf changed > protected.txt`",
+						";", "|", "*", "$HOME", `a\b`, "--generate-shell-completion"},
+				},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					dir := t.TempDir()
+					for name, content := range map[string]string{
+						"completion.bash": script,
+						"protected.txt":   "keep",
+					} {
+						if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					harness := `
+_get_comp_words_by_ref() {
+    words=("${COMP_WORDS[@]}")
+    cword=$COMP_CWORD
+    cur=${words[cword]}
+    prev=${words[cword-1]}
+}
+if [[ $1 == modern ]]; then
+    _comp_initialize() { _get_comp_words_by_ref "$@"; }
+fi
+COMP_CWORD=$2
+COMP_TYPE=$3
+shift 3
+COMP_WORDS=("$@")
+bbb() {
+    printf '%s\0' "$@" > request.args
+    printf '%s\n' 'cp:Copy files' 'cat:Print files' '--concurrency:Concurrent requests'
+}
+source ./completion.bash
+__bbb_bash_autocomplete || exit
+if [[ ${#COMPREPLY[@]} -gt 0 ]]; then
+    printf '%s\0' "${COMPREPLY[@]}"
+fi
+`
+					compType := "9"
+					if test.list {
+						compType = "63"
+					}
+					args := []string{"--noprofile", "--norc", "-c", harness, "completion-test",
+						init, fmt.Sprint(test.cword), compType}
+					cmd := exec.Command(bash, append(args, test.words...)...)
+					cmd.Dir = dir
+					var stderr bytes.Buffer
+					cmd.Stderr = &stderr
+					output, err := cmd.Output()
+					if err != nil {
+						t.Fatalf("Bash completion: %v\n%s", err, stderr.String())
+					}
+					if stderr.Len() != 0 {
+						t.Errorf("unexpected stderr: %s", stderr.String())
+					}
+					request, err := os.ReadFile(filepath.Join(dir, "request.args"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					gotArgs := strings.Split(strings.TrimSuffix(string(request), "\x00"), "\x00")
+					if !reflect.DeepEqual(gotArgs, test.wantArgs) {
+						t.Errorf("request arguments = %q, want %q", gotArgs, test.wantArgs)
+					}
+					if test.wantMatches != nil {
+						want := strings.Join(test.wantMatches, "\x00") + "\x00"
+						if string(output) != want {
+							t.Errorf("matches = %q, want %q", output, want)
+						}
+					}
+					content, err := os.ReadFile(filepath.Join(dir, "protected.txt"))
+					if err != nil || string(content) != "keep" {
+						t.Errorf("completion modified file: content=%q, err=%v", content, err)
+					}
+				})
 			}
 		})
 	}

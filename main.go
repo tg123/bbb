@@ -271,13 +271,11 @@ func main() {
 func newApp() *cli.Command {
 	// logLevel will be set from global flag after parsing
 	return &cli.Command{
-		Name:                  "bbb",
-		Usage:                 "filesystem helper (local + az:// / https://blob / s3:// / hf:// / acr://)",
-		Version:               version(),
-		EnableShellCompletion: true,
-		ConfigureShellCompletionCommand: func(cmd *cli.Command) {
-			cmd.Hidden = false
-		},
+		Name:                            "bbb",
+		Usage:                           "filesystem helper (local + az:// / https://blob / s3:// / hf:// / acr://)",
+		Version:                         version(),
+		EnableShellCompletion:           true,
+		ConfigureShellCompletionCommand: configureShellCompletion,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "loglevel",
