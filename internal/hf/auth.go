@@ -30,7 +30,7 @@ func authToken() (string, error) {
 			if cache == "" {
 				userHome, err := os.UserHomeDir()
 				if err != nil {
-					return "", fmt.Errorf("locate Hugging Face token: %w", err)
+					return "", nil
 				}
 				cache = filepath.Join(userHome, ".cache")
 			}
@@ -80,18 +80,18 @@ func newRequest(ctx context.Context, method, rawURL string) (*http.Request, erro
 func hubClient(base *http.Client) *http.Client {
 	client := *base
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		var err error
+		if base.CheckRedirect != nil {
+			err = base.CheckRedirect(req, via)
+		} else if len(via) >= 10 {
+			err = errors.New("stopped after 10 redirects")
+		}
 		// Go forwards Authorization to subdomains and HTTPS-to-HTTP redirects.
-		// Only the HTTPS Hub endpoint may receive our token, never a CDN.
+		// Enforce the HTTPS Hub restriction after custom policies copy headers.
 		if !isHubURL(req.URL) {
 			req.Header.Del("Authorization")
 		}
-		if base.CheckRedirect != nil {
-			return base.CheckRedirect(req, via)
-		}
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
-		}
-		return nil
+		return err
 	}
 	return &client
 }

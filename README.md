@@ -73,8 +73,10 @@ Credentials are resolved in order: `HF_TOKEN`, the legacy
 `HUGGING_FACE_HUB_TOKEN`, then the token file at `HF_TOKEN_PATH` or
 `$HF_HOME/token`. `HF_HOME` defaults to `$XDG_CACHE_HOME/huggingface`, or
 `~/.cache/huggingface` when `XDG_CACHE_HOME` is unset. A missing or empty token
-allows anonymous access to public repositories; other token-file read errors
-are reported. `HF_HUB_DISABLE_IMPLICIT_TOKEN=1` disables authentication.
+allows anonymous access to public repositories, as does an unavailable default
+home directory when no credentials or cache-path overrides are configured.
+Explicit path expansion errors and other token-file read errors are reported.
+`HF_HUB_DISABLE_IMPLICIT_TOKEN=1` disables authentication.
 
 The token is used for repository listings, file downloads, and resolving signed
 download URLs for Azure server-side copies. It is not forwarded to CDN hosts.
