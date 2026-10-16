@@ -14,6 +14,33 @@ import (
 	"testing"
 )
 
+// Shell regressions re-enter the test binary to exercise the real CLI backend.
+func TestCompletionBackendProcess(t *testing.T) {
+	if os.Getenv("BBB_COMPLETION_TEST_BACKEND") != "1" {
+		return
+	}
+	for i, arg := range os.Args {
+		if arg == "--" {
+			fmt.Print(runCompletionTest(t, os.Args[i+1:]...))
+			os.Exit(0)
+		}
+	}
+	t.Fatal("missing completion arguments")
+}
+
+func completionBackendEnv(t *testing.T, enabled bool) []string {
+	t.Helper()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := "0"
+	if enabled {
+		value = "1"
+	}
+	return append(os.Environ(), "BBB_COMPLETION_TEST_BINARY="+binary, "BBB_COMPLETION_TEST_BACKEND="+value)
+}
+
 func runCompletionTest(t *testing.T, args ...string) string {
 	t.Helper()
 	app := newApp()
@@ -123,10 +150,11 @@ func TestCompletionDoesNotRunActions(t *testing.T) {
 	}{
 		{"file argument", []string{"rm", file}},
 		{"after double dash", []string{"rm", "--", file}},
+		{"empty after double dash", []string{"rm", "--", ""}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			output := runCompletionTest(t, append(test.args, "--generate-shell-completion")...)
-			if test.name == "after double dash" && output != "" {
+			if strings.Contains(test.name, "after double dash") && output != "" {
 				t.Errorf("expected no completions after --, got %q", output)
 			}
 			content, err := os.ReadFile(file)
@@ -148,6 +176,7 @@ func TestPowerShellCompletion(t *testing.T) {
 		before       string
 		after        string
 		direct       bool
+		backend      bool
 		wantArgs     []string
 		wantMatches  []string
 		wantToolTips []string
@@ -198,6 +227,46 @@ func TestPowerShellCompletion(t *testing.T) {
 			before:      "bbb az mk",
 			wantArgs:    []string{"az", "--generate-shell-completion"},
 			wantMatches: []string{"mkcontainer"},
+		},
+		{
+			name:        "real backend separator prefix",
+			before:      "bbb rm --",
+			backend:     true,
+			wantArgs:    []string{"rm", "--", "--generate-shell-completion"},
+			wantMatches: []string{"--quiet", "--concurrency", "--retry-count", "--help", "--loglevel"},
+		},
+		{
+			name:        "real backend empty after separator",
+			before:      "bbb rm -- ",
+			direct:      true,
+			backend:     true,
+			wantArgs:    []string{"rm", "--", "", "--generate-shell-completion"},
+			wantMatches: []string{},
+		},
+		{
+			name:        "real backend positional after separator",
+			before:      "bbb rm -- pro",
+			direct:      true,
+			backend:     true,
+			wantArgs:    []string{"rm", "--", "pro", "--generate-shell-completion"},
+			wantMatches: []string{},
+		},
+		{
+			name:        "real backend flag-like positional after separator",
+			before:      "bbb rm -- --",
+			direct:      true,
+			backend:     true,
+			wantArgs:    []string{"rm", "--", "--", "--generate-shell-completion"},
+			wantMatches: []string{},
+		},
+		{
+			name:        "real backend empty before trailing argument",
+			before:      "bbb rm -- ",
+			after:       "protected.txt",
+			direct:      true,
+			backend:     true,
+			wantArgs:    []string{"rm", "--", "", "--generate-shell-completion"},
+			wantMatches: []string{},
 		},
 		{
 			name:         "candidate without description",
@@ -278,6 +347,10 @@ function Register-ArgumentCompleter {
 }
 function bbb {
     [System.IO.File]::WriteAllText((Join-Path $PWD 'request.json'), (ConvertTo-Json -InputObject @($args) -Compress))
+    if ($env:BBB_COMPLETION_TEST_BACKEND -eq '1') {
+        & $env:BBB_COMPLETION_TEST_BINARY '-test.run=^TestCompletionBackendProcess$' -- @args
+        return
+    }
     'cp:Copy files', 'cat:Print files', 'mkcontainer:Create containers', 'pwsh', '--concurrency:Concurrent requests: at once'
 }
 function bbb.exe { bbb @args }
@@ -310,6 +383,7 @@ if ($case.direct) {
 			}
 			cmd := exec.Command(pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", "harness.ps1")
 			cmd.Dir = dir
+			cmd.Env = completionBackendEnv(t, test.backend)
 			var stderr bytes.Buffer
 			cmd.Stderr = &stderr
 			output, err := cmd.Output()
@@ -369,6 +443,7 @@ func TestBashCompletion(t *testing.T) {
 				words       []string
 				cword       int
 				list        bool
+				backend     bool
 				wantArgs    []string
 				wantMatches []string
 			}{
@@ -385,6 +460,54 @@ func TestBashCompletion(t *testing.T) {
 					cword:       2,
 					wantArgs:    []string{"cp", "--con", "--generate-shell-completion"},
 					wantMatches: []string{"--concurrency"},
+				},
+				{
+					name:        "real backend separator prefix",
+					words:       []string{"bbb", "rm", "--"},
+					cword:       2,
+					backend:     true,
+					wantArgs:    []string{"rm", "--", "--generate-shell-completion"},
+					wantMatches: []string{"--quiet", "--concurrency", "--retry-count", "--help", "--loglevel"},
+				},
+				{
+					name:        "real backend empty after separator",
+					words:       []string{"bbb", "rm", "--", ""},
+					cword:       3,
+					backend:     true,
+					wantArgs:    []string{"rm", "--", "", "--generate-shell-completion"},
+					wantMatches: []string{},
+				},
+				{
+					name:        "real backend positional after separator",
+					words:       []string{"bbb", "rm", "--", "pro"},
+					cword:       3,
+					backend:     true,
+					wantArgs:    []string{"rm", "--", "pro", "--generate-shell-completion"},
+					wantMatches: []string{},
+				},
+				{
+					name:        "real backend flag-like positional after separator",
+					words:       []string{"bbb", "rm", "--", "--"},
+					cword:       3,
+					backend:     true,
+					wantArgs:    []string{"rm", "--", "--", "--generate-shell-completion"},
+					wantMatches: []string{},
+				},
+				{
+					name:        "real backend empty before trailing argument",
+					words:       []string{"bbb", "rm", "--", "", "protected.txt"},
+					cword:       3,
+					backend:     true,
+					wantArgs:    []string{"rm", "--", "", "--generate-shell-completion"},
+					wantMatches: []string{},
+				},
+				{
+					name:        "real backend quoted command",
+					words:       []string{"bbb", `"az"`, "mk"},
+					cword:       2,
+					backend:     true,
+					wantArgs:    []string{"az", "--generate-shell-completion"},
+					wantMatches: []string{"mkcontainer"},
 				},
 				{
 					name:        "cursor before trailing words",
@@ -421,9 +544,9 @@ func TestBashCompletion(t *testing.T) {
 				},
 				{
 					name: "literal metacharacters",
-					words: []string{"bbb", "cat", "a b", "single'quote", `double"quote`,
+					words: []string{"bbb", "cat", `'a b'`, `"single'quote"`, `'double"quote'`,
 						"$(printf changed > protected.txt)", "`printf changed > protected.txt`",
-						";", "|", "*", "$HOME", `a\b`, ""},
+						";", "|", "*", "$HOME", `'a\b'`, ""},
 					cword: 12,
 					wantArgs: []string{"cat", "a b", "single'quote", `double"quote`,
 						"$(printf changed > protected.txt)", "`printf changed > protected.txt`",
@@ -440,6 +563,7 @@ func TestBashCompletion(t *testing.T) {
 							t.Fatal(err)
 						}
 					}
+
 					harness := `
 _get_comp_words_by_ref() {
     words=("${COMP_WORDS[@]}")
@@ -456,6 +580,10 @@ shift 3
 COMP_WORDS=("$@")
 bbb() {
     printf '%s\0' "$@" > request.args
+    if [[ $BBB_COMPLETION_TEST_BACKEND == 1 ]]; then
+        "$BBB_COMPLETION_TEST_BINARY" '-test.run=^TestCompletionBackendProcess$' -- "$@"
+        return
+    fi
     printf '%s\n' 'cp:Copy files' 'cat:Print files' '--concurrency:Concurrent requests'
 }
 source ./completion.bash
@@ -472,6 +600,7 @@ fi
 						init, fmt.Sprint(test.cword), compType}
 					cmd := exec.Command(bash, append(args, test.words...)...)
 					cmd.Dir = dir
+					cmd.Env = completionBackendEnv(t, test.backend)
 					var stderr bytes.Buffer
 					cmd.Stderr = &stderr
 					output, err := cmd.Output()
@@ -490,7 +619,10 @@ fi
 						t.Errorf("request arguments = %q, want %q", gotArgs, test.wantArgs)
 					}
 					if test.wantMatches != nil {
-						want := strings.Join(test.wantMatches, "\x00") + "\x00"
+						want := strings.Join(test.wantMatches, "\x00")
+						if len(test.wantMatches) > 0 {
+							want += "\x00"
+						}
 						if string(output) != want {
 							t.Errorf("matches = %q, want %q", output, want)
 						}

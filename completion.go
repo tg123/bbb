@@ -24,7 +24,41 @@ func configureShellCompletion(cmd *cli.Command) {
 		}
 		return nil
 	}
+	cmd.Command("zsh").Action = func(ctx context.Context, cmd *cli.Command) error {
+		if _, err := io.WriteString(cmd.Root().Writer, zshCompletionScript); err != nil {
+			return fmt.Errorf("write Zsh completion: %w", err)
+		}
+		return nil
+	}
 }
+
+const zshCompletionScript = `#compdef bbb
+compdef _bbb bbb
+
+_bbb() {
+    local -a request opts
+    local i current=${(Q)PREFIX} after_separator=
+    # CURRENT is one-based; PREFIX excludes the part of the word after the cursor.
+    for ((i = 1; i < CURRENT; i++)); do
+        request+=("${(Q)words[i]}")
+        [[ $i -gt 1 && "${request[-1]}" == -- ]] && after_separator=1
+    done
+    if [[ -n "$after_separator" || "$current" == -* ]]; then
+        request+=("$current")
+    fi
+    request+=(--generate-shell-completion)
+    opts=("${(@f)$("${request[@]}")}") || return
+    if [[ -n "${opts[1]}" ]]; then
+        _describe 'values' opts
+    else
+        _files
+    fi
+}
+
+if [[ "$funcstack[1]" == _bbb ]]; then
+    _bbb
+fi
+`
 
 const powerShellCompletionScript = `# PowerShell completion for bbb.
 Register-ArgumentCompleter -Native -CommandName bbb, bbb.exe -ScriptBlock {
@@ -36,6 +70,7 @@ Register-ArgumentCompleter -Native -CommandName bbb, bbb.exe -ScriptBlock {
     $command = $elements[0].Value
     $request = @()
     $prefix = ''
+    $afterSeparator = $false
     for ($i = 1; $i -lt $elements.Count; $i++) {
         $element = $elements[$i]
         if ($element.Extent.StartOffset -ge $cursorPosition) {
@@ -44,19 +79,24 @@ Register-ArgumentCompleter -Native -CommandName bbb, bbb.exe -ScriptBlock {
         if ($element.Extent.EndOffset -ge $cursorPosition) {
             # wordToComplete can include the part of the token after the cursor.
             $prefix = $element.Extent.Text.Substring(0, $cursorPosition - $element.Extent.StartOffset)
-            if ($prefix.StartsWith('-')) {
-                $request += $prefix
-            }
             break
         }
         # AST values unquote strings without expanding variables or subexpressions.
         # Redirections are not CommandElements and are deliberately not forwarded.
         if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
             $element -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
-            $request += $element.Value
+            $argument = $element.Value
         } else {
-            $request += $element.Extent.Text
+            $argument = $element.Extent.Text
         }
+        $request += $argument
+        if ($argument -eq '--') {
+            $afterSeparator = $true
+        }
+    }
+    # Preserve even an empty current argument after a completed -- separator.
+    if ($afterSeparator -or $prefix.StartsWith('-')) {
+        $request += $prefix
     }
     $request += '--generate-shell-completion'
     & $command @request | ForEach-Object {
@@ -74,8 +114,35 @@ Register-ArgumentCompleter -Native -CommandName bbb, bbb.exe -ScriptBlock {
 `
 
 const bashCompletionScript = `# Bash completion for bbb (requires bash-completion).
+# Remove syntactic quotes and escapes, never expand or evaluate shell input.
+__bbb_bash_unquote() {
+    local word=$1 quote= char next i
+    REPLY=
+    for ((i = 0; i < ${#word}; i++)); do
+        char=${word:i:1}
+        if [[ "$quote" == "'" ]]; then
+            if [[ "$char" == "'" ]]; then quote=; else REPLY+=$char; fi
+        elif [[ "$char" == '\' ]]; then
+            next=${word:i+1:1}
+            if [[ -n "$next" && ( "$quote" != '"' || "$next" == '$' ||
+                "$next" == '"' || "$next" == '\' || "$next" == $'\x60' || "$next" == $'\n' ) ]]; then
+                ((i++))
+                [[ "$next" == $'\n' ]] || REPLY+=$next
+            else
+                REPLY+=$char
+            fi
+        elif [[ -z "$quote" && ( "$char" == "'" || "$char" == '"' ) ]]; then
+            quote=$char
+        elif [[ -n "$quote" && "$char" == "$quote" ]]; then
+            quote=
+        else
+            REPLY+=$char
+        fi
+    done
+}
+
 __bbb_bash_autocomplete() {
-    local cur prev cword opts line token description longest=0 i candidate
+    local cur prev cword opts line token description longest=0 i candidate REPLY after_separator=
     local -a words request tokens descriptions
     COMPREPLY=()
 
@@ -84,10 +151,16 @@ __bbb_bash_autocomplete() {
     else
         _get_comp_words_by_ref -n "=:" cur prev words cword || return
     fi
-    [[ "${words[0]}" == source ]] && return
-
-    request=("${words[@]:0:cword}")
-    if [[ "$cur" == -* ]]; then
+    request=()
+    for ((i = 0; i < cword; i++)); do
+        __bbb_bash_unquote "${words[i]}"
+        request+=("$REPLY")
+        [[ $i -gt 0 && "$REPLY" == -- ]] && after_separator=1
+    done
+    [[ "${request[0]}" == source ]] && return
+    __bbb_bash_unquote "$cur"
+    cur=$REPLY
+    if [[ -n "$after_separator" || "$cur" == -* ]]; then
         request+=("$cur")
     fi
     request+=(--generate-shell-completion)
