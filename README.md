@@ -1008,6 +1008,21 @@ when it is readable by the caller; read access does not prove project ownership.
 bbb gs mkbucket gs://newbucket
 ```
 
+## End-to-end tests
+
+The [E2E workflow](.github/workflows/e2e.yaml) runs against local Azurite, MinIO,
+fake-gcs-server, and registry emulators. Run the same suite with Docker:
+
+```bash
+cd internal/e2e
+docker compose up --build --abort-on-container-exit --exit-code-from bbb
+docker compose down
+```
+
+MinIO is built from the pinned `RELEASE.2025-09-07T16-13-09Z` source release.
+Its former Docker Hub and Quay images are no longer publicly pullable, so the
+suite does not depend on either MinIO image registry or registry credentials.
+
 ## Benchmark
 
 The [`Benchmark`](.github/workflows/benchmark.yml) workflow compares `bbb`'s
