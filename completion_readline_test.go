@@ -107,7 +107,11 @@ RPS1=
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer terminal.Close()
+			t.Cleanup(func() {
+				if err := terminal.Close(); err != nil {
+					t.Errorf("close PTY: %v", err)
+				}
+			})
 			var output bytes.Buffer
 			done := make(chan struct{})
 			go func() {
@@ -289,7 +293,11 @@ PS1=
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer terminal.Close()
+			t.Cleanup(func() {
+				if err := terminal.Close(); err != nil {
+					t.Errorf("close PTY: %v", err)
+				}
+			})
 			var output bytes.Buffer
 			done := make(chan struct{})
 			go func() {

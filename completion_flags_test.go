@@ -146,7 +146,9 @@ func TestFlagAliasCompletionPreservesCustomCallback(t *testing.T) {
 		Name:                  "bbb",
 		EnableShellCompletion: true,
 		ShellComplete: func(ctx context.Context, cmd *cli.Command) {
-			fmt.Fprintln(cmd.Root().Writer, "custom")
+			if _, err := fmt.Fprintln(cmd.Root().Writer, "custom"); err != nil {
+				t.Fatal(err)
+			}
 		},
 		Commands: []*cli.Command{{Name: "child"}},
 	}

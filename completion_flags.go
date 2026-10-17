@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"unicode/utf8"
@@ -61,7 +62,10 @@ func completeWithFlagAliases(ctx context.Context, cmd *cli.Command) {
 			if usage != "" {
 				candidate += ":" + usage
 			}
-			fmt.Fprintln(cmd.Root().Writer, candidate)
+			if _, err := fmt.Fprintln(cmd.Root().Writer, candidate); err != nil {
+				slog.ErrorContext(ctx, "write flag completion", "err", err)
+				return
+			}
 		}
 	}
 }

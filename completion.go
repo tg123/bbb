@@ -30,20 +30,39 @@ func configureShellCompletion(cmd *cli.Command) {
 		}
 		return nil
 	}
-	fish := cmd.Command("fish")
-	generateFish := fish.Action
-	fish.Action = func(ctx context.Context, cmd *cli.Command) error {
-		if err := generateFish(ctx, cmd); err != nil {
-			return err
-		}
-		// Fish's --force-files overrides the upstream --no-files registration
-		// without replacing its command and flag completion callback.
-		if _, err := io.WriteString(cmd.Root().Writer, "\ncomplete -c bbb -F\n"); err != nil {
-			return fmt.Errorf("write Fish filename completion: %w", err)
+	cmd.Command("fish").Action = func(ctx context.Context, cmd *cli.Command) error {
+		if _, err := io.WriteString(cmd.Root().Writer, fishCompletionScript); err != nil {
+			return fmt.Errorf("write Fish completion: %w", err)
 		}
 		return nil
 	}
 }
+
+const fishCompletionScript = `# Fish completion for bbb.
+function __bbb_perform_completion
+    # Tokenize completed words and unquote the cursor prefix without evaluating either.
+    set -l args (commandline -opc)
+    set -l current (commandline -ct | string unescape)
+    if contains -- -- $args[2..-1]; or string match -q -- '-*' "$current"
+        # Quoting preserves an empty current argument after a completed --.
+        set -a args "$current"
+    end
+    set -l results ($args[1] $args[2..-1] --generate-shell-completion 2>/dev/null)
+    for line in $results
+        set -l parts (string split -m 1 ':' -- "$line")
+        if test (count $parts) -eq 2
+            printf '%s\t%s\n' "$parts[1]" "$parts[2]"
+        else
+            printf '%s\n' "$line"
+        end
+    end
+end
+
+complete -c bbb -e
+complete -c bbb -f -a '(__bbb_perform_completion)'
+# Retain local filename suggestions alongside command and flag completions.
+complete -c bbb -F
+`
 
 const zshCompletionScript = `#compdef bbb
 compdef _bbb bbb
@@ -92,6 +111,12 @@ Register-ArgumentCompleter -Native -CommandName bbb, bbb.exe -ScriptBlock {
         if ($element.Extent.EndOffset -ge $cursorPosition) {
             # wordToComplete can include the part of the token after the cursor.
             $prefix = $element.Extent.Text.Substring(0, $cursorPosition - $element.Extent.StartOffset)
+            # Parse in argument mode to decode quotes and escapes, never expressions.
+            $prefixTokens = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseInput('bbb ' + $prefix, [ref]$prefixTokens, [ref]$null)
+            if ($prefixTokens[1] -is [System.Management.Automation.Language.StringToken]) {
+                $prefix = $prefixTokens[1].Value
+            }
             break
         }
         # AST values unquote strings without expanding variables or subexpressions.

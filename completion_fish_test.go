@@ -25,6 +25,7 @@ func TestFishCompletion(t *testing.T) {
 		line     string
 		wantArgs []string
 		want     []string
+		omit     []string
 	}{
 		{
 			name:     "commands",
@@ -51,6 +52,12 @@ func TestFishCompletion(t *testing.T) {
 			want:     []string{"--quiet"},
 		},
 		{
+			name:     "quoted current flag",
+			line:     `bbb cpr "--q`,
+			wantArgs: []string{"cpr", "--q", "--generate-shell-completion"},
+			want:     []string{"--quiet"},
+		},
+		{
 			name:     "local source",
 			line:     "bbb cp ./some",
 			wantArgs: []string{"cp", "--generate-shell-completion"},
@@ -71,7 +78,51 @@ func TestFishCompletion(t *testing.T) {
 		{
 			name:     "local operand after separator",
 			line:     "bbb rm -- ./some",
-			wantArgs: []string{"rm", "--", "--generate-shell-completion"},
+			wantArgs: []string{"rm", "--", "./some", "--generate-shell-completion"},
+			want:     []string{"./some-file.txt"},
+		},
+		{
+			name:     "empty operand after separator",
+			line:     "bbb rm -- ",
+			wantArgs: []string{"rm", "--", "", "--generate-shell-completion"},
+			want:     []string{"some-file.txt"},
+			omit:     []string{"--help", "--quiet", "--concurrency", "--loglevel"},
+		},
+		{
+			name:     "quoted empty operand after separator",
+			line:     `bbb rm -- ""`,
+			wantArgs: []string{"rm", "--", "", "--generate-shell-completion"},
+			want:     []string{"some-file.txt"},
+			omit:     []string{"--help", "--quiet", "--concurrency", "--loglevel"},
+		},
+		{
+			name:     "flag-like operand after separator",
+			line:     "bbb rm -- --",
+			wantArgs: []string{"rm", "--", "--", "--generate-shell-completion"},
+			omit:     []string{"--help", "--quiet", "--concurrency", "--loglevel"},
+		},
+		{
+			name:     "quoted separator",
+			line:     `bbb rm "--" ./some`,
+			wantArgs: []string{"rm", "--", "./some", "--generate-shell-completion"},
+			want:     []string{"./some-file.txt"},
+		},
+		{
+			name:     "quoted positional current prefix",
+			line:     `bbb rm -- "./some`,
+			wantArgs: []string{"rm", "--", "./some", "--generate-shell-completion"},
+			want:     []string{"./some-file.txt"},
+		},
+		{
+			name:     "literal current operand",
+			line:     `bbb rm -- "$HOME; $(printf changed > some-file.txt)"`,
+			wantArgs: []string{"rm", "--", "$HOME; $(printf changed > some-file.txt)", "--generate-shell-completion"},
+			omit:     []string{"--help", "--quiet", "--concurrency", "--loglevel"},
+		},
+		{
+			name:     "literal completed operands",
+			line:     `bbb rm -- 'a b' '$HOME' '' ./some`,
+			wantArgs: []string{"rm", "--", "a b", "$HOME", "", "./some", "--generate-shell-completion"},
 			want:     []string{"./some-file.txt"},
 		},
 	} {
@@ -118,6 +169,11 @@ complete -C "$argv[1]"
 			for _, want := range test.want {
 				if !candidates[want] {
 					t.Errorf("missing candidate %q:\n%s", want, output)
+				}
+			}
+			for _, omit := range test.omit {
+				if candidates[omit] {
+					t.Errorf("unexpected candidate %q:\n%s", omit, output)
 				}
 			}
 			content, err := os.ReadFile(filepath.Join(dir, "some-file.txt"))
