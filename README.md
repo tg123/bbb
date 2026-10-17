@@ -46,7 +46,7 @@ bbb completion pwsh | Set-Content $completionFile
 # Add the dot-sourcing line with this file's full path to $PROFILE to load it automatically.
 ```
 
-Completion does not query remote storage paths. The Bash, Zsh, and PowerShell callbacks pass arguments up to the cursor without evaluating shell syntax, so completion does not execute redirections or command substitutions. Bash and Zsh remove syntactic quotes and escapes without expanding shell expressions. PowerShell omits redirections and leaves variables and subexpressions unexpanded. After a completed `--` separator, command and flag suggestions stop, allowing Bash and Zsh filename completion.
+Completion does not query remote storage paths. Fish retains local filename suggestions for path operands. The Bash, Zsh, and PowerShell callbacks pass arguments up to the cursor without evaluating shell syntax, so completion does not execute redirections or command substitutions. Bash and Zsh remove syntactic quotes and escapes without expanding shell expressions. PowerShell omits redirections and leaves variables and subexpressions unexpanded. After a completed `--` separator, command and flag suggestions stop, allowing Bash and Zsh filename completion.
 
 ## Docker
 

@@ -30,6 +30,19 @@ func configureShellCompletion(cmd *cli.Command) {
 		}
 		return nil
 	}
+	fish := cmd.Command("fish")
+	generateFish := fish.Action
+	fish.Action = func(ctx context.Context, cmd *cli.Command) error {
+		if err := generateFish(ctx, cmd); err != nil {
+			return err
+		}
+		// Fish's --force-files overrides the upstream --no-files registration
+		// without replacing its command and flag completion callback.
+		if _, err := io.WriteString(cmd.Root().Writer, "\ncomplete -c bbb -F\n"); err != nil {
+			return fmt.Errorf("write Fish filename completion: %w", err)
+		}
+		return nil
+	}
 }
 
 const zshCompletionScript = `#compdef bbb

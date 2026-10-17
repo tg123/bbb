@@ -70,7 +70,7 @@ func TestCompletionScripts(t *testing.T) {
 	}{
 		{"bash", "complete -o bashdefault -o default -F __bbb_bash_autocomplete bbb"},
 		{"zsh", "compdef _bbb bbb"},
-		{"fish", "complete -c bbb -f -a '(__bbb_perform_completion)'"},
+		{"fish", "complete -c bbb -F"},
 		{"pwsh", "Register-ArgumentCompleter -Native"},
 	} {
 		t.Run(test.shell, func(t *testing.T) {
