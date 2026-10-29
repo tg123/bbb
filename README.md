@@ -1054,6 +1054,11 @@ docker compose up --build --abort-on-container-exit --exit-code-from bbb
 docker compose down
 ```
 
+Azurite's API-version check is disabled in this test environment, as in the
+benchmark suite, so newer Azure SDK versions can exercise the emulator's
+supported operations without being rejected solely for their API-version header.
+This does not change requests to production Azure Storage.
+
 MinIO is built from the pinned `RELEASE.2025-09-07T16-13-09Z` source release.
 Its former Docker Hub and Quay images are no longer publicly pullable, so the
 suite does not depend on either MinIO image registry or registry credentials.
