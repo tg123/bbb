@@ -12,7 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.15
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.23.21
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.8
-	github.com/aws/smithy-go v1.28.8
+	github.com/aws/smithy-go v1.28.9
 	github.com/creack/pty v1.1.24
 	github.com/google/go-containerregistry v0.22.1
 	github.com/urfave/cli/v3 v3.14.0
