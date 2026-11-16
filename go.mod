@@ -16,7 +16,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/google/go-containerregistry v0.22.1
 	github.com/urfave/cli/v3 v3.14.0
-	golang.org/x/sync v0.24.0
+	golang.org/x/sync v0.25.0
 	golang.org/x/sys v0.49.0
 	golang.org/x/text v0.43.0
 	google.golang.org/api v0.311.0
