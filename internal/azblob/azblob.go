@@ -1822,7 +1822,8 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	//      endpoint). azcopy uses the same approach.
 	//   3. Fall back to SAS when no OAuth credential is available (e.g.
 	//      cross-tenant copies).
-	var srcURL, srcAuth string
+	var srcURL string
+	var srcAuth *copySourceAuth
 	if accountKey(src.Account) != "" {
 		sasURL, sasErr := blobSASURL(ctx, src)
 		if sasErr != nil {
@@ -1839,7 +1840,7 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 				return sasErr
 			}
 			srcURL = sasURL
-			srcAuth = ""
+			srcAuth = nil
 		}
 	}
 
@@ -1893,22 +1894,20 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	return nil
 }
 
-// copySourceOAuth resolves a source blob URL and an OAuth bearer header
-// value (suitable for x-ms-copy-source-authorization) for server-side copy.
+// copySourceOAuth resolves a source blob URL and a refreshable OAuth token
+// cache for x-ms-copy-source-authorization during server-side copy.
 // Returns a non-nil error when no token credential is available for the
 // source account (e.g. anonymous public blob, or cross-tenant copy without
 // credentials configured); callers should fall back to a SAS URL in that
 // case.
-func copySourceOAuth(ctx context.Context, src AzurePath) (string, string, error) {
+func copySourceOAuth(ctx context.Context, src AzurePath) (string, *copySourceAuth, error) {
 	cred, err := getCredentialForAccount(ctx, src.Account)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
-	tok, err := cred.GetToken(ctx, policy.TokenRequestOptions{
-		Scopes: []string{"https://storage.azure.com/.default"},
-	})
-	if err != nil {
-		return "", "", err
+	auth := &copySourceAuth{credential: cred}
+	if _, err := auth.getToken(ctx, 0); err != nil {
+		return "", nil, err
 	}
 	// TrimRight defends against BBB_AZBLOB_ENDPOINT values that include a
 	// trailing slash (e.g. "https://%s.blob.core.windows.net/"), which would
@@ -1916,7 +1915,7 @@ func copySourceOAuth(ctx context.Context, src AzurePath) (string, string, error)
 	// containing spaces, '#', '?', etc.
 	endpoint := strings.TrimRight(getEndpoint(src.Account), "/")
 	srcURL := fmt.Sprintf("%s/%s/%s", endpoint, url.PathEscape(src.Container), pathEscapeBlobName(src.Blob))
-	return srcURL, "Bearer " + tok.Token, nil
+	return srcURL, auth, nil
 }
 
 // pathEscapeBlobName URL-escapes a blob name segment-by-segment, preserving
@@ -2027,7 +2026,7 @@ func CopyBlobFromURLServerSide(ctx context.Context, dst AzurePath, sourceURL str
 	}
 	// The external source URL already carries its own auth (a signed CDN
 	// query string), so no x-ms-copy-source-authorization header is sent.
-	err = copyBlobBlocks(ctx, client, dst, sourceURL, "", size, concurrency, onProgress)
+	err = copyBlobBlocks(ctx, client, dst, sourceURL, nil, size, concurrency, onProgress)
 	if err != nil {
 		// StageBlockFromURL (Put Block From URL) returns 501 in emulators
 		// like Azurite. Fall back to the async StartCopyFromURL approach.
@@ -2045,7 +2044,7 @@ func CopyBlobFromURLServerSide(ctx context.Context, dst AzurePath, sourceURL str
 //
 // If staging is rejected because stale uncommitted blocks poison the
 // destination, the blob is cleared and the copy is retried once.
-func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, concurrency int, onProgress CopyProgress) error {
+func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, copySource string, sourceAuth *copySourceAuth, totalSize int64, concurrency int, onProgress CopyProgress) error {
 	// Guard against non-monotonic progress across the self-heal retry below,
 	// which restarts the byte counter from zero.
 	if onProgress != nil {
@@ -2072,11 +2071,9 @@ func copyBlobBlocks(ctx context.Context, client *azblob.Client, dst AzurePath, c
 // copyBlobBlocksOnce performs a single parallel StageBlockFromURL +
 // CommitBlockList pass.
 //
-// When sourceAuth is non-empty, it is forwarded as
-// x-ms-copy-source-authorization on every StageBlockFromURL request so the
-// destination uses OAuth to read the source instead of relying on
-// SAS-embedded credentials (~8× faster intra-region on real Azure).
-func copyBlobBlocksOnce(ctx context.Context, client *azblob.Client, dst AzurePath, copySource, sourceAuth string, totalSize int64, concurrency int, onProgress CopyProgress) error {
+// When sourceAuth is non-nil, each block acquires current source authorization
+// and can recover once if that token is rejected during staging or SDK retries.
+func copyBlobBlocksOnce(ctx context.Context, client *azblob.Client, dst AzurePath, copySource string, sourceAuth *copySourceAuth, totalSize int64, concurrency int, onProgress CopyProgress) error {
 	blockBlobClient := client.ServiceClient().NewContainerClient(dst.Container).NewBlockBlobClient(dst.Blob)
 
 	// Plan blocks and generate IDs.
@@ -2136,10 +2133,7 @@ func copyBlobBlocksOnce(ctx context.Context, client *azblob.Client, dst AzurePat
 			stageOpts := &blockblob.StageBlockFromURLOptions{
 				Range: blob.HTTPRange{Offset: offset, Count: count},
 			}
-			if sourceAuth != "" {
-				stageOpts.CopySourceAuthorization = &sourceAuth
-			}
-			_, err := blockBlobClient.StageBlockFromURL(ctx, blockID, copySource, stageOpts)
+			err := stageBlockFromURL(ctx, blockBlobClient, blockID, copySource, stageOpts, sourceAuth)
 			if err != nil {
 				errMu.Lock()
 				if firstErr == nil {

@@ -285,7 +285,7 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_AZBLOB_DOWNLOAD_CONCURRENCY_MAX` | *(auto)* | Hard upper bound on in-flight download ranges for the adaptive concurrency controller (default cap 512) |
 | `BBB_AZBLOB_UPLOAD_CONCURRENCY_MAX` | *(auto)* | Hard upper bound on in-flight upload blocks for the adaptive concurrency controller (default cap 512) |
 | `BBB_AZBLOB_COPY_CONCURRENCY_MAX` | *(auto)* | Hard upper bound on in-flight blocks for Azure→Azure server-side block copies (default cap 256) |
-| `BBB_AZBLOB_FORCE_S2S` | *(off)* | Set to `1` or `true` to force Azure→Azure server-side (S2S) copy. On a server-side copy failure, bbb does **not** fall back to client-side streaming; instead the error is retried (honouring `--retry-count`) |
+| `BBB_AZBLOB_FORCE_S2S` | *(off)* | Set to `1` or `true` to force Azure→Azure server-side (S2S) copy. On a server-side copy failure, bbb does **not** fall back to client-side streaming; retryable errors honour `--retry-count`, while permanent authorization failures are returned |
 | `BBB_RETRY_JITTER` | *(off)* | Go duration (e.g. `500ms`, `2s`) to wait a random amount of time in `[0, value)` before each retry attempt. Applies to all operations that honour `--retry-count` |
 
 ### Non-Interactive Authentication (`AZURE_*` Env Vars)
@@ -302,6 +302,8 @@ By default, when bbb cannot find shared keys or role-specific credentials it dis
 - `AZURE_SUBSCRIPTION_ID` is not required for Blob Storage data-plane authentication and is ignored.
 
 These take effect before the interactive CLI/browser flow, so no browser popup is opened when they are configured. Single-endpoint commands (`ls`, `cat`, `rm`, etc.) reuse the `SRC` role internally, so the unprefixed `AZURE_*` vars (and `SRC_AZURE_*`) are honored for them too. For per-account scoping across tenants, use the `SRC_` / `DST_` prefixed variables described below.
+
+Azure server-side block copies refresh source OAuth authorization independently of destination authentication. If Azure specifically rejects copy-source authentication during staging or SDK retries, bbb reacquires the source token and retries that block once only if the token changed. Other authorization failures remain terminal. `BBB_AZBLOB_COPY_SAS_EXPIRY` controls SAS validity only; it does not extend OAuth token lifetime.
 
 ### Multi-Tenant / Multi-Account Authentication (`SRC_` / `DST_` Env Vars)
 
