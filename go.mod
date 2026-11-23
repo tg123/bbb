@@ -19,7 +19,7 @@ require (
 	golang.org/x/sync v0.25.0
 	golang.org/x/sys v0.50.0
 	golang.org/x/text v0.44.0
-	google.golang.org/api v0.315.0
+	google.golang.org/api v0.316.0
 )
 
 require (
